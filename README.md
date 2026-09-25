@@ -87,7 +87,7 @@ An item's `agent` name picks a named, owner-written kind of worker: its instruct
 | `subagents.maxParallel` | At most this many of one call's items run at once; the rest queue. Default 4 |
 | `subagents.agentDefinitionModel.use` | `"route"` (the default) ignores an agent definition's `model` and `thinking`, with one warning, and routes the worker as usual. `"preserve"` runs a worker whose definition names a model on that model and thinking, unrouted, and writes an agent-model record (delegation id, agent name, definition file, model, effort). A definition without a model is routed either way |
 | `subagents.agentDefinitionModel.allowBanned` | With `"preserve"`, lets a definition-named model be on the subagent ban list. For a project's agent definition this also needs `allowProjectOverrides`. The agent-model record then gets `banListException: true`. Under `"route"`, a `true` value only warns once. Every other path still refuses a banned model |
-| `subagents.allowProjectOverrides` | Personal settings only, default `false`. Lets a project's `.pi/settings.json` set every `orchestrator.subagents` key except this one. Ignored project keys are logged once, as the guard does for the ban lists |
+| `subagents.allowProjectOverrides` | Personal settings only, default `false`. Lets a project's `.pi/settings.json` set every `orchestrator.subagents` key except this one. A project key replaces the personal value whole: a project's `agentDefinitionModel` replaces the personal object, it is not merged into it. Without the flag every project `orchestrator.subagents` key is ignored; with it, a project value for the flag itself is ignored. Each ignored key is logged once to stderr, as `pi-orchestrator subagents: ignored project settings key <key>`, the way the guard logs ignored ban-list keys |
 
 ## Settings
 
@@ -122,7 +122,7 @@ pi-orchestrator settings live under the `orchestrator` key in personal settings,
 | `routing.classifier` | The model that classifies each task, with its timeout and fallbacks. Every rung must name an installed model |
 | `routing.tiers` | Four tiers, each a list of `provider/model:effort` rungs tried in order |
 
-A project's `.pi/settings.json` may replace individual tiers under `orchestrator.routing.tiers`, and nothing else. A project cannot change either ban list. The guard logs each ignored key once.
+A project's `.pi/settings.json` may replace individual tiers under `orchestrator.routing.tiers`, and, when personal settings switch `orchestrator.subagents.allowProjectOverrides` on, `orchestrator.subagents` keys; nothing else. A project cannot change either ban list. The guard logs each ignored key once.
 
 ### How routing decides
 

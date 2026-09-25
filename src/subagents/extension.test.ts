@@ -553,6 +553,68 @@ test("project settings cannot enable preserve mode for a named definition", asyn
   } finally { h.cleanup(); }
 });
 
+/** Runs `body` with stderr captured, and returns the subagents extension's
+ *  lines about ignored project settings keys. */
+async function ignoredKeysLog(body: () => Promise<void>): Promise<string[]> {
+  const original = process.stderr.write;
+  let output = "";
+  process.stderr.write = ((chunk: string | Uint8Array) => { output += String(chunk); return true; }) as typeof process.stderr.write;
+  try { await body(); } finally { process.stderr.write = original; }
+  return output.split("\n").filter((line) => line.startsWith("pi-orchestrator subagents: ignored project settings key"));
+}
+
+test("without allowProjectOverrides a project's subagents keys are ignored and each is logged once", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: {} } });
+  try {
+    writeAgentDefinition(join(h.agentDir, "agents"), "scout.md",
+      { name: "scout", description: "Scouts", model: HAIKU, thinking: "high" }, "Find files.");
+    mkdirSync(join(h.projectDir, ".pi"));
+    writeFileSync(join(h.projectDir, ".pi", "settings.json"), JSON.stringify({ orchestrator: { subagents: {
+      maxParallel: 1, agentDefinitionModel: { use: "preserve" }, allowProjectOverrides: true,
+    } } }));
+    const provider = fakeAnthropic("done");
+    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h).ctx;
+    const workers: SubagentsDetails["results"][number][] = [];
+    const log = await ignoredKeysLog(async () => {
+      workers.push((await callSubagents(tool, ctx, "First task", "scout")).worker);
+      workers.push((await callSubagents(tool, ctx, "Second task", "scout")).worker);
+    });
+    assert.deepEqual(workers.map((worker) => worker.status), ["completed", "completed"], JSON.stringify(workers));
+    assert.deepEqual(workers.map((worker) => worker.model), [undefined, undefined], "the project's preserve mode is ignored");
+    assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")).map((record) => record.recordType), ["decision", "decision"]);
+    assert.deepEqual(log, [
+      "pi-orchestrator subagents: ignored project settings key orchestrator.subagents.maxParallel",
+      "pi-orchestrator subagents: ignored project settings key orchestrator.subagents.agentDefinitionModel",
+      "pi-orchestrator subagents: ignored project settings key orchestrator.subagents.allowProjectOverrides",
+    ]);
+  } finally { h.cleanup(); }
+});
+
+test("with allowProjectOverrides a project's subagents keys apply, and a project value for the flag itself is ignored and logged", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { allowProjectOverrides: true, agentDefinitionModel: { use: "route" } } } });
+  try {
+    writeAgentDefinition(join(h.agentDir, "agents"), "scout.md",
+      { name: "scout", description: "Scouts", model: HAIKU, thinking: "high" }, "Find files.");
+    mkdirSync(join(h.projectDir, ".pi"));
+    writeFileSync(join(h.projectDir, ".pi", "settings.json"), JSON.stringify({ orchestrator: { subagents: {
+      agentDefinitionModel: { use: "preserve" }, allowProjectOverrides: false,
+    } } }));
+    const provider = fakeAnthropic("done");
+    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h).ctx;
+    const workers: SubagentsDetails["results"][number][] = [];
+    const log = await ignoredKeysLog(async () => {
+      workers.push((await callSubagents(tool, ctx, "First task", "scout")).worker);
+      workers.push((await callSubagents(tool, ctx, "Second task", "scout")).worker);
+    });
+    assert.deepEqual(workers.map((worker) => worker.status), ["completed", "completed"], JSON.stringify(workers));
+    assert.deepEqual(workers.map((worker) => worker.model), [HAIKU, HAIKU], "the project's preserve mode applies");
+    assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")).map((record) => record.recordType), ["agent-model", "agent-model"]);
+    assert.deepEqual(log, ["pi-orchestrator subagents: ignored project settings key orchestrator.subagents.allowProjectOverrides"]);
+  } finally { h.cleanup(); }
+});
+
 test("an unknown agent name fails the item with a reason, and no worker starts", async () => {
   const h = harness();
   try {

@@ -1,9 +1,10 @@
 import { join } from "node:path";
 import type { ExtensionAPI, InlineExtension } from "@earendil-works/pi-coding-agent";
-import { banListsFromSettings, personalAgentDir, personalOrchestrator, readSettingsFile, subagentBanListEntry } from "../policy/ban-lists.ts";
+import { banListsFromSettings, personalAgentDir, readSettingsFile, subagentBanListEntry } from "../policy/ban-lists.ts";
 import { THINKING_LEVELS, splitKnownThinkingSuffix, type ThinkingLevel } from "../models/model-info.ts";
 import { agentDefinitionDirs, agentDefinitionListing, loadAgentDefinitions, resolveAgent } from "./agent-definitions.ts";
 import { renderSubagentsCall, renderSubagentsResult } from "./render.ts";
+import { loadSubagentsSettings } from "./settings.ts";
 import { runWorker, SUBAGENTS_TOOL, type WorkerResult } from "./worker.ts";
 
 // The subagents extension (ADR 0007): a third pi extension, separate from the
@@ -108,38 +109,9 @@ function resultText(result: SubagentResult): string {
   ].join("\n");
 }
 
-function maxParallel(agentDir: string, cwd: string): number {
-  const personal = personalOrchestrator(readSettingsFile(join(agentDir, "settings.json")) ?? {})?.subagents;
-  if (personal !== undefined && (typeof personal !== "object" || personal === null || Array.isArray(personal))) {
-    throw new Error("orchestrator.subagents must be an object");
-  }
-  const personalOptions = personal as Record<string, unknown> | undefined;
-  const allowProjectOverrides = personalOptions?.allowProjectOverrides === true;
-  const project = allowProjectOverrides ? readSettingsFile(join(cwd, ".pi", "settings.json")) : undefined;
-  const projectOptions = project === undefined ? undefined : personalOrchestrator(project)?.subagents;
-  if (projectOptions !== undefined && (typeof projectOptions !== "object" || projectOptions === null || Array.isArray(projectOptions))) {
-    throw new Error("project orchestrator.subagents must be an object");
-  }
-  const limit = (projectOptions as Record<string, unknown> | undefined)?.maxParallel ?? personalOptions?.maxParallel ?? 4;
-  if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1) {
-    throw new Error("orchestrator.subagents.maxParallel must be a positive integer");
-  }
-  return Math.min(limit, 8);
-}
-
-function agentModelSettings(agentDir: string): { use: "route" | "preserve"; banned: readonly string[] } {
-  const personal = readSettingsFile(join(agentDir, "settings.json")) ?? {};
-  const options = personalOrchestrator(personal)?.subagents;
-  if (options !== undefined && (typeof options !== "object" || options === null || Array.isArray(options))) {
-    throw new Error("orchestrator.subagents must be an object");
-  }
-  const config = (options as Record<string, unknown> | undefined)?.agentDefinitionModel;
-  if (config !== undefined && (typeof config !== "object" || config === null || Array.isArray(config))) {
-    throw new Error("orchestrator.subagents.agentDefinitionModel must be an object");
-  }
-  const use = (config as Record<string, unknown> | undefined)?.use ?? "route";
-  if (use !== "route" && use !== "preserve") throw new Error("orchestrator.subagents.agentDefinitionModel.use must be route or preserve");
-  return { use, banned: banListsFromSettings(personal).banLists.subagentBanList };
+/** The subagent ban list from personal settings; a project may not change it (ADR 0002). */
+function personalSubagentBanList(agentDir: string): readonly string[] {
+  return banListsFromSettings(readSettingsFile(join(agentDir, "settings.json")) ?? {}).banLists.subagentBanList;
 }
 
 export interface SubagentsDependencies {
@@ -157,6 +129,12 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
   const deps: SubagentsDependencies = { workerExtensions: [], ...overrides };
   return function subagents(pi: ExtensionAPI): void {
     const warnedSessions = new Set<string>();
+    const logged = new Set<string>();
+    const logOnce = (line: string) => {
+      if (logged.has(line)) return;
+      logged.add(line);
+      process.stderr.write(`pi-orchestrator subagents: ${line}\n`);
+    };
     const registerSubagentsTool = (description: string) => pi.registerTool({
       name: SUBAGENTS_TOOL,
       label: "Subagents",
@@ -166,8 +144,10 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
         const { items } = params as { items: SubagentItem[] };
         if (!Array.isArray(items) || items.length < 1 || items.length > 8) throw new Error("subagents requires 1 to 8 items per call");
         const agentDir = personalAgentDir();
-        const limit = maxParallel(agentDir, ctx.cwd);
-        const modelSettings = agentModelSettings(agentDir);
+        const { settings, ignoredProjectKeys } = loadSubagentsSettings(agentDir, ctx.cwd);
+        for (const key of ignoredProjectKeys) logOnce(`ignored project settings key ${key}`);
+        const limit = settings.maxParallel;
+        const modelSettings = { use: settings.agentDefinitionModel.use, banned: personalSubagentBanList(agentDir) };
         const definitions = loadAgentDefinitions(agentDefinitionDirs(agentDir, ctx.cwd));
         const orchestratorTools = pi.getActiveTools();
         const results: SubagentResult[] = new Array(items.length);
