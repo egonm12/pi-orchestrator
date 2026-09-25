@@ -10,7 +10,7 @@ An agent the orchestrator hands one bounded piece of investigation, implementati
 _Avoid_: Execution agent, subagent (that is pi-subagents' mechanism and tool name, not the role)
 
 **Delegation**:
-One handing of one piece of work from the orchestrator to a worker. Each attempt has a delegation id.
+One handing of one piece of work from the orchestrator to a worker. Each attempt has a delegation id: the id of the worker's pi session.
 _Avoid_: Dispatch, spawn
 
 **Routing policy**:
