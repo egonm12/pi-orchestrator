@@ -14,6 +14,7 @@ import {
 } from "../fixtures/routing-decision.ts";
 import {
   appendRoutingRecord,
+  buildEffortLadderRecord,
   buildExplicitModelRecord,
   DECISION_RECORD_SCHEMA_VERSION,
   decisionRecordPath,
@@ -46,21 +47,23 @@ function tempDir(): { dir: string; cleanup(): void } {
 
 async function liveInput(overrides: Partial<DecisionRecordInput> = {}): Promise<DecisionRecordInput> {
   const tierMap = fixtureTierMap();
+  const route = overrides.route ?? fixtureRoute("standard", tierMap);
   return {
     delegationId: "attempt-live-1",
     at: NOW,
     mode: "live",
+    ranOn: route.ok ? route.rung.rung : SONNET,
     taskText: TASK,
     agentRole: "worker",
     classification: await fixtureClassification(TASK, "standard"),
     tierMap,
-    route: fixtureRoute("standard", tierMap),
+    route,
     ...overrides,
   } as DecisionRecordInput;
 }
 
 async function shadowInput(overrides: Partial<DecisionRecordInput> = {}): Promise<DecisionRecordInput> {
-  return { ...(await liveInput()), delegationId: "attempt-shadow-1", mode: "shadow", handPickedModel: SONNET, ...overrides } as DecisionRecordInput;
+  return { ...(await liveInput()), delegationId: "attempt-shadow-1", mode: "shadow", handPickedModel: SONNET, ranOn: SONNET, ...overrides } as DecisionRecordInput;
 }
 
 function linesOf(path: string): Record<string, unknown>[] {
@@ -85,7 +88,9 @@ test("one shadow write and one live write leave exactly two records, each carryi
     assert.equal(records.length, 2);
     const [first, second] = records as [DecisionRecord, DecisionRecord];
     assert.equal(first.mode, "shadow");
+    assert.equal(first.ranOn, SONNET);
     assert.equal(second.mode, "live");
+    assert.equal(second.ranOn, `${SONNET}:medium`);
 
     for (const record of [first, second]) {
       assert.equal(record.recordType, "decision");
@@ -177,6 +182,8 @@ test("a record with a missing or an unknown field fails validation on read, nami
     const cases: { readonly mutate: (copy: Record<string, unknown>) => void; readonly field: string; readonly problem: string }[] = [
       { mutate: (copy) => delete copy.agentRole, field: "agentRole", problem: missing },
       { mutate: (copy) => delete copy.delegationId, field: "delegationId", problem: missing },
+      { mutate: (copy) => delete copy.ranOn, field: "ranOn", problem: missing },
+      { mutate: (copy) => { copy.ranOn = ""; }, field: "ranOn", problem: "must be a non-blank string; got \"\"" },
       { mutate: (copy) => { copy.surprise = 1; }, field: "surprise", problem: unknown },
       { mutate: (copy) => { copy.handPickedModel = SONNET; }, field: "handPickedModel", problem: unknown },
       { mutate: (copy) => delete (copy.classification as Record<string, unknown>).rubricVersion, field: "classification.rubricVersion", problem: missing },
@@ -215,18 +222,58 @@ test("a record with a missing or an unknown field fails validation on read, nami
     assert.throws(() => validateRoutingRecord(versioned), { message: /'schemaVersion'/ });
 
     // A later version with a new field reports the version, not the field.
-    const future = { ...base, schemaVersion: "decision-record/3", cause: "explicit" };
+    const future = { ...base, schemaVersion: "decision-record/4", cause: "explicit" };
     assert.throws(() => validateRoutingRecord(future), (error: unknown) => {
       assert.ok(error instanceof RoutingRecordError, String(error));
       assert.equal(error.field, "schemaVersion", error.message);
-      assert.match(error.message, /decision-record\/3/);
+      assert.match(error.message, /decision-record\/4/);
       return true;
     });
-    const futureVerdict = { recordType: "verdict", schemaVersion: "decision-record/3", delegationId: "a", timestamp: NOW.toISOString(), verdict: "accept", extra: 1 };
+    const futureVerdict = { recordType: "verdict", schemaVersion: "decision-record/4", delegationId: "a", timestamp: NOW.toISOString(), verdict: "accept", extra: 1 };
     assert.throws(() => validateRoutingRecord(futureVerdict), { name: "RoutingRecordError", message: /field 'schemaVersion'/ });
   } finally {
     cleanup();
   }
+});
+
+test("a folder reads legacy decisions, explicit records and verdicts beside new decisions without relaxing validation", async () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    const { record } = writeDecisionRecord(dir, await liveInput());
+    const oldDecision = { ...record, schemaVersion: "decision-record/2" } as Record<string, unknown>;
+    delete oldDecision.ranOn;
+    const explicit = { ...buildExplicitModelRecord({ delegationId: "old-explicit", at: NOW, mode: "live", slot: "model", model: SONNET, taskText: TASK, agentRole: "worker" }), schemaVersion: "decision-record/2" };
+    const verdict = { recordType: "verdict", schemaVersion: "decision-record/2", delegationId: "old-decision", timestamp: NOW.toISOString(), verdict: "accept", decisionFile: "2026-09-25.jsonl" };
+    const path = decisionRecordPath(dir, NOW);
+    writeFileSync(path, [oldDecision, explicit, verdict, record].map((item) => JSON.stringify(item)).join("\n") + "\n");
+    assert.deepEqual(readRoutingRecords(dir).map((item) => [item.schemaVersion, item.recordType]), [
+      ["decision-record/2", "decision"], ["decision-record/2", "explicit"], ["decision-record/2", "verdict"], ["decision-record/3", "decision"],
+    ]);
+    assert.throws(() => validateRoutingRecord({ ...oldDecision, ranOn: SONNET }), /field 'ranOn' is not a known field/);
+    assert.throws(() => validateRoutingRecord({ ...explicit, surprise: true }), /field 'surprise' is not a known field/);
+    assert.throws(() => validateRoutingRecord({ ...verdict, surprise: true }), /field 'surprise' is not a known field/);
+  } finally { cleanup(); }
+});
+
+test("new effort-ladder records use /3, while legacy /2 remains readable and unknown fields fail", async () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    const tierMap = fixtureTierMap();
+    const route = fixtureRoute("standard", tierMap);
+    assert.equal(route.ok, true);
+    if (!route.ok) return;
+    const record = buildEffortLadderRecord({
+      delegationId: "attempt-2", at: NOW, previousDecisionId: "attempt-1", step: "effort", skipped: [],
+      taskText: TASK, agentRole: "worker", kindOfWork: "implement", tierMap, route,
+    });
+    assert.equal(record.schemaVersion, "decision-record/3");
+    appendRoutingRecord(dir, record);
+    const legacy = { ...record, schemaVersion: "decision-record/2", delegationId: "attempt-old" };
+    appendRoutingRecord(dir, legacy);
+    assert.deepEqual(readRoutingRecords(dir).map((item) => item.schemaVersion), ["decision-record/3", "decision-record/2"]);
+    assert.throws(() => validateRoutingRecord({ ...record, ranOn: SONNET }), /field 'ranOn' is not a known field/);
+    assert.throws(() => validateRoutingRecord({ ...record, surprise: true }), /field 'surprise' is not a known field/);
+  } finally { cleanup(); }
 });
 
 test("an explicit record with a missing or an unknown field fails validation on write and on read, naming the field", async () => {
@@ -266,11 +313,12 @@ test("an explicit record with a missing or an unknown field fails validation on 
 test("the shadow record carries the model the orchestrator named by hand and the live record carries none", async () => {
   const { dir, cleanup } = tempDir();
   try {
-    writeDecisionRecord(dir, await shadowInput({ handPickedModel: "anthropic/claude-opus-5" } as Partial<DecisionRecordInput>));
+    writeDecisionRecord(dir, await shadowInput({ handPickedModel: "anthropic/claude-opus-5", ranOn: "anthropic/claude-opus-5" } as Partial<DecisionRecordInput>));
     writeDecisionRecord(dir, await liveInput());
     const [shadow, live] = linesOf(decisionRecordPath(dir, NOW));
     assert.equal(shadow?.mode, "shadow");
     assert.equal(shadow?.handPickedModel, "anthropic/claude-opus-5");
+    assert.equal(shadow?.ranOn, "anthropic/claude-opus-5");
     assert.equal(live?.mode, "live");
     assert.equal(Object.hasOwn(live!, "handPickedModel"), false);
 
@@ -489,6 +537,7 @@ test("an auth token in a settings key next to orchestrator never appears in any 
       at: NOW,
       mode: "shadow",
       handPickedModel: SONNET,
+      ranOn: SONNET,
       taskText: TASK,
       agentRole: "worker",
       settings,
@@ -498,7 +547,7 @@ test("an auth token in a settings key next to orchestrator never appears in any 
       route: { ...route, settings, ...(route.ok ? { rung: { ...route.rung, token: TOKEN } } : {}) },
     } as unknown as DecisionRecordInput;
     writeDecisionRecord(dir, input);
-    writeDecisionRecord(dir, { ...input, delegationId: "attempt-token-live", mode: "live", handPickedModel: undefined } as unknown as DecisionRecordInput);
+    writeDecisionRecord(dir, { ...input, delegationId: "attempt-token-live", mode: "live", handPickedModel: undefined, ranOn: route.ok ? route.rung.rung : SONNET } as unknown as DecisionRecordInput);
     for (const file of readdirSync(dir)) {
       const text = readFileSync(join(dir, file), "utf8");
       assert.equal(text.includes(TOKEN), false, `${file} holds the token`);

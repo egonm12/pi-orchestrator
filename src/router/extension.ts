@@ -259,10 +259,11 @@ async function planSlot(
   });
   const common = { delegationId, at, taskText, agentRole, classification, tierMap: router.tierMap, route };
   if (router.mode === "live") {
-    const record = buildDecisionRecord({ ...common, mode: "live" });
+    const record = buildDecisionRecord({ ...common, mode: "live", ranOn: route.ok ? route.rung.rung : unroutedModel(agent, router.installedModels, ctx, "live refusal") });
     return route.ok ? { record, write: { object: slot.object, rung: route.rung.rung } } : { record };
   }
-  return { record: buildDecisionRecord({ ...common, mode: "shadow", handPickedModel: handPickedModel(agent, router.installedModels, ctx) }) };
+  const runModel = unroutedModel(agent, router.installedModels, ctx, "shadow mode");
+  return { record: buildDecisionRecord({ ...common, mode: "shadow", handPickedModel: runModel, ranOn: runModel }) };
 }
 
 /** The agent a slot names, found the way pi-subagents finds it for this call:
@@ -292,8 +293,8 @@ function definitionModel(agent: AgentConfig | undefined): string | undefined {
  *  (`resolveEffectiveSubagentModel`, runs/shared/model-resolution.js:281) of
  *  the agent's `model` (here only a `subagents.defaultModel`, since a pinned
  *  one is explicit), else the session model. */
-function handPickedModel(agent: AgentConfig | undefined, installedModels: readonly ModelInfo[], ctx: ExtensionContext): string {
-  if (ctx.model === undefined) throw new Error("shadow mode records the session model, and pi supplied none");
+function unroutedModel(agent: AgentConfig | undefined, installedModels: readonly ModelInfo[], ctx: ExtensionContext, reason: "shadow mode" | "live refusal"): string {
+  if (ctx.model === undefined) throw new Error(`pi supplied no session model for ${reason === "live refusal" ? "a live refusal" : "shadow mode"}`);
   const parent = { provider: ctx.model.provider, id: ctx.model.id };
   const resolved = resolveEffectiveSubagentModel(undefined, agent?.model, parent, [...installedModels], agent?.modelProvider ?? parent.provider);
   return splitKnownThinkingSuffix(resolved ?? `${parent.provider}/${parent.id}`).baseModel;

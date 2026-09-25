@@ -77,6 +77,7 @@ async function knownFolder(): Promise<Known> {
     tier: RiskTier,
     extra: Partial<DecisionRecordInput> & { mode?: "live" | "shadow"; handPickedModel?: string },
   ) => {
+    const route = extra.route ?? fixtureRoute(tier, tierMap);
     writeDecisionRecord(records, {
       delegationId,
       at,
@@ -85,8 +86,9 @@ async function knownFolder(): Promise<Known> {
       agentRole: "worker",
       classification: await fixtureClassification(`task ${delegationId}`, tier),
       tierMap,
-      route: fixtureRoute(tier, tierMap),
+      route,
       ...extra,
+      ranOn: extra.ranOn ?? (extra.mode === "shadow" ? extra.handPickedModel : route.ok ? route.rung.rung : HAIKU),
     } as DecisionRecordInput);
   };
   await decide("d1", day1, "standard", {});

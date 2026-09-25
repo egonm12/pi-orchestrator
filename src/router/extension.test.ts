@@ -134,7 +134,7 @@ async function loadRouter(h: Harness, deps: Partial<RouterDependencies> = {}, mo
 
 /** The router with the classifier call it would use in pi (unless `deps`
  *  replaces it): the in-session call over `modelRegistry`. */
-async function loadRouterWith(h: Harness, deps: Partial<RouterDependencies>, model: typeof SESSION_MODEL, modelRegistry: SessionModelRegistry): Promise<LoadedRouter> {
+async function loadRouterWith(h: Harness, deps: Partial<RouterDependencies>, model: typeof SESSION_MODEL | undefined, modelRegistry: SessionModelRegistry): Promise<LoadedRouter> {
   const handlers = new Map<string, Handler>();
   const factory = createRouterExtension({
     evidence: () => () => evidenceOf(),
@@ -259,6 +259,8 @@ test("in shadow mode a call with no model proceeds unchanged and the record show
     assert.deepEqual(h.records().map(summary), [
       { recordType: "decision", delegationId: "call-1", mode: "shadow", tier: "standard", cause: "model:anthropic/claude-haiku-4-5:low", route: "anthropic/claude-sonnet-5:medium", handPickedModel: "anthropic/claude-haiku-4-5" },
     ]);
+    const record = h.records()[0];
+    assert.equal(record?.recordType === "decision" && record.ranOn, HAIKU);
   } finally { h.cleanup(); }
 });
 
@@ -272,6 +274,8 @@ test("in live mode the same call runs on the router's rung, written into its mod
     assert.deepEqual(h.records().map(summary), [
       { recordType: "decision", delegationId: "call-1", mode: "live", tier: "standard", cause: "model:anthropic/claude-haiku-4-5:low", route: "anthropic/claude-sonnet-5:medium" },
     ]);
+    const record = h.records()[0];
+    assert.equal(record?.recordType === "decision" && record.ranOn, "anthropic/claude-sonnet-5:medium");
   } finally { h.cleanup(); }
 });
 
@@ -345,6 +349,8 @@ test("a subagents.defaultModel in settings is routed over: the rung is written w
           ...(routing.mode === "shadow" ? { handPickedModel: "anthropic/claude-sonnet-5" } : {}),
         },
       ]);
+      const record = h.records()[0];
+      assert.equal(record?.recordType === "decision" && record.ranOn, routing.mode === "shadow" ? "anthropic/claude-sonnet-5" : `${HAIKU}:low`);
     } finally { h.cleanup(); }
   }
 });
@@ -521,9 +527,26 @@ test("a router refusal leaves the call unchanged in live mode and is recorded", 
     const [record] = h.records();
     assert.equal(record?.recordType === "decision" && record.route.outcome, "refused");
     if (record?.recordType === "decision") {
+      assert.equal(record.ranOn, HAIKU);
       assert.deepEqual(record.route.tiersTried, ["mechanical", "standard", "elevated", "critical"]);
       assert.deepEqual([...new Set(record.route.removed.map((removed) => removed.reason))], ["unapproved recipient"]);
     }
+  } finally { h.cleanup(); }
+});
+
+test("a live refusal without a session model reports the missing model without claiming shadow mode", async () => {
+  const h = harness(LIVE);
+  try {
+    const router = await loadRouterWith(h, {
+      classifierCall: () => answering("mechanical").call,
+      evidence: () => () => evidenceOf({ authorization: emptyAuthorization() }),
+    }, undefined, fakeSessionRegistry([]));
+    const input = { agent: "worker", task: "Fix the typo in README.md" };
+    const stderr = await stderrOf(async () => { await router.toolCall(input); });
+    assert.match(stderr, /pi-orchestrator router disabled: pi supplied no session model for a live refusal/);
+    assert.doesNotMatch(stderr, /shadow mode/);
+    assert.deepEqual(input, { agent: "worker", task: "Fix the typo in README.md" });
+    assert.deepEqual(h.records(), []);
   } finally { h.cleanup(); }
 });
 

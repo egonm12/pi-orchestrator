@@ -24,6 +24,7 @@ import {
 } from "../fixtures/routing-decision.ts";
 import {
   readRoutingRecords,
+  validateRoutingRecord,
   writeDecisionRecord,
   type DecisionRecordInput,
   type OrphanedVerdictRecord,
@@ -64,6 +65,7 @@ function folder(): Folder {
 
 async function decide(records: string, overrides: Partial<DecisionRecordInput> = {}) {
   const tierMap = fixtureTierMap();
+  const route = overrides.route ?? fixtureRoute("standard", tierMap);
   return writeDecisionRecord(records, {
     delegationId: "attempt-1",
     at: DECIDED_AT,
@@ -72,8 +74,9 @@ async function decide(records: string, overrides: Partial<DecisionRecordInput> =
     agentRole: "worker",
     classification: await fixtureClassification(TASK, "standard", "implement"),
     tierMap,
-    route: fixtureRoute("standard", tierMap),
+    route,
     ...overrides,
+    ranOn: overrides.ranOn ?? (overrides.mode === "shadow" ? overrides.handPickedModel : route.ok ? route.rung.rung : "anthropic/claude-haiku-4-5"),
   } as DecisionRecordInput);
 }
 
@@ -159,10 +162,17 @@ test("a verdict with a known delegation id is attached to that decision and one 
       ["orphaned-verdict", "attempt-unknown"],
     ]);
     const verdict = records[1] as VerdictRecord;
+    assert.equal(verdict.schemaVersion, "decision-record/3");
     assert.equal(verdict.verdict, "accept");
     assert.equal(verdict.decisionFile, "2026-09-25.jsonl");
     assert.equal(verdict.timestamp, REVIEWED_AT.toISOString());
+    assert.equal((records[2] as OrphanedVerdictRecord).schemaVersion, "decision-record/3");
     assert.equal((records[2] as OrphanedVerdictRecord).verdict, "request_changes");
+    for (const record of [verdict, records[2]!]) {
+      assert.throws(() => validateRoutingRecord({ ...record, ranOn: "anthropic/claude-haiku-4-5" }), /field 'ranOn' is not a known field/);
+      assert.throws(() => validateRoutingRecord({ ...record, surprise: true }), /field 'surprise' is not a known field/);
+      assert.equal(validateRoutingRecord({ ...record, schemaVersion: "decision-record/2" }).schemaVersion, "decision-record/2");
+    }
     assert.deepEqual(verifiedOutcomes(f.ledger).map((o) => o.instance), ["attempt-1"], "an orphan records no observation");
   } finally {
     f.cleanup();

@@ -9,8 +9,9 @@
 // The writer copies each field it records by name from the values it is
 // given: ticket 23's classification, ticket 22's resolved tier map, ticket
 // 24's router decision, and the delegation facts (delegation id, mode, task text,
-// agent role, the hand-picked model in shadow mode). Nothing else an input
-// object carries (a parsed settings file, a token) can reach the file.
+// agent role, the model the worker ran on, and the hand-picked model in
+// shadow mode). Nothing else an input object carries (a parsed settings file,
+// a token) can reach the file.
 //
 // Free text (task text, the classifier's `why` and reasons, hop details,
 // route messages, removal and drop reasons, skipped-rung details) passes one
@@ -35,7 +36,9 @@ import type { LadderSkippedRung } from "./effort-ladder.ts";
 import { LADDER_SKIP_REASONS } from "./skip-reasons.ts";
 import type { RemovedRung, TierRouteDecision } from "./tier-router.ts";
 
-export const DECISION_RECORD_SCHEMA_VERSION = "decision-record/2";
+export const DECISION_RECORD_SCHEMA_VERSION = "decision-record/3";
+/** Only for reading old records and writing the explicit records retired by the auto model. */
+export const LEGACY_DECISION_RECORD_SCHEMA_VERSION = "decision-record/2";
 
 /** Records hold at most this many characters of task text (story 34). */
 export const TASK_TEXT_PREFIX_LIMIT = 200;
@@ -231,6 +234,8 @@ export interface DecisionRecord extends RecordCommon {
   readonly classification: RecordedClassification;
   readonly tierMap: RecordedTierMap;
   readonly route: RecordedRoute;
+  /** The rung in live mode, or the model the worker ran on in shadow mode or on refusal. Absent on /2 records. */
+  readonly ranOn?: string;
   /** Shadow mode only: the model the orchestrator named by hand. */
   readonly handPickedModel?: string;
 }
@@ -264,7 +269,7 @@ export interface EffortLadderRecord extends RecordCommon {
 }
 
 /** Ticket 27: a delegation slot that named its own model, which the router left
- *  alone (story 38). An additive record type under `decision-record/2`, with a
+ *  alone (story 38). A legacy record type under `decision-record/2`, with a
  *  top-level `cause` as the ladder record has. It is not a routing decision:
  *  it has no tier and no rung, so it is not a report row and
  *  `isRoutedDecision` does not accept it. */
@@ -455,10 +460,10 @@ const COMMON_KEYS = ["recordType", "schemaVersion", "delegationId", "timestamp"]
 /** First of all checks: a record of another version may have other fields
  *  and record types, so the version is reported before anything else. */
 function checkSchemaVersion(record: Json): void {
-  if (record.schemaVersion !== DECISION_RECORD_SCHEMA_VERSION) {
+  if (record.schemaVersion !== DECISION_RECORD_SCHEMA_VERSION && record.schemaVersion !== LEGACY_DECISION_RECORD_SCHEMA_VERSION) {
     throw new RoutingRecordError(
       "schemaVersion",
-      `is unsupported: must be ${DECISION_RECORD_SCHEMA_VERSION}; got ${JSON.stringify(record.schemaVersion)}`,
+      `is unsupported: must be ${LEGACY_DECISION_RECORD_SCHEMA_VERSION} or ${DECISION_RECORD_SCHEMA_VERSION}; got ${JSON.stringify(record.schemaVersion)}`,
     );
   }
 }
@@ -475,14 +480,19 @@ export function validateRoutingRecord(value: unknown): RoutingRecord {
   if (!isObject(value)) throw new RoutingRecordError("(record)", `must be a JSON object; got ${JSON.stringify(value)}`);
   checkSchemaVersion(value);
   const recordType = oneOf(value, "recordType", "", ["decision", "effort-ladder", "explicit", "verdict", "orphaned-verdict"] as const);
+  if (value.schemaVersion === DECISION_RECORD_SCHEMA_VERSION && recordType === "explicit") {
+    throw new RoutingRecordError("schemaVersion", `is unsupported for ${recordType} records`);
+  }
   if (recordType === "decision") {
     const mode = oneOf(value, "mode", "", ROUTING_MODES);
-    const required = [...COMMON_KEYS, "mode", "taskTextPrefix", "agentRole", "classification", "tierMap", "route"];
+    const required = [...COMMON_KEYS, "mode", "taskTextPrefix", "agentRole", "classification", "tierMap", "route",
+      ...(value.schemaVersion === DECISION_RECORD_SCHEMA_VERSION ? ["ranOn"] : [])];
     checkKeys(value, "", mode === "shadow" ? [...required, "handPickedModel"] : required);
     checkCommon(value);
     stringAt(value, "taskTextPrefix", "");
     stringAt(value, "agentRole", "", { nonBlank: true });
     if (mode === "shadow") stringAt(value, "handPickedModel", "", { nonBlank: true });
+    if (value.schemaVersion === DECISION_RECORD_SCHEMA_VERSION) stringAt(value, "ranOn", "", { nonBlank: true });
     checkClassification(value);
     checkTierMap(value);
     checkRoute(value);
@@ -539,6 +549,7 @@ interface DecisionRecordInputCommon {
   readonly classification: TierClassification;
   readonly tierMap: ResolvedTierMap;
   readonly route: TierRouteDecision;
+  readonly ranOn: string;
 }
 
 export type DecisionRecordInput =
@@ -649,6 +660,7 @@ export function buildDecisionRecord(input: DecisionRecordInput): DecisionRecord 
     classification: recordedClassification(input.classification),
     tierMap: recordedTierMap(input.tierMap),
     route: recordedRoute(input.route),
+    ranOn: input.ranOn,
     ...(input.handPickedModel === undefined ? {} : { handPickedModel: input.handPickedModel }),
   };
   return checkedRecord(record);
@@ -701,7 +713,7 @@ export interface ExplicitModelRecordInput {
 export function buildExplicitModelRecord(input: ExplicitModelRecordInput): ExplicitModelRecord {
   const record: ExplicitModelRecord = {
     recordType: "explicit",
-    schemaVersion: DECISION_RECORD_SCHEMA_VERSION,
+    schemaVersion: LEGACY_DECISION_RECORD_SCHEMA_VERSION,
     delegationId: input.delegationId,
     timestamp: input.at.toISOString(),
     cause: "explicit",

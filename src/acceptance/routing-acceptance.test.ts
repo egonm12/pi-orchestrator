@@ -10,7 +10,7 @@ import { emptyRefreshState, saveRefreshState, updateFromCallResult } from "../ca
 import { createGuardedAgentDir, credentialsAvailable, liveAuthExtensionPath, realAgentDirPath } from "../fixtures/guarded-agent-dir.ts";
 import { piEvents, PROVIDER_REFUSAL, type PiEvent } from "../fixtures/live-pi-session.ts";
 import { installPiLaunchLog, type PiLaunch } from "../fixtures/pi-launch-log.ts";
-import { fixtureClassification, fixtureRefusal, fixtureRoute, fixtureTierMap, HAIKU as FIXTURE_HAIKU, OPUS } from "../fixtures/routing-decision.ts";
+import { fixtureClassification, fixtureRefusal, fixtureRoute, fixtureTierMap, HAIKU as FIXTURE_HAIKU, OPUS, SONNET } from "../fixtures/routing-decision.ts";
 import { createTempRepo } from "../fixtures/temp-repo.ts";
 import { GUARD_PREFIX } from "../guard/extension.ts";
 import { livePiModelAvailability, PI_LIST_MODELS_TIMEOUT_MS, selectedLivePiModel } from "../policy/live-model.ts";
@@ -300,13 +300,14 @@ test("the gate's hand-computed report equals routing-report.ts over a folder wit
     const task = "Reformat src/report.ts with prettier.";
     const mechanical = await fixtureClassification(task, "mechanical", "implement");
     const common = { at, taskText: task, agentRole: "worker", classification: mechanical, tierMap };
-    writeDecisionRecord(records, { ...common, delegationId: "m-live", mode: "live", route: fixtureRoute("mechanical", tierMap) });
-    writeDecisionRecord(records, { ...common, delegationId: "m-shadow-agrees", mode: "shadow", handPickedModel: FIXTURE_HAIKU, route: fixtureRoute("mechanical", tierMap) });
-    writeDecisionRecord(records, { ...common, delegationId: "m-shadow-differs", mode: "shadow", handPickedModel: OPUS, route: fixtureRoute("mechanical", tierMap) });
+    writeDecisionRecord(records, { ...common, delegationId: "m-live", mode: "live", ranOn: `${FIXTURE_HAIKU}:low`, route: fixtureRoute("mechanical", tierMap) });
+    writeDecisionRecord(records, { ...common, delegationId: "m-shadow-agrees", mode: "shadow", handPickedModel: FIXTURE_HAIKU, ranOn: FIXTURE_HAIKU, route: fixtureRoute("mechanical", tierMap) });
+    writeDecisionRecord(records, { ...common, delegationId: "m-shadow-differs", mode: "shadow", handPickedModel: OPUS, ranOn: OPUS, route: fixtureRoute("mechanical", tierMap) });
     writeDecisionRecord(records, {
       ...common,
       delegationId: "s-live",
       mode: "live",
+      ranOn: `${SONNET}:medium`,
       classification: await fixtureClassification(task, "standard", "implement"),
       route: fixtureRoute("standard", tierMap),
     });
@@ -314,6 +315,7 @@ test("the gate's hand-computed report equals routing-report.ts over a folder wit
       ...common,
       delegationId: "e-refused",
       mode: "live",
+      ranOn: FIXTURE_HAIKU,
       classification: await fixtureClassification(task, "elevated", "implement"),
       route: fixtureRefusal("elevated", tierMap),
     });
