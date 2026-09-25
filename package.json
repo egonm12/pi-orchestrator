@@ -13,7 +13,8 @@
   "pi": {
     "extensions": [
       "./src/router/extension.ts",
-      "./src/guard/extension.ts"
+      "./src/guard/extension.ts",
+      "./src/subagents/extension.ts"
     ]
   },
   "scripts": {

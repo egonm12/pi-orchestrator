@@ -18,6 +18,7 @@ ADR 0006 rejected an own worker runtime because pi-orchestrator would have to bu
 - The tool is named `subagents`, so it does not clash with pi-subagents' `subagent` if that is installed again. The role stays "worker" (CONTEXT.md).
 - Version 1 has one call with up to 8 tasks, at most `maxParallel` (default 4) running at once. The orchestrator waits on them, and abort stops them. Background workers, chains, resume and nested delegation are left for later. Workers do not get the `subagents` tool.
 - A worker loads the same installed extensions as the orchestrator. Its session is saved under the orchestrator's session folder, and its session id is the delegation id.
+- Note (2026-09-26): "share its model registry" means the same model and auth config in the same process. pi keeps the registry's runtime private, so each worker gets its own runtime from the agent dir's auth.json and models.json.
 - Agent definitions are markdown files with frontmatter in `~/.pi/agent/agents/` and `.pi/agents/`. A project file wins by name. A `tools:` list only narrows the tool set.
 - `orchestrator.subagents.agentDefinitionModel.use` is `"route"` by default: a definition's `model` and `thinking` are ignored, with a warning. With `"preserve"`, a definition that names a model runs on it without routing, and gets an `agent-model` record naming the definition file.
 - `agentDefinitionModel.allowBanned` lets a preserved model be on the subagent ban list (see the note on ADR 0002). For a project's agent definition, this applies only when `allowProjectOverrides` is also on.
