@@ -16,15 +16,20 @@ import { createGuardedAgentDir } from "../fixtures/guarded-agent-dir.ts";
 import { pathToFileURL } from "node:url";
 import { stateFolderEvidence } from "./evidence.ts";
 import { INSTALLED_MODEL_IDS } from "../fixtures/installed-models.ts";
+import { INSTALLED_MODEL_INFO } from "../fixtures/installed-model-info.ts";
 import { resetBanLists } from "../policy/ban-lists.ts";
 import { authorizeRecipient, emptyAuthorization, grantOwnerApproval, type RecipientAuthorization } from "../recipients/authorization.ts";
 import { readRoutingRecords, type RoutingRecord } from "../routing/decision-record.ts";
-import { answerEvents, errorEvents, fakeSessionRegistry } from "../fixtures/session-model-registry.ts";
+import { answerEvents, errorEvents, fakeSessionRegistry, assistantMessage } from "../fixtures/session-model-registry.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { TestContext as ExtensionContext } from "../fixtures/extension-context.ts";
 import type { SessionModelRegistry } from "../routing/model-stream.ts";
 import { createRouterExtension, type RouterDependencies, type RoutingEvidence } from "./extension.ts";
 import { OWNER_BAN_LIST_SETTINGS, useOwnerBanLists } from "../fixtures/owner-ban-lists.ts";
+
+type ProviderConfigInput = NonNullable<Parameters<ExtensionAPI["registerProvider"]>[1]>;
+type AutoStream = NonNullable<ProviderConfigInput["streamSimple"]>;
+const AUTO_MODEL = { provider: "orchestrator", id: "auto", api: "orchestrator-auto" } as Parameters<AutoStream>[0];
 
 useOwnerBanLists();
 
@@ -753,6 +758,227 @@ test("under PI_ORCHESTRATOR_ROUTER_PROBE=1 the router says it loaded and prints 
 function classifierAnswer(tier: string): string {
   return JSON.stringify({ tier, risk: { level: "none", reasons: [] }, ambiguity: "clear", complexity: "low", kindOfWork: "implement", why: `session classifier says ${tier}` });
 }
+
+async function loadAutoProvider(h: Harness, registry: SessionModelRegistry, deps: Partial<RouterDependencies> = {}): Promise<AutoStream> {
+  let provider: ProviderConfigInput | undefined;
+  const handlers = new Map<string, Handler>();
+  createRouterExtension({ classifierCall: () => answering("mechanical").call, evidence: () => () => evidenceOf(), now: () => NOW, ...deps })({
+    registerProvider(name: string, config: ProviderConfigInput) { assert.equal(name, "orchestrator"); provider = config; },
+    on(event: string, handler: Handler) { handlers.set(event, handler); },
+  } as unknown as ExtensionAPI);
+  await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, {
+    cwd: h.projectDir, hasUI: false, model: SESSION_MODEL, modelRegistry: registry, sessionManager: { getSessionId: () => "parent" },
+  });
+  assert.equal(provider?.models?.[0]?.id, "auto");
+  assert.ok(provider.streamSimple);
+  return provider.streamSimple;
+}
+
+async function autoEvents(stream: AutoStream, messages: unknown[], sessionId?: string) {
+  const events = [];
+  for await (const event of stream(AUTO_MODEL, { messages } as unknown as Parameters<AutoStream>[1], { sessionId })) events.push(event);
+  return events;
+}
+
+test("the auto model reads the agent role from system prompt sections and text parts", async () => {
+  const h = harness(LIVE);
+  try {
+    const classifier = answering("mechanical");
+    const stream = await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("ok") }]), { classifierCall: () => classifier.call });
+    await autoEvents(stream, [
+      { role: "system", content: [{ type: "text", text: "ordinary prompt" }], sections: { preamble: "instructions", addendum: '<active_agent name="reviewer"/>' }, timestamp: 0 },
+      { role: "user", content: "Review README.md", timestamp: 0 },
+    ], "sections-worker");
+    assert.match(classifier.prompts[0]!, /Agent role: reviewer/);
+    const [record] = h.records();
+    assert.equal(record?.recordType === "decision" && record.agentRole, "reviewer");
+  } finally { h.cleanup(); }
+});
+
+test("the auto model reads the agent role from system text parts", async () => {
+  const h = harness(LIVE);
+  try {
+    const stream = await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("ok") }]));
+    await autoEvents(stream, [
+      { role: "system", content: [{ type: "text", text: '<active_agent name="worker"/>' }], timestamp: 0 },
+      { role: "user", content: "Fix README.md", timestamp: 0 },
+    ], "text-parts-worker");
+    const [record] = h.records();
+    assert.equal(record?.recordType === "decision" && record.agentRole, "worker");
+  } finally { h.cleanup(); }
+});
+
+test("the auto model sends no reasoning option for an off rung", async () => {
+  const h = harness({ ...LIVE, tiers: { ...TEST_TIERS, mechanical: [`${HAIKU}:off`] } });
+  try {
+    const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
+    const stream = await loadAutoProvider(h, registry);
+    await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "off-worker");
+    assert.equal(Object.hasOwn(registry.calls[0]?.options ?? {}, "reasoning"), false);
+  } finally { h.cleanup(); }
+});
+
+test("the auto model clamps the rung's effort to the current model's supported levels", async () => {
+  const h = harness(LIVE);
+  try {
+    const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
+    const currentRegistry: SessionModelRegistry = { ...registry, find(provider, id) {
+      const model = registry.find(provider, id);
+      return model?.id === "claude-haiku-4-5" ? { ...model, reasoning: false } : model;
+    } };
+    const stream = await loadAutoProvider(h, currentRegistry);
+    await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "clamped-worker");
+    assert.equal(Object.hasOwn(registry.calls[0]?.options ?? {}, "reasoning"), false);
+  } finally { h.cleanup(); }
+});
+
+async function autoScenario(h: Harness) {
+  const classifier = answering("mechanical");
+  const real = { provider: "anthropic", model: "claude-haiku-4-5", api: "anthropic-messages" };
+  const usage = { input: 12, output: 8, cacheRead: 1, cacheWrite: 0, totalTokens: 21, cost: { total: 0.007 } };
+  const registry = fakeSessionRegistry([
+    { events: [{ type: "start", partial: assistantMessage({ ...real, usage }) } as never, ...answerEvents("hello", { ...real, usage }).slice(1)] },
+    { events: errorEvents("rung failed") },
+  ], INSTALLED_MODEL_INFO.map((entry) => ({ ...entry, api: "anthropic-messages" })));
+  const stream = await loadAutoProvider(h, registry, { classifierCall: () => classifier.call });
+  const previous = { ...assistantMessage({ content: [{ type: "thinking", thinking: "old" }] }), ...AUTO_MODEL, model: "auto" };
+  const context = [{ role: "system", content: '<active_agent name="worker"/>', timestamp: 0 },
+    { role: "user", content: "Fix README.md", timestamp: 0 }];
+  const signal = new AbortController().signal;
+  const onPayload = () => {};
+  const onResponse = () => {};
+  const options = { sessionId: "worker-1", apiKey: "wrong", headers: { Authorization: "wrong" }, reasoning: "high" as const, signal, onPayload, onResponse };
+  const first = [];
+  for await (const event of stream(AUTO_MODEL, { messages: context } as unknown as Parameters<AutoStream>[1], options)) first.push(event);
+  const second = [];
+  for await (const event of stream(AUTO_MODEL, { messages: [...context, previous] } as unknown as Parameters<AutoStream>[1], options)) second.push(event);
+  return { classifier, real, usage, registry, previous, signal, onPayload, onResponse, options, first, second };
+}
+
+test("a worker on the auto model forwards with the rung's effort and credentials", async () => {
+  const h = harness(LIVE);
+  try {
+    const { registry, signal, onPayload, onResponse, options } = await autoScenario(h);
+    assert.equal(registry.calls[0]?.model.provider, "anthropic");
+    assert.equal(registry.calls[0]?.model.id, "claude-haiku-4-5");
+    assert.equal(registry.calls[0]?.options?.reasoning, "low");
+    assert.equal(registry.calls[0]?.options?.signal, signal);
+    assert.equal((registry.calls[0]?.options as typeof options).onPayload, onPayload);
+    assert.equal((registry.calls[0]?.options as typeof options).onResponse, onResponse);
+    assert.equal("apiKey" in (registry.calls[0]?.options ?? {}), false);
+    assert.equal("headers" in (registry.calls[0]?.options ?? {}), false);
+  } finally { h.cleanup(); }
+});
+
+test("later requests keep the session pin without classifying again", async () => {
+  const h = harness(LIVE);
+  try {
+    const { classifier, registry } = await autoScenario(h);
+    assert.equal(classifier.prompts.length, 1);
+    assert.match(classifier.prompts[0]!, /Agent role: worker/);
+    assert.equal(registry.calls.length, 2);
+    assert.deepEqual(registry.calls.map((call) => call.model.id), ["claude-haiku-4-5", "claude-haiku-4-5"]);
+    assert.equal(h.records().length, 1);
+  } finally { h.cleanup(); }
+});
+
+test("auto model relabels earlier replies inward and streamed replies outward without losing usage", async () => {
+  const h = harness(LIVE);
+  try {
+    const { real, usage, registry, previous, first, second } = await autoScenario(h);
+    assert.deepEqual(registry.calls[1]?.context.messages[2], { ...previous, ...real });
+    assert.deepEqual((first[0] as { partial?: unknown }).partial, { ...assistantMessage({ ...real, usage }), provider: "orchestrator", model: "auto", api: "orchestrator-auto" });
+    assert.deepEqual(first.at(-1), { type: "done", reason: "stop", message: { ...assistantMessage({ ...real, usage, content: [{ type: "thinking", thinking: "hmm" }, { type: "text", text: "hello" }] }), provider: "orchestrator", model: "auto", api: "orchestrator-auto" } });
+    assert.deepEqual(second.at(-1), { type: "error", reason: "error", error: { ...assistantMessage({ stopReason: "error", errorMessage: "rung failed" }), provider: "orchestrator", model: "auto", api: "orchestrator-auto" } });
+  } finally { h.cleanup(); }
+});
+
+test("the classified session has one decision-record/3 with ranOn equal to its rung", async () => {
+  const h = harness(LIVE);
+  try {
+    await autoScenario(h);
+    const [record] = h.records();
+    assert.equal(h.records().length, 1);
+    assert.equal(record?.recordType, "decision");
+    assert.equal(record.schemaVersion, "decision-record/3");
+    assert.equal(record.delegationId, "worker-1");
+    assert.equal(record.recordType === "decision" && record.ranOn, `${HAIKU}:low`);
+  } finally { h.cleanup(); }
+});
+
+test("a registry exception is returned as an error labelled orchestrator/auto", async () => {
+  const h = harness(LIVE);
+  try {
+    const stream = await loadAutoProvider(h, fakeSessionRegistry([{ throws: "rung connection lost" }]));
+    const events = await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "throwing-worker");
+    const last = events.at(-1);
+    assert.equal(last?.type, "error");
+    if (last?.type === "error") {
+      assert.equal(last.error.errorMessage, "rung connection lost");
+      assert.deepEqual([last.error.provider, last.error.model, last.error.api], ["orchestrator", "auto", "orchestrator-auto"]);
+    }
+  } finally { h.cleanup(); }
+});
+
+test("an auto model request without a session id returns a clear labelled error", async () => {
+  const h = harness(LIVE);
+  try {
+    const registry = fakeSessionRegistry([]);
+    const stream = await loadAutoProvider(h, registry);
+    const events = await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }]);
+    const last = events.at(-1);
+    assert.equal(last?.type, "error");
+    if (last?.type === "error") {
+      assert.match(last.error.errorMessage ?? "", /no sessionId/);
+      assert.deepEqual([last.error.provider, last.error.model, last.error.api], ["orchestrator", "auto", "orchestrator-auto"]);
+    }
+    assert.equal(registry.calls.length, 0);
+    assert.equal(h.records().length, 0);
+  } finally { h.cleanup(); }
+});
+
+test("an inner stream without a final event returns a labelled error and settles result", async () => {
+  const h = harness(LIVE);
+  try {
+    const stream = await loadAutoProvider(h, fakeSessionRegistry([{ events: [{ type: "start" }] }]));
+    const request = stream(AUTO_MODEL, { messages: [{ role: "user", content: "Fix README.md", timestamp: 0 }] } as unknown as Parameters<AutoStream>[1], { sessionId: "unfinished-worker" });
+    const events = [];
+    for await (const event of request) events.push(event);
+    const final = await request.result();
+    assert.equal(events.at(-1)?.type, "error");
+    assert.match(final.errorMessage ?? "", /without a final message/);
+    assert.deepEqual([final.provider, final.model, final.api], ["orchestrator", "auto", "orchestrator-auto"]);
+  } finally { h.cleanup(); }
+});
+
+test("the auto model probe reports the rung, pin and time for each request", async () => {
+  const h = harness(LIVE);
+  process.env.PI_ORCHESTRATOR_ROUTER_PROBE = "1";
+  try {
+    const registry = fakeSessionRegistry([{ events: answerEvents("first") }, { events: answerEvents("second") }]);
+    let provider: ProviderConfigInput | undefined;
+    const handlers = new Map<string, Handler>();
+    const lines = await stderrOf(async () => {
+      createRouterExtension({ classifierCall: () => answering("mechanical").call, evidence: () => () => evidenceOf(), now: () => NOW })({
+        registerProvider(_name: string, config: ProviderConfigInput) { provider = config; },
+        on(event: string, handler: Handler) { handlers.set(event, handler); },
+      } as unknown as ExtensionAPI);
+      await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, {
+        cwd: h.projectDir, hasUI: false, model: SESSION_MODEL, modelRegistry: registry,
+        sessionManager: { getSessionId: () => "parent" },
+      });
+      const stream = provider?.streamSimple;
+      assert.ok(stream);
+      const model = { provider: "orchestrator", id: "auto", api: "orchestrator-auto" } as Parameters<typeof stream>[0];
+      const context = { messages: [{ role: "user", content: "Fix README.md", timestamp: 0 }] } as unknown as Parameters<typeof stream>[1];
+      for (let i = 0; i < 2; i++) for await (const _event of stream(model, context, { sessionId: "worker-probe" })) { /* consume */ }
+    });
+    const probes = lines.split("\n").filter((line) => line.includes("request worker-probe"));
+    assert.equal(probes.length, 2, lines);
+    assert.match(probes[0]!, /rung anthropic\/claude-haiku-4-5:low, pin new, \d+\.\d ms$/);
+    assert.match(probes[1]!, /rung anthropic\/claude-haiku-4-5:low, pin reused, \d+\.\d ms$/);
+  } finally { delete process.env.PI_ORCHESTRATOR_ROUTER_PROBE; h.cleanup(); }
+});
 
 test("by default the router classifies through the session's model registry, not a pi child, and writes the chosen rung", async () => {
   const h = harness(LIVE);

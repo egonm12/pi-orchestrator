@@ -76,7 +76,7 @@ function clampThinkingLevel(model: RegistryModel, level: ModelThinkingLevel): Mo
 /** pi's agent sends no reasoning option for `off` (pi-agent-core
  *  dist/agent.js:305). A rung without an effort is `off`, as `pi` without
  *  `--thinking` would not be; the chain refuses such a rung at load anyway. */
-function streamReasoning(model: RegistryModel, effort: string): ThinkingLevel | undefined {
+export function streamReasoning(model: RegistryModel, effort: string): ThinkingLevel | undefined {
   const level = EXTENDED_THINKING_LEVELS.find((candidate) => candidate === effort) ?? "off";
   const clamped = clampThinkingLevel(model, level);
   return clamped === "off" ? undefined : clamped;

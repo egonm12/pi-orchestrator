@@ -1,11 +1,13 @@
 import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@earendil-works/pi-coding-agent";
 import { toModelInfo, splitKnownThinkingSuffix, type ModelInfo } from "../models/model-info.ts";
+import { autoProviderConfig } from "./auto-provider.ts";
+import { routeTask, type ActiveRouter } from "./route-task.ts";
 import { discoverAgents, resolveAgentName, type AgentConfig } from "../subagents/agents.ts";
 import { resolveExecutionAgentScope } from "../subagents/agents.ts";
 import { INHERIT_MODEL, resolveEffectiveSubagentModel } from "../subagents/model-resolution.ts";
-import { newTaskLedger, TaskAllowanceOwner, allowanceConstraint } from "../budget/task-allowance.ts";
-import { banListsFromSettings, configureBanLists, personalAgentDir, personalOrchestrator, readSettingsFile, type BanLists } from "../policy/ban-lists.ts";
+import { newTaskLedger, TaskAllowanceOwner } from "../budget/task-allowance.ts";
+import { banListsFromSettings, configureBanLists, personalAgentDir, personalOrchestrator, readSettingsFile } from "../policy/ban-lists.ts";
 import { delegationObjects, isModelField, isPlainObject } from "../guard/boundaries.ts";
 import {
   appendRoutingRecord,
@@ -18,23 +20,21 @@ import {
 import { sessionClassifierModelCall, type SessionClassifierCallReport } from "../routing/session-classifier-call.ts";
 import {
   classifierConfigFromSettings,
-  classifyTier,
   loadClassifierChain,
   type ClassifierModelCall,
-  type LoadedClassifierChain,
 } from "../routing/tier-classifier.ts";
-import { tierMapFromSettings, type ResolvedTierMap } from "../routing/tier-map.ts";
-import { routeTier } from "../routing/tier-router.ts";
+import { tierMapFromSettings } from "../routing/tier-map.ts";
 import { runInit } from "../init/command.ts";
 import { INIT_COMMAND, setupNotice, setupStatus } from "../init/setup.ts";
-import { deriveProviderUsage, stateFolderEvidence, type EvidenceSetup, type RoutingEvidenceSource } from "./evidence.ts";
+import { stateFolderEvidence, type EvidenceSetup, type RoutingEvidenceSource } from "./evidence.ts";
 
 export type { RoutingEvidence, RoutingEvidenceSource, EvidenceSetup } from "./evidence.ts";
 
 // Ticket 27: the router extension (stories 38 to 44). A personal pi extension,
 // separate from the guard, hooked on `tool_call` for `subagent`.
 
-export const ROUTER_PREFIX = "pi-orchestrator router:";
+import { ROUTER_PREFIX } from "./prefix.ts";
+export { ROUTER_PREFIX };
 export const ROUTER_DISABLED_PREFIX = "pi-orchestrator router disabled:";
 
 /** The state folder when `PI_ORCHESTRATOR_STATE_DIR` is not set: under the agent
@@ -100,19 +100,6 @@ function routingMode(personal: unknown): RoutingMode | undefined {
     throw new Error(`orchestrator.routing.mode must be one of ${ROUTING_MODES.join(", ")}; got ${JSON.stringify(mode)}.`);
   }
   return mode as RoutingMode;
-}
-
-interface ActiveRouter {
-  readonly mode: RoutingMode;
-  readonly tierMap: ResolvedTierMap;
-  readonly banLists: BanLists;
-  readonly chain: LoadedClassifierChain;
-  readonly callModel: ClassifierModelCall;
-  readonly evidence: RoutingEvidenceSource;
-  readonly owner: TaskAllowanceOwner;
-  readonly recordDir: string;
-  /** pi's available models, as pi-subagents resolves a child's model. */
-  readonly installedModels: readonly ModelInfo[];
 }
 
 function installedModel(model: string, installedModels: readonly ModelInfo[]): ModelInfo | undefined {
@@ -189,27 +176,6 @@ function delegationSlots(input: Record<string, unknown>): Slot[] {
   return [...(top ? [{ path: "", object: input }] : []), ...nested];
 }
 
-const WRAPPING = /^[\s"'`([{<]+|[\s"'`)\]}>.,;:!?]+$/g;
-const FILE_NAME = /^[\w.-]*[\w-]{2}\.[A-Za-z][A-Za-z0-9]{0,7}$/;
-
-/**
- * The file paths a task text names, by a deliberately simple rule, not a
- * parser: split on whitespace, strip surrounding quotes, backticks, brackets
- * and trailing punctuation, drop URLs (`://`), and keep a word that contains
- * a `/` or looks like a file name with an extension (`README.md`; two
- * characters before the dot, so `e.g` is not one). First mention first, each
- * once.
- */
-function namedPaths(taskText: string): string[] {
-  const paths: string[] = [];
-  for (const word of taskText.split(/\s+/)) {
-    const candidate = word.replace(WRAPPING, "");
-    if (candidate.length === 0 || candidate.includes("://")) continue;
-    if ((candidate.includes("/") || FILE_NAME.test(candidate)) && !paths.includes(candidate)) paths.push(candidate);
-  }
-  return paths;
-}
-
 function slotName(path: string): string {
   return path === "" ? "model" : `${path}.model`;
 }
@@ -239,24 +205,7 @@ async function planSlot(
   const agent = agentName === undefined ? undefined : discoveredAgent(agentName, input, ctx);
   const pinned = definitionModel(agent);
   if (agent !== undefined && pinned !== undefined) return explicit(`agent:${agent.name}.model`, pinned);
-  const evidence = router.evidence();
-  const classification = await classifyTier(
-    { task: taskText, role: agentRole, paths: namedPaths(taskText) },
-    { chain: router.chain, callModel: router.callModel, allowance: { owner: router.owner, catalog: evidence.catalog } },
-  );
-  const estimatedPromptTokens = Buffer.byteLength(taskText, "utf8");
-  const route = routeTier({
-    tier: classification.tier,
-    tierMap: router.tierMap,
-    evidence: {
-      providerUsage: deriveProviderUsage(evidence, at),
-      catalog: evidence.catalog,
-      estimatedPromptTokens,
-      allowance: allowanceConstraint(router.owner, evidence.catalog, { role: "subtask", maxInputTokens: estimatedPromptTokens }),
-      authorization: evidence.authorization,
-      banLists: router.banLists,
-    },
-  });
+  const { classification, route } = await routeTask(router, taskText, agentRole, at);
   const common = { delegationId, at, taskText, agentRole, classification, tierMap: router.tierMap, route };
   if (router.mode === "live") {
     const record = buildDecisionRecord({ ...common, mode: "live", ranOn: route.ok ? route.rung.rung : unroutedModel(agent, router.installedModels, ctx, "live refusal") });
@@ -307,6 +256,10 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
     // line and leaves the hook inert for the rest of the session.
     let disabled = false;
     let active: ActiveRouter | undefined;
+    let sessionRegistry: ExtensionContext["modelRegistry"];
+    if (typeof pi.registerProvider === "function") pi.registerProvider("orchestrator", autoProviderConfig({
+      router: () => active, registry: () => sessionRegistry, now: deps.now,
+    }));
     const disable = (error: unknown) => {
       active = undefined;
       if (disabled) return;
@@ -341,6 +294,7 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
             else process.stderr.write(`${notice}\n`);
           }
         }
+        sessionRegistry = ctx.modelRegistry;
         active = startRouting(ctx, deps);
         if (probe && active) process.stderr.write(`${ROUTER_PREFIX} routing enabled, mode ${active.mode}, records ${active.recordDir}\n`);
       } catch (error) { disable(error); }
