@@ -1,0 +1,268 @@
+import { appendFileSync } from "node:fs";
+import {
+  checkModelScope,
+  matchesScopePattern,
+} from "../../../../../../.pi/agent/npm/node_modules/pi-subagents/src/runs/shared/model-scope.js";
+import type {
+  ModelScopeConfig,
+  ModelSource,
+} from "../../../../../../.pi/agent/npm/node_modules/pi-subagents/src/runs/shared/model-scope.js";
+import { splitKnownThinkingSuffix } from "../../../../../../.pi/agent/npm/node_modules/pi-subagents/src/shared/model-info.js";
+import type { Availability } from "../fixtures/provider-double.ts";
+import { isProhibitedModel, subagentBanListEntry } from "./ban-lists.ts";
+
+// Every admitting layer imports the ban-list predicate from here; its one
+// definition, and the settings it reads, live in ./ban-lists.ts.
+export { isProhibitedModel };
+
+// Ticket 04: every dispatch names the provider and model it goes to, so
+// assignments and failures are explainable.
+//
+// The scope decision is delegated to pi-subagents' real `checkModelScope`
+// (src/runs/shared/model-scope.js:38) rather than reimplemented, so this
+// harness enforces the same rule the product does.
+//
+// Imported by relative file path on purpose. Two things rule out the tidier
+// options, both verified:
+//   - The deep specifier `pi-subagents/src/runs/shared/model-scope.js` fails
+//     with ERR_PACKAGE_PATH_NOT_EXPORTED -- `model-scope` is not in
+//     pi-subagents' package.json `exports` map. A file path bypasses that
+//     encapsulation.
+//   - The bare specifier `pi-subagents` resolves (from agent/npm) but does
+//     not re-export checkModelScope; it comes back undefined.
+// pi-subagents also lives in agent/npm/node_modules, pi's extension install
+// tree, which is not this project's dependency tree -- so neither specifier
+// resolves from this project root at all.
+
+// Name-based prohibition (the subagent ban list, ./ban-lists.ts) is
+// independent of model-scope's allow patterns, which have no deny field
+// (`ModelScopeRule`, model-scope.d.ts:15-21).
+
+// Enumerated deliberately narrowly. `anthropic/*` and `openai-codex/*` are
+// both WRONG here and the audit test proves it: this registry really contains
+// anthropic/claude-fable-5, anthropic/claude-fable-5-1 and
+// openai-codex/gpt-6-astra.
+//
+// `openai-codex/gpt-6-*` is absent for the same reason -- it would admit
+// gpt-6-astra. The owner chose gpt-6-luna and gpt-6-sol for agent work, so
+// they are granted as EXACT ids instead: an exact grant cannot widen, and
+// gpt-6-astra stays refused because nothing names it.
+export const HARNESS_ALLOW_PATTERNS = [
+  "anthropic/claude-haiku-*",
+  "anthropic/claude-opus-*",
+  "anthropic/claude-sonnet-*",
+  "openai-codex/gpt-5.*",
+  "openai-codex/gpt-6-luna",
+  "openai-codex/gpt-6-sol",
+] as const;
+
+// enforce: true  -- scope checks are opt-in; without it checkModelScope is a
+//                   no-op (model-scope.js:39).
+// strict: true   -- without it an INHERITED out-of-scope model is only a
+//                   `warn` (model-scope.js:47). The user's prohibition must
+//                   hold regardless of how the model was reached, so
+//                   inherited must be an error too.
+export const HARNESS_MODEL_SCOPE: ModelScopeConfig = {
+  enforce: true,
+  strict: true,
+  allow: [...HARNESS_ALLOW_PATTERNS],
+};
+
+export type DispatchFailureCode =
+  | "missing_model"
+  | "out_of_scope"
+  | "unavailable"
+  | "throttled"
+  | "call_failure";
+
+export interface ResolvedDispatch {
+  ok: true;
+  /** Always explicit. Never inherited, never defaulted. */
+  provider: string;
+  id: string;
+  /** `provider/id`, thinking suffix stripped. */
+  baseModel: string;
+  /** Exactly what the caller asked for, suffix included. */
+  requestedModel: string;
+  thinkingSuffix: string;
+  source: ModelSource;
+}
+
+export interface RejectedDispatch {
+  ok: false;
+  code: DispatchFailureCode;
+  /** The model the caller asked for, echoed back so a failure names its
+   *  subject. `undefined` only for `missing_model`. */
+  requestedModel?: string;
+  message: string;
+  source: ModelSource;
+  allowedPatterns?: string[];
+  retryAfterSeconds?: number;
+}
+
+export type DispatchDecision = ResolvedDispatch | RejectedDispatch;
+
+/** Audit helper: does `allow` admit any model on the subagent ban list?
+ *  Returns the offending ids. Empty means the allow list is safe. */
+export function allowListAdmitsProhibitedModel(
+  allow: readonly string[],
+  knownModelIds: readonly string[],
+): string[] {
+  return knownModelIds.filter(
+    (id) =>
+      isProhibitedModel(id) &&
+      allow.some((pattern) => matchesScopePattern(id, pattern)),
+  );
+}
+
+export interface DispatchRequest {
+  /** Absent/blank is a hard failure, never an inherited or default model. */
+  model?: string;
+  source: ModelSource;
+  scope?: ModelScopeConfig;
+  /** Optional availability probe. Omitted means "not checked here". */
+  availability?: (baseModel: string) => Availability;
+}
+
+export function resolveDispatchModel(request: DispatchRequest): DispatchDecision {
+  const { source, scope = HARNESS_MODEL_SCOPE } = request;
+  const requested = request.model?.trim();
+
+  // checkModelScope returns undefined for a falsy model (model-scope.js:39),
+  // so a missing model would pass the scope check silently and then inherit
+  // from agent frontmatter / defaultModel / the parent session. That is the
+  // exact fall-through this ticket forbids, so it is rejected here first.
+  if (!requested) {
+    return {
+      ok: false,
+      code: "missing_model",
+      source,
+      message:
+        "pi-orchestration-harness: dispatch specified no model. Every dispatch " +
+        "must name an explicit provider/model; inheriting from the parent " +
+        "session, agent frontmatter or defaultModel is not permitted.",
+    };
+  }
+
+  const { baseModel } = splitKnownThinkingSuffix(requested);
+  if (isProhibitedModel(baseModel)) {
+    return {
+      ok: false,
+      code: "out_of_scope",
+      requestedModel: requested,
+      source,
+      message:
+        `pi-orchestration-harness: model '${requested}' is prohibited by name ` +
+        `(subagent ban list entry '${subagentBanListEntry(baseModel)}'); it is never dispatched.`,
+      allowedPatterns: [...(scope.allow ?? [])],
+    };
+  }
+
+  const violation = checkModelScope(requested, scope, source);
+  if (violation && violation.severity === "error") {
+    return {
+      ok: false,
+      code: "out_of_scope",
+      requestedModel: requested,
+      source,
+      message: violation.message,
+      allowedPatterns: violation.allowedPatterns,
+    };
+  }
+
+  const { thinkingSuffix } = splitKnownThinkingSuffix(requested);
+  const slash = baseModel.indexOf("/");
+  if (slash <= 0 || slash === baseModel.length - 1) {
+    return {
+      ok: false,
+      code: "missing_model",
+      requestedModel: requested,
+      source,
+      message:
+        `pi-orchestration-harness: model '${requested}' does not name a ` +
+        "provider. Dispatches must use an explicit 'provider/id' identity.",
+    };
+  }
+
+  if (request.availability) {
+    const probe = request.availability(baseModel);
+    // No substitution. A model that cannot be reached is reported as itself;
+    // silently swapping in a working model is the failure being designed out.
+    if (probe.status !== "available") {
+      const code: DispatchFailureCode =
+        probe.status === "throttled"
+          ? "throttled"
+          : probe.status === "call-failure"
+            ? "call_failure"
+            : "unavailable";
+      const detail = probe.detail ? ` ${probe.detail}` : "";
+      return {
+        ok: false,
+        code,
+        requestedModel: requested,
+        source,
+        ...(probe.retryAfterSeconds !== undefined
+          ? { retryAfterSeconds: probe.retryAfterSeconds }
+          : {}),
+        message:
+          `pi-orchestration-harness: model '${baseModel}' is not usable ` +
+          `(${probe.status}).${detail} No substitute model was selected; ` +
+          "choose another model explicitly or report the blocker.",
+      };
+    }
+  }
+
+  return {
+    ok: true,
+    provider: baseModel.slice(0, slash),
+    id: baseModel.slice(slash + 1),
+    baseModel,
+    requestedModel: requested,
+    thinkingSuffix,
+    source,
+  };
+}
+
+export const DISPATCH_RECORD_PREFIX = "DISPATCH=";
+
+/**
+ * Stable caller-supplied identity shared by every trace record for one
+ * dispatch attempt. It is optional at the formatter boundary so old callers
+ * and old JSONL remain readable, but a recipient success without it cannot
+ * prove that it belongs to a failed dispatch and therefore cannot override
+ * that failure.
+ */
+export interface DispatchAttemptIdentity {
+  readonly attemptId: string;
+}
+
+/** Shared validation keeps all record emitters from writing blank identities. */
+export function validatedDispatchAttemptId(
+  identity?: DispatchAttemptIdentity,
+): string | undefined {
+  if (identity === undefined) return undefined;
+  const attemptId = identity.attemptId.trim();
+  if (attemptId.length === 0) {
+    throw new Error("dispatch attempt identity must be a non-blank string");
+  }
+  return attemptId;
+}
+
+/** Observable output: one JSONL line per decision. Tests read this from
+ *  outside the harness instead of inspecting internals. */
+export function formatDispatchRecord(
+  decision: DispatchDecision,
+  identity?: DispatchAttemptIdentity,
+): string {
+  const attemptId = validatedDispatchAttemptId(identity);
+  const record = attemptId === undefined ? decision : { ...decision, attemptId };
+  return `${DISPATCH_RECORD_PREFIX}${JSON.stringify(record)}`;
+}
+
+export function recordDispatchDecision(
+  path: string,
+  decision: DispatchDecision,
+  identity?: DispatchAttemptIdentity,
+): void {
+  appendFileSync(path, `${formatDispatchRecord(decision, identity)}\n`);
+}
