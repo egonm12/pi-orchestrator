@@ -21,15 +21,8 @@ import { ROUTER_PREFIX } from "./extension.ts";
 // are `packages` entries of the throwaway `settings.json`, loaded from where
 // they already are; nothing is copied and the real agent dir is only read.
 // pi-subagents is pointed at `orchestrator/auto` through its own
-// `subagents.defaultModel` in that throwaway settings file.
-//
-// While the router's `tool_call` hook for `subagent` still exists, it routes
-// over a `subagents.defaultModel` and would write the real rung into the call,
-// so the worker would never run on `orchestrator/auto`. The test agents
-// therefore also pin `model: orchestrator/auto` in their frontmatter, which
-// the hook records as an explicit-model record and leaves alone. Ticket itu1
-// removes the hook and this frontmatter pin, so the `defaultModel` path is
-// exercised on its own. Until then only `decision` records are asserted on.
+// `subagents.defaultModel` in that throwaway settings file; the test agents
+// name no model, so that default is the only thing that puts workers on it.
 //
 // Every rung is Haiku (at a different effort per tier, or the dated Haiku id
 // in the compact-and-retry case), the classifier is Haiku :off and the
@@ -58,7 +51,6 @@ function agentFile(name: string, tools: string, body: string): string {
     "---",
     `name: ${name}`,
     `description: ${name}, used by the auto model's live test`,
-    `model: ${AUTO_MODEL}`,
     "thinking: off",
     `tools: ${tools}`,
     "defaultContext: fresh",
@@ -124,8 +116,12 @@ function textOf(content: unknown): string {
   return content.map((part) => (part as { type?: string; text?: string }).type === "text" ? (part as { text?: string }).text ?? "" : "").join("");
 }
 
+/** The state folder's records, all decision records: the router extension
+ *  writes no explicit-model records. */
 function decisionRecords(stateDir: string): DecisionRecord[] {
-  return readRoutingRecords(join(stateDir, "routing")).filter((record): record is DecisionRecord => record.recordType === "decision");
+  const records = readRoutingRecords(join(stateDir, "routing"));
+  assert.deepEqual(records.filter((record) => record.recordType !== "decision").map((record) => record.recordType), [], "only decision records");
+  return records as DecisionRecord[];
 }
 
 interface ParentRun {

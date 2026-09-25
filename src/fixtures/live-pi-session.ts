@@ -1,7 +1,6 @@
-// Shared by the live-pi tests and scripts (router/session.test.ts,
-// router/measure-latency.ts, acceptance/routing-acceptance.test.ts): pi's
-// `--mode json` events and the provider-refusal pattern that turns a live run
-// into a skip.
+// Shared by the live-pi tests (router/auto-model-session.test.ts,
+// acceptance/routing-acceptance.test.ts): pi's `--mode json` events and the
+// provider-refusal pattern that turns a live run into a skip.
 
 /** The fields of one pi `--mode json` event that the live tests read. */
 export interface PiEvent {

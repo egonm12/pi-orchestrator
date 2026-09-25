@@ -11,11 +11,12 @@ import {
   fixtureRoute,
   fixtureTierMap,
   HAIKU,
+  legacyExplicitRecord,
   OPUS,
   SONNET,
 } from "../fixtures/routing-decision.ts";
 import type { RiskTier } from "./classifier.ts";
-import { appendRoutingRecord, buildExplicitModelRecord, NODE_RECORD_FOLDER_READER, writeDecisionRecord, type DecisionRecordInput, type RecordFolderReader } from "./decision-record.ts";
+import { appendRoutingRecord, NODE_RECORD_FOLDER_READER, writeDecisionRecord, type DecisionRecordInput, type RecordFolderReader } from "./decision-record.ts";
 import { buildRoutingReport, renderRoutingReport } from "./routing-report.ts";
 import { attachVerdict } from "./verdicts.ts";
 
@@ -142,9 +143,8 @@ test("the report on a folder of known records prints decisions, verdicts by kind
 test("an explicit-model record (ticket 27) is neither a decision row nor an orphaned verdict", async () => {
   const known = await knownFolder();
   try {
-    appendRoutingRecord(known.records, buildExplicitModelRecord({
-      delegationId: "e1", at: new Date("2026-09-26T10:00:00.000Z"), mode: "live", slot: "model",
-      model: "anthropic/claude-opus-5-5:high", taskText: "Review the change", agentRole: "reviewer",
+    appendRoutingRecord(known.records, legacyExplicitRecord({
+      delegationId: "e1", timestamp: "2026-09-26T10:00:00.000Z", model: "anthropic/claude-opus-5-5:high", agentRole: "reviewer",
     }));
     assert.equal(renderRoutingReport(known.records, buildRoutingReport(known.records)), expectedReport(known.records));
   } finally {

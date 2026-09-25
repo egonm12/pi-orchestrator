@@ -1,5 +1,6 @@
 // The classifier model call inside the running pi session (ADR 0004). The
-// router calls it from its `tool_call` hook, so each hop is one request
+// router extension calls it for a worker's first request to the auto model,
+// so each hop is one request
 // through the session's own model registry, `ctx.modelRegistry.streamSimple`,
 // instead of a fresh `pi -p` child (./pi-classifier-call.ts): no pi startup,
 // and the same auth the session has. On the Anthropic subscription route that

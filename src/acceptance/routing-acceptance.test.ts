@@ -68,14 +68,12 @@ const EMPTIED_CRITICAL = [`${LUNA}:high`, `${SOL}:high`];
  *  simulated out-of-usage, so the top tier is empty at route time. */
 const PROJECT_EMPTIED_CRITICAL = { orchestrator: { routing: { tiers: { critical: EMPTIED_CRITICAL } } } };
 
-// Until itu1 removes the old tool_call hook, pin the agent frontmatter to
-// orchestrator/auto as well as setting subagents.defaultModel. The hook sees
-// this as an explicit model and does not rewrite it to a real rung.
+// The worker names no model: pi-subagents' subagents.defaultModel puts it on
+// orchestrator/auto.
 const WORKER_DEFINITION = [
   "---",
   `name: ${WORKER_AGENT}`,
   "description: Stub worker that replies ACK; used by the routing acceptance test",
-  `model: ${AUTO_MODEL}`,
   "thinking: off",
   "tools: read",
   "defaultContext: fresh",
@@ -557,6 +555,7 @@ test(`routing acceptance gate on ${HAIKU}: six routed delegations, project overr
     const [shadow, live1, live2, emptied] = sessions as readonly [SessionRun, SessionRun, SessionRun, SessionRun];
 
     const allRecords = readRoutingRecords(recordDir);
+    assert.deepEqual(allRecords.filter((record) => record.recordType === "explicit"), [], "the router extension writes no explicit-model records");
     const records = allRecords.filter((record): record is DecisionRecord => record.recordType === "decision");
     assert.equal(records.length, 8, "one decision per worker session; no decision for the banned call");
     for (const record of records) t.diagnostic(`record ${record.delegationId}: ${record.recordType} ${describeDecision(record)}`);

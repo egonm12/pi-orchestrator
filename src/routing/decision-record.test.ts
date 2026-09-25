@@ -10,12 +10,12 @@ import {
   fixtureRefusal,
   fixtureRoute,
   fixtureTierMap,
+  legacyExplicitRecord,
   SONNET,
 } from "../fixtures/routing-decision.ts";
 import {
   appendRoutingRecord,
   buildEffortLadderRecord,
-  buildExplicitModelRecord,
   DECISION_RECORD_SCHEMA_VERSION,
   decisionRecordPath,
   FREE_TEXT_LIMIT,
@@ -32,10 +32,10 @@ import { useOwnerBanLists } from "../fixtures/owner-ban-lists.ts";
 
 useOwnerBanLists();
 
-// Ticket 25, stories 28 and 34. Seam: `writeDecisionRecord`, the public
-// function ticket 27's extension hook will call once per routing decision,
-// with every value injected. Ticket 27 completes the "one hook call" form of
-// checkbox 1; here it is two writer calls, one per mode.
+// Ticket 25, stories 28 and 34. Seam: `writeDecisionRecord` and
+// `buildDecisionRecord`, the public functions for one routing decision, with
+// every value injected. The auto provider writes one record per worker's
+// first request; here it is two writer calls, one per mode.
 
 const NOW = new Date("2026-09-25T09:30:00.000Z");
 const TASK = "Add a CSV export button to the reports page and wire it to the existing export service.";
@@ -242,7 +242,7 @@ test("a folder reads legacy decisions, explicit records and verdicts beside new 
     const { record } = writeDecisionRecord(dir, await liveInput());
     const oldDecision = { ...record, schemaVersion: "decision-record/2" } as Record<string, unknown>;
     delete oldDecision.ranOn;
-    const explicit = { ...buildExplicitModelRecord({ delegationId: "old-explicit", at: NOW, mode: "live", slot: "model", model: SONNET, taskText: TASK, agentRole: "worker" }), schemaVersion: "decision-record/2" };
+    const explicit = legacyExplicitRecord({ timestamp: NOW.toISOString(), taskTextPrefix: TASK });
     const verdict = { recordType: "verdict", schemaVersion: "decision-record/2", delegationId: "old-decision", timestamp: NOW.toISOString(), verdict: "accept", decisionFile: "2026-09-25.jsonl" };
     const path = decisionRecordPath(dir, NOW);
     writeFileSync(path, [oldDecision, explicit, verdict, record].map((item) => JSON.stringify(item)).join("\n") + "\n");
@@ -279,7 +279,7 @@ test("new effort-ladder records use /3, while legacy /2 remains readable and unk
 test("an explicit record with a missing or an unknown field fails validation on write and on read, naming the field", async () => {
   const { dir, cleanup } = tempDir();
   try {
-    const record = buildExplicitModelRecord({ delegationId: "attempt-explicit", at: NOW, mode: "shadow", slot: "tasks[1].model", model: SONNET, taskText: TASK, agentRole: "reviewer" });
+    const record = legacyExplicitRecord({ delegationId: "attempt-explicit", timestamp: NOW.toISOString(), mode: "shadow", slot: "tasks[1].model", taskTextPrefix: TASK, agentRole: "reviewer" });
     const cases: readonly (readonly [(copy: Record<string, unknown>) => void, string, string])[] = [
       [(copy) => delete copy.slot, "slot", "is missing"],
       [(copy) => delete copy.cause, "cause", "is missing"],
@@ -383,9 +383,7 @@ test("credential-shaped text in the task and in hop details, route messages and 
       removed: refusal.removed.map((removed) => ({ ...removed, detail: `Bearer ${BEARER}` })),
     } as typeof refusal;
     writeDecisionRecord(dir, await liveInput({ delegationId: "attempt-leaky", taskText: task, classification: leaky, route: leakyRefusal }));
-    appendRoutingRecord(dir, buildExplicitModelRecord({
-      delegationId: "attempt-leaky-explicit", at: NOW, mode: "live", slot: "model", model: SONNET, taskText: task, agentRole: "worker",
-    }));
+    appendRoutingRecord(dir, legacyExplicitRecord({ delegationId: "attempt-leaky-explicit", timestamp: NOW.toISOString(), taskTextPrefix: task }));
 
     const files = readdirSync(dir);
     assert.deepEqual(files, ["2026-09-25.jsonl"]);
@@ -530,7 +528,7 @@ test("an auth token in a settings key next to orchestrator never appears in any 
     const tierMap = fixtureTierMap(settings);
     const classification = await fixtureClassification(TASK, "standard");
     const route = fixtureRoute("standard", tierMap);
-    // Everything a hook could have at hand is passed in, including the parsed
+    // Everything a caller could have at hand is passed in, including the parsed
     // settings object and copies of the values with the token spliced in.
     const input = {
       delegationId: "attempt-token",

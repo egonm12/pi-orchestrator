@@ -5,6 +5,7 @@ import { HARNESS_MODEL_SCOPE } from "../policy/model-resolution.ts";
 import { authorizeRecipient, emptyAuthorization, grantOwnerApproval } from "../recipients/authorization.ts";
 import { NO_BUDGET_CONSTRAINT } from "../recipients/authorized-delegation.ts";
 import type { RiskTier } from "../routing/classifier.ts";
+import { LEGACY_DECISION_RECORD_SCHEMA_VERSION, type ExplicitModelRecord } from "../routing/decision-record.ts";
 import { classifyTier, loadClassifierChain, type TierClassification } from "../routing/tier-classifier.ts";
 import type { KindOfWork } from "../routing/tier-answer-schema.ts";
 import { tierMapFromSettings, type ResolvedTierMap } from "../routing/tier-map.ts";
@@ -132,4 +133,22 @@ export function fixtureRefusal(tier: RiskTier, tierMap: ResolvedTierMap = fixtur
     "openai-codex": { state: "out-of-usage", detail: "fixture" },
     anthropic: { state: "out-of-usage", detail: "fixture" },
   });
+}
+
+/** A legacy `decision-record/2` explicit record, as the retired `subagent`
+ *  call rewriting wrote it, for tests of readers that keep accepting it. */
+export function legacyExplicitRecord(overrides: Partial<ExplicitModelRecord> = {}): ExplicitModelRecord {
+  return {
+    recordType: "explicit",
+    schemaVersion: LEGACY_DECISION_RECORD_SCHEMA_VERSION,
+    delegationId: "old-explicit",
+    timestamp: "2026-09-25T12:00:00.000Z",
+    cause: "explicit",
+    mode: "live",
+    slot: "model",
+    model: SONNET,
+    taskTextPrefix: "Review the change",
+    agentRole: "worker",
+    ...overrides,
+  };
 }

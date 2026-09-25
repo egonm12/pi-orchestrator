@@ -17,7 +17,7 @@ import { tierMapFromSettings, type ResolvedTierMap } from "./tier-map.ts";
 import { routeTier, type RouterEvidence, type TierRouteDecision, type TierRouteInput } from "./tier-router.ts";
 
 // Seam (ticket 24): `routeTier` with every piece of evidence injected as a
-// plain value. Ticket 27's extension hook will call this function with the
+// plain value. The router extension calls this function with the
 // classified tier, the loaded tier map and live evidence. The tier map comes
 // from ticket 22's real loader, so the rungs are the ones a settings file
 // would produce.

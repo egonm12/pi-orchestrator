@@ -39,15 +39,14 @@ export function isPlainObject(value: unknown): value is Record<string, unknown> 
 }
 
 /** Whether a key names a model field: `model`, case ignored. The one rule for
- *  what counts as a model field, read by the guard and the router. */
+ *  what counts as a model field. */
 export function isModelField(key: string): boolean {
   return key.toLowerCase() === "model";
 }
 
 /** Every object that can carry a `model` field, parents before children: the
  *  input itself and, for a delegation input, every object nested in it at any
- *  depth, directly or as an array item. The guard reads `model` on each; the
- *  router (ticket 27) keeps the delegation slots among them. */
+ *  depth, directly or as an array item. The guard reads `model` on each. */
 export function delegationObjects(input: unknown, delegation = false): DelegationObject[] {
   const found: DelegationObject[] = [];
   const visit = (value: unknown, path: string) => {

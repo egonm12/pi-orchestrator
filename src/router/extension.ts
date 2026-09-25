@@ -1,24 +1,14 @@
 import { join, resolve } from "node:path";
-import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { toModelInfo, splitKnownThinkingSuffix, type ModelInfo } from "../models/model-info.ts";
 import { autoProviderConfig } from "./auto-provider.ts";
 import { autoModelLimits, withAutoModelLimits } from "./auto-model-limits.ts";
 import { refuseAutoModelForMainThread } from "./main-thread.ts";
-import { routeTask, type ActiveRouter } from "./route-task.ts";
-import { discoverAgents, resolveAgentName, type AgentConfig } from "../subagents/agents.ts";
-import { resolveExecutionAgentScope } from "../subagents/agents.ts";
-import { INHERIT_MODEL, resolveEffectiveSubagentModel } from "../subagents/model-resolution.ts";
+import type { ActiveRouter } from "./route-task.ts";
 import { newTaskLedger, TaskAllowanceOwner } from "../budget/task-allowance.ts";
 import { banListsFromSettings, configureBanLists, loadBanListsOrDefaults, personalAgentDir, personalOrchestrator, readSettingsFile } from "../policy/ban-lists.ts";
-import { delegationObjects, isModelField, isPlainObject } from "../guard/boundaries.ts";
-import {
-  appendRoutingRecord,
-  buildDecisionRecord,
-  buildExplicitModelRecord,
-  ROUTING_MODES,
-  type RoutingMode,
-  type RoutingRecord,
-} from "../routing/decision-record.ts";
+import { isPlainObject } from "../guard/boundaries.ts";
+import { ROUTING_MODES, type RoutingMode } from "../routing/decision-record.ts";
 import { sessionClassifierModelCall, type SessionClassifierCallReport } from "../routing/session-classifier-call.ts";
 import {
   classifierConfigFromSettings,
@@ -32,8 +22,9 @@ import { stateFolderEvidence, type EvidenceSetup, type RoutingEvidenceSource } f
 
 export type { RoutingEvidence, RoutingEvidenceSource, EvidenceSetup } from "./evidence.ts";
 
-// Ticket 27: the router extension (stories 38 to 44). A personal pi extension,
-// separate from the guard, hooked on `tool_call` for `subagent`.
+// The router extension (ADR 0006): a personal pi extension, separate from the
+// guard, that serves the auto model `orchestrator/auto` as the `orchestrator`
+// provider. It hooks no tool calls.
 
 import { ROUTER_PREFIX } from "./prefix.ts";
 export { ROUTER_PREFIX };
@@ -149,117 +140,12 @@ function startRouting(ctx: ExtensionContext, deps: RouterDependencies): ActiveRo
   };
 }
 
-interface Slot {
-  readonly path: string;
-  readonly object: Record<string, unknown>;
-}
-
-const NESTED_SLOT = /^(?:tasks\[\d+\]|chain\[\d+\]|workflow\.steps\[\d+\])$/;
-
-/** The model a slot names: a model field (the guard's rule) holding a
- *  non-blank string. A blank value names no model, so the slot is routed. */
-function namedModel(object: Record<string, unknown>): string | undefined {
-  for (const [key, value] of Object.entries(object)) {
-    if (isModelField(key) && typeof value === "string" && value.trim().length > 0) return value;
-  }
-  return undefined;
-}
-
-function text(value: unknown): string | undefined {
-  return typeof value === "string" ? value : undefined;
-}
-
-/**
- * The delegation slots of a `subagent` call, over the guard's walk
- * (`delegationObjects`): the top level when it names an agent, a task or a
- * model, then each `tasks[i]`, `chain[i]` and `workflow.steps[i]`. A model
- * named at the top level covers the nested slots, so they are not routed.
- */
-function delegationSlots(input: Record<string, unknown>): Slot[] {
-  if (namedModel(input) !== undefined) return [{ path: "", object: input }];
-  const top = text(input.agent) !== undefined || text(input.task) !== undefined;
-  const nested = delegationObjects(input, true).filter((entry) => NESTED_SLOT.test(entry.path));
-  return [...(top ? [{ path: "", object: input }] : []), ...nested];
-}
-
-function slotName(path: string): string {
-  return path === "" ? "model" : `${path}.model`;
-}
-
-interface SlotPlan {
-  readonly record: RoutingRecord;
-  /** Live mode, rung chosen: the rung to write into the slot. */
-  readonly write?: { readonly object: Record<string, unknown>; readonly rung: string };
-}
-
-async function planSlot(
-  router: ActiveRouter,
-  input: Record<string, unknown>,
-  slot: Slot,
-  delegationId: string,
-  at: Date,
-  ctx: ExtensionContext,
-): Promise<SlotPlan> {
-  const taskText = text(slot.object.task) ?? text(input.task) ?? "";
-  const agentName = text(slot.object.agent) ?? text(input.agent);
-  const agentRole = agentName ?? "unknown";
-  const explicit = (slotLabel: string, model: string): SlotPlan => ({
-    record: buildExplicitModelRecord({ delegationId, at, mode: router.mode, slot: slotLabel, model, taskText, agentRole }),
-  });
-  const model = namedModel(slot.object);
-  if (model !== undefined) return explicit(slotName(slot.path), model);
-  const agent = agentName === undefined ? undefined : discoveredAgent(agentName, input, ctx);
-  const pinned = definitionModel(agent);
-  if (agent !== undefined && pinned !== undefined) return explicit(`agent:${agent.name}.model`, pinned);
-  const { classification, route } = await routeTask(router, taskText, agentRole, at);
-  const common = { delegationId, at, taskText, agentRole, classification, tierMap: router.tierMap, route };
-  if (router.mode === "live") {
-    const record = buildDecisionRecord({ ...common, mode: "live", ranOn: route.ok ? route.rung.rung : unroutedModel(agent, router.installedModels, ctx, "live refusal") });
-    return route.ok ? { record, write: { object: slot.object, rung: route.rung.rung } } : { record };
-  }
-  const runModel = unroutedModel(agent, router.installedModels, ctx, "shadow mode");
-  return { record: buildDecisionRecord({ ...common, mode: "shadow", handPickedModel: runModel, ranOn: runModel }) };
-}
-
-/** The agent a slot names, found the way pi-subagents finds it for this call:
- *  its discovery for the call's `agentScope` (default both) and its name,
- *  local-name and alias lookup. Discovery reads the agent files and the
- *  `subagents` settings, with pi-subagents' own fingerprinted cache; a
- *  malformed `subagents` key throws, which disables the router. */
-function discoveredAgent(name: string, input: Record<string, unknown>, ctx: ExtensionContext): AgentConfig | undefined {
-  const scope = resolveExecutionAgentScope(input.agentScope);
-  return resolveAgentName(name, discoverAgents(ctx.cwd, scope, ctx.model?.provider).agents).agent;
-}
-
-/** A model the agent's definition pins: its frontmatter `model` or a builtin
- *  override's. A `subagents.defaultModel` from settings fills `model` as well,
- *  marked by `modelSource` (pi-subagents tells them apart the same way,
- *  agent-management.js:1063); it is a global default, not a pin, so it is
- *  routed over. `inherit` names the session model and pins nothing. */
-function definitionModel(agent: AgentConfig | undefined): string | undefined {
-  const model = agent?.model?.trim();
-  if (model === undefined || model === "" || model === INHERIT_MODEL) return undefined;
-  if (agent?.modelSource?.type === "subagents.defaultModel" && agent.modelSource.model === agent.model) return undefined;
-  return model;
-}
-
-/** The model pi resolves for a slot that names none, canonical `provider/id`
- *  with the thinking suffix stripped: pi-subagents' own resolution
- *  (`resolveEffectiveSubagentModel`, runs/shared/model-resolution.js:281) of
- *  the agent's `model` (here only a `subagents.defaultModel`, since a pinned
- *  one is explicit), else the session model. */
-function unroutedModel(agent: AgentConfig | undefined, installedModels: readonly ModelInfo[], ctx: ExtensionContext, reason: "shadow mode" | "live refusal"): string {
-  if (ctx.model === undefined) throw new Error(`pi supplied no session model for ${reason === "live refusal" ? "a live refusal" : "shadow mode"}`);
-  const parent = { provider: ctx.model.provider, id: ctx.model.id };
-  const resolved = resolveEffectiveSubagentModel(undefined, agent?.model, parent, [...installedModels], agent?.modelProvider ?? parent.provider);
-  return splitKnownThinkingSuffix(resolved ?? `${parent.provider}/${parent.id}`).baseModel;
-}
-
 export function createRouterExtension(overrides: Partial<RouterDependencies> = {}) {
   const deps: RouterDependencies = { ...DEFAULT_DEPENDENCIES, ...overrides };
   return function router(pi: ExtensionAPI): void {
     // Fail open, as the guard does: the first failure anywhere prints one
-    // line and leaves the hook inert for the rest of the session.
+    // line and stops routing for the rest of the session; workers then run
+    // on the orchestrator's model.
     let disabled = false;
     let active: ActiveRouter | undefined;
     let sessionRegistry: ExtensionContext["modelRegistry"];
@@ -330,29 +216,6 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
       rememberSessionModel(ctx.model, event.level);
     });
 
-    pi.on("tool_call", async (event: ToolCallEvent, ctx: ExtensionContext) => {
-      if (disabled || active === undefined || event.toolName !== "subagent") return;
-      const started = performance.now();
-      try {
-        const router = active;
-        const at = deps.now();
-        const plans: SlotPlan[] = [];
-        for (const slot of delegationSlots(event.input)) {
-          const delegationId = slot.path === "" ? event.toolCallId : `${event.toolCallId}:${slot.path}`;
-          plans.push(await planSlot(router, event.input, slot, delegationId, at, ctx));
-        }
-        // Every record is written before the call changes, so a failed write
-        // leaves the call exactly as the orchestrator made it.
-        for (const plan of plans) appendRoutingRecord(router.recordDir, plan.record);
-        for (const plan of plans) if (plan.write) plan.write.object.model = plan.write.rung;
-        if (probe) {
-          const elapsed = (performance.now() - started).toFixed(1);
-          process.stderr.write(`${ROUTER_PREFIX} hook ${elapsed} ms for ${plans.length} slot(s), mode ${router.mode}\n`);
-        }
-      } catch (error) { disable(error); }
-      // Never a block: refusing a call is the guard's job, not the router's.
-      return undefined;
-    });
     if (probe) process.stderr.write(`${ROUTER_PREFIX} loaded\n`);
   };
 }

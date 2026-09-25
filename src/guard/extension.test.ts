@@ -136,3 +136,28 @@ test("a turn started without an input event is aborted while the session model i
   await turnStart(turn, ctx);
   assert.equal(aborts, 1);
 });
+
+// Workers start on the auto model (ADR 0006). `orchestrator/auto` is on no
+// ban list, so a `subagent` call naming it needs no special case, while a
+// call naming a banned real model is still refused.
+const SUBAGENT_BAN_LIST_SETTINGS = { orchestrator: { subagentBanList: ["fable", "astra"], sessionBanList: [] } };
+
+async function subagentCall(input: Record<string, unknown>): Promise<unknown> {
+  writeFileSync(join(agentDir, "settings.json"), JSON.stringify(SUBAGENT_BAN_LIST_SETTINGS));
+  const handlers = loadGuard();
+  const ctx: ExtensionContext = { cwd: agentDir, hasUI: false, model: { provider: "anthropic", id: "claude-haiku-4-5" } };
+  await handlers.get("session_start")!({ type: "session_start", reason: "startup" }, ctx);
+  return handlers.get("tool_call")!({ type: "tool_call", toolCallId: "call-1", toolName: "subagent", input }, ctx);
+}
+
+test("a subagent call naming orchestrator/auto is not refused", async () => {
+  assert.equal(await subagentCall({ agent: "worker", task: "say hello", model: "orchestrator/auto" }), undefined);
+  assert.equal(await subagentCall({ tasks: [{ agent: "worker", task: "say hello", model: "orchestrator/auto:high" }] }), undefined);
+});
+
+test("a subagent call naming a banned real model is still refused", async () => {
+  assert.deepEqual(await subagentCall({ agent: "worker", task: "say hello", model: "anthropic/claude-fable-5" }),
+    { block: true, reason: "pi-orchestrator guard: prohibited model: anthropic/claude-fable-5" });
+  assert.deepEqual(await subagentCall({ tasks: [{ agent: "worker", task: "say hello", model: "orchestrator/auto" }, { agent: "reviewer", task: "review", model: "openai-codex/gpt-6-astra" }] }),
+    { block: true, reason: "pi-orchestrator guard: prohibited model: openai-codex/gpt-6-astra" });
+});

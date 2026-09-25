@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -105,10 +105,19 @@ test("a structured verdict field is read as it is, whatever the prose says", () 
   assert.equal(verdictFromReviewResult({ structuredOutput: { verdict: "request_changes", summary: "off by one" } }), "request_changes");
 });
 
-test("the reviewer agent definition declares outputSchema with a required verdict enum, as pi-subagents parses it", (t) => {
-  // Parsed by the installed pi-subagents itself, so this runs only where it is installed.
-  const agents = join(homedir(), ".pi", "agent", "npm", "node_modules", "pi-subagents", "src", "agents", "agents.js");
-  if (!existsSync(agents)) return t.skip("pi-subagents is not installed in ~/.pi/agent");
+/** The `key: value` lines of a definition file's frontmatter, each value as
+ *  written. The reviewer's frontmatter is one line per key. */
+function frontmatter(text: string): Record<string, string> {
+  const match = /^---\n([\s\S]*?)\n---\n/.exec(text);
+  assert.ok(match, "the definition starts with a frontmatter block");
+  return Object.fromEntries(match[1]!.split("\n").map((line) => {
+    const colon = line.indexOf(":");
+    assert.ok(colon > 0, `a frontmatter line without a key: ${line}`);
+    return [line.slice(0, colon).trim(), line.slice(colon + 1).trim()];
+  }));
+}
+
+test("the installed reviewer agent definition declares outputSchema with a required verdict enum", () => {
   assert.deepEqual(VERDICT_OUTPUT_SCHEMA.required, ["verdict"]);
   assert.deepEqual(VERDICT_OUTPUT_SCHEMA.properties.verdict.enum, ["accept", "request_changes"]);
   const home = mkdtempSync(join(tmpdir(), "pi-harness-reviewer-agent-"));
@@ -116,23 +125,13 @@ test("the reviewer agent definition declares outputSchema with a required verdic
     const agentDir = join(home, "agent");
     const installed = installVerdictReviewer(agentDir);
     assert.equal(installed, join(agentDir, "agents", `${VERDICT_REVIEWER_AGENT}.md`));
-    const probe =
-      `import { discoverAgents } from ${JSON.stringify(agents)};` +
-      `const found = discoverAgents(${JSON.stringify(home)}, "user").agents.find((agent) => agent.name === ${JSON.stringify(VERDICT_REVIEWER_AGENT)});` +
-      "process.stdout.write(JSON.stringify(found ? { outputSchema: found.outputSchema, model: found.model, defaultAsync: found.defaultAsync } : null));";
-    const run = spawnSync(process.execPath, ["--input-type=module", "-e", probe], {
-      encoding: "utf8",
-      env: { ...process.env, HOME: home, PI_CODING_AGENT_DIR: agentDir },
-      timeout: 30_000,
-    });
-    assert.equal(run.status, 0, run.stderr);
-    const parsed = JSON.parse(run.stdout) as { outputSchema: unknown; model: string; defaultAsync?: boolean } | null;
-    assert.ok(parsed, "pi-subagents did not discover the reviewer");
-    assert.deepEqual(parsed.outputSchema, VERDICT_OUTPUT_SCHEMA);
-    assert.equal(parsed.model, "anthropic/claude-haiku-4-5");
+    const fields = frontmatter(readFileSync(installed, "utf8"));
+    assert.equal(fields.name, VERDICT_REVIEWER_AGENT);
+    assert.deepEqual(JSON.parse(fields.outputSchema ?? "null"), VERDICT_OUTPUT_SCHEMA);
+    assert.equal(fields.model, "anthropic/claude-haiku-4-5");
     // Foreground by default, so a call that omits `async` still returns the
     // structured verdict in the tool result.
-    assert.equal(parsed.defaultAsync, false);
+    assert.equal(fields.async, "false");
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

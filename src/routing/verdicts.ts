@@ -44,7 +44,7 @@ export const REVIEW_VERDICTS = ["accept", "request_changes"] as const;
 export type ReviewVerdict = (typeof REVIEW_VERDICTS)[number];
 
 /** The schema `verdict-reviewer.md` declares in its frontmatter. A test checks
- *  the two are equal as pi-subagents parses the file. */
+ *  the two are equal. */
 export const VERDICT_OUTPUT_SCHEMA = {
   type: "object",
   properties: {

@@ -14,7 +14,7 @@ useOwnerBanLists();
 
 // Seam (ticket 22): the loader's returned value. The pure core takes parsed
 // settings objects; the file loader reads a temp agent dir and a temp project
-// dir. Ticket 27's extension hook will pass the same value through unchanged.
+// dir. The router extension passes the same value through unchanged.
 
 /** The example tier map in harness/README.md "Tier map (ticket 22)". The
  *  spec has no literal example map, so this one is built from the spec's

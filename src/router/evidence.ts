@@ -9,7 +9,7 @@ import type { ProviderUsage } from "../routing/tier-router.ts";
 // Ticket 27: the evidence the router's hard filters read, and the one place
 // ticket 08's per-model observations become ticket 24's per-provider state.
 
-/** What the hook reads for one routed slot. */
+/** What the hard filters read for one worker's first request. */
 export interface RoutingEvidence {
   /** Context windows, prices and ticket 08's `usageHeadroom` per model. */
   readonly catalog: ModelCatalog;
@@ -19,7 +19,7 @@ export interface RoutingEvidence {
   readonly authorization: RecipientAuthorization;
 }
 
-/** Called once per routed slot, so the evidence is as current as the files. */
+/** Called once per routed request, so the evidence is as current as the files. */
 export type RoutingEvidenceSource = () => RoutingEvidence;
 
 export interface EvidenceSetup {

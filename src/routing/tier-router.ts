@@ -24,8 +24,8 @@ import type { ResolvedTierMap, TierRung } from "./tier-map.ts";
 //            owner's order.
 //
 // All evidence is a plain input, so the router reads no file, no clock and no
-// network. Ticket 27's extension hook calls `routeTier`; ticket 19's
-// `computeAgentCandidates` consumes the same decision.
+// network. The router extension calls `routeTier` (../router/route-task.ts);
+// ticket 19's `computeAgentCandidates` consumes the same decision.
 
 export type ProviderUsageState = "out-of-usage" | "throttled";
 

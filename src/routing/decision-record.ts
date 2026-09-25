@@ -22,7 +22,8 @@
 //
 // Every record is validated on write and on read: a missing or unknown field,
 // at the top level or inside the classification, tier map or route, fails
-// with the field named. Ticket 27's extension hook calls `writeDecisionRecord`.
+// with the field named. The auto provider (../router/auto-provider.ts) writes
+// one decision record per worker's first request.
 //
 // This module imports no other harness module at run time except the tier
 // list, so the report CLI that reads records loads nothing else.
@@ -37,7 +38,7 @@ import { LADDER_SKIP_REASONS } from "./skip-reasons.ts";
 import type { RemovedRung, TierRouteDecision } from "./tier-router.ts";
 
 export const DECISION_RECORD_SCHEMA_VERSION = "decision-record/3";
-/** Only for reading old records and writing the explicit records retired by the auto model. */
+/** Only for reading old records, including the explicit records no longer written. */
 export const LEGACY_DECISION_RECORD_SCHEMA_VERSION = "decision-record/2";
 
 /** Records hold at most this many characters of task text (story 34). */
@@ -268,11 +269,12 @@ export interface EffortLadderRecord extends RecordCommon {
   readonly route: RecordedRouteChoice;
 }
 
-/** Ticket 27: a delegation slot that named its own model, which the router left
- *  alone (story 38). A legacy record type under `decision-record/2`, with a
- *  top-level `cause` as the ladder record has. It is not a routing decision:
- *  it has no tier and no rung, so it is not a report row and
- *  `isRoutedDecision` does not accept it. */
+/** Ticket 27: a delegation slot that named its own model, which the retired
+ *  `subagent` call rewriting left alone. The router extension no longer
+ *  writes it; readers keep accepting it. A legacy record type under
+ *  `decision-record/2`, with a top-level `cause` as the ladder record has. It
+ *  is not a routing decision: it has no tier and no rung, so it is not a
+ *  report row and `isRoutedDecision` does not accept it. */
 export interface ExplicitModelRecord extends RecordCommon {
   readonly recordType: "explicit";
   readonly cause: "explicit";
@@ -700,33 +702,7 @@ export interface WrittenDecisionRecord {
   readonly record: DecisionRecord;
 }
 
-export interface ExplicitModelRecordInput {
-  readonly delegationId: string;
-  readonly at: Date;
-  readonly mode: RoutingMode;
-  readonly slot: string;
-  readonly model: string;
-  readonly taskText: string;
-  readonly agentRole: string;
-}
-
-export function buildExplicitModelRecord(input: ExplicitModelRecordInput): ExplicitModelRecord {
-  const record: ExplicitModelRecord = {
-    recordType: "explicit",
-    schemaVersion: LEGACY_DECISION_RECORD_SCHEMA_VERSION,
-    delegationId: input.delegationId,
-    timestamp: input.at.toISOString(),
-    cause: "explicit",
-    mode: input.mode,
-    slot: input.slot,
-    model: input.model,
-    taskTextPrefix: input.taskText,
-    agentRole: input.agentRole,
-  };
-  return checkedRecord(record);
-}
-
-/** Seam for ticket 27's extension hook: one call per routing decision. */
+/** Build, write and return one decision record. */
 export function writeDecisionRecord(dir: string, input: DecisionRecordInput): WrittenDecisionRecord {
   const record = buildDecisionRecord(input);
   return { path: appendRoutingRecord(dir, record), record };
