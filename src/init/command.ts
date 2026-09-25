@@ -4,6 +4,7 @@ import { tierMapFromSettings } from "../routing/tier-map.ts";
 import { toModelInfo, type ModelInfo, type RegistryModelLike } from "../models/model-info.ts";
 import {
   approveRecipients,
+  AUTO_MODEL_SETUP_LINE,
   INIT_COMMAND,
   planSettings,
   readPersonalSettings,
@@ -88,7 +89,7 @@ export async function runInit(args: string, ctx: InitContext, options: InitOptio
   for (const provider of providers) {
     const yes = await ctx.ui.confirm(
       `Approve ${provider} as a data recipient?`,
-      `The router may send the task text of subagent calls to ${provider} models, to classify them and to run them.`,
+      `The router extension may send worker task text to ${provider} models, to classify and run the work.`,
     );
     if (yes) approved.push(provider);
   }
@@ -100,5 +101,6 @@ export async function runInit(args: string, ctx: InitContext, options: InitOptio
       (declined.length ? `; not approved: ${declined.join(", ")} (their rungs are skipped)` : "") +
       `. Store: ${storePath}. Start a new session to route.`,
   );
+  say(AUTO_MODEL_SETUP_LINE);
   return lines;
 }

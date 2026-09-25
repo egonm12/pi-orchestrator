@@ -164,8 +164,8 @@ async function stderrOf(run: () => Promise<unknown>): Promise<string> {
   let output = "";
   process.stderr.write = ((chunk: string) => { output += chunk; return true; }) as typeof process.stderr.write;
   try { await run(); } finally { process.stderr.write = original; }
-  // The fresh-install notice is covered by init/setup.test.ts.
-  output = output.split("\n").filter((line) => !line.startsWith("pi-orchestrator: not set up:")).join("\n");
+  // Fresh-install guidance has its own router extension test.
+  output = output.split("\n").filter((line) => !line.startsWith("pi-orchestrator: not set up:") && !line.startsWith("pi-orchestrator: make orchestrator/auto")).join("\n");
   return output;
 }
 
@@ -208,6 +208,24 @@ async function autoEvents(stream: AutoStream, messages: unknown[], sessionId?: s
 }
 
 const FIX_README = [{ role: "user", content: "Fix the typo in README.md", timestamp: 0 }];
+
+test("the router extension's fresh-install notice tells the owner to set the auto model", async () => {
+  const h = harness(undefined);
+  try {
+    const notices: string[] = [];
+    const handlers = piHandlers();
+    createRouterExtension()({
+      registerProvider() {},
+      on(event: string, handler: Handler) { handlers.on(event, handler); },
+    } as unknown as ExtensionAPI);
+    await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, {
+      cwd: h.projectDir, hasUI: true, model: SESSION_MODEL, thinkingLevel: "medium",
+      ui: { notify: (message: string) => { notices.push(message); } },
+    } as ExtensionContext);
+    assert.equal(notices.length, 1);
+    assert.match(notices[0]!, /make orchestrator\/auto the default worker model in your subagent extension.*subagents\.defaultModel/);
+  } finally { h.cleanup(); }
+});
 
 test("the router extension registers no tool_call handler", async () => {
   const h = harness(LIVE);

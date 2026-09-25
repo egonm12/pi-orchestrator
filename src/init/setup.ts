@@ -24,6 +24,7 @@ import { getSupportedThinkingLevels, type ModelInfo, type ThinkingLevel } from "
 
 export const INIT_COMMAND = "pi-orchestrator";
 export const RECIPIENTS_FILE = "authorized-recipients.json";
+export const AUTO_MODEL_SETUP_LINE = "pi-orchestrator: make orchestrator/auto the default worker model in your subagent extension (for example, subagents.defaultModel in pi-subagents settings).";
 
 export interface SetupStatus {
   readonly tiersMissing: boolean;
@@ -51,7 +52,7 @@ export function setupStatus(personal: unknown, stateDir: string): SetupStatus {
   };
 }
 
-/** The one line printed at session start when something is missing, or
+/** The notice printed at session start when something is missing, or
  *  `undefined` when the package is set up. */
 export function setupNotice(status: SetupStatus, stateDir: string): string | undefined {
   const missing = [
@@ -59,7 +60,7 @@ export function setupNotice(status: SetupStatus, stateDir: string): string | und
     ...(status.recipientsMissing ? [`no approved recipients (${join(stateDir, RECIPIENTS_FILE)})`] : []),
   ];
   if (missing.length === 0) return undefined;
-  return `pi-orchestrator: not set up: ${missing.join(", ")}. Run /${INIT_COMMAND} init.`;
+  return `pi-orchestrator: not set up: ${missing.join(", ")}. Run /${INIT_COMMAND} init.\n${AUTO_MODEL_SETUP_LINE}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -142,7 +143,7 @@ export interface SettingsPlan {
 
 /** Add what is missing and keep what is there: an existing tier map,
  *  classifier or ban list is never replaced. A new tier map starts in shadow
- *  mode, which records decisions and changes no call. */
+ *  mode, which records decisions while workers run on the session model. */
 export function planSettings(personal: Record<string, unknown>, starter: StarterTierMap | undefined, subagentBanList: readonly string[]): SettingsPlan {
   const changes: string[] = [];
   const orchestrator = { ...orchestratorOf(personal) };
