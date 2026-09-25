@@ -8,7 +8,7 @@ import { discoverAgents, resolveAgentName, type AgentConfig } from "../subagents
 import { resolveExecutionAgentScope } from "../subagents/agents.ts";
 import { INHERIT_MODEL, resolveEffectiveSubagentModel } from "../subagents/model-resolution.ts";
 import { newTaskLedger, TaskAllowanceOwner } from "../budget/task-allowance.ts";
-import { banListsFromSettings, configureBanLists, personalAgentDir, personalOrchestrator, readSettingsFile } from "../policy/ban-lists.ts";
+import { banListsFromSettings, configureBanLists, loadBanListsOrDefaults, personalAgentDir, personalOrchestrator, readSettingsFile } from "../policy/ban-lists.ts";
 import { delegationObjects, isModelField, isPlainObject } from "../guard/boundaries.ts";
 import {
   appendRoutingRecord,
@@ -37,6 +37,10 @@ export type { RoutingEvidence, RoutingEvidenceSource, EvidenceSetup } from "./ev
 import { ROUTER_PREFIX } from "./prefix.ts";
 export { ROUTER_PREFIX };
 export const ROUTER_DISABLED_PREFIX = "pi-orchestrator router disabled:";
+/** pi loads each extension with a fresh module copy (jiti moduleCache: false),
+ *  so the once-per-process disabled line is kept on the process's global object. */
+export const DISABLED_LINE_REPORTED = Symbol.for("pi-orchestrator.router.disabled-line-reported");
+type ProcessGlobal = typeof globalThis & { [DISABLED_LINE_REPORTED]?: boolean };
 
 /** The state folder when `PI_ORCHESTRATOR_STATE_DIR` is not set: under the agent
  *  directory, never inside the package checkout. */
@@ -258,12 +262,19 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
     let disabled = false;
     let active: ActiveRouter | undefined;
     let sessionRegistry: ExtensionContext["modelRegistry"];
-    const autoConfig = autoProviderConfig({ router: () => active, registry: () => sessionRegistry, now: deps.now });
+    const autoConfig = autoProviderConfig({
+      router: () => active, registry: () => sessionRegistry, now: deps.now,
+      banLists: () => active?.banLists ?? loadBanListsOrDefaults().banLists,
+      disabled: () => disabled,
+      disable: (error) => disable(error),
+    });
     if (typeof pi.registerProvider === "function") pi.registerProvider("orchestrator", autoConfig);
     const disable = (error: unknown) => {
       active = undefined;
       if (disabled) return;
       disabled = true;
+      if ((globalThis as ProcessGlobal)[DISABLED_LINE_REPORTED]) return;
+      (globalThis as ProcessGlobal)[DISABLED_LINE_REPORTED] = true;
       const message = error instanceof Error ? error.message : String(error);
       process.stderr.write(`${ROUTER_DISABLED_PREFIX} ${message.split(/\r?\n/, 1)[0]}\n`);
       if (process.env.PI_ORCHESTRATOR_ROUTER_DEBUG === "1") process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
@@ -280,8 +291,16 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
       },
     });
 
+    const rememberSessionModel = (model: { provider: string; id: string } | undefined, effort: string) => {
+      if (process.env.PI_SUBAGENT_CHILD === "1" || process.env.PI_SUBAGENTS_HERDR_BRIDGE === "1") return;
+      if (model?.provider === "orchestrator" && model.id === "auto") return;
+      if (model) process.env.PI_ORCHESTRATOR_SESSION_MODEL = `${model.provider}/${model.id}:${effort}`;
+      else delete process.env.PI_ORCHESTRATOR_SESSION_MODEL;
+    };
     let noticeShown = false;
     pi.on("session_start", (_event, ctx) => {
+      rememberSessionModel(ctx.model, ctx.thinkingLevel ?? "off");
+      sessionRegistry = ctx.modelRegistry;
       if (disabled) return;
       try {
         // One line on a fresh install, in the owner's session only.
@@ -294,13 +313,19 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
             else process.stderr.write(`${notice}\n`);
           }
         }
-        sessionRegistry = ctx.modelRegistry;
         active = startRouting(ctx, deps);
         if (active && typeof pi.registerProvider === "function") {
           pi.registerProvider("orchestrator", withAutoModelLimits(autoConfig, autoModelLimits(active.tierMap, active.installedModels)));
         }
         if (probe && active) process.stderr.write(`${ROUTER_PREFIX} routing enabled, mode ${active.mode}, records ${active.recordDir}\n`);
       } catch (error) { disable(error); }
+    });
+
+    pi.on("model_select", (event, ctx) => {
+      rememberSessionModel(event.model, ctx.thinkingLevel ?? "off");
+    });
+    pi.on("thinking_level_select", (event, ctx) => {
+      rememberSessionModel(ctx.model, event.level);
     });
 
     pi.on("tool_call", async (event: ToolCallEvent, ctx: ExtensionContext) => {

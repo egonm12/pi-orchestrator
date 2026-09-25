@@ -1,5 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { appendRoutingRecord, buildDecisionRecord } from "../routing/decision-record.ts";
+import { splitKnownThinkingSuffix } from "../models/model-info.ts";
+import { subagentBanListEntry, type BanLists } from "../policy/ban-lists.ts";
 import { streamReasoning } from "../routing/session-classifier-call.ts";
 import { autoStream } from "./auto-stream.ts";
 import { ROUTER_PREFIX } from "./prefix.ts";
@@ -11,6 +13,9 @@ export interface AutoProviderDependencies {
   readonly router: () => ActiveRouter | undefined;
   readonly registry: () => ExtensionContext["modelRegistry"];
   readonly now: () => Date;
+  readonly banLists: () => BanLists;
+  readonly disabled: () => boolean;
+  readonly disable: (error: unknown) => void;
 }
 
 function contentText(content: string | readonly { type: string; text?: string }[]): string {
@@ -34,6 +39,20 @@ function firstTaskAndRole(context: Context): { taskText: string; agentRole: stri
   return { taskText, agentRole: prompt.match(/<active_agent\s+name=["']([^"']+)["']/)?.[1] ?? "unknown" };
 }
 
+class SessionModelError extends Error {}
+
+function sessionPin(banLists: BanLists): { model: string; effort: string } {
+  const value = process.env.PI_ORCHESTRATOR_SESSION_MODEL;
+  if (!value) throw new SessionModelError("PI_ORCHESTRATOR_SESSION_MODEL is missing; no orchestrator session model is known");
+  const { baseModel, thinkingSuffix } = splitKnownThinkingSuffix(value);
+  if (!thinkingSuffix || !/^[^/]+\/.+$/.test(baseModel) || baseModel === "orchestrator/auto") {
+    throw new SessionModelError(`PI_ORCHESTRATOR_SESSION_MODEL is invalid: ${value}`);
+  }
+  const banned = subagentBanListEntry(baseModel, banLists);
+  if (banned) throw new SessionModelError(`orchestrator session model ${baseModel} is on the subagent ban list (entry '${banned}')`);
+  return { model: baseModel, effort: thinkingSuffix.slice(1) };
+}
+
 export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConfig {
   const pins = new Map<string, { model: string; effort: string }>();
   return {
@@ -49,19 +68,33 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
         let probeRung: string | undefined;
         try {
           if (!sessionId) throw new Error("auto model request has no sessionId");
-          const router = deps.router();
           const registry = deps.registry();
-          if (!router || router.mode !== "live" || !registry) throw new Error("auto model requires active live routing and a session model registry");
+          if (!registry) throw new Error("auto model has no session model registry");
           let pin = pins.get(sessionId);
           wasPinned = pin !== undefined;
           if (!pin) {
-            const at = deps.now();
-            const { taskText, agentRole } = firstTaskAndRole(context);
-            const { classification, route } = await routeTask(router, taskText, agentRole, at);
-            if (!route.ok) throw new Error(`auto model routing refused: ${route.message}`);
-            appendRoutingRecord(router.recordDir, buildDecisionRecord({ delegationId: sessionId, at, taskText, agentRole,
-              classification, tierMap: router.tierMap, route, mode: "live", ranOn: route.rung.rung }));
-            pin = { model: route.rung.model, effort: route.rung.effort };
+            const router = deps.disabled() ? undefined : deps.router();
+            if (!router) pin = sessionPin(deps.banLists());
+            else {
+              try {
+                const at = deps.now();
+                const { taskText, agentRole } = firstTaskAndRole(context);
+                const { classification, route } = await routeTask(router, taskText, agentRole, at);
+                pin = router.mode === "shadow" || !route.ok
+                  ? sessionPin(router.banLists)
+                  : { model: route.rung.model, effort: route.rung.effort };
+                const ranOn = `${pin.model}:${pin.effort}`;
+                const common = { delegationId: sessionId, at, taskText, agentRole, classification, tierMap: router.tierMap, route, ranOn };
+                appendRoutingRecord(router.recordDir, buildDecisionRecord(router.mode === "shadow"
+                  ? { ...common, mode: "shadow", handPickedModel: pin.model }
+                  : { ...common, mode: "live" }));
+              } catch (error) {
+                // An unavailable or banned session model is a refusal, not a router bug.
+                if (error instanceof SessionModelError) throw error;
+                deps.disable(error);
+                pin = sessionPin(deps.banLists());
+              }
+            }
             pins.set(sessionId, pin);
           }
           probeRung = `${pin.model}:${pin.effort}`;

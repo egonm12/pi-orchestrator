@@ -45,9 +45,14 @@ const originalEnv = {
   PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
   PI_ORCHESTRATOR_STATE_DIR: process.env.PI_ORCHESTRATOR_STATE_DIR,
   PI_ORCHESTRATOR_ROUTER_PROBE: process.env.PI_ORCHESTRATOR_ROUTER_PROBE,
+  PI_ORCHESTRATOR_SESSION_MODEL: process.env.PI_ORCHESTRATOR_SESSION_MODEL,
+  PI_SUBAGENT_CHILD: process.env.PI_SUBAGENT_CHILD,
+  PI_SUBAGENTS_HERDR_BRIDGE: process.env.PI_SUBAGENTS_HERDR_BRIDGE,
   PI_OFFLINE: process.env.PI_OFFLINE,
 };
 delete process.env.PI_ORCHESTRATOR_ROUTER_PROBE;
+delete process.env.PI_SUBAGENT_CHILD;
+delete process.env.PI_SUBAGENTS_HERDR_BRIDGE;
 after(() => {
   for (const [name, value] of Object.entries(originalEnv)) {
     if (value === undefined) delete process.env[name];
@@ -133,6 +138,17 @@ interface LoadedRouter {
 
 const SESSION_MODEL = { provider: "anthropic", id: "claude-haiku-4-5" };
 
+// Each synthetic pi load is an isolated module instance, as a separate test
+// process would be. Within one test, reuse a factory to check process-wide state.
+let isolatedModule = 0;
+function startFreshProcess(): void {
+  delete (globalThis as Record<symbol, unknown>)[Symbol.for("pi-orchestrator.router.disabled-line-reported")];
+}
+async function isolatedRouterExtension(): Promise<typeof createRouterExtension> {
+  startFreshProcess();
+  return (await import(`./extension.ts?seam-1=${++isolatedModule}`)).createRouterExtension;
+}
+
 async function loadRouter(h: Harness, deps: Partial<RouterDependencies> = {}, model = SESSION_MODEL): Promise<LoadedRouter> {
   return loadRouterWith(h, { classifierCall: () => answering("mechanical").call, ...deps }, model, fakeSessionRegistry([]));
 }
@@ -141,7 +157,8 @@ async function loadRouter(h: Harness, deps: Partial<RouterDependencies> = {}, mo
  *  replaces it): the in-session call over `modelRegistry`. */
 async function loadRouterWith(h: Harness, deps: Partial<RouterDependencies>, model: typeof SESSION_MODEL | undefined, modelRegistry: SessionModelRegistry): Promise<LoadedRouter> {
   const handlers = new Map<string, Handler>();
-  const factory = createRouterExtension({
+  const createIsolatedRouterExtension = await isolatedRouterExtension();
+  const factory = createIsolatedRouterExtension({
     evidence: () => () => evidenceOf(),
     now: () => NOW,
     ...deps,
@@ -762,12 +779,14 @@ function classifierAnswer(tier: string): string {
 async function loadAutoProvider(h: Harness, registry: SessionModelRegistry, deps: Partial<RouterDependencies> = {}): Promise<AutoStream> {
   let provider: ProviderConfigInput | undefined;
   const handlers = new Map<string, Handler>();
-  createRouterExtension({ classifierCall: () => answering("mechanical").call, evidence: () => () => evidenceOf(), now: () => NOW, ...deps })({
+  const createIsolatedRouterExtension = await isolatedRouterExtension();
+  createIsolatedRouterExtension({ classifierCall: () => answering("mechanical").call, evidence: () => () => evidenceOf(), now: () => NOW, ...deps })({
     registerProvider(name: string, config: ProviderConfigInput) { assert.equal(name, "orchestrator"); provider = config; },
     on(event: string, handler: Handler) { handlers.set(event, handler); },
   } as unknown as ExtensionAPI);
   await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, {
-    cwd: h.projectDir, hasUI: false, model: SESSION_MODEL, modelRegistry: registry, sessionManager: { getSessionId: () => "parent" },
+    cwd: h.projectDir, hasUI: false, model: SESSION_MODEL, modelRegistry: registry, thinkingLevel: "medium",
+    sessionManager: { getSessionId: () => "parent" },
   });
   assert.equal(provider?.models?.[0]?.id, "auto");
   assert.ok(provider.streamSimple);
@@ -779,6 +798,179 @@ async function autoEvents(stream: AutoStream, messages: unknown[], sessionId?: s
   for await (const event of stream(AUTO_MODEL, { messages } as unknown as Parameters<AutoStream>[1], { sessionId })) events.push(event);
   return events;
 }
+
+test("the main session exports its model and effort at startup", async () => {
+  const h = harness(LIVE);
+  try {
+    delete process.env.PI_ORCHESTRATOR_SESSION_MODEL;
+    const registry = fakeSessionRegistry([]);
+    await loadAutoProvider(h, registry);
+    assert.equal(process.env.PI_ORCHESTRATOR_SESSION_MODEL, `${HAIKU}:medium`);
+  } finally { h.cleanup(); }
+});
+
+test("model selections update the session model, but auto and delegated sessions cannot replace it", async () => {
+  const h = harness(LIVE);
+  try {
+    const handlers = new Map<string, Handler>();
+    createRouterExtension()({ on(event: string, handler: Handler) { handlers.set(event, handler); } } as unknown as ExtensionAPI);
+    const ctx = { cwd: h.projectDir, hasUI: false, model: SESSION_MODEL, thinkingLevel: "low" as const, modelRegistry: fakeSessionRegistry([]) };
+    const select = handlers.get("model_select");
+    assert.ok(select);
+    process.env.PI_ORCHESTRATOR_SESSION_MODEL = `${HAIKU}:low`;
+    await select({ type: "model_select", model: { provider: "anthropic", id: "claude-sonnet-5" }, source: "set" }, { ...ctx, thinkingLevel: "high" });
+    assert.equal(process.env.PI_ORCHESTRATOR_SESSION_MODEL, "anthropic/claude-sonnet-5:high");
+    await select({ type: "model_select", model: AUTO_MODEL, source: "set" }, ctx);
+    assert.equal(process.env.PI_ORCHESTRATOR_SESSION_MODEL, "anthropic/claude-sonnet-5:high");
+    const thinkingSelect = handlers.get("thinking_level_select");
+    assert.ok(thinkingSelect);
+    await thinkingSelect({ type: "thinking_level_select", level: "low", previousLevel: "high" }, { ...ctx, model: { provider: "anthropic", id: "claude-sonnet-5" }, thinkingLevel: "low" });
+    assert.equal(process.env.PI_ORCHESTRATOR_SESSION_MODEL, "anthropic/claude-sonnet-5:low");
+    await thinkingSelect({ type: "thinking_level_select", level: "medium", previousLevel: "low" }, { ...ctx, model: AUTO_MODEL, thinkingLevel: "medium" });
+    assert.equal(process.env.PI_ORCHESTRATOR_SESSION_MODEL, "anthropic/claude-sonnet-5:low");
+    process.env.PI_SUBAGENT_CHILD = "1";
+    await thinkingSelect({ type: "thinking_level_select", level: "high", previousLevel: "medium" }, { ...ctx, model: { provider: "anthropic", id: "claude-opus-5" }, thinkingLevel: "high" });
+    assert.equal(process.env.PI_ORCHESTRATOR_SESSION_MODEL, "anthropic/claude-sonnet-5:low");
+    await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, { ...ctx, model: AUTO_MODEL });
+    assert.equal(process.env.PI_ORCHESTRATOR_SESSION_MODEL, "anthropic/claude-sonnet-5:low");
+  } finally { delete process.env.PI_SUBAGENT_CHILD; h.cleanup(); }
+});
+
+test("a refused route runs on the session model with its effort and records ranOn", async () => {
+  const h = harness(LIVE);
+  try {
+    const registry = fakeSessionRegistry([{ events: answerEvents("fallback") }]);
+    const stream = await loadAutoProvider(h, registry, { evidence: () => () => evidenceOf({ authorization: emptyAuthorization() }) });
+    process.env.PI_ORCHESTRATOR_SESSION_MODEL = "anthropic/claude-sonnet-5:high";
+    const events = await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "refused-worker");
+    assert.equal(events.at(-1)?.type, "done");
+    assert.equal(registry.calls[0]?.model.id, "claude-sonnet-5");
+    assert.equal(registry.calls[0]?.options?.reasoning, "high");
+    const [record] = h.records();
+    assert.equal(record?.recordType === "decision" && record.route.outcome, "refused");
+    assert.equal(record?.recordType === "decision" && record.ranOn, "anthropic/claude-sonnet-5:high");
+  } finally { h.cleanup(); }
+});
+
+test("shadow mode runs on the session model but records the chosen rung", async () => {
+  const h = harness(SHADOW);
+  try {
+    const registry = fakeSessionRegistry([{ events: answerEvents("shadow") }]);
+    const stream = await loadAutoProvider(h, registry);
+    process.env.PI_ORCHESTRATOR_SESSION_MODEL = "anthropic/claude-sonnet-5:high";
+    assert.equal((await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "shadow-worker")).at(-1)?.type, "done");
+    assert.equal(registry.calls[0]?.model.id, "claude-sonnet-5");
+    const [record] = h.records();
+    assert.equal(record?.recordType === "decision" && record.route.outcome === "chosen" && record.route.rung.rung, `${HAIKU}:low`);
+    assert.equal(record?.recordType === "decision" && record.handPickedModel, "anthropic/claude-sonnet-5");
+    assert.equal(record?.recordType === "decision" && record.ranOn, "anthropic/claude-sonnet-5:high");
+  } finally { h.cleanup(); }
+});
+
+test("when routing is not enabled the auto model runs on the session model without a record", async () => {
+  const h = harness({ ...LIVE, enabled: false });
+  try {
+    const registry = fakeSessionRegistry([{ events: answerEvents("unrouted") }]);
+    const stream = await loadAutoProvider(h, registry);
+    process.env.PI_ORCHESTRATOR_SESSION_MODEL = "anthropic/claude-sonnet-5:medium";
+    assert.equal((await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "off-worker")).at(-1)?.type, "done");
+    assert.equal(registry.calls[0]?.model.id, "claude-sonnet-5");
+    assert.equal(registry.calls[0]?.options?.reasoning, "medium");
+    assert.deepEqual(h.records(), []);
+  } finally { h.cleanup(); }
+});
+
+test("the auto model fails with a reason and forwards nothing when the session model is missing or banned", async () => {
+  const h = harness(LIVE, { subagentBanList: ["sonnet"] });
+  try {
+    const registry = fakeSessionRegistry([]);
+    const stream = await loadAutoProvider(h, registry, { evidence: () => () => evidenceOf({ authorization: emptyAuthorization() }) });
+    delete process.env.PI_ORCHESTRATOR_SESSION_MODEL;
+    const missing = await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "missing-worker");
+    assert.equal(missing.at(-1)?.type, "error");
+    const missingFinal = missing.at(-1);
+    if (missingFinal?.type === "error") assert.match(missingFinal.error.errorMessage ?? "", /PI_ORCHESTRATOR_SESSION_MODEL.*missing/);
+    process.env.PI_ORCHESTRATOR_SESSION_MODEL = "anthropic/claude-sonnet-5:high";
+    const banned = await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "banned-worker");
+    assert.equal(banned.at(-1)?.type, "error");
+    const bannedFinal = banned.at(-1);
+    if (bannedFinal?.type === "error") assert.match(bannedFinal.error.errorMessage ?? "", /subagent ban list.*sonnet/);
+    assert.equal(registry.calls.length, 0);
+    assert.deepEqual(h.records(), []);
+  } finally { h.cleanup(); }
+});
+
+test("an internal routing failure disables routing once and later workers still run on the session model", async () => {
+  const h = harness(LIVE);
+  try {
+    const registry = fakeSessionRegistry([{ events: answerEvents("first") }, { events: answerEvents("second") }]);
+    const stream = await loadAutoProvider(h, registry, { evidence: () => () => { throw new Error("evidence exploded"); } });
+    process.env.PI_ORCHESTRATOR_SESSION_MODEL = "anthropic/claude-sonnet-5:high";
+    const stderr = await stderrOf(async () => {
+      for (const id of ["failed-one", "failed-two"]) {
+        const events = await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], id);
+        assert.equal(events.at(-1)?.type, "done");
+      }
+    });
+    assert.deepEqual(stderr.split("\n").filter(Boolean), ["pi-orchestrator router disabled: evidence exploded"]);
+    assert.deepEqual(registry.calls.map((call) => [call.model.id, call.options?.reasoning]), [["claude-sonnet-5", "high"], ["claude-sonnet-5", "high"]]);
+    assert.deepEqual(h.records(), []);
+  } finally { h.cleanup(); }
+});
+
+test("provider, startup and hook failures across extension instances print one disabled line per process", async () => {
+  const first = harness(LIVE);
+  const second = harness({ ...LIVE, classifier: { model: "anthropic/unknown:low" } });
+  const third = harness(LIVE);
+  try {
+    startFreshProcess();
+    const setup = async (h: Harness, failure: "provider" | "startup" | "hook") => {
+      // pi gives every load its own module copy; the line is still once per process.
+      const { createRouterExtension: fresh } = await import(`./extension.ts?disable-process-${failure}-${++isolatedModule}`);
+      process.env.PI_CODING_AGENT_DIR = h.agentDir;
+      process.env.PI_ORCHESTRATOR_STATE_DIR = h.stateDir;
+      const handlers = new Map<string, Handler>();
+      let provider: ProviderConfigInput | undefined;
+      fresh({ classifierCall: () => answering("mechanical").call,
+        evidence: () => () => { if (failure !== "startup") throw new Error(`${failure} evidence exploded`); return evidenceOf(); }, now: () => NOW })({
+        on(event: string, handler: Handler) { handlers.set(event, handler); },
+        registerProvider(_name: string, config: ProviderConfigInput) { provider = config; },
+      } as unknown as ExtensionAPI);
+      await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, {
+        cwd: h.projectDir, hasUI: false, model: SESSION_MODEL, thinkingLevel: "medium", modelRegistry: fakeSessionRegistry([{ events: answerEvents("ok") }]),
+        sessionManager: { getSessionId: () => "parent" },
+      });
+      return { stream: provider?.streamSimple, toolCall: handlers.get("tool_call") };
+    };
+    const stderr = await stderrOf(async () => {
+      const provider = await setup(first, "provider");
+      assert.ok(provider.stream);
+      assert.equal((await autoEvents(provider.stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "provider-failure")).at(-1)?.type, "done");
+      await setup(second, "startup");
+      const hook = await setup(third, "hook");
+      await hook.toolCall?.({ type: "tool_call", toolName: "subagent", toolCallId: "hook-failure", input: { agent: "worker", task: "Fix README.md" } }, {
+        cwd: third.projectDir, hasUI: false, model: SESSION_MODEL,
+      });
+    });
+    assert.deepEqual(stderr.split("\n").filter(Boolean), ["pi-orchestrator router disabled: provider evidence exploded"]);
+  } finally { first.cleanup(); second.cleanup(); third.cleanup(); }
+});
+
+test("a startup routing failure still forwards the auto model to the session model", async () => {
+  const h = harness({ ...LIVE, classifier: { model: "anthropic/unknown:low" } });
+  try {
+    const registry = fakeSessionRegistry([{ events: answerEvents("startup fallback") }]);
+    let stream!: AutoStream;
+    const stderr = await stderrOf(async () => {
+      stream = await loadAutoProvider(h, registry);
+      const events = await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "startup-failed-worker");
+      assert.equal(events.at(-1)?.type, "done");
+    });
+    assert.match(stderr, /pi-orchestrator router disabled: classifier rung/);
+    assert.equal(registry.calls[0]?.model.id, "claude-haiku-4-5");
+    assert.deepEqual(h.records(), []);
+  } finally { h.cleanup(); }
+});
 
 test("the auto model reads the agent role from system prompt sections and text parts", async () => {
   const h = harness(LIVE);

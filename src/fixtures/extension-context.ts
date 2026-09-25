@@ -7,6 +7,7 @@ export interface TestContext {
   hasUI: boolean;
   cwd: string;
   model?: { provider: string; id: string };
+  thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   modelRegistry?: SessionModelRegistry;
   sessionManager?: { getSessionId(): string };
   ui?: { notify(message: string, type?: "info" | "warning" | "error"): void };
