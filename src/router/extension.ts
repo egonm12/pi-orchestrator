@@ -2,6 +2,7 @@ import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@earendil-works/pi-coding-agent";
 import { toModelInfo, splitKnownThinkingSuffix, type ModelInfo } from "../models/model-info.ts";
 import { autoProviderConfig } from "./auto-provider.ts";
+import { autoModelLimits, withAutoModelLimits } from "./auto-model-limits.ts";
 import { routeTask, type ActiveRouter } from "./route-task.ts";
 import { discoverAgents, resolveAgentName, type AgentConfig } from "../subagents/agents.ts";
 import { resolveExecutionAgentScope } from "../subagents/agents.ts";
@@ -257,9 +258,8 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
     let disabled = false;
     let active: ActiveRouter | undefined;
     let sessionRegistry: ExtensionContext["modelRegistry"];
-    if (typeof pi.registerProvider === "function") pi.registerProvider("orchestrator", autoProviderConfig({
-      router: () => active, registry: () => sessionRegistry, now: deps.now,
-    }));
+    const autoConfig = autoProviderConfig({ router: () => active, registry: () => sessionRegistry, now: deps.now });
+    if (typeof pi.registerProvider === "function") pi.registerProvider("orchestrator", autoConfig);
     const disable = (error: unknown) => {
       active = undefined;
       if (disabled) return;
@@ -296,6 +296,9 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
         }
         sessionRegistry = ctx.modelRegistry;
         active = startRouting(ctx, deps);
+        if (active && typeof pi.registerProvider === "function") {
+          pi.registerProvider("orchestrator", withAutoModelLimits(autoConfig, autoModelLimits(active.tierMap, active.installedModels)));
+        }
         if (probe && active) process.stderr.write(`${ROUTER_PREFIX} routing enabled, mode ${active.mode}, records ${active.recordDir}\n`);
       } catch (error) { disable(error); }
     });

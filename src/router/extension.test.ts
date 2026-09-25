@@ -951,6 +951,91 @@ test("an inner stream without a final event returns a labelled error and settles
   } finally { h.cleanup(); }
 });
 
+test("the auto model declares the largest context window and output limit among the tier map's rungs", async () => {
+  const h = harness(LIVE);
+  try {
+    const limits: Record<string, { contextWindow: number; maxTokens: number }> = {
+      "anthropic/claude-haiku-4-5": { contextWindow: 200_000, maxTokens: 64_000 },
+      "anthropic/claude-sonnet-5": { contextWindow: 1_000_000, maxTokens: 64_000 },
+      "anthropic/claude-opus-5": { contextWindow: 200_000, maxTokens: 128_000 },
+      "openai-codex/gpt-6-sol": { contextWindow: 400_000, maxTokens: 100_000 },
+      // Not a rung of the tier map: its larger limits must not count.
+      "anthropic/claude-fable-5": { contextWindow: 2_000_000, maxTokens: 256_000 },
+    };
+    const registry = fakeSessionRegistry([], INSTALLED_MODEL_INFO.map((entry) => ({ ...entry, ...limits[entry.fullId] })));
+    const registered: ProviderConfigInput[] = [];
+    const handlers = new Map<string, Handler>();
+    createRouterExtension({ classifierCall: () => answering("mechanical").call, evidence: () => () => evidenceOf(), now: () => NOW })({
+      registerProvider(name: string, config: ProviderConfigInput) { assert.equal(name, "orchestrator"); registered.push(config); },
+      on(event: string, handler: Handler) { handlers.set(event, handler); },
+    } as unknown as ExtensionAPI);
+    await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, {
+      cwd: h.projectDir, hasUI: false, model: SESSION_MODEL, modelRegistry: registry, sessionManager: { getSessionId: () => "parent" },
+    });
+    const [auto] = registered.at(-1)?.models ?? [];
+    assert.equal(auto?.id, "auto");
+    assert.deepEqual([auto?.contextWindow, auto?.maxTokens], [1_000_000, 128_000]);
+  } finally { h.cleanup(); }
+});
+
+test("an overflow error from the rung comes back labelled orchestrator/auto with its message unchanged, and the retry stays on the rung", async () => {
+  const h = harness(LIVE);
+  try {
+    // pi compacts and retries only when the error matches pi-ai's overflow
+    // patterns (isContextOverflow, pi-ai 0.87.1 dist/utils/overflow.js) and
+    // the reply's provider and model equal the session model's
+    // (AgentSession._checkCompaction, pi-coding-agent 0.87.1). This is
+    // Anthropic's overflow message as pi-ai documents it.
+    const overflow = "prompt is too long: 213462 tokens > 200000 maximum";
+    const real = { provider: "anthropic", model: "claude-haiku-4-5", api: "anthropic-messages" };
+    const classifier = answering("mechanical");
+    const registry = fakeSessionRegistry([
+      { events: [{ type: "error", reason: "error", error: assistantMessage({ ...real, stopReason: "error", errorMessage: overflow }) } as never] },
+      { events: answerEvents("done after compaction") },
+    ]);
+    const stream = await loadAutoProvider(h, registry, { classifierCall: () => classifier.call });
+    const failed = await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "long-worker");
+    assert.deepEqual(failed.at(-1), { type: "error", reason: "error", error: { ...assistantMessage({ stopReason: "error", errorMessage: overflow }), provider: "orchestrator", model: "auto", api: "orchestrator-auto" } });
+    await autoEvents(stream, [{ role: "user", content: "Fix README.md after compaction", timestamp: 0 }], "long-worker");
+    assert.deepEqual(registry.calls.map((call) => `${call.model.provider}/${call.model.id}:${call.options?.reasoning}`), [`${HAIKU}:low`, `${HAIKU}:low`]);
+    assert.equal(classifier.prompts.length, 1);
+  } finally { h.cleanup(); }
+});
+
+test("a compaction summary request with a new session id is classified and recorded as a first request", async () => {
+  const h = harness(LIVE);
+  try {
+    const classifier = answering("mechanical");
+    const registry = fakeSessionRegistry([{ events: answerEvents("working") }, { events: answerEvents("## Goal") }]);
+    const stream = await loadAutoProvider(h, registry, { classifierCall: () => classifier.call });
+    await autoEvents(stream, [
+      { role: "system", content: '<active_agent name="worker"/>', timestamp: 0 },
+      { role: "user", content: "Fix README.md", timestamp: 0 },
+    ], "worker-before-compaction");
+    // The request pi's compaction sends (generateSummaryWithRequest, pi-coding-agent
+    // 0.87.1): its own system prompt and one user message wrapping the conversation.
+    const summaryPrompt = "<conversation>\n[User]: Fix README.md\n[Assistant]: working\n</conversation>\n\n"
+      + "The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.";
+    const request = stream(AUTO_MODEL, {
+      systemPrompt: "You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.",
+      messages: [{ role: "user", content: [{ type: "text", text: summaryPrompt }], timestamp: 0 }],
+    } as unknown as Parameters<AutoStream>[1], { sessionId: "compaction-summary" });
+    for await (const _event of request) { /* consume */ }
+    assert.equal((await request.result()).stopReason, "stop");
+    assert.equal(classifier.prompts.length, 2);
+    assert.match(classifier.prompts[1]!, /conversation to summarize/);
+    const records = h.records();
+    assert.deepEqual(records.map((record) => record.delegationId), ["worker-before-compaction", "compaction-summary"]);
+    const summary = records[1];
+    assert.equal(summary?.recordType, "decision");
+    if (summary?.recordType === "decision") {
+      assert.equal(summary.agentRole, "unknown");
+      assert.ok(summaryPrompt.startsWith(summary.taskTextPrefix));
+      assert.equal(summary.ranOn, `${HAIKU}:low`);
+    }
+  } finally { h.cleanup(); }
+});
+
 test("the auto model probe reports the rung, pin and time for each request", async () => {
   const h = harness(LIVE);
   process.env.PI_ORCHESTRATOR_ROUTER_PROBE = "1";
