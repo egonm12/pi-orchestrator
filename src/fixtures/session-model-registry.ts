@@ -5,7 +5,7 @@ import type {
   StreamContext,
   StreamedAssistantMessage,
   StreamSimpleOptions,
-} from "../types/pi-extension.ts";
+} from "../routing/model-stream.ts";
 import { INSTALLED_MODEL_INFO } from "./installed-model-info.ts";
 
 // A fake of pi's session model registry (`ctx.modelRegistry`) for seam 1 of

@@ -59,8 +59,8 @@ export interface StopRunningResult {
 }
 
 export interface PiLaunchLog {
-  /** Prepend to PATH, with `PI_HARNESS_LAUNCH_LOG_DIR`, in a child's env. */
-  readonly env: { readonly PATH: string; readonly PI_HARNESS_LAUNCH_LOG_DIR: string };
+  /** Prepend to PATH, with `PI_ORCHESTRATOR_LAUNCH_LOG_DIR`, in a child's env. */
+  readonly env: { readonly PATH: string; readonly PI_ORCHESTRATOR_LAUNCH_LOG_DIR: string };
   read(): PiLaunch[];
   /** SIGKILL the process group of every logged real pi that has not exited
    *  (an orphan of a SIGKILLed shim) and is still the process the shim
@@ -97,7 +97,7 @@ function shimSource(realPi: string): string {
 const { spawn, spawnSync } = require("node:child_process");
 const { mkdirSync, openSync, writeSync, writeFileSync } = require("node:fs");
 const { join } = require("node:path");
-const dir = process.env.PI_HARNESS_LAUNCH_LOG_DIR;
+const dir = process.env.PI_ORCHESTRATOR_LAUNCH_LOG_DIR;
 mkdirSync(dir, { recursive: true });
 const id = \`\${Date.now()}-\${process.pid}\`;
 writeFileSync(join(dir, \`\${id}.args.json\`), JSON.stringify(process.argv.slice(2)));
@@ -132,7 +132,7 @@ export function installPiLaunchLog(home: string, path: string = process.env.PATH
   writeFileSync(shim, shimSource(realPiPath(path)));
   chmodSync(shim, 0o755);
   return {
-    env: { PATH: `${bin}${delimiter}${path}`, PI_HARNESS_LAUNCH_LOG_DIR: logDir },
+    env: { PATH: `${bin}${delimiter}${path}`, PI_ORCHESTRATOR_LAUNCH_LOG_DIR: logDir },
     read: () => readLaunches(logDir),
     stopRunning: () => stopRunningLaunches(logDir),
   };

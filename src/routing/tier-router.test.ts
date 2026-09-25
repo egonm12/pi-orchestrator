@@ -42,7 +42,7 @@ type Tiers = Record<keyof typeof TIERS, readonly string[]>;
 
 /** The map as ticket 22's loader resolves it from a personal settings file. */
 function tierMap(tiers: Tiers = TIERS): ResolvedTierMap {
-  const map = tierMapFromSettings({ harness: { routing: { enabled: true, tiers } } }, undefined, {
+  const map = tierMapFromSettings({ orchestrator: { routing: { enabled: true, tiers } } }, undefined, {
     installedModels: INSTALLED_MODEL_INFO,
     modelScope: HARNESS_MODEL_SCOPE,
     banLists: DEFAULT_BAN_LISTS,

@@ -2,12 +2,12 @@ import { appendFileSync } from "node:fs";
 import {
   checkModelScope,
   matchesScopePattern,
-} from "../../../../../../.pi/agent/npm/node_modules/pi-subagents/src/runs/shared/model-scope.js";
+} from "../subagents/model-scope.ts";
 import type {
   ModelScopeConfig,
   ModelSource,
-} from "../../../../../../.pi/agent/npm/node_modules/pi-subagents/src/runs/shared/model-scope.js";
-import { splitKnownThinkingSuffix } from "../../../../../../.pi/agent/npm/node_modules/pi-subagents/src/shared/model-info.js";
+} from "../subagents/model-scope.ts";
+import { splitKnownThinkingSuffix } from "../subagents/model-info.ts";
 import type { Availability } from "../fixtures/provider-double.ts";
 import { isProhibitedModel, subagentBanListEntry } from "./ban-lists.ts";
 

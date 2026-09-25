@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { test } from "node:test";
+import { liveTest as test } from "../fixtures/live.ts";
 import { createGuardedAgentDir, credentialsAvailable, liveAuthExtensionPath, realAgentDirPath } from "../fixtures/guarded-agent-dir.ts";
 import { createTempRepo } from "../fixtures/temp-repo.ts";
 import { livePiModelAvailability, PI_LIST_MODELS_TIMEOUT_MS, selectedLivePiModel } from "../policy/live-model.ts";
@@ -37,12 +37,12 @@ test("installed entry loads with configured or tilde-expanded agent directory", 
   const other = createGuardedAgentDir({ installGuard: false });
   try {
     const args = ["-p", "noop", "--no-session"];
-    const guarded = runPi(args, repo.dir, agent.env({ PI_OFFLINE: "1", PI_HARNESS_GUARD_PROBE: "1" }));
+    const guarded = runPi(args, repo.dir, agent.env({ PI_OFFLINE: "1", PI_ORCHESTRATOR_GUARD_PROBE: "1" }));
     if (guarded.missing) return t.skip("pi unavailable");
     assert.match(guarded.output, new RegExp(`${GUARD_PREFIX} loaded`));
-    const tilde = runPi(args, repo.dir, agent.env({ PI_OFFLINE: "1", PI_HARNESS_GUARD_PROBE: "1", PI_CODING_AGENT_DIR: "~/.pi/agent" }));
+    const tilde = runPi(args, repo.dir, agent.env({ PI_OFFLINE: "1", PI_ORCHESTRATOR_GUARD_PROBE: "1", PI_CODING_AGENT_DIR: "~/.pi/agent" }));
     assert.match(tilde.output, new RegExp(`${GUARD_PREFIX} loaded`));
-    assert.doesNotMatch(runPi(args, repo.dir, other.env({ PI_OFFLINE: "1", PI_HARNESS_GUARD_PROBE: "1" })).output, new RegExp(GUARD_PREFIX));
+    assert.doesNotMatch(runPi(args, repo.dir, other.env({ PI_OFFLINE: "1", PI_ORCHESTRATOR_GUARD_PROBE: "1" })).output, new RegExp(GUARD_PREFIX));
   } finally { agent.cleanup(); other.cleanup(); repo.cleanup(); }
 });
 
@@ -58,7 +58,7 @@ test("a broken imported guard logs one disabled line and pi still starts", (t) =
     if (run.missing) return t.skip("pi unavailable");
     assert.equal(run.status, 0, run.output);
     assert.match(run.output, /PI_SESSION_STARTED/);
-    assert.equal((run.output.match(/harness guard disabled:/g) ?? []).length, 1, run.output);
+    assert.equal((run.output.match(/pi-orchestrator guard disabled:/g) ?? []).length, 1, run.output);
   } finally { agent.cleanup(); repo.cleanup(); }
 });
 
@@ -78,7 +78,7 @@ test(`live guard handles six tool calls in one Haiku session (live route: ${MODE
       `6. bash command ${plainCommand}.\n` +
       `Finally reply DONE.`;
     const subagents = join(realAgentDirPath(), "npm", "node_modules", "pi-subagents", "index.js");
-    const run = runPi(["-p", prompt, "--mode", "json", "-t", "write,bash,subagent", "-e", liveAuthExtensionPath()!, "-e", subagents, "--model", MODEL, "--no-session"], repo.dir, agent.env({ PI_HARNESS_GUARD_PROBE: "1" }), 240_000);
+    const run = runPi(["-p", prompt, "--mode", "json", "-t", "write,bash,subagent", "-e", liveAuthExtensionPath()!, "-e", subagents, "--model", MODEL, "--no-session"], repo.dir, agent.env({ PI_ORCHESTRATOR_GUARD_PROBE: "1" }), 240_000);
     if (/"message":"[^"]*(?:usage|quota|rate limit|credit)[^"]*"/i.test(run.output)) return t.skip(`live provider refused: ${run.output.slice(-300)}`);
     assert.equal(run.status, 0, run.output.slice(-1500));
     assert.match(run.output, new RegExp(`${GUARD_PREFIX} loaded`));
@@ -115,13 +115,13 @@ test(`live guard handles six tool calls in one Haiku session (live route: ${MODE
 // for "the turn ran"; its absence plus the refusal line is "the turn was blocked".
 // ---------------------------------------------------------------------------
 
-function withHarnessSettings(agentDir: string, harness: unknown): void {
+function withOrchestratorSettings(agentDir: string, orchestrator: unknown): void {
   const path = join(agentDir, "settings.json");
-  writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), harness }));
+  writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), orchestrator }));
 }
 
 function offlineEnv(agent: ReturnType<typeof createGuardedAgentDir>): NodeJS.ProcessEnv {
-  const env = agent.env({ PI_OFFLINE: "1", PI_HARNESS_GUARD_PROBE: "1" });
+  const env = agent.env({ PI_OFFLINE: "1", PI_ORCHESTRATOR_GUARD_PROBE: "1" });
   delete env.ANTHROPIC_API_KEY;
   delete env.ANTHROPIC_OAUTH_TOKEN;
   return env;
@@ -138,11 +138,11 @@ test("the guard reads the subagent ban list from personal settings at startup", 
     const args = ["-p", "noop", "--model", "anthropic/claude-haiku-4-5", "--no-session"];
     const defaults = runPi(args, repo.dir, offlineEnv(agent));
     if (defaults.missing) return t.skip("pi unavailable");
-    assert.match(defaults.output, guardLine("subagent ban list: fable, astra; session ban list: (none)"), defaults.output);
-    withHarnessSettings(agent.dir, { subagentBanList: ["fable", "astra", "sonnet"] });
+    assert.match(defaults.output, guardLine("subagent ban list: (none); session ban list: (none)"), defaults.output);
+    withOrchestratorSettings(agent.dir, { subagentBanList: ["fable", "astra", "sonnet"] });
     const configured = runPi(args, repo.dir, offlineEnv(agent));
     assert.match(configured.output, guardLine("subagent ban list: fable, astra, sonnet; session ban list: (none)"), configured.output);
-    assert.doesNotMatch(configured.output, /harness guard disabled/);
+    assert.doesNotMatch(configured.output, /pi-orchestrator guard disabled/);
   } finally { agent.cleanup(); repo.cleanup(); }
 });
 
@@ -155,7 +155,7 @@ test("a session model on the session ban list is refused and its turn never runs
     assert.doesNotMatch(allowed.output, /session ban list \(entry/, allowed.output);
     assert.match(allowed.output, NO_KEY, allowed.output);
 
-    withHarnessSettings(agent.dir, { sessionBanList: ["haiku"] });
+    withOrchestratorSettings(agent.dir, { sessionBanList: ["haiku"] });
     const refused = runPi(args, repo.dir, offlineEnv(agent));
     assert.match(refused.output, /session ban list \(entry 'haiku'\)/, refused.output);
     assert.doesNotMatch(refused.output, NO_KEY, refused.output);
@@ -169,7 +169,7 @@ test("a session whose own model is on the subagent ban list runs normally", (t) 
     if (run.missing) return t.skip("pi unavailable");
     assert.match(run.output, guardLine("loaded"), run.output);
     assert.doesNotMatch(run.output, /session ban list \(entry/, run.output);
-    assert.doesNotMatch(run.output, /harness guard disabled/);
+    assert.doesNotMatch(run.output, /pi-orchestrator guard disabled/);
     assert.match(run.output, NO_KEY, run.output);
   } finally { agent.cleanup(); repo.cleanup(); }
 });
@@ -178,11 +178,12 @@ test("project settings carrying either ban list change nothing and the guard log
   const repo = createTempRepo(), agent = createGuardedAgentDir();
   try {
     mkdirSync(join(repo.dir, ".pi"), { recursive: true });
-    writeFileSync(join(repo.dir, ".pi", "settings.json"), JSON.stringify({ harness: { subagentBanList: [], sessionBanList: ["haiku"] } }));
+    writeFileSync(join(repo.dir, ".pi", "settings.json"), JSON.stringify({ orchestrator: { subagentBanList: [], sessionBanList: ["haiku"] } }));
+    withOrchestratorSettings(agent.dir, { subagentBanList: ["fable", "astra"] });
     const run = runPi(["-p", "noop", "--model", "anthropic/claude-haiku-4-5", "--no-session"], repo.dir, offlineEnv(agent));
     if (run.missing) return t.skip("pi unavailable");
-    assert.equal(countLines(run.output, "ignored project settings key harness.subagentBanList"), 1, run.output);
-    assert.equal(countLines(run.output, "ignored project settings key harness.sessionBanList"), 1, run.output);
+    assert.equal(countLines(run.output, "ignored project settings key orchestrator.subagentBanList"), 1, run.output);
+    assert.equal(countLines(run.output, "ignored project settings key orchestrator.sessionBanList"), 1, run.output);
     assert.match(run.output, guardLine("subagent ban list: fable, astra; session ban list: (none)"), run.output);
     assert.match(run.output, NO_KEY, run.output);
   } finally { agent.cleanup(); repo.cleanup(); }
@@ -191,21 +192,21 @@ test("project settings carrying either ban list change nothing and the guard log
 test("a malformed personal ban-list key keeps the other key, logs one line and leaves the guard running", (t) => {
   const repo = createTempRepo(), agent = createGuardedAgentDir();
   try {
-    withHarnessSettings(agent.dir, { subagentBanList: ["fable", "astra", "sonnet"], sessionBanList: "haiku" });
+    withOrchestratorSettings(agent.dir, { subagentBanList: ["fable", "astra", "sonnet"], sessionBanList: "haiku" });
     const run = runPi(["-p", "noop", "--model", "anthropic/claude-haiku-4-5", "--no-session"], repo.dir, offlineEnv(agent));
     if (run.missing) return t.skip("pi unavailable");
     const lines = run.output.split("\n").filter((line) => line.startsWith(`${GUARD_PREFIX} ban lists: `));
     assert.equal(lines.length, 1, run.output);
-    assert.match(lines[0]!, /harness\.sessionBanList/);
+    assert.match(lines[0]!, /orchestrator\.sessionBanList/);
     assert.match(run.output, guardLine("subagent ban list: fable, astra, sonnet; session ban list: (none)"), run.output);
-    assert.doesNotMatch(run.output, /harness guard disabled/);
+    assert.doesNotMatch(run.output, /pi-orchestrator guard disabled/);
   } finally { agent.cleanup(); repo.cleanup(); }
 });
 
 test("an unreadable project settings file logs one line and the personal lists still apply", (t) => {
   const repo = createTempRepo(), agent = createGuardedAgentDir();
   try {
-    withHarnessSettings(agent.dir, { sessionBanList: ["opus"] });
+    withOrchestratorSettings(agent.dir, { subagentBanList: ["fable", "astra"], sessionBanList: ["opus"] });
     mkdirSync(join(repo.dir, ".pi"), { recursive: true });
     const projectSettings = join(repo.dir, ".pi", "settings.json");
     writeFileSync(projectSettings, "{ not json");
@@ -215,7 +216,7 @@ test("an unreadable project settings file logs one line and the personal lists s
     assert.equal(lines.length, 1, run.output);
     assert.match(lines[0]!, /\.pi\/settings\.json/);
     assert.match(run.output, guardLine("subagent ban list: fable, astra; session ban list: opus"), run.output);
-    assert.doesNotMatch(run.output, /harness guard disabled/);
+    assert.doesNotMatch(run.output, /pi-orchestrator guard disabled/);
   } finally { agent.cleanup(); repo.cleanup(); }
 });
 
@@ -246,7 +247,7 @@ test("a turn triggered by an extension message, not by input, is aborted while t
     assert.match(allowed.output, /Provider is not configured: anthropic/, allowed.output);
     assert.doesNotMatch(allowed.output, /session ban list \(entry/, allowed.output);
 
-    withHarnessSettings(agent.dir, { sessionBanList: ["haiku"] });
+    withOrchestratorSettings(agent.dir, { sessionBanList: ["haiku"] });
     const refused = runPi(args, repo.dir, offlineEnv(agent));
     assert.match(refused.output, /session ban list \(entry 'haiku'\)/, refused.output);
     assert.match(refused.output, /This operation was aborted/, refused.output);

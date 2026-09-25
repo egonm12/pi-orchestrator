@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -102,7 +102,10 @@ test("a structured verdict field is read as it is, whatever the prose says", () 
   assert.equal(verdictFromReviewResult({ structuredOutput: { verdict: "request_changes", summary: "off by one" } }), "request_changes");
 });
 
-test("the reviewer agent definition declares outputSchema with a required verdict enum, as pi-subagents parses it", () => {
+test("the reviewer agent definition declares outputSchema with a required verdict enum, as pi-subagents parses it", (t) => {
+  // Parsed by the installed pi-subagents itself, so this runs only where it is installed.
+  const agents = join(homedir(), ".pi", "agent", "npm", "node_modules", "pi-subagents", "src", "agents", "agents.js");
+  if (!existsSync(agents)) return t.skip("pi-subagents is not installed in ~/.pi/agent");
   assert.deepEqual(VERDICT_OUTPUT_SCHEMA.required, ["verdict"]);
   assert.deepEqual(VERDICT_OUTPUT_SCHEMA.properties.verdict.enum, ["accept", "request_changes"]);
   const home = mkdtempSync(join(tmpdir(), "pi-harness-reviewer-agent-"));
@@ -110,7 +113,6 @@ test("the reviewer agent definition declares outputSchema with a required verdic
     const agentDir = join(home, "agent");
     const installed = installVerdictReviewer(agentDir);
     assert.equal(installed, join(agentDir, "agents", `${VERDICT_REVIEWER_AGENT}.md`));
-    const agents = fileURLToPath(new URL("../../../../../../.pi/agent/npm/node_modules/pi-subagents/src/agents/agents.js", import.meta.url));
     const probe =
       `import { discoverAgents } from ${JSON.stringify(agents)};` +
       `const found = discoverAgents(${JSON.stringify(home)}, "user").agents.find((agent) => agent.name === ${JSON.stringify(VERDICT_REVIEWER_AGENT)});` +
@@ -300,7 +302,7 @@ function strings(value: unknown): string[] {
 test("live review on anthropic/claude-haiku-4-5 returns a structured verdict equal to the reviewer's verdict line", async (t) => {
   const liveModel = selectedLivePiModel();
   if (liveModel !== "anthropic/claude-haiku-4-5") {
-    return t.skip(`the live review is approved on anthropic/claude-haiku-4-5 only; PI_HARNESS_LIVE_MODEL selected ${liveModel}`);
+    return t.skip(`the live review is approved on anthropic/claude-haiku-4-5 only; PI_ORCHESTRATOR_LIVE_MODEL selected ${liveModel}`);
   }
   const agent = createGuardedAgentDir({ withCredentials: true, installGuard: false });
   const repo = createTempRepo();

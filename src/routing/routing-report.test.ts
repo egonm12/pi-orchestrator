@@ -59,7 +59,7 @@ async function knownFolder(): Promise<Known> {
   const later = (day: Date) => new Date(day.getTime() + 60 * 60 * 1000);
   const tierMap = fixtureTierMap();
   const onlyCodexStandard = fixtureTierMap({
-    harness: {
+    orchestrator: {
       routing: {
         enabled: true,
         tiers: {

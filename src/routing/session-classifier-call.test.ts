@@ -10,7 +10,7 @@ import {
   fakeSessionRegistry,
   type StreamScript,
 } from "../fixtures/session-model-registry.ts";
-import type { RegistryModel } from "../types/pi-extension.ts";
+import type { RegistryModel } from "./model-stream.ts";
 import { CLASSIFIER_SYSTEM_PROMPT } from "./classifier-reply.ts";
 import { sessionClassifierModelCall, type SessionClassifierCallReport } from "./session-classifier-call.ts";
 import {
@@ -274,11 +274,11 @@ test("aborted calls close consumers promptly and never inspect or request late e
       let nextCalls = 0;
       let returns = 0;
       let reads = 0;
-      let settle!: (value: IteratorResult<import("../types/pi-extension.ts").AssistantMessageEvent>) => void;
+      let settle!: (value: IteratorResult<import("./model-stream.ts").AssistantMessageEvent>) => void;
       const controller = new AbortController();
       const stream = { [Symbol.asyncIterator]: () => ({
-        next() { nextCalls++; return new Promise<IteratorResult<import("../types/pi-extension.ts").AssistantMessageEvent>>((resolve) => { settle = resolve; }); },
-        return(): Promise<IteratorResult<import("../types/pi-extension.ts").AssistantMessageEvent>> {
+        next() { nextCalls++; return new Promise<IteratorResult<import("./model-stream.ts").AssistantMessageEvent>>((resolve) => { settle = resolve; }); },
+        return(): Promise<IteratorResult<import("./model-stream.ts").AssistantMessageEvent>> {
           returns++;
           if (close === "throw") throw new Error("close failed");
           return close === "reject" ? Promise.reject(new Error("close failed")) : new Promise(() => {});

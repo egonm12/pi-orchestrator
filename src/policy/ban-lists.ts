@@ -1,13 +1,13 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { splitKnownThinkingSuffix } from "../../../../../../.pi/agent/npm/node_modules/pi-subagents/src/shared/model-info.js";
+import { splitKnownThinkingSuffix } from "../subagents/model-info.ts";
 
 // Ticket 21, ADR 0002: two owner-configured ban lists read from pi's personal
-// settings under the `harness` key.
+// settings under the `orchestrator` key.
 //
-//   harness.subagentBanList  binds every delegated agent. Default below.
-//   harness.sessionBanList   binds only the orchestrator's own session model.
+//   orchestrator.subagentBanList  binds every delegated agent. Default below.
+//   orchestrator.sessionBanList   binds only the orchestrator's own session model.
 //                            Empty by default.
 //
 // A project settings file may not extend, shorten or replace either list; a
@@ -18,7 +18,7 @@ import { splitKnownThinkingSuffix } from "../../../../../../.pi/agent/npm/node_m
 // subagent ban list; nothing else holds a copy of the names or the match.
 //
 // Seam: the lists are module-level state. They start at the defaults (the
-// "no harness key" case) and change only through `configureBanLists`. Two
+// "no orchestrator key" case) and change only through `configureBanLists`. Two
 // hosts call it: the personal guard (harness/guard/extension.ts), with
 // `loadBanListsOrDefaults(...)`, and the router extension
 // (harness/router/extension.ts, ticket 27), at session start with the same
@@ -32,7 +32,7 @@ export interface BanLists {
 }
 
 export const DEFAULT_BAN_LISTS: BanLists = Object.freeze({
-  subagentBanList: Object.freeze(["fable", "astra"]),
+  subagentBanList: Object.freeze([]),
   sessionBanList: Object.freeze([]),
 });
 
@@ -42,7 +42,7 @@ const BAN_LIST_KEYS: readonly BanListKey[] = ["subagentBanList", "sessionBanList
 export interface LoadedBanLists {
   readonly banLists: BanLists;
   /** Dotted keys a project settings file carried and the loader ignored,
-   *  e.g. `harness.subagentBanList`. Data for the guard's log and, later,
+   *  e.g. `orchestrator.subagentBanList`. Data for the guard's log and, later,
    *  the decision record (ticket 25). */
   readonly ignoredProjectKeys: readonly string[];
 }
@@ -55,7 +55,7 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  *  silently empty or default list. Entries are trimmed; a blank entry would
  *  match every model id, so it is refused too. */
 function validatedBanList(key: BanListKey, value: unknown): readonly string[] {
-  const expected = `harness.${key} must be an array of non-empty strings`;
+  const expected = `orchestrator.${key} must be an array of non-empty strings`;
   if (!Array.isArray(value)) throw new Error(`${expected}; got ${JSON.stringify(value)}.`);
   return Object.freeze(
     value.map((entry, index) => {
@@ -67,26 +67,26 @@ function validatedBanList(key: BanListKey, value: unknown): readonly string[] {
   );
 }
 
-/** The personal `harness` object, `undefined` when absent. Throws when the
+/** The personal `orchestrator` object, `undefined` when absent. Throws when the
  *  settings or the key are not objects. Shared with the tier-map loader
  *  (harness/routing/tier-map.ts). */
-export function personalHarness(personal: unknown): Record<string, unknown> | undefined {
+export function personalOrchestrator(personal: unknown): Record<string, unknown> | undefined {
   if (!isPlainObject(personal)) {
     throw new Error("personal settings must be a JSON object.");
   }
-  const harness = personal.harness;
-  if (harness !== undefined && !isPlainObject(harness)) {
-    throw new Error("personal settings key 'harness' must be an object.");
+  const orchestrator = personal.orchestrator;
+  if (orchestrator !== undefined && !isPlainObject(orchestrator)) {
+    throw new Error("personal settings key 'orchestrator' must be an object.");
   }
-  return harness;
+  return orchestrator;
 }
 
 /** Pure: effective lists from parsed personal and (optional) project settings. */
 export function banListsFromSettings(personal: unknown, project?: unknown): LoadedBanLists {
-  const harness = personalHarness(personal);
+  const orchestrator = personalOrchestrator(personal);
   const lists: Record<BanListKey, readonly string[]> = { ...DEFAULT_BAN_LISTS };
   for (const key of BAN_LIST_KEYS) {
-    if (harness && Object.hasOwn(harness, key)) lists[key] = validatedBanList(key, harness[key]);
+    if (orchestrator && Object.hasOwn(orchestrator, key)) lists[key] = validatedBanList(key, orchestrator[key]);
   }
 
   return { banLists: Object.freeze(lists), ignoredProjectKeys: ignoredProjectBanListKeys(project) };
@@ -94,9 +94,9 @@ export function banListsFromSettings(personal: unknown, project?: unknown): Load
 
 /** Ban-list keys a project settings value carries, whatever their value. */
 function ignoredProjectBanListKeys(project: unknown): string[] {
-  const projectHarness = isPlainObject(project) ? project.harness : undefined;
-  return isPlainObject(projectHarness)
-    ? BAN_LIST_KEYS.filter((key) => Object.hasOwn(projectHarness, key)).map((key) => `harness.${key}`)
+  const projectOrchestrator = isPlainObject(project) ? project.orchestrator : undefined;
+  return isPlainObject(projectOrchestrator)
+    ? BAN_LIST_KEYS.filter((key) => Object.hasOwn(projectOrchestrator, key)).map((key) => `orchestrator.${key}`)
     : [];
 }
 
@@ -161,7 +161,7 @@ function narrowedBanList(key: BanListKey, value: unknown, errors: string[]): rea
 /** The personal guard's loader. It never throws and never widens:
  *  - each personal key is validated on its own, so a bad key never discards
  *    a good one, and a bad list keeps its defaults plus its usable entries;
- *  - an unreadable personal file or a non-object `harness` leaves the
+ *  - an unreadable personal file or a non-object `orchestrator` leaves the
  *    defaults in force;
  *  - an unusable project file leaves the personal lists in force.
  *  Each failure is one message. */
@@ -169,9 +169,9 @@ export function loadBanListsOrDefaults({ agentDir = personalAgentDir(), projectC
   const errors: string[] = [];
   const lists: Record<BanListKey, readonly string[]> = { ...DEFAULT_BAN_LISTS };
   try {
-    const harness = personalHarness(readSettingsFile(join(agentDir, "settings.json")) ?? {});
+    const orchestrator = personalOrchestrator(readSettingsFile(join(agentDir, "settings.json")) ?? {});
     for (const key of BAN_LIST_KEYS) {
-      if (harness && Object.hasOwn(harness, key)) lists[key] = narrowedBanList(key, harness[key], errors);
+      if (orchestrator && Object.hasOwn(orchestrator, key)) lists[key] = narrowedBanList(key, orchestrator[key], errors);
     }
   } catch (error) {
     errors.push(messageOf(error));
@@ -202,7 +202,7 @@ export function activeBanLists(): BanLists {
   return configuredBanLists;
 }
 
-/** Back to the defaults, as if no `harness` key were present. */
+/** Back to the defaults, as if no `orchestrator` key were present. */
 export function resetBanLists(): void {
   configuredBanLists = DEFAULT_BAN_LISTS;
 }

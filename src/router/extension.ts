@@ -1,11 +1,11 @@
 import { join, resolve } from "node:path";
-import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "../types/pi-extension.ts";
-import { toModelInfo, splitKnownThinkingSuffix, type ModelInfo } from "../../../../../../.pi/agent/npm/node_modules/pi-subagents/src/shared/model-info.js";
-import { discoverAgents, resolveAgentName, type AgentConfig } from "../../../../../../.pi/agent/npm/node_modules/pi-subagents/src/agents/agents.js";
-import { resolveExecutionAgentScope } from "../../../../../../.pi/agent/npm/node_modules/pi-subagents/src/agents/agent-scope.js";
-import { INHERIT_MODEL, resolveEffectiveSubagentModel } from "../../../../../../.pi/agent/npm/node_modules/pi-subagents/src/runs/shared/model-resolution.js";
+import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@earendil-works/pi-coding-agent";
+import { toModelInfo, splitKnownThinkingSuffix, type ModelInfo } from "../subagents/model-info.ts";
+import { discoverAgents, resolveAgentName, type AgentConfig } from "../subagents/agents.ts";
+import { resolveExecutionAgentScope } from "../subagents/agents.ts";
+import { INHERIT_MODEL, resolveEffectiveSubagentModel } from "../subagents/model-resolution.ts";
 import { newTaskLedger, TaskAllowanceOwner, allowanceConstraint } from "../budget/task-allowance.ts";
-import { banListsFromSettings, configureBanLists, personalAgentDir, personalHarness, readSettingsFile, type BanLists } from "../policy/ban-lists.ts";
+import { banListsFromSettings, configureBanLists, personalAgentDir, personalOrchestrator, readSettingsFile, type BanLists } from "../policy/ban-lists.ts";
 import { delegationObjects, isModelField, isPlainObject } from "../guard/boundaries.ts";
 import {
   appendRoutingRecord,
@@ -25,6 +25,8 @@ import {
 } from "../routing/tier-classifier.ts";
 import { tierMapFromSettings, type ResolvedTierMap } from "../routing/tier-map.ts";
 import { routeTier } from "../routing/tier-router.ts";
+import { runInit } from "../init/command.ts";
+import { INIT_COMMAND, setupNotice, setupStatus } from "../init/setup.ts";
 import { deriveProviderUsage, stateFolderEvidence, type EvidenceSetup, type RoutingEvidenceSource } from "./evidence.ts";
 
 export type { RoutingEvidence, RoutingEvidenceSource, EvidenceSetup } from "./evidence.ts";
@@ -32,13 +34,18 @@ export type { RoutingEvidence, RoutingEvidenceSource, EvidenceSetup } from "./ev
 // Ticket 27: the router extension (stories 38 to 44). A personal pi extension,
 // separate from the guard, hooked on `tool_call` for `subagent`.
 
-export const ROUTER_PREFIX = "pi-orchestration-harness router:";
-export const ROUTER_DISABLED_PREFIX = "harness router disabled:";
+export const ROUTER_PREFIX = "pi-orchestrator router:";
+export const ROUTER_DISABLED_PREFIX = "pi-orchestrator router disabled:";
 
-/** The state folder when `PI_HARNESS_STATE_DIR` is not set: under the agent
+/** The state folder when `PI_ORCHESTRATOR_STATE_DIR` is not set: under the agent
  *  directory, never inside the package checkout. */
 export function defaultStateDir(): string {
   return join(personalAgentDir(), "pi-orchestrator");
+}
+
+/** The state folder this session uses. */
+export function stateDir(): string {
+  return resolve(process.env.PI_ORCHESTRATOR_STATE_DIR ?? defaultStateDir());
 }
 
 export interface RouterDependencies {
@@ -73,7 +80,7 @@ const DEFAULT_DEPENDENCIES: RouterDependencies = {
   // (ADR 0004), not in a `pi -p` child.
   classifierCall: (ctx) => {
     if (ctx.modelRegistry === undefined) throw new Error("pi supplied no model registry");
-    return sessionClassifierModelCall(ctx.modelRegistry, process.env.PI_HARNESS_ROUTER_PROBE === "1" ? { onCallEnd: printClassifierProbe } : {});
+    return sessionClassifierModelCall(ctx.modelRegistry, process.env.PI_ORCHESTRATOR_ROUTER_PROBE === "1" ? { onCallEnd: printClassifierProbe } : {});
   },
   evidence: stateFolderEvidence,
   now: () => new Date(),
@@ -81,16 +88,16 @@ const DEFAULT_DEPENDENCIES: RouterDependencies = {
 
 /** `undefined` when routing is not enabled. Throws on a malformed key. */
 function routingMode(personal: unknown): RoutingMode | undefined {
-  const routing = personalHarness(personal)?.routing;
+  const routing = personalOrchestrator(personal)?.routing;
   if (routing === undefined) return undefined;
-  if (!isPlainObject(routing)) throw new Error(`harness.routing must be an object; got ${JSON.stringify(routing)}.`);
+  if (!isPlainObject(routing)) throw new Error(`orchestrator.routing must be an object; got ${JSON.stringify(routing)}.`);
   if (routing.enabled !== undefined && typeof routing.enabled !== "boolean") {
-    throw new Error(`harness.routing.enabled must be a boolean; got ${JSON.stringify(routing.enabled)}.`);
+    throw new Error(`orchestrator.routing.enabled must be a boolean; got ${JSON.stringify(routing.enabled)}.`);
   }
   if (routing.enabled !== true) return undefined;
   const mode = routing.mode ?? "shadow";
   if (!ROUTING_MODES.includes(mode as RoutingMode)) {
-    throw new Error(`harness.routing.mode must be one of ${ROUTING_MODES.join(", ")}; got ${JSON.stringify(mode)}.`);
+    throw new Error(`orchestrator.routing.mode must be one of ${ROUTING_MODES.join(", ")}; got ${JSON.stringify(mode)}.`);
   }
   return mode as RoutingMode;
 }
@@ -126,7 +133,7 @@ function startRouting(ctx: ExtensionContext, deps: RouterDependencies): ActiveRo
   if (ctx.modelRegistry === undefined) throw new Error("pi supplied no model registry");
   const installedModels = ctx.modelRegistry.getAvailable().map((model) => toModelInfo(model));
   const tierMap = tierMapFromSettings(personal, project, { installedModels, banLists });
-  if (tierMap === undefined) throw new Error("harness.routing.tiers is missing");
+  if (tierMap === undefined) throw new Error("orchestrator.routing.tiers is missing");
   const chain = loadClassifierChain(classifierConfigFromSettings(personal));
   for (const { rung } of chain.entries) {
     const { baseModel } = splitKnownThinkingSuffix(rung);
@@ -134,7 +141,7 @@ function startRouting(ctx: ExtensionContext, deps: RouterDependencies): ActiveRo
       throw new Error(`classifier rung '${rung}' names a model pi does not have (${baseModel})`);
     }
   }
-  const stateDir = resolve(process.env.PI_HARNESS_STATE_DIR ?? defaultStateDir());
+  const folder = stateDir();
   const sessionId = ctx.sessionManager?.getSessionId() ?? "unknown";
   return {
     mode,
@@ -142,9 +149,9 @@ function startRouting(ctx: ExtensionContext, deps: RouterDependencies): ActiveRo
     banLists,
     chain,
     callModel: deps.classifierCall(ctx),
-    evidence: deps.evidence({ stateDir, installedModelIds: installedModels.map((model) => model.fullId) }),
+    evidence: deps.evidence({ stateDir: folder, installedModelIds: installedModels.map((model) => model.fullId) }),
     owner: new TaskAllowanceOwner(newTaskLedger({ taskId: `router-session:${sessionId}` })),
-    recordDir: join(stateDir, "routing"),
+    recordDir: join(folder, "routing"),
     installedModels,
   };
 }
@@ -305,13 +312,34 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
       disabled = true;
       const message = error instanceof Error ? error.message : String(error);
       process.stderr.write(`${ROUTER_DISABLED_PREFIX} ${message.split(/\r?\n/, 1)[0]}\n`);
-      if (process.env.PI_HARNESS_ROUTER_DEBUG === "1") process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
+      if (process.env.PI_ORCHESTRATOR_ROUTER_DEBUG === "1") process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
     };
-    const probe = process.env.PI_HARNESS_ROUTER_PROBE === "1";
+    const probe = process.env.PI_ORCHESTRATOR_ROUTER_PROBE === "1";
 
+    // `/pi-orchestrator init` sets up a fresh install. Its failures are
+    // reported by the command and never disable routing.
+    if (typeof pi.registerCommand === "function") pi.registerCommand(INIT_COMMAND, {
+      description: "Set up pi-orchestrator: starter tier map, ban list and approved recipients (init)",
+      handler: async (args, ctx) => {
+        try { await runInit(args, ctx, { stateDir: stateDir() }); }
+        catch (error) { ctx.ui.notify(`pi-orchestrator init failed: ${String(error).split(/\r?\n/, 1)[0]}`, "error"); }
+      },
+    });
+
+    let noticeShown = false;
     pi.on("session_start", (_event, ctx) => {
       if (disabled) return;
       try {
+        // One line on a fresh install, in the owner's session only.
+        if (!noticeShown && process.env.PI_SUBAGENT_CHILD !== "1") {
+          noticeShown = true;
+          const personal = readSettingsFile(join(personalAgentDir(), "settings.json")) ?? {};
+          const notice = setupNotice(setupStatus(personal, stateDir()), stateDir());
+          if (notice) {
+            if (ctx.hasUI) ctx.ui.notify(notice, "warning");
+            else process.stderr.write(`${notice}\n`);
+          }
+        }
         active = startRouting(ctx, deps);
         if (probe && active) process.stderr.write(`${ROUTER_PREFIX} routing enabled, mode ${active.mode}, records ${active.recordDir}\n`);
       } catch (error) { disable(error); }

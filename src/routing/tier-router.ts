@@ -1,7 +1,7 @@
 import {
   checkModelScope,
   type ModelScopeCheckRule,
-} from "../../../../../../.pi/agent/npm/node_modules/pi-subagents/src/runs/shared/model-scope.js";
+} from "../subagents/model-scope.ts";
 import { lookup, type ModelCatalog } from "../catalog/model-catalog.ts";
 import { isProhibitedModel, subagentBanListReason, type BanLists } from "../policy/ban-lists.ts";
 import { HARNESS_MODEL_SCOPE } from "../policy/model-resolution.ts";

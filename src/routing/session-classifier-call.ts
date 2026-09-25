@@ -14,14 +14,14 @@
 // is no pi session-level auto-retry. maxTokens is set to
 // CLASSIFIER_MAX_OUTPUT_TOKENS; provider thinking can raise that ceiling.
 
-import { splitKnownThinkingSuffix } from "../../../../../../.pi/agent/npm/node_modules/pi-subagents/src/shared/model-info.js";
+import { splitKnownThinkingSuffix } from "../subagents/model-info.ts";
 import type {
   AssistantMessageEvent,
   RegistryModel,
   SessionModelRegistry,
   StreamedAssistantMessage,
   ThinkingLevel,
-} from "../types/pi-extension.ts";
+} from "./model-stream.ts";
 import { CLASSIFIER_SYSTEM_PROMPT, piClassifierReplyFromMessage, type PiClassifierReply } from "./classifier-reply.ts";
 import { CLASSIFIER_MAX_OUTPUT_TOKENS } from "./tier-classifier.ts";
 

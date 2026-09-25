@@ -1,12 +1,30 @@
 {
   "name": "pi-orchestrator",
-  "private": true,
+  "version": "0.1.0",
+  "description": "Pi package: a model router for subagent delegations and a personal model ban-list guard.",
+  "keywords": [
+    "pi-package"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/egonm12/pi-orchestrator.git"
+  },
   "type": "module",
+  "pi": {
+    "extensions": [
+      "./src/router/extension.ts",
+      "./src/guard/extension.ts"
+    ]
+  },
   "scripts": {
     "test": "node --test 'src/**/*.test.ts'",
     "typecheck": "tsc --noEmit"
   },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
   "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.87.1",
     "@types/node": "^22.10.0",
     "typescript": "^5.7.0"
   }

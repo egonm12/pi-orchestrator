@@ -1,6 +1,7 @@
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { LIVE_TESTS_ENABLED } from "./live.ts";
 import { installGuardEntry } from "./extension-entry.ts";
 
 // A throwaway agent directory with the personal guard installed, used so guard
@@ -36,7 +37,8 @@ export function realAgentDirPath(): string {
 
 /** Whether the real agent directory can supply a live route's credentials. */
 export function credentialsAvailable(): boolean {
-  return existsSync(join(realAgentDirPath(), "auth.json"));
+  // Credentialed tests are live tests: only with PI_ORCHESTRATOR_LIVE=1.
+  return LIVE_TESTS_ENABLED && existsSync(join(realAgentDirPath(), "auth.json"));
 }
 
 /**

@@ -32,7 +32,7 @@ import type { ModelCatalog } from "../catalog/model-catalog.ts";
 import {
   splitKnownThinkingSuffix,
   THINKING_LEVELS,
-} from "../../../../../../.pi/agent/npm/node_modules/pi-subagents/src/shared/model-info.js";
+} from "../subagents/model-info.ts";
 import { resolveDispatchModel } from "../policy/model-resolution.ts";
 import {
   classifyTask,
@@ -52,7 +52,7 @@ import {
 import { classifierPrompt, RUBRIC_VERSION, type ClassifierInput } from "./tier-rubric.ts";
 
 // ---------------------------------------------------------------------------
-// Settings: harness.routing.classifier
+// Settings: orchestrator.routing.classifier
 // ---------------------------------------------------------------------------
 
 export interface ClassifierConfig {
@@ -73,7 +73,7 @@ export const DEFAULT_CLASSIFIER_CONFIG: ClassifierConfig = Object.freeze({
 });
 
 const CLASSIFIER_KEYS = ["model", "timeoutMs", "fallback"] as const;
-const SETTINGS_KEY = "harness.routing.classifier";
+const SETTINGS_KEY = "orchestrator.routing.classifier";
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -98,8 +98,8 @@ function rungSetting(value: unknown, dotted: string): string {
  *  personal settings are read, so a project cannot change the classifier. */
 export function classifierConfigFromSettings(personal: unknown): ClassifierConfig {
   if (!isPlainObject(personal)) throw new Error("personal settings must be a JSON object.");
-  const harness = objectAt(personal, "harness", "harness");
-  const routing = harness && objectAt(harness, "routing", "harness.routing");
+  const orchestrator = objectAt(personal, "orchestrator", "orchestrator");
+  const routing = orchestrator && objectAt(orchestrator, "routing", "orchestrator.routing");
   const classifier = routing && objectAt(routing, "classifier", SETTINGS_KEY);
   if (!classifier) return DEFAULT_CLASSIFIER_CONFIG;
 

@@ -1,4 +1,4 @@
-import { getSupportedThinkingLevels, type ModelInfo } from "../../../../../../.pi/agent/npm/node_modules/pi-subagents/src/shared/model-info.js";
+import { getSupportedThinkingLevels, type ModelInfo } from "../subagents/model-info.ts";
 import { RISK_TIERS, type RiskTier } from "./classifier.ts";
 import type { ResolvedTierMap, TierRung } from "./tier-map.ts";
 import { MAX_NOT_LISTED, type LadderSkipReason } from "./skip-reasons.ts";

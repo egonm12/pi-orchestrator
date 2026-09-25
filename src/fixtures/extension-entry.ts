@@ -19,7 +19,7 @@ function entryContent(name: "router" | "guard", source: string, debugEnv: string
     `// Test entry for the ${name} extension.\n` +
     `export default async function (pi) {\n` +
     `  try { const { default: ${name} } = await import(${JSON.stringify(source)}); await ${name}(pi); }\n` +
-    `  catch (error) { process.stderr.write(\`harness ${name} disabled: \${String(error).split(/\\r?\\n/, 1)[0]}\\n\`);\n` +
+    `  catch (error) { process.stderr.write(\`pi-orchestrator ${name} disabled: \${String(error).split(/\\r?\\n/, 1)[0]}\\n\`);\n` +
     `    if (process.env.${debugEnv} === "1") process.stderr.write(\`\${error instanceof Error ? error.stack : String(error)}\\n\`); }\n` +
     `}\n`
   );
@@ -27,8 +27,8 @@ function entryContent(name: "router" | "guard", source: string, debugEnv: string
 
 export const routerEntryPath = (agentDir: string): string => join(agentDir, "extensions", ROUTER_ENTRY_NAME);
 export const guardEntryPath = (agentDir: string): string => join(agentDir, "extensions", GUARD_ENTRY_NAME);
-export const routerEntryContent = (): string => entryContent("router", ROUTER_SOURCE, "PI_HARNESS_ROUTER_DEBUG");
-export const guardEntryContent = (): string => entryContent("guard", GUARD_SOURCE, "PI_HARNESS_GUARD_DEBUG");
+export const routerEntryContent = (): string => entryContent("router", ROUTER_SOURCE, "PI_ORCHESTRATOR_ROUTER_DEBUG");
+export const guardEntryContent = (): string => entryContent("guard", GUARD_SOURCE, "PI_ORCHESTRATOR_GUARD_DEBUG");
 
 function install(entry: string, content: string): string {
   if (existsSync(entry)) throw new Error(`Refusing to replace the existing entry ${entry}`);

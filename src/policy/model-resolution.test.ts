@@ -13,6 +13,9 @@ import {
   isProhibitedModel,
   resolveDispatchModel,
 } from "./model-resolution.ts";
+import { useOwnerBanLists } from "../fixtures/owner-ban-lists.ts";
+
+useOwnerBanLists();
 
 // Every model id the user prohibits, as it really appears in this registry.
 // `openai/fable-1` is 01-findings.md's example and is kept even though this
@@ -76,7 +79,7 @@ test("the real checkModelScope no-ops on a missing model, so the harness must ca
   // rejecting a missing model itself, this fails and the harness check can
   // be revisited rather than silently duplicating product behaviour.
   const { checkModelScope } = await import(
-    "../../../../../../.pi/agent/npm/node_modules/pi-subagents/src/runs/shared/model-scope.js"
+    "../subagents/model-scope.ts"
   );
   assert.equal(checkModelScope(undefined, HARNESS_MODEL_SCOPE, "explicit"), undefined);
   assert.equal(checkModelScope("", HARNESS_MODEL_SCOPE, "explicit"), undefined);
@@ -152,7 +155,7 @@ test("prohibited models are rejected with a thinking suffix and in any case", ()
 
 test("strict mode is what makes an inherited prohibited model an error, not a warning", async () => {
   const { checkModelScope } = await import(
-    "../../../../../../.pi/agent/npm/node_modules/pi-subagents/src/runs/shared/model-scope.js"
+    "../subagents/model-scope.ts"
   );
   const allow = [...HARNESS_ALLOW_PATTERNS];
   for (const model of ["anthropic/claude-fable-5", "openai-codex/gpt-6-astra"]) {
@@ -171,7 +174,7 @@ test("strict mode is what makes an inherited prohibited model an error, not a wa
 
 test("enforcement is genuinely on: without enforce, nothing is rejected", async () => {
   const { checkModelScope } = await import(
-    "../../../../../../.pi/agent/npm/node_modules/pi-subagents/src/runs/shared/model-scope.js"
+    "../subagents/model-scope.ts"
   );
   assert.equal(
     checkModelScope("openai-codex/gpt-6-astra", { allow: [...HARNESS_ALLOW_PATTERNS] }, "explicit"),

@@ -1,16 +1,18 @@
-import type { ExtensionAPI, ExtensionContext, ModelInfo } from "../types/pi-extension.ts";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+
+type ModelInfo = { provider: string; id: string };
 import { activeBanLists, configureBanLists, loadBanListsOrDefaults, personalAgentDir, sessionBanListRefusal } from "../policy/ban-lists.ts";
 import { toolRefusal } from "./boundaries.ts";
 
-export const GUARD_PREFIX = "pi-orchestration-harness guard:";
+export const GUARD_PREFIX = "pi-orchestrator guard:";
 
 export default function personalGuard(pi: ExtensionAPI) {
   let disabled = false;
   const disable = (error: unknown) => {
     if (disabled) return;
     disabled = true;
-    process.stderr.write(`harness guard disabled: ${String(error).split(/\r?\n/, 1)[0]}\n`);
-    if (process.env.PI_HARNESS_GUARD_DEBUG === "1") process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
+    process.stderr.write(`pi-orchestrator guard disabled: ${String(error).split(/\r?\n/, 1)[0]}\n`);
+    if (process.env.PI_ORCHESTRATOR_GUARD_DEBUG === "1") process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
   };
   try {
     const agentDir = personalAgentDir();
@@ -70,7 +72,7 @@ export default function personalGuard(pi: ExtensionAPI) {
       if (disabled) return;
       try {
         applyBanLists(ctx.cwd);
-        if (process.env.PI_HARNESS_GUARD_PROBE === "1") {
+        if (process.env.PI_ORCHESTRATOR_GUARD_PROBE === "1") {
           const { subagentBanList, sessionBanList } = activeBanLists();
           const list = (entries: readonly string[]) => entries.join(", ") || "(none)";
           process.stderr.write(`${GUARD_PREFIX} subagent ban list: ${list(subagentBanList)}; session ban list: ${list(sessionBanList)}\n`);
@@ -108,6 +110,6 @@ export default function personalGuard(pi: ExtensionAPI) {
         ctx.abort?.();
       } catch (error) { disable(error); }
     });
-    if (process.env.PI_HARNESS_GUARD_PROBE === "1") process.stderr.write(`${GUARD_PREFIX} loaded\n`);
+    if (process.env.PI_ORCHESTRATOR_GUARD_PROBE === "1") process.stderr.write(`${GUARD_PREFIX} loaded\n`);
   } catch (error) { disable(error); }
 }

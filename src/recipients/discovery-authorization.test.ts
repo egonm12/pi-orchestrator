@@ -57,6 +57,9 @@ import {
   reconcileRun,
   stopRun,
 } from "./run-state.ts";
+import { useOwnerBanLists } from "../fixtures/owner-ban-lists.ts";
+
+useOwnerBanLists();
 
 const here = dirname(fileURLToPath(import.meta.url));
 

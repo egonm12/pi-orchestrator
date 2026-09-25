@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { after, test } from "node:test";
 import { resetBanLists } from "../policy/ban-lists.ts";
 import personalGuard from "./extension.ts";
-import type { ExtensionAPI, ExtensionContext } from "../types/pi-extension.ts";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { TestContext as ExtensionContext } from "../fixtures/extension-context.ts";
 
 // The guard reads settings.json from PI_CODING_AGENT_DIR at load. Point it at
 // a throwaway dir so these tests never read the real ~/.pi/agent.
@@ -46,11 +47,11 @@ test("session model is not on the delegated-agent ban; runtime failure disables 
     assert.equal(await handler(event, broken), undefined);
     assert.equal(await handler(event, broken), undefined);
   } finally { process.stderr.write = original; }
-  assert.equal(output, "harness guard disabled: Error: first line\n");
+  assert.equal(output, "pi-orchestrator guard disabled: Error: first line\n");
 });
 
 test("selecting a session-banned model mid-session blocks turns until an allowed model is selected", async () => {
-  writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ harness: { sessionBanList: ["opus"] } }));
+  writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ orchestrator: { sessionBanList: ["opus"] } }));
   const handlers = loadGuard();
   const modelSelect = handlers.get("model_select")!, input = handlers.get("input")!;
   const notices: string[] = [];
@@ -77,7 +78,7 @@ test("selecting a session-banned model mid-session blocks turns until an allowed
 // delegated agent is not the orchestrator's own session (ADR 0002).
 for (const marker of ["PI_SUBAGENT_CHILD", "PI_SUBAGENTS_HERDR_BRIDGE"]) {
   test(`in a child-hosting process (${marker}=1) a session-banned model is not refused`, async () => {
-    writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ harness: { sessionBanList: ["opus"] } }));
+    writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ orchestrator: { sessionBanList: ["opus"] } }));
     const opus = { provider: "anthropic", id: "claude-opus-5-5" };
     const prompt = { type: "input", text: "hello", source: "interactive" };
     const run = async (childHost: boolean) => {
@@ -110,7 +111,7 @@ for (const marker of ["PI_SUBAGENT_CHILD", "PI_SUBAGENTS_HERDR_BRIDGE"]) {
 // before each provider request (pi-agent-core agent-loop.js:51 and :113), so
 // aborting there stops the turn before the model is called.
 test("a turn started without an input event is aborted while the session model is session-banned", async () => {
-  writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ harness: { sessionBanList: ["opus"] } }));
+  writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ orchestrator: { sessionBanList: ["opus"] } }));
   const handlers = loadGuard();
   const turnStart = handlers.get("turn_start");
   assert.ok(turnStart, "the guard handles turn_start");

@@ -20,8 +20,13 @@ import { resetBanLists } from "../policy/ban-lists.ts";
 import { authorizeRecipient, emptyAuthorization, grantOwnerApproval, type RecipientAuthorization } from "../recipients/authorization.ts";
 import { readRoutingRecords, type RoutingRecord } from "../routing/decision-record.ts";
 import { answerEvents, errorEvents, fakeSessionRegistry } from "../fixtures/session-model-registry.ts";
-import type { ExtensionAPI, ExtensionContext, SessionModelRegistry } from "../types/pi-extension.ts";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { TestContext as ExtensionContext } from "../fixtures/extension-context.ts";
+import type { SessionModelRegistry } from "../routing/model-stream.ts";
 import { createRouterExtension, type RouterDependencies, type RoutingEvidence } from "./extension.ts";
+import { OWNER_BAN_LIST_SETTINGS, useOwnerBanLists } from "../fixtures/owner-ban-lists.ts";
+
+useOwnerBanLists();
 
 // Seam 1 (docs/specs/auto-routing.md, "Testing decisions"): the router's hook,
 // called directly. The fakes sit at the system boundaries only: the classifier
@@ -33,11 +38,11 @@ import { createRouterExtension, type RouterDependencies, type RoutingEvidence } 
 const originalEnv = {
   HOME: process.env.HOME,
   PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
-  PI_HARNESS_STATE_DIR: process.env.PI_HARNESS_STATE_DIR,
-  PI_HARNESS_ROUTER_PROBE: process.env.PI_HARNESS_ROUTER_PROBE,
+  PI_ORCHESTRATOR_STATE_DIR: process.env.PI_ORCHESTRATOR_STATE_DIR,
+  PI_ORCHESTRATOR_ROUTER_PROBE: process.env.PI_ORCHESTRATOR_ROUTER_PROBE,
   PI_OFFLINE: process.env.PI_OFFLINE,
 };
-delete process.env.PI_HARNESS_ROUTER_PROBE;
+delete process.env.PI_ORCHESTRATOR_ROUTER_PROBE;
 after(() => {
   for (const [name, value] of Object.entries(originalEnv)) {
     if (value === undefined) delete process.env[name];
@@ -97,14 +102,14 @@ function harness(routing: unknown, extra: Record<string, unknown> = {}): Harness
   const agentDir = join(home, "agent"), projectDir = join(home, "project"), stateDir = join(home, "state");
   mkdirSync(agentDir);
   mkdirSync(projectDir);
-  writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ harness: { routing, ...extra } }));
+  writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ orchestrator: { routing, ...extra } }));
   // pi-subagents' agent discovery also reads `~/.agents`: a throwaway home
   // keeps the owner's agents out of the test. `PI_OFFLINE=1` stops it running
   // `npm root -g` and reading agents from the global npm packages.
   process.env.HOME = home;
   process.env.PI_OFFLINE = "1";
   process.env.PI_CODING_AGENT_DIR = agentDir;
-  process.env.PI_HARNESS_STATE_DIR = stateDir;
+  process.env.PI_ORCHESTRATOR_STATE_DIR = stateDir;
   return {
     agentDir,
     projectDir,
@@ -157,6 +162,8 @@ async function stderrOf(run: () => Promise<unknown>): Promise<string> {
   let output = "";
   process.stderr.write = ((chunk: string) => { output += chunk; return true; }) as typeof process.stderr.write;
   try { await run(); } finally { process.stderr.write = original; }
+  // The fresh-install notice is covered by init/setup.test.ts.
+  output = output.split("\n").filter((line) => !line.startsWith("pi-orchestrator: not set up:")).join("\n");
   return output;
 }
 
@@ -326,7 +333,7 @@ test("a subagents.defaultModel in settings is routed over: the rung is written w
   for (const routing of [LIVE, SHADOW]) {
     const h = harness(routing);
     try {
-      writeFileSync(join(h.agentDir, "settings.json"), JSON.stringify({ subagents: { defaultModel: "anthropic/claude-sonnet-5:high" }, harness: { routing } }));
+      writeFileSync(join(h.agentDir, "settings.json"), JSON.stringify({ subagents: { defaultModel: "anthropic/claude-sonnet-5:high" }, orchestrator: { routing } }));
       writeAgent(h, "plain-worker");
       const router = await loadRouter(h);
       const input: Record<string, unknown> = { agent: "plain-worker", task: "Fix the typo in README.md" };
@@ -346,7 +353,7 @@ test("agent discovery that throws at hook time: the call proceeds unchanged and 
   const h = harness(LIVE);
   try {
     // pi-subagents reads `subagents` strictly and throws on a malformed key.
-    writeFileSync(join(h.agentDir, "settings.json"), JSON.stringify({ subagents: { disableBuiltins: "yes" }, harness: { routing: LIVE } }));
+    writeFileSync(join(h.agentDir, "settings.json"), JSON.stringify({ subagents: { disableBuiltins: "yes" }, orchestrator: { routing: LIVE } }));
     assert.match(await assertFailsOpen(h), /disableBuiltins/);
   } finally { h.cleanup(); }
 });
@@ -387,7 +394,7 @@ async function assertFailsOpen(h: Harness, deps: Partial<RouterDependencies> = {
   assert.deepEqual(input, { agent: "worker", task: "Fix the typo in README.md" });
   const lines = stderr.split("\n").filter((line) => line.length > 0);
   assert.equal(lines.length, 1, stderr);
-  assert.match(lines[0]!, /^harness router disabled: /);
+  assert.match(lines[0]!, /^pi-orchestrator router disabled: /);
   return lines[0]!;
 }
 
@@ -628,12 +635,12 @@ for (const [label, installGuard, order] of BANNED_CASES) {
   test(`a call naming a banned model ${label}`, async () => {
     const agent = createGuardedAgentDir({ installGuard });
     const stateDir = join(agent.home, "state");
-    const previous = { agentDir: process.env.PI_CODING_AGENT_DIR, stateDir: process.env.PI_HARNESS_STATE_DIR, offline: process.env.PI_OFFLINE };
+    const previous = { agentDir: process.env.PI_CODING_AGENT_DIR, stateDir: process.env.PI_ORCHESTRATOR_STATE_DIR, offline: process.env.PI_OFFLINE };
     try {
-      writeFileSync(join(agent.dir, "settings.json"), JSON.stringify({ harness: { routing: LIVE } }));
+      writeFileSync(join(agent.dir, "settings.json"), JSON.stringify({ orchestrator: { ...OWNER_BAN_LIST_SETTINGS, routing: LIVE } }));
       installRouterEntry(agent.dir);
       process.env.PI_CODING_AGENT_DIR = agent.dir;
-      process.env.PI_HARNESS_STATE_DIR = stateDir;
+      process.env.PI_ORCHESTRATOR_STATE_DIR = stateDir;
       process.env.PI_OFFLINE = "1";
       const ctx: ExtensionContext = { cwd: agent.home, hasUI: false, model: { provider: "anthropic", id: "claude-haiku-4-5" }, modelRegistry: fakeSessionRegistry([]), sessionManager: { getSessionId: () => "session-27" } };
       const input = { agent: "worker", task: "say hello", model: "anthropic/claude-fable-5" };
@@ -642,7 +649,7 @@ for (const [label, installGuard, order] of BANNED_CASES) {
       const records = readRoutingRecords(join(stateDir, "routing")).map(summary);
       const explicit = [{ recordType: "explicit", attemptId: "call-banned", mode: "live", slot: "model", model: "anthropic/claude-fable-5" }];
       if (installGuard) {
-        assert.deepEqual(result, { block: true, reason: "pi-orchestration-harness guard: prohibited model: anthropic/claude-fable-5" });
+        assert.deepEqual(result, { block: true, reason: "pi-orchestrator guard: prohibited model: anthropic/claude-fable-5" });
         // An explicit record says the router saw the call, not that it ran.
         assert.deepEqual(records, order[0] === ROUTER_ENTRY_NAME ? explicit : []);
       } else {
@@ -650,7 +657,7 @@ for (const [label, installGuard, order] of BANNED_CASES) {
         assert.deepEqual(records, explicit);
       }
     } finally {
-      for (const [name, value] of [["PI_CODING_AGENT_DIR", previous.agentDir], ["PI_HARNESS_STATE_DIR", previous.stateDir], ["PI_OFFLINE", previous.offline]] as const) {
+      for (const [name, value] of [["PI_CODING_AGENT_DIR", previous.agentDir], ["PI_ORCHESTRATOR_STATE_DIR", previous.stateDir], ["PI_OFFLINE", previous.offline]] as const) {
         if (value === undefined) delete process.env[name];
         else process.env[name] = value;
       }
@@ -691,26 +698,26 @@ test("added latency over ten hook calls in shadow and ten in live mode, with the
     } finally { h.cleanup(); }
   }
   // Printed only when asked for, as the router's own probe lines are.
-  if (originalEnv.PI_HARNESS_ROUTER_PROBE === "1") {
+  if (originalEnv.PI_ORCHESTRATOR_ROUTER_PROBE === "1") {
     process.stderr.write(`router hook latency over ten calls, classifier faked (seam 1): ${lines.join("; ")}\n`);
   }
 });
 
-test("under PI_HARNESS_ROUTER_PROBE=1 the router says it loaded and prints each hook call's wall time", async () => {
+test("under PI_ORCHESTRATOR_ROUTER_PROBE=1 the router says it loaded and prints each hook call's wall time", async () => {
   const h = harness(LIVE);
-  process.env.PI_HARNESS_ROUTER_PROBE = "1";
+  process.env.PI_ORCHESTRATOR_ROUTER_PROBE = "1";
   try {
     const stderr = await stderrOf(async () => {
       const router = await loadRouter(h);
       await router.toolCall({ agent: "worker", task: "Fix the typo in README.md" });
     });
     const lines = stderr.split("\n").filter((line) => line.length > 0);
-    assert.equal(lines[0], "pi-orchestration-harness router: loaded");
-    assert.equal(lines[1], `pi-orchestration-harness router: routing enabled, mode live, records ${join(h.stateDir, "routing")}`);
-    assert.match(lines[2]!, /^pi-orchestration-harness router: hook \d+\.\d ms for 1 slot\(s\), mode live$/);
+    assert.equal(lines[0], "pi-orchestrator router: loaded");
+    assert.equal(lines[1], `pi-orchestrator router: routing enabled, mode live, records ${join(h.stateDir, "routing")}`);
+    assert.match(lines[2]!, /^pi-orchestrator router: hook \d+\.\d ms for 1 slot\(s\), mode live$/);
     assert.equal(lines.length, 3, stderr);
   } finally {
-    delete process.env.PI_HARNESS_ROUTER_PROBE;
+    delete process.env.PI_ORCHESTRATOR_ROUTER_PROBE;
     h.cleanup();
   }
 });
@@ -734,7 +741,7 @@ test("by default the router classifies through the session's model registry, not
       assert.equal(await router.toolCall(input), undefined);
       assert.equal(input.model, `${HAIKU}:low`);
     });
-    assert.doesNotMatch(stderr, /harness router disabled/, stderr);
+    assert.doesNotMatch(stderr, /pi-orchestrator router disabled/, stderr);
     assert.equal(registry.calls.length, 1, "one classifier request through the session registry");
     assert.deepEqual(registry.calls[0]?.context.messages.length, 1);
     const [record] = h.records();
@@ -755,7 +762,7 @@ test("a failing in-session classifier request is a recorded hop failure: the rou
       assert.equal(await router.toolCall({ agent: "worker", task: "Fix the typo in README.md" }, "call-1"), undefined);
       assert.equal(await router.toolCall({ agent: "worker", task: "Fix the typo in README.md" }, "call-2"), undefined);
     });
-    assert.doesNotMatch(stderr, /harness router disabled/, stderr);
+    assert.doesNotMatch(stderr, /pi-orchestrator router disabled/, stderr);
     const [first, second] = h.records();
     assert.deepEqual(first?.recordType === "decision" && first.classification.hops.map((hop) => [hop.hop, hop.outcome]), [[`${HAIKU}:low`, "out-of-usage"], ["keywords", "decided"]]);
     assert.equal(first?.recordType === "decision" && first.classification.cause, "keywords");
@@ -763,9 +770,9 @@ test("a failing in-session classifier request is a recorded hop failure: the rou
   } finally { h.cleanup(); }
 });
 
-test("under PI_HARNESS_ROUTER_PROBE=1 the in-session classifier prints its time to first token, total time, tokens and reported cost", async () => {
+test("under PI_ORCHESTRATOR_ROUTER_PROBE=1 the in-session classifier prints its time to first token, total time, tokens and reported cost", async () => {
   const h = harness(LIVE);
-  process.env.PI_HARNESS_ROUTER_PROBE = "1";
+  process.env.PI_ORCHESTRATOR_ROUTER_PROBE = "1";
   try {
     const usage = { input: 900, output: 80, cacheRead: 0, cacheWrite: 0, totalTokens: 980, cost: { total: 0.0012 } };
     const registry = fakeSessionRegistry([{ events: answerEvents(classifierAnswer("mechanical"), { usage }) }, { events: errorEvents("socket hang up") }]);
@@ -774,15 +781,15 @@ test("under PI_HARNESS_ROUTER_PROBE=1 the in-session classifier prints its time 
       await router.toolCall({ agent: "worker", task: "Fix the typo in README.md" }, "call-1");
       await router.toolCall({ agent: "worker", task: "Fix the typo in README.md" }, "call-2");
     });
-    const classifierLines = stderr.split("\n").filter((line) => line.startsWith("pi-orchestration-harness router: classifier "));
+    const classifierLines = stderr.split("\n").filter((line) => line.startsWith("pi-orchestrator router: classifier "));
     assert.equal(classifierLines.length, 2, stderr);
     assert.match(
       classifierLines[0]!,
-      /^pi-orchestration-harness router: classifier anthropic\/claude-haiku-4-5:low first token \d+\.\d ms, total \d+\.\d ms, tokens 980, reported cost \$0\.00120$/,
+      /^pi-orchestrator router: classifier anthropic\/claude-haiku-4-5:low first token \d+\.\d ms, total \d+\.\d ms, tokens 980, reported cost \$0\.00120$/,
     );
-    assert.match(classifierLines[1]!, /^pi-orchestration-harness router: classifier anthropic\/claude-haiku-4-5:low failed after \d+\.\d ms: pi classifier call ended with error: socket hang up$/);
+    assert.match(classifierLines[1]!, /^pi-orchestrator router: classifier anthropic\/claude-haiku-4-5:low failed after \d+\.\d ms: pi classifier call ended with error: socket hang up$/);
   } finally {
-    delete process.env.PI_HARNESS_ROUTER_PROBE;
+    delete process.env.PI_ORCHESTRATOR_ROUTER_PROBE;
     h.cleanup();
   }
 });

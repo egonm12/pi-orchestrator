@@ -29,6 +29,9 @@ import {
   type TierClassification,
 } from "./tier-classifier.ts";
 import { RUBRIC_VERSION } from "./tier-rubric.ts";
+import { useOwnerBanLists } from "../fixtures/owner-ban-lists.ts";
+
+useOwnerBanLists();
 
 // Ticket 23: seam 1 is `classifyTier` with the model call injected as a fake.
 // Seam 2 is the three live Haiku cases at the end of this file.
@@ -458,34 +461,34 @@ for (const reportedUsd of [Number.NaN, -1, Number.POSITIVE_INFINITY]) {
 // Settings (story 18: a configurable rung)
 // ---------------------------------------------------------------------------
 
-test("classifier settings come from harness.routing.classifier with defaults, and a malformed key fails closed", () => {
+test("classifier settings come from orchestrator.routing.classifier with defaults, and a malformed key fails closed", () => {
   assert.deepEqual(classifierConfigFromSettings({}), DEFAULT_CLASSIFIER_CONFIG);
   assert.deepEqual(
-    classifierConfigFromSettings({ harness: { routing: { classifier: { model: HAIKU, timeoutMs: 5000, fallback: [LUNA] } } } }),
+    classifierConfigFromSettings({ orchestrator: { routing: { classifier: { model: HAIKU, timeoutMs: 5000, fallback: [LUNA] } } } }),
     { model: HAIKU, timeoutMs: 5000, fallback: [LUNA] },
   );
   assert.deepEqual(
-    classifierConfigFromSettings({ harness: { routing: { classifier: { fallback: [HAIKU] } } } }),
+    classifierConfigFromSettings({ orchestrator: { routing: { classifier: { fallback: [HAIKU] } } } }),
     { ...DEFAULT_CLASSIFIER_CONFIG, fallback: [HAIKU] },
   );
   assert.throws(
-    () => classifierConfigFromSettings({ harness: { routing: { classifier: { timeoutMs: -1 } } } }),
-    /harness\.routing\.classifier\.timeoutMs/,
+    () => classifierConfigFromSettings({ orchestrator: { routing: { classifier: { timeoutMs: -1 } } } }),
+    /orchestrator\.routing\.classifier\.timeoutMs/,
   );
   assert.throws(
-    () => classifierConfigFromSettings({ harness: { routing: { classifier: { fallback: "anthropic/claude-haiku-4-5:low" } } } }),
-    /harness\.routing\.classifier\.fallback/,
+    () => classifierConfigFromSettings({ orchestrator: { routing: { classifier: { fallback: "anthropic/claude-haiku-4-5:low" } } } }),
+    /orchestrator\.routing\.classifier\.fallback/,
   );
   assert.throws(
-    () => classifierConfigFromSettings({ harness: { routing: { classifier: { model: "" } } } }),
-    /harness\.routing\.classifier\.model/,
+    () => classifierConfigFromSettings({ orchestrator: { routing: { classifier: { model: "" } } } }),
+    /orchestrator\.routing\.classifier\.model/,
   );
 });
 
-test("an unknown key under harness.routing.classifier fails closed naming the key", () => {
+test("an unknown key under orchestrator.routing.classifier fails closed naming the key", () => {
   assert.throws(
-    () => classifierConfigFromSettings({ harness: { routing: { classifier: { model: HAIKU, timeOutMs: 5000 } } } }),
-    /unknown key\(s\) harness\.routing\.classifier\.timeOutMs/,
+    () => classifierConfigFromSettings({ orchestrator: { routing: { classifier: { model: HAIKU, timeOutMs: 5000 } } } }),
+    /unknown key\(s\) orchestrator\.routing\.classifier\.timeOutMs/,
   );
 });
 
@@ -522,7 +525,7 @@ const LIVE_CASES = [
 test(`live classifier on ${LIVE_CLASSIFIER_RUNG} classifies a formatting fix, a routine multi-file change and a one-line auth change`, async (t) => {
   const liveModel = selectedLivePiModel();
   if (liveModel !== "anthropic/claude-haiku-4-5") {
-    return t.skip(`the classifier live cases are approved on anthropic/claude-haiku-4-5 only; PI_HARNESS_LIVE_MODEL selected ${liveModel}`);
+    return t.skip(`the classifier live cases are approved on anthropic/claude-haiku-4-5 only; PI_ORCHESTRATOR_LIVE_MODEL selected ${liveModel}`);
   }
   const agent = createGuardedAgentDir({ withCredentials: true, installGuard: false });
   try {

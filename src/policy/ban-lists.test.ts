@@ -72,18 +72,18 @@ function loadBanListsOrDefaultsFrom(personal: unknown) {
 // Defaults (stories 2, 6)
 // ---------------------------------------------------------------------------
 
-test("with no harness key the subagent ban list defaults to fable and astra and the session ban list is empty", () => {
-  for (const personal of [{}, { defaultModel: "anthropic/claude-haiku-4-5" }, { harness: {} }]) {
+test("with no orchestrator key both ban lists are empty: the package ships no ban list", () => {
+  for (const personal of [{}, { defaultModel: "anthropic/claude-haiku-4-5" }, { orchestrator: {} }]) {
     const loaded = banListsFromSettings(personal);
-    assert.deepEqual(loaded.banLists.subagentBanList, ["fable", "astra"]);
+    assert.deepEqual(loaded.banLists.subagentBanList, []);
     assert.deepEqual(loaded.banLists.sessionBanList, []);
     assert.deepEqual(loaded.ignoredProjectKeys, []);
   }
-  assert.deepEqual(DEFAULT_BAN_LISTS, { subagentBanList: ["fable", "astra"], sessionBanList: [] });
+  assert.deepEqual(DEFAULT_BAN_LISTS, { subagentBanList: [], sessionBanList: [] });
 });
 
-test("with no personal settings file the loader returns the defaults and resolveDispatchModel refuses the real Fable and Astra ids", () => {
-  const dirs = tempSettings();
+test("a personal subagent ban list of fable and astra makes resolveDispatchModel refuse the real Fable and Astra ids", () => {
+  const dirs = tempSettings({ orchestrator: { subagentBanList: ["fable", "astra"] } });
   try {
     configureBanLists(loadBanLists({ agentDir: dirs.agentDir, projectCwd: dirs.projectCwd }).banLists);
     for (const model of ["anthropic/claude-fable-5", "anthropic/claude-fable-5-1", "openai-codex/gpt-6-astra"]) {
@@ -103,7 +103,7 @@ test("with no personal settings file the loader returns the defaults and resolve
 // ---------------------------------------------------------------------------
 
 test("adding sonnet to the subagent ban list refuses anthropic/claude-sonnet-5 at dispatch resolution, and removing it admits it again", () => {
-  const dirs = tempSettings({ harness: { subagentBanList: ["fable", "astra", "sonnet"] } });
+  const dirs = tempSettings({ orchestrator: { subagentBanList: ["fable", "astra", "sonnet"] } });
   try {
     configureBanLists(loadBanLists({ agentDir: dirs.agentDir }).banLists);
     const refused = resolveDispatchModel({ model: "anthropic/claude-sonnet-5", source: "explicit" });
@@ -113,7 +113,7 @@ test("adding sonnet to the subagent ban list refuses anthropic/claude-sonnet-5 a
     assert.match(refused.message, /'sonnet'/);
     assert.equal(isProhibitedModel("anthropic/claude-sonnet-5"), true);
 
-    writeFileSync(join(dirs.agentDir, "settings.json"), JSON.stringify({ harness: { subagentBanList: ["fable", "astra"] } }));
+    writeFileSync(join(dirs.agentDir, "settings.json"), JSON.stringify({ orchestrator: { subagentBanList: ["fable", "astra"] } }));
     configureBanLists(loadBanLists({ agentDir: dirs.agentDir }).banLists);
     assert.ok(resolveDispatchModel({ model: "anthropic/claude-sonnet-5", source: "explicit" }).ok);
     assert.equal(isProhibitedModel("anthropic/claude-sonnet-5"), false);
@@ -176,15 +176,15 @@ test("the allow-list audit reads the same configured subagent ban list", () => {
 // Session ban list (story 3)
 // ---------------------------------------------------------------------------
 
-test("a model on the subagent ban list is not session-banned under the defaults", () => {
-  const defaults = banListsFromSettings({}).banLists;
+test("a model on the subagent ban list is not session-banned", () => {
+  const defaults = banListsFromSettings({ orchestrator: { subagentBanList: ["fable", "astra"] } }).banLists;
   assert.equal(isSessionBannedModel("anthropic/claude-fable-5-1", defaults), false);
   assert.equal(sessionBanListRefusal("anthropic/claude-fable-5-1", defaults), undefined);
   assert.equal(isProhibitedModel("anthropic/claude-fable-5-1", defaults), true);
 });
 
 test("sessionBanList opus refuses anthropic/claude-opus-5-5 as the session model with a message naming the session ban list", () => {
-  const banLists = banListsFromSettings({ harness: { sessionBanList: ["opus"] } }).banLists;
+  const banLists = banListsFromSettings({ orchestrator: { sessionBanList: ["opus"] } }).banLists;
   assert.equal(isSessionBannedModel("anthropic/claude-opus-5-5", banLists), true);
   assert.equal(isSessionBannedModel("ANTHROPIC/CLAUDE-OPUS-5-5:high", banLists), true);
   const refusal = sessionBanListRefusal("anthropic/claude-opus-5-5", banLists);
@@ -240,13 +240,13 @@ test("a banned name in task text, a commit message, a path or shell text does no
 
 test("a project settings file carrying either ban list changes nothing and the loader names each ignored key", () => {
   const dirs = tempSettings(
-    { harness: { sessionBanList: ["opus"] } },
-    { harness: { subagentBanList: [], sessionBanList: ["haiku"], routing: { tiers: {} } } },
+    { orchestrator: { subagentBanList: ["fable", "astra"], sessionBanList: ["opus"] } },
+    { orchestrator: { subagentBanList: [], sessionBanList: ["haiku"], routing: { tiers: {} } } },
   );
   try {
     const loaded = loadBanLists({ agentDir: dirs.agentDir, projectCwd: dirs.projectCwd });
     assert.deepEqual(loaded.banLists, { subagentBanList: ["fable", "astra"], sessionBanList: ["opus"] });
-    assert.deepEqual(loaded.ignoredProjectKeys, ["harness.subagentBanList", "harness.sessionBanList"]);
+    assert.deepEqual(loaded.ignoredProjectKeys, ["orchestrator.subagentBanList", "orchestrator.sessionBanList"]);
     configureBanLists(loaded.banLists);
     assert.ok(!resolveDispatchModel({ model: "anthropic/claude-fable-5", source: "explicit" }).ok);
   } finally {
@@ -255,13 +255,13 @@ test("a project settings file carrying either ban list changes nothing and the l
 });
 
 test("a project ban-list key is ignored and named even when its value is malformed", () => {
-  const loaded = banListsFromSettings({}, { harness: { subagentBanList: "nonsense" } });
+  const loaded = banListsFromSettings({}, { orchestrator: { subagentBanList: "nonsense" } });
   assert.deepEqual(loaded.banLists, DEFAULT_BAN_LISTS);
-  assert.deepEqual(loaded.ignoredProjectKeys, ["harness.subagentBanList"]);
+  assert.deepEqual(loaded.ignoredProjectKeys, ["orchestrator.subagentBanList"]);
 });
 
 test("a project file with no ban-list key reports nothing ignored", () => {
-  for (const project of [{}, { harness: { routing: { tiers: {} } } }, { defaultModel: "x/y" }]) {
+  for (const project of [{}, { orchestrator: { routing: { tiers: {} } } }, { defaultModel: "x/y" }]) {
     assert.deepEqual(banListsFromSettings({}, project).ignoredProjectKeys, []);
   }
 });
@@ -278,22 +278,22 @@ for (const key of ["subagentBanList", "sessionBanList"] as const) {
     ["an empty-string entry", ["fable", ""]],
     ["a blank entry", ["fable", "   "]],
   ] as const) {
-    test(`a personal harness.${key} with ${label} fails closed naming the key`, () => {
+    test(`a personal orchestrator.${key} with ${label} fails closed naming the key`, () => {
       assert.throws(
-        () => banListsFromSettings({ harness: { [key]: value } }),
-        new RegExp(`harness\\.${key}`),
+        () => banListsFromSettings({ orchestrator: { [key]: value } }),
+        new RegExp(`orchestrator\\.${key}`),
       );
       assert.throws(
         () => configureBanLists({ ...DEFAULT_BAN_LISTS, [key]: value } as unknown as BanLists),
-        new RegExp(`harness\\.${key}`),
+        new RegExp(`orchestrator\\.${key}`),
       );
     });
   }
 }
 
-test("a personal harness key that is not an object fails closed naming the key", () => {
-  for (const harness of ["x", ["fable"], null]) {
-    assert.throws(() => banListsFromSettings({ harness }), /'harness'/);
+test("a personal orchestrator key that is not an object fails closed naming the key", () => {
+  for (const orchestrator of ["x", ["fable"], null]) {
+    assert.throws(() => banListsFromSettings({ orchestrator }), /'orchestrator'/);
   }
 });
 
@@ -309,51 +309,51 @@ test("an unreadable personal settings file fails closed naming the file", () => 
 });
 
 test("the guard loader keeps the defaults when personal settings are malformed and reports one error naming the key", () => {
-  const dirs = tempSettings({ harness: { subagentBanList: ["fable", ""] } });
+  const dirs = tempSettings({ orchestrator: { subagentBanList: { fable: true } } });
   try {
     const loaded = loadBanListsOrDefaults({ agentDir: dirs.agentDir, projectCwd: dirs.projectCwd });
     assert.deepEqual(loaded.banLists, DEFAULT_BAN_LISTS);
     assert.equal(loaded.errors.length, 1);
-    assert.match(loaded.errors[0]!, /harness\.subagentBanList/);
+    assert.match(loaded.errors[0]!, /orchestrator\.subagentBanList/);
   } finally {
     dirs.cleanup();
   }
 });
 
 test("the guard loader keeps a valid subagent list when the session list is malformed", () => {
-  const dirs = tempSettings({ harness: { subagentBanList: ["fable", "astra", "sonnet"], sessionBanList: "opus" } });
+  const dirs = tempSettings({ orchestrator: { subagentBanList: ["fable", "astra", "sonnet"], sessionBanList: "opus" } });
   try {
     const loaded = loadBanListsOrDefaults({ agentDir: dirs.agentDir });
     assert.deepEqual(loaded.banLists.subagentBanList, ["fable", "astra", "sonnet"]);
     assert.equal(isProhibitedModel("anthropic/claude-sonnet-5", loaded.banLists), true);
     assert.equal(loaded.errors.length, 1);
-    assert.match(loaded.errors[0]!, /harness\.sessionBanList/);
+    assert.match(loaded.errors[0]!, /orchestrator\.sessionBanList/);
   } finally {
     dirs.cleanup();
   }
 });
 
 test("the guard loader keeps a valid session list when the subagent list is malformed", () => {
-  const loaded = loadBanListsOrDefaultsFrom({ harness: { subagentBanList: "sonnet", sessionBanList: ["opus"] } });
-  assert.deepEqual(loaded.banLists, { subagentBanList: ["fable", "astra"], sessionBanList: ["opus"] });
+  const loaded = loadBanListsOrDefaultsFrom({ orchestrator: { subagentBanList: "sonnet", sessionBanList: ["opus"] } });
+  assert.deepEqual(loaded.banLists, { subagentBanList: [], sessionBanList: ["opus"] });
   assert.equal(loaded.errors.length, 1);
-  assert.match(loaded.errors[0]!, /harness\.subagentBanList/);
+  assert.match(loaded.errors[0]!, /orchestrator\.subagentBanList/);
 });
 
 test("a malformed personal list keeps the defaults plus its valid entries, so it can only narrow", () => {
-  const loaded = loadBanListsOrDefaultsFrom({ harness: { subagentBanList: ["sonnet", "", 3, " opus "], sessionBanList: ["haiku", null] } });
-  assert.deepEqual(loaded.banLists.subagentBanList, ["fable", "astra", "sonnet", "opus"]);
+  const loaded = loadBanListsOrDefaultsFrom({ orchestrator: { subagentBanList: ["sonnet", "", 3, " opus "], sessionBanList: ["haiku", null] } });
+  assert.deepEqual(loaded.banLists.subagentBanList, ["sonnet", "opus"]);
   assert.deepEqual(loaded.banLists.sessionBanList, ["haiku"]);
   assert.equal(loaded.errors.length, 2);
 });
 
 test("the guard loader keeps the personal lists when the project file is unreadable and reports one error naming the file", () => {
-  const dirs = tempSettings({ harness: { sessionBanList: ["opus"] } });
+  const dirs = tempSettings({ orchestrator: { sessionBanList: ["opus"] } });
   try {
     const projectFile = join(dirs.projectCwd, ".pi", "settings.json");
     writeFileSync(projectFile, "{ not json");
     const loaded = loadBanListsOrDefaults({ agentDir: dirs.agentDir, projectCwd: dirs.projectCwd });
-    assert.deepEqual(loaded.banLists, { subagentBanList: ["fable", "astra"], sessionBanList: ["opus"] });
+    assert.deepEqual(loaded.banLists, { subagentBanList: [], sessionBanList: ["opus"] });
     assert.deepEqual(loaded.ignoredProjectKeys, []);
     assert.equal(loaded.errors.length, 1);
     assert.ok(loaded.errors[0]!.includes(projectFile));
@@ -363,7 +363,7 @@ test("the guard loader keeps the personal lists when the project file is unreada
 });
 
 test("the guard loader matches the strict loader when both files are usable", () => {
-  const dirs = tempSettings({ harness: { sessionBanList: ["opus"] } }, { harness: { subagentBanList: [] } });
+  const dirs = tempSettings({ orchestrator: { sessionBanList: ["opus"] } }, { orchestrator: { subagentBanList: [] } });
   try {
     const sources = { agentDir: dirs.agentDir, projectCwd: dirs.projectCwd };
     const strict = loadBanLists(sources);
@@ -377,13 +377,13 @@ test("the guard loader matches the strict loader when both files are usable", ()
 });
 
 test("an entry is trimmed before matching so stray whitespace cannot silently match nothing", () => {
-  const banLists = banListsFromSettings({ harness: { subagentBanList: [" sonnet "] } }).banLists;
+  const banLists = banListsFromSettings({ orchestrator: { subagentBanList: [" sonnet "] } }).banLists;
   assert.deepEqual(banLists.subagentBanList, ["sonnet"]);
   assert.equal(isProhibitedModel("anthropic/claude-sonnet-5", banLists), true);
 });
 
 test("an explicit empty personal subagent ban list is honored", () => {
-  const banLists = banListsFromSettings({ harness: { subagentBanList: [] } }).banLists;
+  const banLists = banListsFromSettings({ orchestrator: { subagentBanList: [] } }).banLists;
   assert.equal(isProhibitedModel("anthropic/claude-fable-5", banLists), false);
 });
 
@@ -403,7 +403,7 @@ function harnessSources(): Array<{ path: string; text: string }> {
     if (!entry.isFile() || !entry.name.endsWith(".ts") || entry.name.endsWith(".test.ts")) continue;
     const path = join(entry.parentPath, entry.name);
     const rel = relative(harnessRoot, path);
-    if (rel.startsWith("state") || rel.includes("node_modules")) continue;
+    if (rel.startsWith("state") || rel.startsWith("fixtures") || rel.includes("node_modules")) continue;
     out.push({ path: rel, text: readFileSync(path, "utf8") });
   }
   return out;
@@ -415,9 +415,9 @@ function harnessSources(): Array<{ path: string; text: string }> {
 // "anthropic/claude-fable-5" in fixtures are not matched.
 const BANNED_NAME_LITERAL = /["'`]\*?(fable|astra)\*?["'`]/gi;
 
-test("the banned-name rule and its default names are defined in exactly one harness source file", () => {
+test("no source file names a banned model: the package ships no ban list", () => {
   const hits = harnessSources().flatMap(({ path, text }) =>
     [...text.matchAll(BANNED_NAME_LITERAL)].map((match) => `${path}: ${match[0]}`),
   );
-  assert.deepEqual(hits, ['policy/ban-lists.ts: "fable"', 'policy/ban-lists.ts: "astra"']);
+  assert.deepEqual(hits, [], "only test fixtures may name the owner's banned models");
 });

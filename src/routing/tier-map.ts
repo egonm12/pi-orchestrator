@@ -4,16 +4,16 @@ import {
   THINKING_LEVELS,
   type ModelInfo,
   type ThinkingLevel,
-} from "../../../../../../.pi/agent/npm/node_modules/pi-subagents/src/shared/model-info.js";
+} from "../subagents/model-info.ts";
 import {
   checkModelScope,
   type ModelScopeCheckRule,
-} from "../../../../../../.pi/agent/npm/node_modules/pi-subagents/src/runs/shared/model-scope.js";
+} from "../subagents/model-scope.ts";
 import {
   banListsFromSettings,
   isProhibitedModel,
   personalAgentDir,
-  personalHarness,
+  personalOrchestrator,
   readSettingsFile,
   type BanListSources,
   type BanLists,
@@ -23,18 +23,18 @@ import { RISK_TIERS, type RiskTier } from "./classifier.ts";
 
 // Ticket 22, ADR 0001: the owner-written tier map.
 //
-//   harness.routing.tiers   personal settings: all four tiers, each a
+//   orchestrator.routing.tiers   personal settings: all four tiers, each a
 //                           non-empty ordered list of rungs written
 //                           `provider/model:effort`.
 //
 // A project settings file (`<cwd>/.pi/settings.json`) may carry only
-// `harness.routing.tiers`. A project tier replaces the personal tier of the
-// same name; unnamed tiers are inherited. Every other project `harness` key,
+// `orchestrator.routing.tiers`. A project tier replaces the personal tier of the
+// same name; unnamed tiers are inherited. Every other project `orchestrator` key,
 // and a project key that is not one of the four tiers, is ignored and named in
 // `ignoredProjectKeys`.
 //
 // Every rung must pass the subagent ban list (`isProhibitedModel`, reading the
-// personal `harness.subagentBanList`), the allowed-model list (ticket 04's
+// personal `orchestrator.subagentBanList`), the allowed-model list (ticket 04's
 // scope, `checkModelScope`) and name an installed model. A failing rung, from
 // either file, is dropped with its reason so a wrong map stays visible in the
 // decision record (ADR 0001). A project tier emptied by drops inherits the
@@ -84,7 +84,7 @@ export interface TierMapInputs {
 
 type SettingsFile = "personal" | "project";
 
-const TIERS_KEY = "harness.routing.tiers";
+const TIERS_KEY = "orchestrator.routing.tiers";
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -165,18 +165,18 @@ interface PersonalTiers {
 /** The personal map, every rung checked and failing rungs dropped;
  *  `undefined` when there is none and routing is not enabled. */
 function personalTiers(personal: unknown, inputs: Required<TierMapInputs>): PersonalTiers | undefined {
-  const harness = personalHarness(personal);
-  const routing = harness?.routing;
+  const orchestrator = personalOrchestrator(personal);
+  const routing = orchestrator?.routing;
   if (routing !== undefined && !isPlainObject(routing)) {
-    throw keyError("personal", "harness.routing", `must be an object; got ${JSON.stringify(routing)}.`);
+    throw keyError("personal", "orchestrator.routing", `must be an object; got ${JSON.stringify(routing)}.`);
   }
   const enabled = routing?.enabled;
   if (enabled !== undefined && typeof enabled !== "boolean") {
-    throw keyError("personal", "harness.routing.enabled", `must be a boolean; got ${JSON.stringify(enabled)}.`);
+    throw keyError("personal", "orchestrator.routing.enabled", `must be a boolean; got ${JSON.stringify(enabled)}.`);
   }
   const tiers = routing?.tiers;
   if (tiers === undefined) {
-    if (enabled === true) throw keyError("personal", TIERS_KEY, "is missing while harness.routing.enabled is true.");
+    if (enabled === true) throw keyError("personal", TIERS_KEY, "is missing while orchestrator.routing.enabled is true.");
     return undefined;
   }
   if (!isPlainObject(tiers)) {
@@ -226,14 +226,14 @@ function projectOverride(project: unknown): ProjectOverride {
   const override = { tiers, ignoredProjectKeys };
   if (project === undefined) return override;
   if (!isPlainObject(project)) throw new Error("tier map: project settings must be a JSON object.");
-  const harness = project.harness;
-  if (harness === undefined) return override;
-  if (!isPlainObject(harness)) throw keyError("project", "harness", `must be an object; got ${JSON.stringify(harness)}.`);
-  for (const key of Object.keys(harness)) if (key !== "routing") ignoredProjectKeys.push(`harness.${key}`);
-  const routing = harness.routing;
+  const orchestrator = project.orchestrator;
+  if (orchestrator === undefined) return override;
+  if (!isPlainObject(orchestrator)) throw keyError("project", "orchestrator", `must be an object; got ${JSON.stringify(orchestrator)}.`);
+  for (const key of Object.keys(orchestrator)) if (key !== "routing") ignoredProjectKeys.push(`orchestrator.${key}`);
+  const routing = orchestrator.routing;
   if (routing === undefined) return override;
-  if (!isPlainObject(routing)) throw keyError("project", "harness.routing", `must be an object; got ${JSON.stringify(routing)}.`);
-  for (const key of Object.keys(routing)) if (key !== "tiers") ignoredProjectKeys.push(`harness.routing.${key}`);
+  if (!isPlainObject(routing)) throw keyError("project", "orchestrator.routing", `must be an object; got ${JSON.stringify(routing)}.`);
+  for (const key of Object.keys(routing)) if (key !== "tiers") ignoredProjectKeys.push(`orchestrator.routing.${key}`);
   const projectTiers = routing.tiers;
   if (projectTiers === undefined) return override;
   if (!isPlainObject(projectTiers)) {

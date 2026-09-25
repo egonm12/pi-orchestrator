@@ -26,6 +26,9 @@ import {
   type RoutingPolicyConfig,
   type RoutingRequest,
 } from "./routing-policy.ts";
+import { useOwnerBanLists } from "../fixtures/owner-ban-lists.ts";
+
+useOwnerBanLists();
 
 const here = dirname(fileURLToPath(import.meta.url));
 

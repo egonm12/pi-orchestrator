@@ -13,7 +13,7 @@
 //
 // Per mode (shadow, then live) it runs ONE real `pi -p` session on
 // anthropic/claude-haiku-4-5 with the router installed in a throwaway agent
-// dir and PI_HARNESS_ROUTER_PROBE=1. The parent calls `subagent` `--calls`
+// dir and PI_ORCHESTRATOR_ROUTER_PROBE=1. The parent calls `subagent` `--calls`
 // times on an agent that does not exist: the router's `tool_call` hook runs
 // in full for each call (classify, route, record; pi runs every call's hook
 // before any tool executes, pi-agent-core dist/agent-loop.js:364-440), and
@@ -81,7 +81,7 @@ function measureMode(mode: "shadow" | "live", calls: number, authExtension: stri
       defaultProjectTrust: "ask",
       quietStartup: true,
       enableInstallTelemetry: false,
-      harness: { routing: { enabled: true, mode, classifier: { model: rung, timeoutMs: 90_000, fallback: [] }, tiers: { mechanical: [rung], standard: [rung], elevated: [rung], critical: [rung] } } },
+      orchestrator: { routing: { enabled: true, mode, classifier: { model: rung, timeoutMs: 90_000, fallback: [] }, tiers: { mechanical: [rung], standard: [rung], elevated: [rung], critical: [rung] } } },
     }));
     const stateDir = join(agent.home, "state");
     const approval = grantOwnerApproval({ approvedBy: "router latency measurement", scope: "data-recipient", acknowledgement: "send the measurement task to anthropic" });
@@ -99,7 +99,7 @@ function measureMode(mode: "shadow" | "live", calls: number, authExtension: stri
     const run = spawnSync(
       "pi",
       ["-p", prompt, "--mode", "json", "-t", "subagent", "-e", authExtension, "-e", subagents, "--model", HAIKU, "--thinking", "off", "--no-session"],
-      { cwd: repo.dir, env: agent.env({ ...launches.env, TMPDIR: tmp, PI_HARNESS_STATE_DIR: stateDir, PI_HARNESS_ROUTER_PROBE: "1" }), encoding: "utf8", timeout: 600_000, maxBuffer: 256 * 1024 * 1024 },
+      { cwd: repo.dir, env: agent.env({ ...launches.env, TMPDIR: tmp, PI_ORCHESTRATOR_STATE_DIR: stateDir, PI_ORCHESTRATOR_ROUTER_PROBE: "1" }), encoding: "utf8", timeout: 600_000, maxBuffer: 256 * 1024 * 1024 },
     );
     const stdout = run.stdout ?? "";
     const stderr = run.stderr ?? "";
@@ -137,7 +137,7 @@ function measureMode(mode: "shadow" | "live", calls: number, authExtension: stri
       const routed = record?.recordType === "decision" ? `decision ${record.classification.cause} -> ${record.route.outcome}` : `record ${record?.recordType ?? "missing"}`;
       process.stdout.write(`${mode} call ${index + 1}: ${end.toolCallId} ${routed}; hook ${hookMs[index]?.toFixed(1) ?? "?"} ms; tool error=${String(end.isError)}: ${text.slice(0, 80)}\n`);
     }
-    for (const line of lines.filter((l) => l.startsWith("harness router disabled"))) process.stdout.write(`${mode}: ${line}\n`);
+    for (const line of lines.filter((l) => l.startsWith("pi-orchestrator router disabled"))) process.stdout.write(`${mode}: ${line}\n`);
     for (const launch of launches.read()) {
       process.stdout.write(`${mode} launch ${launch.index + 1}: ${launch.kind} turns=${launch.assistantTurns} tokens=${launch.usage.totalTokens} reported cost $${launch.usage.costUsd.toFixed(5)}\n`);
     }

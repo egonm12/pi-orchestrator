@@ -27,6 +27,9 @@ import {
   type DecisionRecordInput,
   type RoutingRecord,
 } from "./decision-record.ts";
+import { useOwnerBanLists } from "../fixtures/owner-ban-lists.ts";
+
+useOwnerBanLists();
 
 // Ticket 25, stories 28 and 34. Seam: `writeDecisionRecord`, the public
 // function ticket 27's extension hook will call once per routing decision,
@@ -108,7 +111,7 @@ test("one shadow write and one live write leave exactly two records, each carryi
       assert.equal(record.tierMap.tiers.elevated[0]?.origin, "project");
       assert.equal(record.tierMap.tiers.standard[0]?.origin, "personal");
       assert.deepEqual(record.tierMap.drops.map((drop) => drop.reason), ["subagent ban list"]);
-      assert.deepEqual(record.tierMap.ignoredProjectKeys, ["harness.subagentBanList"]);
+      assert.deepEqual(record.tierMap.ignoredProjectKeys, ["orchestrator.subagentBanList"]);
       // The router: removed rungs with reasons, escalation fields, the rung.
       assert.equal(record.route.outcome, "chosen");
       if (record.route.outcome !== "chosen") continue;
@@ -130,8 +133,8 @@ test("an escalation and a refusal are both recorded with the tiers tried and eve
   try {
     // Standard holds only a Codex rung, so Codex out of usage moves the task up.
     const settings = fixturePersonalSettings();
-    const tiers = { ...(settings.harness as { routing: { tiers: Record<string, string[]> } }).routing.tiers, standard: ["openai-codex/gpt-6-luna:medium"] };
-    const tierMap = fixtureTierMap({ harness: { routing: { enabled: true, tiers } } }, FIXTURE_PROJECT_SETTINGS);
+    const tiers = { ...(settings.orchestrator as { routing: { tiers: Record<string, string[]> } }).routing.tiers, standard: ["openai-codex/gpt-6-luna:medium"] };
+    const tierMap = fixtureTierMap({ orchestrator: { routing: { enabled: true, tiers } } }, FIXTURE_PROJECT_SETTINGS);
     writeDecisionRecord(dir, await liveInput({ attemptId: "attempt-escalated", tierMap, route: fixtureRoute("standard", tierMap) }));
     writeDecisionRecord(dir, await liveInput({ attemptId: "attempt-refused", tierMap, route: fixtureRefusal("elevated", tierMap) }));
     const [escalated, refused] = readRoutingRecords(dir) as [DecisionRecord, DecisionRecord];
@@ -471,7 +474,7 @@ test("a 5,000-character hop detail is stored bounded to 500 characters, and a lo
   }
 });
 
-test("an auth token in a settings key next to harness never appears in any record", async () => {
+test("an auth token in a settings key next to orchestrator never appears in any record", async () => {
   const { dir, cleanup } = tempDir();
   try {
     const TOKEN = "sk-ant-oat01-TICKET25-DO-NOT-RECORD-7f3a9c";

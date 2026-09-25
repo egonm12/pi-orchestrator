@@ -124,7 +124,7 @@ test("pi launch log: after a SIGKILL on the shim (the classifier's escalation), 
     assert.ok(await waitFor(() => existsSync(setup.pidsFile), 10_000), "the fake pi never started");
     // The shim records the start time just after the spawn; a SIGKILL before
     // that would leave a launch stopRunning refuses to touch.
-    const logDir = setup.launches.env.PI_HARNESS_LAUNCH_LOG_DIR;
+    const logDir = setup.launches.env.PI_ORCHESTRATOR_LAUNCH_LOG_DIR;
     assert.ok(await waitFor(() => readdirSync(logDir).some((name) => name.endsWith(".start")), 10_000), "the shim never recorded a start time");
     const pids = fakePids(setup);
     shim.kill("SIGKILL");
@@ -152,7 +152,7 @@ function startSleeper(): number {
 /** Log a launch by hand: `<id>.pid`, and optionally `<id>.start` and an
  *  `<id>.exit` marker, as the shim writes them. */
 function logLaunch(setup: FakePiSetup, id: string, pid: number, extra: { start?: string; exited?: boolean }): void {
-  const dir = setup.launches.env.PI_HARNESS_LAUNCH_LOG_DIR;
+  const dir = setup.launches.env.PI_ORCHESTRATOR_LAUNCH_LOG_DIR;
   writeFileSync(join(dir, `${id}.pid`), String(pid));
   if (extra.start !== undefined) writeFileSync(join(dir, `${id}.start`), extra.start);
   if (extra.exited) writeFileSync(join(dir, `${id}.exit`), JSON.stringify({ code: 0, signal: null }));

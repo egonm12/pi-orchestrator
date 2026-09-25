@@ -16,11 +16,11 @@ test("live model selection defaults to the exact Claude subscription route", () 
 
 test("live model selection accepts only exact approved IDs", () => {
   assert.equal(
-    selectedLivePiModel({ PI_HARNESS_LIVE_MODEL: "openai-codex/gpt-6-luna" }),
+    selectedLivePiModel({ PI_ORCHESTRATOR_LIVE_MODEL: "openai-codex/gpt-6-luna" }),
     "openai-codex/gpt-6-luna",
   );
   assert.equal(
-    selectedLivePiModel({ PI_HARNESS_LIVE_MODEL: "anthropic/claude-haiku-4-5" }),
+    selectedLivePiModel({ PI_ORCHESTRATOR_LIVE_MODEL: "anthropic/claude-haiku-4-5" }),
     "anthropic/claude-haiku-4-5",
   );
   for (const value of [
@@ -41,8 +41,8 @@ test("live model selection accepts only exact approved IDs", () => {
     "",
   ]) {
     assert.throws(
-      () => selectedLivePiModel({ PI_HARNESS_LIVE_MODEL: value }),
-      /Unsupported PI_HARNESS_LIVE_MODEL/,
+      () => selectedLivePiModel({ PI_ORCHESTRATOR_LIVE_MODEL: value }),
+      /Unsupported PI_ORCHESTRATOR_LIVE_MODEL/,
       `expected ${JSON.stringify(value)} to be rejected`,
     );
   }
@@ -104,7 +104,7 @@ test("model registry failures throw instead of making live checks skippable", ()
 });
 
 test("Codex portability does not redefine the subscription test route", () => {
-  const genericRoute = selectedLivePiModel({ PI_HARNESS_LIVE_MODEL: "openai-codex/gpt-6-luna" });
+  const genericRoute = selectedLivePiModel({ PI_ORCHESTRATOR_LIVE_MODEL: "openai-codex/gpt-6-luna" });
   assert.notEqual(genericRoute, SUBSCRIPTION_TEST_MODEL);
   assert.equal(SUBSCRIPTION_TEST_MODEL, "anthropic/claude-haiku-4-5");
 });

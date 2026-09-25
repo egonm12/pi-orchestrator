@@ -80,13 +80,13 @@ export function livePiModelAvailability(
 export function selectedLivePiModel(
   env: NodeJS.ProcessEnv = process.env,
 ): (typeof APPROVED_LIVE_PI_MODELS)[number] {
-  const requested = env.PI_HARNESS_LIVE_MODEL ?? DEFAULT_LIVE_PI_MODEL;
+  const requested = env.PI_ORCHESTRATOR_LIVE_MODEL ?? DEFAULT_LIVE_PI_MODEL;
   if (
     isProhibitedModel(requested) ||
     !(APPROVED_LIVE_PI_MODELS as readonly string[]).includes(requested)
   ) {
     throw new Error(
-      `Unsupported PI_HARNESS_LIVE_MODEL ${JSON.stringify(requested)}. ` +
+      `Unsupported PI_ORCHESTRATOR_LIVE_MODEL ${JSON.stringify(requested)}. ` +
         `Choose one exact approved ID: ${APPROVED_LIVE_PI_MODELS.join(", ")}`,
     );
   }

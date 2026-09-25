@@ -1,4 +1,4 @@
-import type { ModelInfo } from "../../../../../../.pi/agent/npm/node_modules/pi-subagents/src/shared/model-info.js";
+import type { ModelInfo } from "../subagents/model-info.ts";
 
 // Thinking facts for every id in ./installed-models.ts, as pi's model
 // registry defines them. Captured 2026-09-24 from pi-ai 0.87.1's provider

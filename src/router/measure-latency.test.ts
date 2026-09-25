@@ -37,7 +37,7 @@ function evidence() {
       { type: "tool_execution_end", toolName: "subagent", toolCallId: "call-1", isError: true, result: { content: [{ text: "Unknown agent: router-latency-absent" }] } },
     ],
     records: [{ attemptId: "call-1", recordType: "decision", classification: { cause: `model:${rung}` } }],
-    lines: [`pi-orchestration-harness router: hook 10.0 ms for 1 slot(s), mode shadow`, `pi-orchestration-harness router: classifier ${rung} first token 1.0 ms, total 9.0 ms, tokens 20, reported cost $0.00100`],
+    lines: [`pi-orchestrator router: hook 10.0 ms for 1 slot(s), mode shadow`, `pi-orchestrator router: classifier ${rung} first token 1.0 ms, total 9.0 ms, tokens 20, reported cost $0.00100`],
     launches: [{ kind: "parent" }, { kind: "list-models" }],
   };
 }
@@ -48,7 +48,7 @@ test("latency validation accepts complete requested-rung evidence", async () => 
 });
 
 const invalidEvidence: [string, (e: ReturnType<typeof evidence>) => void][] = [
-  ["failed probe replacing success", (e) => { e.lines[1] = `pi-orchestration-harness router: classifier ${rung} failed after 1.0 ms: timeout`; }],
+  ["failed probe replacing success", (e) => { e.lines[1] = `pi-orchestrator router: classifier ${rung} failed after 1.0 ms: timeout`; }],
   ["missing parent launch", (e) => { e.launches = [{ kind: "list-models" }]; }],
   ["extra parent launch", (e) => { e.launches.push({ kind: "parent" }); }],
   ["missing result ID", (e) => { e.events[1]!.toolCallId = ""; e.records[0]!.attemptId = ""; e.events[0]!.toolCallId = ""; }],
@@ -71,7 +71,7 @@ const invalidEvidence: [string, (e: ReturnType<typeof evidence>) => void][] = [
   ["keyword fallback", (e) => { e.records[0]!.classification.cause = "keywords"; }],
   ["wrong decision rung", (e) => { e.records[0]!.classification.cause = "model:anthropic/claude-haiku-4-5:low"; }],
   ["wrong probe rung", (e) => { e.lines[1] = e.lines[1]!.replace(":off", ":low"); }],
-  ["failed probe alongside success", (e) => { e.lines.push(`pi-orchestration-harness router: classifier ${rung} failed after 1.0 ms: timeout`); }],
+  ["failed probe alongside success", (e) => { e.lines.push(`pi-orchestrator router: classifier ${rung} failed after 1.0 ms: timeout`); }],
   ["missing probe", (e) => { e.lines.pop(); }],
   ["unrelated error", (e) => { e.events[1]!.result!.content[0]!.text = "permission denied"; }],
   ["different unknown agent", (e) => { e.events[1]!.result!.content[0]!.text = "Unknown agent: other"; }],

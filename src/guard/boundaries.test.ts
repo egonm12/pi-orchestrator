@@ -5,6 +5,9 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { configureBanLists, resetBanLists } from "../policy/ban-lists.ts";
 import { launchesUnguardedPi, toolRefusal, withinAgentDir } from "./boundaries.ts";
+import { useOwnerBanLists } from "../fixtures/owner-ban-lists.ts";
+
+useOwnerBanLists();
 
 const ctx = { agentDir: "/tmp/guard-agent", cwd: "/tmp/work" };
 

@@ -3,11 +3,14 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import type { ModelInfo } from "../../../../../../.pi/agent/npm/node_modules/pi-subagents/src/shared/model-info.js";
+import type { ModelInfo } from "../subagents/model-info.ts";
 import { INSTALLED_MODEL_IDS } from "../fixtures/installed-models.ts";
 import { INSTALLED_MODEL_INFO } from "../fixtures/installed-model-info.ts";
 import { HARNESS_ALLOW_PATTERNS, HARNESS_MODEL_SCOPE } from "../policy/model-resolution.ts";
 import { loadTierMap, tierMapFromSettings, type ResolvedTierMap, type TierMapInputs } from "./tier-map.ts";
+import { OWNER_BAN_LIST_SETTINGS, useOwnerBanLists } from "../fixtures/owner-ban-lists.ts";
+
+useOwnerBanLists();
 
 // Seam (ticket 22): the loader's returned value. The pure core takes parsed
 // settings objects; the file loader reads a temp agent dir and a temp project
@@ -27,10 +30,10 @@ const EXAMPLE_TIERS = {
 };
 
 const examplePersonal = (routing: Record<string, unknown> = {}) => ({
-  harness: { routing: { enabled: true, ...routing, tiers: EXAMPLE_TIERS } },
+  orchestrator: { ...OWNER_BAN_LIST_SETTINGS, routing: { enabled: true, ...routing, tiers: EXAMPLE_TIERS } },
 });
 
-const projectTiers = (tiers: Record<string, unknown>) => ({ harness: { routing: { tiers } } });
+const projectTiers = (tiers: Record<string, unknown>) => ({ orchestrator: { routing: { tiers } } });
 
 /** A real pi-ai 0.87.1 model on a third provider, not installed here. */
 const GEMINI: ModelInfo = {
@@ -128,7 +131,7 @@ test("a tier listing three rungs from three providers loads all three in order",
     "google/gemini-3.1-pro-preview:medium",
   ];
   const map = tierMapFromSettings(
-    { harness: { routing: { tiers: { ...EXAMPLE_TIERS, standard } } } },
+    { orchestrator: { routing: { tiers: { ...EXAMPLE_TIERS, standard } } } },
     undefined,
     { ...WITH_GEMINI_INSTALLED, modelScope: { ...HARNESS_MODEL_SCOPE, allow: [...HARNESS_ALLOW_PATTERNS, GEMINI.fullId] } },
   );
@@ -157,8 +160,8 @@ test("a project file with only elevated replaces that tier with a project rung a
   assert.deepEqual(loadFromFiles(examplePersonal(), project), map);
 });
 
-test("a project file without harness.routing.tiers leaves the personal map in force", () => {
-  for (const project of [{}, { defaultModel: "anthropic/claude-haiku-4-5" }, { harness: {} }, { harness: { routing: {} } }]) {
+test("a project file without orchestrator.routing.tiers leaves the personal map in force", () => {
+  for (const project of [{}, { defaultModel: "anthropic/claude-haiku-4-5" }, { orchestrator: {} }, { orchestrator: { routing: {} } }]) {
     const map = tierMapFromSettings(examplePersonal(), project, INPUTS);
     assert.deepEqual(rungsByTier(map), EXAMPLE_BY_TIER);
     assert.deepEqual(map!.drops, []);
@@ -196,13 +199,13 @@ test("project rungs on the subagent ban list or outside the allowed-model list a
 test("the ban list the project drops use is the personal subagentBanList, and a project cannot change it", () => {
   // The example's only sonnet rung is replaced, so the personal map itself passes.
   const personal = {
-    harness: {
+    orchestrator: {
       subagentBanList: ["fable", "astra", "sonnet"],
       routing: { tiers: { ...EXAMPLE_TIERS, standard: ["openai-codex/gpt-6-sol:medium"] } },
     },
   };
   const project = {
-    harness: {
+    orchestrator: {
       subagentBanList: [],
       routing: { tiers: { standard: ["anthropic/claude-sonnet-5:medium", "anthropic/claude-fable-5:medium"] } },
     },
@@ -214,7 +217,7 @@ test("the ban list the project drops use is the personal subagentBanList, and a 
     { tier: "standard", rung: "anthropic/claude-fable-5:medium", origin: "project", reason: "subagent ban list" },
     { tier: "standard", origin: "project", reason: "inherited after drops" },
   ]);
-  assert.deepEqual(map!.ignoredProjectKeys, ["harness.subagentBanList"]);
+  assert.deepEqual(map!.ignoredProjectKeys, ["orchestrator.subagentBanList"]);
 });
 
 test("a project tier whose every rung is dropped resolves to the personal tier and the drop list says inherited after drops", () => {
@@ -240,9 +243,9 @@ test("a project tier whose every rung is dropped resolves to the personal tier a
 // Ignored project keys (story 9)
 // ---------------------------------------------------------------------------
 
-test("a project fifth tier and every harness key other than routing.tiers are left out of the map and named as ignored", () => {
+test("a project fifth tier and every orchestrator key other than routing.tiers are left out of the map and named as ignored", () => {
   const project = {
-    harness: {
+    orchestrator: {
       subagentBanList: [],
       sessionBanList: ["opus"],
       somethingElse: true,
@@ -264,21 +267,21 @@ test("a project fifth tier and every harness key other than routing.tiers are le
   });
   assert.equal(Object.hasOwn(map!.tiers, "experimental"), false);
   assert.deepEqual(map!.ignoredProjectKeys, [
-    "harness.subagentBanList",
-    "harness.sessionBanList",
-    "harness.somethingElse",
-    "harness.routing.enabled",
-    "harness.routing.mode",
-    "harness.routing.classifier",
-    "harness.routing.tiers.experimental",
+    "orchestrator.subagentBanList",
+    "orchestrator.sessionBanList",
+    "orchestrator.somethingElse",
+    "orchestrator.routing.enabled",
+    "orchestrator.routing.mode",
+    "orchestrator.routing.classifier",
+    "orchestrator.routing.tiers.experimental",
   ]);
   assert.deepEqual(map!.drops, []);
 
   assert.deepEqual(loadFromFiles(examplePersonal(), project), map);
 });
 
-test("a project harness.routing.enabled cannot switch routing on when the personal file has no tiers", () => {
-  const project = { harness: { routing: { enabled: true, tiers: { elevated: ["anthropic/claude-sonnet-5:high"] } } } };
+test("a project orchestrator.routing.enabled cannot switch routing on when the personal file has no tiers", () => {
+  const project = { orchestrator: { routing: { enabled: true, tiers: { elevated: ["anthropic/claude-sonnet-5:high"] } } } };
   assert.equal(tierMapFromSettings({}, project, INPUTS), undefined);
 });
 
@@ -286,43 +289,43 @@ test("a project harness.routing.enabled cannot switch routing on when the person
 // Fail closed, naming the key (story 11)
 // ---------------------------------------------------------------------------
 
-const withPersonalTiers = (tiers: Record<string, unknown>) => ({ harness: { routing: { enabled: true, tiers } } });
+const withPersonalTiers = (tiers: Record<string, unknown>) => ({ orchestrator: { ...OWNER_BAN_LIST_SETTINGS, routing: { enabled: true, tiers } } });
 
 const FAIL_CLOSED_CASES: ReadonlyArray<{ name: string; tiers: Record<string, unknown>; key: string; says: RegExp }> = [
   {
     name: "an unknown tier name",
     tiers: { ...EXAMPLE_TIERS, experimental: ["anthropic/claude-haiku-4-5:low"] },
-    key: "harness.routing.tiers.experimental",
+    key: "orchestrator.routing.tiers.experimental",
     says: /not a tier/,
   },
   {
     name: "an empty tier list",
     tiers: { ...EXAMPLE_TIERS, standard: [] },
-    key: "harness.routing.tiers.standard",
+    key: "orchestrator.routing.tiers.standard",
     says: /non-empty/,
   },
   {
     name: "a rung without :effort",
     tiers: { ...EXAMPLE_TIERS, elevated: ["openai-codex/gpt-6-sol:high", "anthropic/claude-sonnet-5"] },
-    key: "harness.routing.tiers.elevated[1]",
+    key: "orchestrator.routing.tiers.elevated[1]",
     says: /no ':effort'/,
   },
   {
     name: "an effort outside pi's levels",
     tiers: { ...EXAMPLE_TIERS, elevated: ["anthropic/claude-sonnet-5:ultra"] },
-    key: "harness.routing.tiers.elevated[0]",
+    key: "orchestrator.routing.tiers.elevated[0]",
     says: /'ultra' is not one of pi's levels/,
   },
   {
     name: "an effort the named model does not support (max on haiku)",
     tiers: { ...EXAMPLE_TIERS, mechanical: ["anthropic/claude-haiku-4-5:max"] },
-    key: "harness.routing.tiers.mechanical[0]",
+    key: "orchestrator.routing.tiers.mechanical[0]",
     says: /does not support effort 'max'/,
   },
   {
     name: "an effort the named model does not support (off on opus 5)",
     tiers: { ...EXAMPLE_TIERS, critical: ["anthropic/claude-opus-5:off"] },
-    key: "harness.routing.tiers.critical[0]",
+    key: "orchestrator.routing.tiers.critical[0]",
     says: /does not support effort 'off'/,
   },
 ];
@@ -336,17 +339,17 @@ for (const { name, tiers, key, says } of FAIL_CLOSED_CASES) {
 }
 
 test("fails closed naming the key: a personal file with no tiers when routing is enabled", () => {
-  for (const personal of [{ harness: { routing: { enabled: true } } }, { harness: { routing: { enabled: true, mode: "shadow" } } }]) {
+  for (const personal of [{ orchestrator: { routing: { enabled: true } } }, { orchestrator: { routing: { enabled: true, mode: "shadow" } } }]) {
     assert.throws(
       () => tierMapFromSettings(personal, undefined, INPUTS),
-      /personal settings key 'harness\.routing\.tiers' is missing while harness\.routing\.enabled is true/,
+      /personal settings key 'orchestrator\.routing\.tiers' is missing while orchestrator\.routing\.enabled is true/,
     );
-    assert.throws(() => loadFromFiles(personal), /'harness\.routing\.tiers' is missing/);
+    assert.throws(() => loadFromFiles(personal), /'orchestrator\.routing\.tiers' is missing/);
   }
 });
 
 test("with routing not enabled, a personal file with no tiers yields no tier map", () => {
-  for (const personal of [{}, { harness: {} }, { harness: { routing: {} } }, { harness: { routing: { enabled: false } } }]) {
+  for (const personal of [{}, { orchestrator: {} }, { orchestrator: { routing: {} } }, { orchestrator: { routing: { enabled: false } } }]) {
     assert.equal(tierMapFromSettings(personal, undefined, INPUTS), undefined);
   }
   const dirs = tempSettings();
@@ -358,18 +361,18 @@ test("with routing not enabled, a personal file with no tiers yields no tier map
 });
 
 test("with routing not enabled, personal tiers still load and are still checked", () => {
-  const personal = { harness: { routing: { enabled: false, tiers: EXAMPLE_TIERS } } };
+  const personal = { orchestrator: { routing: { enabled: false, tiers: EXAMPLE_TIERS } } };
   assert.deepEqual(rungsByTier(tierMapFromSettings(personal, undefined, INPUTS)), EXAMPLE_BY_TIER);
   assert.throws(
-    () => tierMapFromSettings({ harness: { routing: { tiers: { ...EXAMPLE_TIERS, standard: [] } } } }, undefined, INPUTS),
-    /'harness\.routing\.tiers\.standard'/,
+    () => tierMapFromSettings({ orchestrator: { routing: { tiers: { ...EXAMPLE_TIERS, standard: [] } } } }, undefined, INPUTS),
+    /'orchestrator\.routing\.tiers\.standard'/,
   );
 });
 
-test("fails closed naming the key: harness.routing.enabled that is not a boolean", () => {
+test("fails closed naming the key: orchestrator.routing.enabled that is not a boolean", () => {
   assert.throws(
-    () => tierMapFromSettings({ harness: { routing: { enabled: "true", tiers: EXAMPLE_TIERS } } }, undefined, INPUTS),
-    /personal settings key 'harness\.routing\.enabled' must be a boolean/,
+    () => tierMapFromSettings({ orchestrator: { routing: { enabled: "true", tiers: EXAMPLE_TIERS } } }, undefined, INPUTS),
+    /personal settings key 'orchestrator\.routing\.enabled' must be a boolean/,
   );
 });
 
@@ -377,7 +380,7 @@ test("fails closed naming the key: a personal file missing one of the four tiers
   const { critical: _critical, ...threeTiers } = EXAMPLE_TIERS;
   assert.throws(
     () => tierMapFromSettings(withPersonalTiers(threeTiers), undefined, INPUTS),
-    /personal settings key 'harness\.routing\.tiers\.critical' is missing/,
+    /personal settings key 'orchestrator\.routing\.tiers\.critical' is missing/,
   );
 });
 
@@ -407,7 +410,7 @@ test("personal rungs on the subagent ban list or outside the allowed-model list 
 });
 
 test("adding a ban-list name the personal map uses drops that rung and keeps routing", () => {
-  const personal = { harness: { subagentBanList: ["fable", "astra", "sonnet"], routing: { enabled: true, tiers: EXAMPLE_TIERS } } };
+  const personal = { orchestrator: { subagentBanList: ["fable", "astra", "sonnet"], routing: { enabled: true, tiers: EXAMPLE_TIERS } } };
   const map = tierMapFromSettings(personal, undefined, INPUTS);
   assert.deepEqual(rungsByTier(map), { ...EXAMPLE_BY_TIER, standard: personalRungs(["openai-codex/gpt-6-sol:medium"]) });
   assert.deepEqual(map!.drops, [
@@ -420,7 +423,7 @@ test("fails closed naming the key: a personal tier whose every rung is dropped",
     ...EXAMPLE_TIERS,
     critical: ["anthropic/claude-fable-5:max", "openai-codex/gpt-6-astra:high"],
   });
-  const expected = /personal settings key 'harness\.routing\.tiers\.critical' has every rung dropped \(subagent ban list, subagent ban list\)/;
+  const expected = /personal settings key 'orchestrator\.routing\.tiers\.critical' has every rung dropped \(subagent ban list, subagent ban list\)/;
   assert.throws(() => tierMapFromSettings(personal, undefined, INPUTS), expected);
   assert.throws(() => loadFromFiles(personal), expected);
 });
@@ -460,7 +463,7 @@ test("rungs naming a model that is not installed are dropped with reason not ins
 test("fails closed naming the key: a personal tier whose every rung is not installed", () => {
   assert.throws(
     () => tierMapFromSettings(withPersonalTiers({ ...EXAMPLE_TIERS, mechanical: ["anthropic/claude-haiku-9:low"] }), undefined, INPUTS),
-    /personal settings key 'harness\.routing\.tiers\.mechanical' has every rung dropped \(not installed\)/,
+    /personal settings key 'orchestrator\.routing\.tiers\.mechanical' has every rung dropped \(not installed\)/,
   );
 });
 
@@ -487,26 +490,26 @@ test("the installed lookup ignores case on the full id, as pi's model resolver d
   assert.throws(
     // pi's default levels include off; claude-opus-5's own map excludes it.
     () => tierMapFromSettings(examplePersonal(), projectTiers({ critical: ["ANTHROPIC/CLAUDE-OPUS-5:off"] }), INPUTS),
-    /project settings key 'harness\.routing\.tiers\.critical\[0\]'.*does not support effort 'off'/,
+    /project settings key 'orchestrator\.routing\.tiers\.critical\[0\]'.*does not support effort 'off'/,
   );
 });
 
 test("fails closed naming the key: malformed project tiers", () => {
   const cases: ReadonlyArray<{ tiers: Record<string, unknown>; expected: RegExp }> = [
-    { tiers: { standard: [] }, expected: /project settings key 'harness\.routing\.tiers\.standard'.*non-empty/ },
-    { tiers: { standard: "anthropic/claude-sonnet-5:medium" }, expected: /project settings key 'harness\.routing\.tiers\.standard'.*non-empty/ },
-    { tiers: { elevated: ["anthropic/claude-sonnet-5"] }, expected: /project settings key 'harness\.routing\.tiers\.elevated\[0\]'.*no ':effort'/ },
-    { tiers: { elevated: ["anthropic/claude-sonnet-5:ultra"] }, expected: /project settings key 'harness\.routing\.tiers\.elevated\[0\]'.*not one of pi's levels/ },
-    { tiers: { mechanical: ["anthropic/claude-haiku-4-5:max"] }, expected: /project settings key 'harness\.routing\.tiers\.mechanical\[0\]'.*does not support effort 'max'/ },
-    { tiers: { mechanical: ["claude-haiku-4-5:low"] }, expected: /project settings key 'harness\.routing\.tiers\.mechanical\[0\]'.*provider\/model/ },
+    { tiers: { standard: [] }, expected: /project settings key 'orchestrator\.routing\.tiers\.standard'.*non-empty/ },
+    { tiers: { standard: "anthropic/claude-sonnet-5:medium" }, expected: /project settings key 'orchestrator\.routing\.tiers\.standard'.*non-empty/ },
+    { tiers: { elevated: ["anthropic/claude-sonnet-5"] }, expected: /project settings key 'orchestrator\.routing\.tiers\.elevated\[0\]'.*no ':effort'/ },
+    { tiers: { elevated: ["anthropic/claude-sonnet-5:ultra"] }, expected: /project settings key 'orchestrator\.routing\.tiers\.elevated\[0\]'.*not one of pi's levels/ },
+    { tiers: { mechanical: ["anthropic/claude-haiku-4-5:max"] }, expected: /project settings key 'orchestrator\.routing\.tiers\.mechanical\[0\]'.*does not support effort 'max'/ },
+    { tiers: { mechanical: ["claude-haiku-4-5:low"] }, expected: /project settings key 'orchestrator\.routing\.tiers\.mechanical\[0\]'.*provider\/model/ },
   ];
   for (const { tiers, expected } of cases) {
     assert.throws(() => tierMapFromSettings(examplePersonal(), projectTiers(tiers), INPUTS), expected);
     assert.throws(() => loadFromFiles(examplePersonal(), projectTiers(tiers)), expected);
   }
   assert.throws(
-    () => tierMapFromSettings(examplePersonal(), { harness: { routing: { tiers: ["anthropic/claude-sonnet-5:high"] } } }, INPUTS),
-    /project settings key 'harness\.routing\.tiers' must be an object/,
+    () => tierMapFromSettings(examplePersonal(), { orchestrator: { routing: { tiers: ["anthropic/claude-sonnet-5:high"] } } }, INPUTS),
+    /project settings key 'orchestrator\.routing\.tiers' must be an object/,
   );
 });
 
@@ -546,5 +549,5 @@ test("the resolved map is a plain frozen value with per-rung origin and the full
     { tier: "elevated", origin: "project", reason: "inherited after drops" },
     { tier: "critical", rung: "openai-codex/gpt-6-astra:high", origin: "project", reason: "subagent ban list" },
   ]);
-  assert.deepEqual(map.ignoredProjectKeys, ["harness.routing.tiers.experimental"]);
+  assert.deepEqual(map.ignoredProjectKeys, ["orchestrator.routing.tiers.experimental"]);
 });

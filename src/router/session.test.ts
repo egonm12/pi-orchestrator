@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { test, type TestContext } from "node:test";
+import type { TestContext } from "node:test";
+import { liveTest as test } from "../fixtures/live.ts";
 import { createGuardedAgentDir, credentialsAvailable, liveAuthExtensionPath, realAgentDirPath } from "../fixtures/guarded-agent-dir.ts";
 import { piEvents, PROVIDER_REFUSAL } from "../fixtures/live-pi-session.ts";
 import { installPiLaunchLog, type PiLaunch } from "../fixtures/pi-launch-log.ts";
@@ -66,7 +67,7 @@ interface LiveSession {
 
 async function routerSession(t: TestContext, mode: "shadow" | "live", tierRung: string): Promise<LiveSession | undefined> {
   const liveModel = selectedLivePiModel();
-  if (liveModel !== HAIKU) { t.skip(`the router's live test is approved on ${HAIKU} only; PI_HARNESS_LIVE_MODEL selected ${liveModel}`); return undefined; }
+  if (liveModel !== HAIKU) { t.skip(`the router's live test is approved on ${HAIKU} only; PI_ORCHESTRATOR_LIVE_MODEL selected ${liveModel}`); return undefined; }
   const authExtension = liveAuthExtensionPath();
   if (!credentialsAvailable() || !authExtension) { t.skip("live credentials/auth extension unavailable"); return undefined; }
   const agent = createGuardedAgentDir({ withCredentials: true, installGuard: false });
@@ -83,7 +84,7 @@ async function routerSession(t: TestContext, mode: "shadow" | "live", tierRung: 
       defaultProjectTrust: "ask",
       quietStartup: true,
       enableInstallTelemetry: false,
-      harness: { routing: { enabled: true, mode, classifier: { model: `${HAIKU}:off`, timeoutMs: 90_000 }, tiers: allTiers(tierRung) } },
+      orchestrator: { routing: { enabled: true, mode, classifier: { model: `${HAIKU}:off`, timeoutMs: 90_000 }, tiers: allTiers(tierRung) } },
     }));
     const stateDir = join(agent.home, "state");
     const approval = grantOwnerApproval({ approvedBy: "ticket 27 live test", scope: "data-recipient", acknowledgement: "send the test task to anthropic" });
@@ -100,7 +101,7 @@ async function routerSession(t: TestContext, mode: "shadow" | "live", tierRung: 
     const run = spawnSync(
       "pi",
       ["-p", prompt, "--mode", "json", "-t", "subagent", "-e", authExtension, "-e", subagents, "--model", HAIKU, "--no-session"],
-      { cwd: repo.dir, env: agent.env({ ...launchLog.env, TMPDIR: tmp, PI_HARNESS_STATE_DIR: stateDir, PI_HARNESS_ROUTER_PROBE: "1" }), encoding: "utf8", timeout: 300_000 },
+      { cwd: repo.dir, env: agent.env({ ...launchLog.env, TMPDIR: tmp, PI_ORCHESTRATOR_STATE_DIR: stateDir, PI_ORCHESTRATOR_ROUTER_PROBE: "1" }), encoding: "utf8", timeout: 300_000 },
     );
     const output = `${run.stdout ?? ""}${run.stderr ?? ""}`;
     if (PROVIDER_REFUSAL.test(output)) {
@@ -122,7 +123,7 @@ async function routerSession(t: TestContext, mode: "shadow" | "live", tierRung: 
     t.diagnostic(`${mode}: ${classifierLine ?? "no classifier line"}`);
     for (const launch of launches) t.diagnostic(`${mode}: launch ${launch.index + 1}: ${launch.kind} turns=${launch.assistantTurns} usage=${JSON.stringify(launch.usage)}`);
     assert.equal(run.status, 0, output.slice(-2000));
-    assert.doesNotMatch(run.stderr ?? "", /harness router disabled/, output.slice(-2000));
+    assert.doesNotMatch(run.stderr ?? "", /pi-orchestrator router disabled/, output.slice(-2000));
     assert.ok(end, `no subagent tool result: ${output.slice(-2000)}`);
     assert.equal(end.isError, false, JSON.stringify(end.result?.content).slice(0, 2000));
     return { childModel: child?.model, callArgs: start?.args, records: readRoutingRecords(join(stateDir, "routing")), hookLine, launches };

@@ -73,7 +73,7 @@ import { attachVerdict, installVerdictReviewer, VERDICT_REVIEWER_AGENT, verdictF
 // pi-subagents' intercom bridge is off in the throwaway agent dir, so a child
 // has no `contact_supervisor` tool and cannot detach (SUBAGENT_CONFIG).
 //
-// With PI_HARNESS_ACCEPTANCE_TRANSCRIPT_DIR set to an existing directory,
+// With PI_ORCHESTRATOR_ACCEPTANCE_TRANSCRIPT_DIR set to an existing directory,
 // each session's stdout and stderr and the records folder are copied there
 // before the throwaway environment is removed, so a failed run can be read
 // without another one.
@@ -103,11 +103,11 @@ const PERSONAL_TIERS = {
 const FABLE_RUNG = `${FABLE}:high`;
 /** Project 1: a Fable rung for standard, dropped by the ban list, so the
  *  personal standard tier is inherited. */
-const PROJECT_WITH_FABLE = { harness: { routing: { tiers: { standard: [FABLE_RUNG] } } } };
+const PROJECT_WITH_FABLE = { orchestrator: { routing: { tiers: { standard: [FABLE_RUNG] } } } };
 const EMPTIED_CRITICAL = [`${LUNA}:high`, `${SOL}:high`];
 /** Project 2: critical replaced by Codex rungs only, both removed by the
  *  simulated out-of-usage, so the top tier is empty at route time. */
-const PROJECT_EMPTIED_CRITICAL = { harness: { routing: { tiers: { critical: EMPTIED_CRITICAL } } } };
+const PROJECT_EMPTIED_CRITICAL = { orchestrator: { routing: { tiers: { critical: EMPTIED_CRITICAL } } } };
 
 /** A worker with no model: the router routes it, and without a written rung
  *  pi's resolution is the session model with this `thinking: off`. The name
@@ -448,7 +448,7 @@ function describeDecision(record: RoutingRecord | undefined): string {
 
 test(`routing acceptance gate on ${HAIKU}: six routed dispatches with verdicts, project override, out of usage, emptied top tier, shadow then live, banned model, report`, async (t: TestContext) => {
   const liveModel = selectedLivePiModel();
-  if (liveModel !== HAIKU) return t.skip(`the routing acceptance runs on ${HAIKU} only; PI_HARNESS_LIVE_MODEL selected ${liveModel}`);
+  if (liveModel !== HAIKU) return t.skip(`the routing acceptance runs on ${HAIKU} only; PI_ORCHESTRATOR_LIVE_MODEL selected ${liveModel}`);
   const authExtension = liveAuthExtensionPath();
   if (!credentialsAvailable() || !authExtension) return t.skip("live credentials/auth extension unavailable");
 
@@ -488,7 +488,7 @@ test(`routing acceptance gate on ${HAIKU}: six routed dispatches with verdicts, 
       defaultProjectTrust: "ask",
       quietStartup: true,
       enableInstallTelemetry: false,
-      harness: {
+      orchestrator: {
         subagentBanList: ["fable", "astra"],
         sessionBanList: ["gpt-6-astra"],
         routing: { enabled: true, mode, classifier: { model: CLASSIFIER_RUNG, timeoutMs: 120_000, fallback: [] }, tiers: PERSONAL_TIERS },
@@ -531,7 +531,7 @@ test(`routing acceptance gate on ${HAIKU}: six routed dispatches with verdicts, 
         ["-p", parentPrompt(calls), "--mode", "json", "-t", "subagent", "-e", authExtension, "-e", subagents, "--model", HAIKU, "--thinking", "off", "--no-session"],
         {
           cwd,
-          env: agent.env({ ...launches.env, TMPDIR: tmp, PI_HARNESS_STATE_DIR: stateDir, PI_HARNESS_ROUTER_PROBE: "1", PI_HARNESS_GUARD_PROBE: "1" }),
+          env: agent.env({ ...launches.env, TMPDIR: tmp, PI_ORCHESTRATOR_STATE_DIR: stateDir, PI_ORCHESTRATOR_ROUTER_PROBE: "1", PI_ORCHESTRATOR_GUARD_PROBE: "1" }),
           encoding: "utf8",
           timeout: timeoutMs,
           // The JSON event stream of a six-call session is several MB.
@@ -569,7 +569,7 @@ test(`routing acceptance gate on ${HAIKU}: six routed dispatches with verdicts, 
         { agent: WORKER_AGENT, task: BANNED_TASK, model: FABLE, context: "fresh", async: false },
       ], SESSION_TIMEOUTS_MS.emptied),
     ]);
-    const transcripts = process.env.PI_HARNESS_ACCEPTANCE_TRANSCRIPT_DIR;
+    const transcripts = process.env.PI_ORCHESTRATOR_ACCEPTANCE_TRANSCRIPT_DIR;
     if (transcripts) {
       for (const [index, session] of sessions.entries()) {
         writeFileSync(join(transcripts, `session-${index + 1}.stdout.jsonl`), session.stdout);
@@ -634,7 +634,7 @@ test(`routing acceptance gate on ${HAIKU}: six routed dispatches with verdicts, 
         assert.match(session.stderr, new RegExp(`${GUARD_PREFIX} loaded`), session.label);
         assert.match(session.stderr, new RegExp(`${ROUTER_PREFIX} loaded`), session.label);
         assert.doesNotMatch(session.stderr, new RegExp(ROUTER_DISABLED_PREFIX), `${session.label}: ${session.stderr.slice(-2000)}`);
-        assert.doesNotMatch(session.stderr, /harness guard disabled:/, `${session.label}: ${session.stderr.slice(-2000)}`);
+        assert.doesNotMatch(session.stderr, /pi-orchestrator guard disabled:/, `${session.label}: ${session.stderr.slice(-2000)}`);
         assert.match(session.stderr, /subagent ban list: fable, astra; session ban list: gpt-6-astra/, session.label);
       }
       for (const launch of logged.filter((l) => l.kind === "parent")) {

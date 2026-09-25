@@ -1,6 +1,6 @@
+import { OWNER_BAN_LIST_SETTINGS, OWNER_BAN_LISTS } from "./owner-ban-lists.ts";
 import { newTaskLedger, TaskAllowanceOwner } from "../budget/task-allowance.ts";
 import { buildCatalog } from "../catalog/model-catalog.ts";
-import { DEFAULT_BAN_LISTS } from "../policy/ban-lists.ts";
 import { HARNESS_MODEL_SCOPE } from "../policy/model-resolution.ts";
 import { authorizeRecipient, emptyAuthorization, grantOwnerApproval } from "../recipients/authorization.ts";
 import { NO_BUDGET_CONSTRAINT } from "../recipients/authorized-dispatch.ts";
@@ -32,14 +32,14 @@ export const FIXTURE_TIERS = {
 /** Personal settings with the fixture map. Extra top-level keys (a token, say)
  *  can be merged in by a test. */
 export function fixturePersonalSettings(extra: Record<string, unknown> = {}): Record<string, unknown> {
-  return { harness: { routing: { enabled: true, tiers: FIXTURE_TIERS } }, ...extra };
+  return { orchestrator: { ...OWNER_BAN_LIST_SETTINGS, routing: { enabled: true, tiers: FIXTURE_TIERS } }, ...extra };
 }
 
 /** A project override that replaces `elevated`, drops a banned rung and
  *  carries one key a project may not set, so origin, drops and ignored keys
  *  are all non-empty. */
 export const FIXTURE_PROJECT_SETTINGS = {
-  harness: {
+  orchestrator: {
     subagentBanList: [],
     routing: { tiers: { elevated: ["anthropic/claude-fable-5:high", `${OPUS}:high`] } },
   },
@@ -49,7 +49,7 @@ export function fixtureTierMap(personal: unknown = fixturePersonalSettings(), pr
   const map = tierMapFromSettings(personal, project, {
     installedModels: INSTALLED_MODEL_INFO,
     modelScope: HARNESS_MODEL_SCOPE,
-    banLists: DEFAULT_BAN_LISTS,
+    banLists: OWNER_BAN_LISTS,
   });
   if (!map) throw new Error("fixture tier map did not resolve");
   return map;
@@ -120,7 +120,7 @@ export function fixtureRoute(
       estimatedPromptTokens: 20_000,
       allowance: NO_BUDGET_CONSTRAINT,
       authorization: authorizedFor(["anthropic", "openai-codex"]),
-      banLists: DEFAULT_BAN_LISTS,
+      banLists: OWNER_BAN_LISTS,
       modelScope: HARNESS_MODEL_SCOPE,
     },
   });

@@ -3,7 +3,7 @@ import { newTaskLedger, TaskAllowanceOwner } from "../budget/task-allowance.ts";
 import { buildCatalog } from "../catalog/model-catalog.ts";
 import { sessionClassifierModelCall } from "../routing/session-classifier-call.ts";
 import { classifyTier, loadClassifierChain } from "../routing/tier-classifier.ts";
-import type { ExtensionAPI } from "../types/pi-extension.ts";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 // Test-only pi extension for the classifier's live check (ADR 0004). At session
 // start it classifies the cases named in PI_ORCHESTRATOR_CLASSIFIER_CASES
