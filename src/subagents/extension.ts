@@ -3,6 +3,7 @@ import type { ExtensionAPI, InlineExtension } from "@earendil-works/pi-coding-ag
 import { banListsFromSettings, personalAgentDir, personalOrchestrator, readSettingsFile, subagentBanListEntry } from "../policy/ban-lists.ts";
 import { THINKING_LEVELS, splitKnownThinkingSuffix, type ThinkingLevel } from "../models/model-info.ts";
 import { agentDefinitionDirs, agentDefinitionListing, loadAgentDefinitions, resolveAgent } from "./agent-definitions.ts";
+import { renderSubagentsCall, renderSubagentsResult } from "./render.ts";
 import { runWorker, SUBAGENTS_TOOL, type WorkerResult } from "./worker.ts";
 
 // The subagents extension (ADR 0007): a third pi extension, separate from the
@@ -10,7 +11,8 @@ import { runWorker, SUBAGENTS_TOOL, type WorkerResult } from "./worker.ts";
 // this pi process, normally on the auto model `orchestrator/auto`, and the
 // router extension routes it. A call queues up to eight tasks. A task may name an
 // agent definition, which gives the worker its instructions and narrows its
-// tools.
+// tools. While the call runs, partial updates show each item queued, running
+// with its worker's current tool, or finished (render.ts draws them).
 
 type ToolParameters = Parameters<ExtensionAPI["registerTool"]>[0]["parameters"];
 
@@ -48,10 +50,18 @@ interface SubagentItem {
   readonly agent?: string;
 }
 
+/** The model a worker ran on when its agent definition named one and the
+ *  model was preserved, not routed (ADR 0007), and whether the subagent ban
+ *  list's exception let it run. Absent for a routed worker. */
+interface PreservedModel {
+  readonly model?: string;
+  readonly banListException?: boolean;
+}
+
 /** An item's result. Only a started worker has a session id: an item whose
  *  agent is unknown fails before a worker starts, and an item still queued at
  *  abort is not started. */
-export type SubagentResult =
+export type SubagentResult = PreservedModel & (
   | (SubagentItem & WorkerResult)
   | (SubagentItem & {
     readonly status: "failed";
@@ -66,11 +76,24 @@ export type SubagentResult =
     readonly sessionFile?: never;
     readonly finalText: "";
     readonly error?: never;
-  });
+  }));
 
 /** The tool result's `details`. */
 export interface SubagentsDetails {
   readonly results: readonly SubagentResult[];
+}
+
+/** An item while its call runs: queued, running (with the tool its worker is
+ *  in, if any), or finished with its result. */
+export type SubagentProgress =
+  | (SubagentItem & { readonly status: "queued" })
+  | (SubagentItem & PreservedModel & { readonly status: "running"; readonly tool?: string })
+  | SubagentResult;
+
+/** A partial result's `details`, sent through `onUpdate` while the call runs.
+ *  The final `details` is a `SubagentsDetails`, which is one of these too. */
+export interface SubagentsProgressDetails {
+  readonly results: readonly SubagentProgress[];
 }
 
 function resultText(result: SubagentResult): string {
@@ -139,7 +162,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
       label: "Subagents",
       description,
       parameters: PARAMETERS,
-      async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      async execute(_toolCallId, params, signal, onUpdate, ctx) {
         const { items } = params as { items: SubagentItem[] };
         if (!Array.isArray(items) || items.length < 1 || items.length > 8) throw new Error("subagents requires 1 to 8 items per call");
         const agentDir = personalAgentDir();
@@ -148,6 +171,17 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
         const definitions = loadAgentDefinitions(agentDefinitionDirs(agentDir, ctx.cwd));
         const orchestratorTools = pi.getActiveTools();
         const results: SubagentResult[] = new Array(items.length);
+        const progress: SubagentProgress[] = items.map(({ task, agent }) => ({ task, ...(agent === undefined ? {} : { agent }), status: "queued" }));
+        const sendProgress = () => {
+          const done = progress.filter((item) => item.status !== "queued" && item.status !== "running").length;
+          const update: SubagentsProgressDetails = { results: [...progress] };
+          onUpdate?.({ content: [{ type: "text", text: `${done}/${items.length} workers done` }], details: update });
+        };
+        const showProgress = (index: number, state: SubagentProgress) => {
+          progress[index] = state;
+          sendProgress();
+        };
+        sendProgress();
         let next = 0;
         const runQueue = async () => {
           while (next < items.length) {
@@ -158,6 +192,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
             const resolution = resolveAgent(agent, definitions, orchestratorTools);
             if (!resolution.ok) {
               results[index] = { ...item, status: "failed", finalText: "", error: resolution.error };
+              showProgress(index, results[index]);
               continue;
             }
             const definition = resolution.definition;
@@ -176,26 +211,33 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               const [provider, ...parts] = baseModel.split("/");
               if (!provider || parts.length !== 1 || !parts[0]) {
                 results[index] = { ...item, status: "failed", finalText: "", error: `agent ${definition.name} must name a provider/model` };
+                showProgress(index, results[index]);
                 continue;
               }
               const banned = subagentBanListEntry(baseModel, { subagentBanList: modelSettings.banned, sessionBanList: [] });
               if (banned) {
                 results[index] = { ...item, status: "failed", finalText: "", error: `agent ${definition.name} model ${baseModel} is on the subagent ban list (entry '${banned}')` };
+                showProgress(index, results[index]);
                 continue;
               }
               const effort = definition.thinking ?? (thinkingSuffix ? thinkingSuffix.slice(1) : undefined);
               if (effort !== undefined && !THINKING_LEVELS.includes(effort as ThinkingLevel)) {
                 results[index] = { ...item, status: "failed", finalText: "", error: `agent ${definition.name} has invalid thinking level ${effort}` };
+                showProgress(index, results[index]);
                 continue;
               }
               namedModel = { model: baseModel, ...(effort === undefined ? {} : { effort: effort as ThinkingLevel }), agent: definition.name, definitionFile: definition.file };
             }
+            const preservedModel = namedModel === undefined ? {} : { model: namedModel.model };
+            showProgress(index, { ...item, ...preservedModel, status: "running" });
             const worker = await runWorker({
               task, cwd: ctx.cwd, agentDir, orchestratorSession: ctx.sessionManager, signal,
               extensionFactories: deps.workerExtensions, instructions: resolution.instructions, tools: resolution.tools,
               ...(namedModel === undefined ? {} : { namedModel }),
+              onTool: (tool) => showProgress(index, { ...item, ...preservedModel, status: "running", ...(tool === undefined ? {} : { tool }) }),
             });
-            results[index] = { ...item, ...worker, finalText: cutText(worker.finalText, worker.sessionFile) };
+            results[index] = { ...item, ...preservedModel, ...worker, finalText: cutText(worker.finalText, worker.sessionFile) };
+            showProgress(index, results[index]);
           }
         };
         await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => runQueue()));
@@ -206,6 +248,8 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
         const details: SubagentsDetails = { results };
         return { content: [{ type: "text", text: results.map(resultText).join("\n\n") }], details };
       },
+      renderCall: (args, theme) => renderSubagentsCall(args, theme),
+      renderResult: (result, options, theme) => renderSubagentsResult(result, options, theme),
     });
     // Registered at load, so a worker's extension set can leave this extension
     // out by its tool. The listing of agent definitions follows at session start,

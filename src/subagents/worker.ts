@@ -57,6 +57,9 @@ export interface WorkerSetup {
   readonly tools?: readonly string[];
   /** A preserved agent definition names a real model, so the auto router is bypassed. */
   readonly namedModel?: { readonly model: string; readonly effort?: ThinkingLevel; readonly agent: string; readonly definitionFile: string };
+  /** Called with a tool's name when the worker starts running it, and with
+   *  the name of a tool still running, or `undefined`, when one ends. */
+  readonly onTool?: (tool: string | undefined) => void;
 }
 
 /** Where a worker's session is saved: below the orchestrator's session
@@ -134,6 +137,13 @@ export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
   }
 
   const abort = () => { void session.abort(); };
+  const runningTools = new Map<string, string>();
+  const unsubscribe = session.subscribe((event) => {
+    if (event.type === "tool_execution_start") runningTools.set(event.toolCallId, event.toolName);
+    else if (event.type === "tool_execution_end") runningTools.delete(event.toolCallId);
+    else return;
+    setup.onTool?.([...runningTools.values()].at(-1));
+  });
   try {
     // Binding starts the extensions: the router extension reads its settings
     // at session_start.
@@ -152,6 +162,7 @@ export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
     return failed(errorText(error));
   } finally {
     setup.signal?.removeEventListener("abort", abort);
+    unsubscribe();
     session.dispose();
   }
 }

@@ -11,7 +11,7 @@ import { authorizeRecipient, emptyAuthorization, grantOwnerApproval } from "../r
 import { readRoutingRecords } from "../routing/decision-record.ts";
 import { autoStream } from "../router/auto-stream.ts";
 import { createRouterExtension } from "../router/extension.ts";
-import { createSubagentsExtension, MAX_TEXT_BYTES, type SubagentsDetails } from "./extension.ts";
+import { createSubagentsExtension, MAX_TEXT_BYTES, type SubagentsDetails, type SubagentsProgressDetails } from "./extension.ts";
 
 // The subagents extension as pi loads it. A fake ExtensionAPI records the
 // registered tool; a test calls its `execute` as pi does. The worker is a real
@@ -472,6 +472,7 @@ test("route mode ignores a definition's model and thinking and warns once per se
     const second = await callSubagents(tool, ctx, "Second task", "scout");
     assert.equal(first.worker.status, "completed", JSON.stringify(first.worker));
     assert.equal(second.worker.status, "completed", JSON.stringify(second.worker));
+    assert.equal(first.worker.model, undefined, "routed workers do not report a preserved model");
     assert.equal(warnings.length, 1, JSON.stringify(warnings));
     assert.match(warnings[0]!, /model.*thinking.*ignored/i);
     assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")).map((record) => record.recordType), ["decision", "decision"]);
@@ -490,6 +491,8 @@ test("preserve mode uses the named model and effort without routing and records 
     const tool = loadSubagentsTool([routerExtension(), provider.extension]);
     const { worker } = await callSubagents(tool, orchestrator(h).ctx, "Find files", "scout");
     assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.equal(worker.model, HAIKU, "the result details expose the preserved provider/model to the renderer");
+    assert.equal(worker.banListException, undefined);
     assert.deepEqual(sessionLines(worker.sessionFile!).filter((line) => line.type === "model_change").map((line) => `${line.provider}/${line.modelId}`), [HAIKU]);
     assert.equal(provider.requests[0]?.thinkingLevel, "high");
     const records = readRoutingRecords(join(h.stateDir, "routing"));
@@ -590,5 +593,54 @@ test("an unknown agent fails only its own item, and the call's other items still
     assert.equal(provider.requests.length, 2, "only the two resolvable items start workers");
     const text = result.content.map((part) => part.type === "text" ? part.text : "").join("");
     assert.ok(text.includes(details.results[1]!.error!), text);
+  } finally { h.cleanup(); }
+});
+
+/** A fake `anthropic` provider whose worker first calls the probe tool, then
+ *  replies "done" once the tool's result is in its context. */
+function probeCallingAnthropic(): InlineExtension {
+  const config: ProviderConfig = {
+    name: "Fake Anthropic", baseUrl: "http://localhost/unused", apiKey: "unused", api: "fake-anthropic" as never,
+    models: [{ id: "claude-haiku-4-5", name: "Claude Haiku 4.5", reasoning: true, input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200_000, maxTokens: 64_000 }],
+    streamSimple(model, context) {
+      const probed = context.messages.some((message) => message.role === "toolResult");
+      const { stream, push, end } = autoStream();
+      const message = {
+        role: "assistant", api: model.api, provider: model.provider, model: model.id,
+        content: probed ? [{ type: "text", text: "done" }] : [{ type: "toolCall", id: "probe-1", name: "probe", arguments: {} }],
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+        stopReason: probed ? "stop" : "toolUse", timestamp: Date.now(),
+      };
+      push({ type: "start", partial: { ...message, content: [] } } as never);
+      push({ type: "done", reason: message.stopReason, message } as never);
+      end({ api: model.api, provider: model.provider, model: model.id });
+      return stream;
+    },
+  };
+  return { name: "fake-anthropic", factory: (pi) => pi.registerProvider("anthropic", config) };
+}
+
+test("while a call runs, partial updates show each item queued, running with its worker's current tool, then finished", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { maxParallel: 1 } } });
+  try {
+    const tool = loadSubagentsTool([routerExtension(), probeCallingAnthropic(), PROBE_TOOL_EXTENSION]);
+    const updates: SubagentsProgressDetails[] = [];
+    const items = [{ task: "Probe once" }, { task: "Probe again", agent: "reviewr" }, { task: "Probe last" }];
+    const result = await tool.execute("call-1", { items } as never, undefined,
+      (update) => { updates.push(update.details as SubagentsProgressDetails); }, orchestrator(h).ctx);
+    const final = result.details as SubagentsDetails;
+    assert.deepEqual(final.results.map((item) => item.status), ["completed", "failed", "completed"], JSON.stringify(final.results));
+
+    const states = updates.map((update) => update.results.map((item) =>
+      item.status === "running" && item.tool !== undefined ? `running: ${item.tool}` : item.status).join(", "));
+    assert.equal(states[0], "queued, queued, queued", "the first update shows every item queued");
+    const seen = (state: string) => assert.ok(states.includes(state), `${state} in ${JSON.stringify(states, null, 1)}`);
+    seen("running, queued, queued");
+    seen("running: probe, queued, queued");
+    seen("completed, failed, running: probe");
+    assert.equal(states.at(-1), "completed, failed, completed");
+    assert.ok(updates.every((update) => update.results.map((item) => item.task).join() === items.map((item) => item.task).join()), "updates keep item order");
+    assert.equal(updates.at(-1)?.results[1]?.agent, "reviewr");
   } finally { h.cleanup(); }
 });
