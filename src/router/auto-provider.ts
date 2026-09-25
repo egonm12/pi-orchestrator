@@ -1,11 +1,11 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { appendRoutingRecord, buildDecisionRecord } from "../routing/decision-record.ts";
+import { appendRoutingRecord, buildDecisionRecord, readRoutingRecords, RoutingRecordError, type DecisionRecord } from "../routing/decision-record.ts";
 import { splitKnownThinkingSuffix } from "../models/model-info.ts";
 import { subagentBanListEntry, type BanLists } from "../policy/ban-lists.ts";
 import { streamReasoning } from "../routing/session-classifier-call.ts";
 import { autoStream } from "./auto-stream.ts";
 import { ROUTER_PREFIX } from "./prefix.ts";
-import { routeTask, type ActiveRouter } from "./route-task.ts";
+import { recordedRungPassesHardFilters, routeTask, type ActiveRouter } from "./route-task.ts";
 
 type ProviderConfig = NonNullable<Parameters<ExtensionAPI["registerProvider"]>[1]>;
 
@@ -23,6 +23,16 @@ function contentText(content: string | readonly { type: string; text?: string }[
 }
 
 type Context = Parameters<NonNullable<ProviderConfig["streamSimple"]>>[1];
+
+function latestDecision(dir: string, sessionId: string): DecisionRecord | undefined {
+  try {
+    return readRoutingRecords(dir).filter((record): record is DecisionRecord =>
+      record.recordType === "decision" && record.delegationId === sessionId).at(-1);
+  } catch (error) {
+    if (error instanceof RoutingRecordError) return undefined;
+    throw error;
+  }
+}
 
 function firstTaskAndRole(context: Context): { taskText: string; agentRole: string } {
   const messages = context.messages;
@@ -79,15 +89,22 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
               try {
                 const at = deps.now();
                 const { taskText, agentRole } = firstTaskAndRole(context);
-                const { classification, route } = await routeTask(router, taskText, agentRole, at);
-                pin = router.mode === "shadow" || !route.ok
-                  ? sessionPin(router.banLists)
-                  : { model: route.rung.model, effort: route.rung.effort };
-                const ranOn = `${pin.model}:${pin.effort}`;
-                const common = { delegationId: sessionId, at, taskText, agentRole, classification, tierMap: router.tierMap, route, ranOn };
-                appendRoutingRecord(router.recordDir, buildDecisionRecord(router.mode === "shadow"
-                  ? { ...common, mode: "shadow", handPickedModel: pin.model }
-                  : { ...common, mode: "live" }));
+                const latest = router.mode === "live" ? latestDecision(router.recordDir, sessionId) : undefined;
+                if (latest?.mode === "live" && latest.route.outcome === "chosen" &&
+                  (latest.ranOn === undefined || latest.ranOn === `${latest.route.rung.model}:${latest.route.rung.effort}`) &&
+                  recordedRungPassesHardFilters(router, latest.route.rung, taskText, at)) {
+                  pin = { model: latest.route.rung.model, effort: latest.route.rung.effort };
+                } else {
+                  const { classification, route } = await routeTask(router, taskText, agentRole, at);
+                  pin = router.mode === "shadow" || !route.ok
+                    ? sessionPin(router.banLists)
+                    : { model: route.rung.model, effort: route.rung.effort };
+                  const ranOn = `${pin.model}:${pin.effort}`;
+                  const common = { delegationId: sessionId, at, taskText, agentRole, classification, tierMap: router.tierMap, route, ranOn };
+                  appendRoutingRecord(router.recordDir, buildDecisionRecord(router.mode === "shadow"
+                    ? { ...common, mode: "shadow", handPickedModel: pin.model }
+                    : { ...common, mode: "live" }));
+                }
               } catch (error) {
                 // An unavailable or banned session model is a refusal, not a router bug.
                 if (error instanceof SessionModelError) throw error;

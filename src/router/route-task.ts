@@ -2,8 +2,8 @@ import { allowanceConstraint, type TaskAllowanceOwner } from "../budget/task-all
 import type { ModelInfo } from "../models/model-info.ts";
 import type { BanLists } from "../policy/ban-lists.ts";
 import { classifyTier, type ClassifierModelCall, type LoadedClassifierChain } from "../routing/tier-classifier.ts";
-import type { ResolvedTierMap } from "../routing/tier-map.ts";
-import { routeTier } from "../routing/tier-router.ts";
+import type { ResolvedTierMap, TierRung } from "../routing/tier-map.ts";
+import { failedHardFilter, routeTier, type RouterEvidence } from "../routing/tier-router.ts";
 import { deriveProviderUsage, type RoutingEvidenceSource } from "./evidence.ts";
 import type { RoutingMode } from "../routing/decision-record.ts";
 
@@ -35,17 +35,25 @@ function namedPaths(taskText: string): string[] {
   return paths;
 }
 
+function hardFilterEvidence(router: ActiveRouter, taskText: string, at: Date, evidence: ReturnType<RoutingEvidenceSource>): RouterEvidence {
+  const estimatedPromptTokens = Buffer.byteLength(taskText, "utf8");
+  return {
+    providerUsage: deriveProviderUsage(evidence, at), catalog: evidence.catalog, estimatedPromptTokens,
+    allowance: allowanceConstraint(router.owner, evidence.catalog, { role: "subtask", maxInputTokens: estimatedPromptTokens }),
+    authorization: evidence.authorization, banLists: router.banLists,
+  };
+}
+
+export function recordedRungPassesHardFilters(router: ActiveRouter, rung: Pick<TierRung, "model">, taskText: string, at: Date): boolean {
+  return failedHardFilter(rung, hardFilterEvidence(router, taskText, at, router.evidence())) === undefined;
+}
+
 export async function routeTask(router: ActiveRouter, taskText: string, agentRole: string, at: Date) {
   const evidence = router.evidence();
   const classification = await classifyTier(
     { task: taskText, role: agentRole, paths: namedPaths(taskText) },
     { chain: router.chain, callModel: router.callModel, allowance: { owner: router.owner, catalog: evidence.catalog } },
   );
-  const estimatedPromptTokens = Buffer.byteLength(taskText, "utf8");
-  const route = routeTier({ tier: classification.tier, tierMap: router.tierMap, evidence: {
-    providerUsage: deriveProviderUsage(evidence, at), catalog: evidence.catalog, estimatedPromptTokens,
-    allowance: allowanceConstraint(router.owner, evidence.catalog, { role: "subtask", maxInputTokens: estimatedPromptTokens }),
-    authorization: evidence.authorization, banLists: router.banLists,
-  } });
+  const route = routeTier({ tier: classification.tier, tierMap: router.tierMap, evidence: hardFilterEvidence(router, taskText, at, evidence) });
   return { classification, route };
 }

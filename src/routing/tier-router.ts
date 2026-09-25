@@ -124,7 +124,7 @@ interface Removal {
   readonly detail: string;
 }
 
-export function failedHardFilter(rung: TierRung, evidence: RouterEvidence): Removal | undefined {
+export function failedHardFilter(rung: Pick<TierRung, "model">, evidence: RouterEvidence): Removal | undefined {
   const { model } = rung;
   if (isProhibitedModel(model, evidence.banLists)) {
     return { reason: "subagent ban list", detail: subagentBanListReason(model, evidence.banLists) };

@@ -1239,6 +1239,185 @@ test("later requests keep the session pin without classifying again", async () =
   } finally { h.cleanup(); }
 });
 
+test("shadow mode classifies rather than restoring an earlier live pin", async () => {
+  const h = harness(LIVE);
+  try {
+    const messages = [{ role: "user", content: "Fix README.md", timestamp: 0 }];
+    await autoEvents(await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("live") }])), messages, "mode-changed-worker");
+    writeFileSync(join(h.agentDir, "settings.json"), JSON.stringify({ orchestrator: { routing: SHADOW } }));
+    const classifier = answering("standard");
+    const registry = fakeSessionRegistry([{ events: answerEvents("shadow") }]);
+    const stream = await loadAutoProvider(h, registry, { classifierCall: () => classifier.call });
+    process.env.PI_ORCHESTRATOR_SESSION_MODEL = "anthropic/claude-sonnet-5:high";
+    assert.equal((await autoEvents(stream, messages, "mode-changed-worker")).at(-1)?.type, "done");
+    assert.equal(classifier.prompts.length, 1);
+    assert.equal(registry.calls[0]?.model.id, "claude-sonnet-5");
+    assert.deepEqual(h.records().map((record) => record.recordType === "decision" && record.mode), ["live", "shadow"]);
+  } finally { h.cleanup(); }
+});
+
+test("a resumed worker reuses its recorded rung without classifying or writing a record", async () => {
+  const h = harness(LIVE);
+  try {
+    const first = await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("first") }]));
+    const messages = [{ role: "user", content: "Fix README.md", timestamp: 0 }];
+    await autoEvents(first, messages, "resumed-worker");
+    const classifier = answering("standard");
+    const registry = fakeSessionRegistry([{ events: answerEvents("resumed") }]);
+    const resumed = await loadAutoProvider(h, registry, { classifierCall: () => classifier.call });
+    await autoEvents(resumed, messages, "resumed-worker");
+    assert.equal(registry.calls[0]?.model.id, "claude-haiku-4-5");
+    assert.equal(registry.calls[0]?.options?.reasoning, "low");
+    assert.equal(classifier.prompts.length, 0);
+    assert.equal(h.records().length, 1);
+  } finally { h.cleanup(); }
+});
+
+test("a resumed worker reuses a rung written in settings with different case", async () => {
+  const mixedCase = { ...TEST_TIERS, mechanical: ["Anthropic/Claude-Haiku-4-5:low", "openai-codex/gpt-6-luna:low"] };
+  const h = harness({ ...LIVE, tiers: mixedCase });
+  try {
+    const first = await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("first") }]));
+    const messages = [{ role: "user", content: "Fix README.md", timestamp: 0 }];
+    await autoEvents(first, messages, "mixed-case-worker");
+    const classifier = answering("standard");
+    const registry = fakeSessionRegistry([{ events: answerEvents("resumed") }]);
+    const resumed = await loadAutoProvider(h, registry, { classifierCall: () => classifier.call });
+    await autoEvents(resumed, messages, "mixed-case-worker");
+    assert.equal(registry.calls[0]?.model.id, "claude-haiku-4-5");
+    assert.equal(classifier.prompts.length, 0);
+    assert.equal(h.records().length, 1);
+  } finally { h.cleanup(); }
+});
+
+test("a damaged decision-record day file does not stop a new worker from classifying", async () => {
+  const h = harness(LIVE);
+  try {
+    const folder = join(h.stateDir, "routing");
+    mkdirSync(folder, { recursive: true });
+    writeFileSync(join(folder, "2026-09-25.jsonl"), "{broken json\n");
+    const classifier = answering("standard");
+    const registry = fakeSessionRegistry([{ events: answerEvents("classified") }]);
+    const stream = await loadAutoProvider(h, registry, { classifierCall: () => classifier.call });
+    const events = await autoEvents(stream, [{ role: "user", content: "Add a retry option", timestamp: 0 }], "damaged-record-worker");
+    assert.equal(events.at(-1)?.type, "done");
+    assert.equal(classifier.prompts.length, 1);
+    assert.equal(registry.calls[0]?.model.id, "claude-sonnet-5");
+    const file = join(folder, "2026-09-26.jsonl");
+    const record = JSON.parse(readFileSync(file, "utf8")) as { delegationId: string };
+    assert.equal(record.delegationId, "damaged-record-worker");
+  } finally { h.cleanup(); }
+});
+
+test("a resumed worker accepts a legacy /2 decision record", async () => {
+  const h = harness(LIVE);
+  try {
+    const messages = [{ role: "user", content: "Fix README.md", timestamp: 0 }];
+    await autoEvents(await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("first") }])), messages, "legacy-worker");
+    const file = join(h.stateDir, "routing", "2026-09-26.jsonl");
+    const record = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    record.schemaVersion = "decision-record/2";
+    delete record.ranOn;
+    writeFileSync(file, `${JSON.stringify(record)}\n`);
+    const classifier = answering("standard");
+    const registry = fakeSessionRegistry([{ events: answerEvents("resumed") }]);
+    await autoEvents(await loadAutoProvider(h, registry, { classifierCall: () => classifier.call }), messages, "legacy-worker");
+    assert.equal(registry.calls[0]?.model.id, "claude-haiku-4-5");
+    assert.equal(classifier.prompts.length, 0);
+    assert.equal(h.records().length, 1);
+  } finally { h.cleanup(); }
+});
+
+test("a shadow decision cannot pin a resumed worker to its hypothetical rung", async () => {
+  const h = harness(LIVE);
+  try {
+    const messages = [{ role: "user", content: "Fix README.md", timestamp: 0 }];
+    await autoEvents(await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("first") }])), messages, "shadow-worker");
+    const file = join(h.stateDir, "routing", "2026-09-26.jsonl");
+    const record = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    record.mode = "shadow";
+    record.ranOn = HAIKU;
+    record.handPickedModel = HAIKU;
+    writeFileSync(file, `${JSON.stringify(record)}\n`);
+    assert.equal(h.records()[0]?.recordType, "decision", "the shadow fixture must be readable");
+    const classifier = answering("standard");
+    const registry = fakeSessionRegistry([{ events: answerEvents("resumed") }]);
+    await autoEvents(await loadAutoProvider(h, registry, { classifierCall: () => classifier.call }), messages, "shadow-worker");
+    assert.equal(classifier.prompts.length, 1);
+    assert.equal(registry.calls[0]?.model.id, "claude-sonnet-5");
+    assert.equal(h.records().length, 2);
+  } finally { h.cleanup(); }
+});
+
+test("a live decision whose ranOn differs from its rung cannot restore a pin", async () => {
+  const h = harness(LIVE);
+  try {
+    const messages = [{ role: "user", content: "Fix README.md", timestamp: 0 }];
+    await autoEvents(await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("first") }])), messages, "fallback-worker");
+    const file = join(h.stateDir, "routing", "2026-09-26.jsonl");
+    const record = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    record.ranOn = HAIKU;
+    writeFileSync(file, `${JSON.stringify(record)}\n`);
+    assert.equal(h.records()[0]?.recordType, "decision", "the fallback fixture must be readable");
+    const classifier = answering("standard");
+    const registry = fakeSessionRegistry([{ events: answerEvents("resumed") }]);
+    await autoEvents(await loadAutoProvider(h, registry, { classifierCall: () => classifier.call }), messages, "fallback-worker");
+    assert.equal(classifier.prompts.length, 1);
+    assert.equal(registry.calls[0]?.model.id, "claude-sonnet-5");
+    assert.equal(h.records().length, 2);
+  } finally { h.cleanup(); }
+});
+
+test("a resumed worker whose rung fails a hard filter is classified and recorded again", async () => {
+  const h = harness(LIVE);
+  try {
+    const messages = [{ role: "user", content: "Fix README.md", timestamp: 0 }];
+    const first = await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("first") }]));
+    await autoEvents(first, messages, "filtered-worker");
+    const classifier = answering("standard");
+    const registry = fakeSessionRegistry([{ events: answerEvents("new rung") }]);
+    const resumed = await loadAutoProvider(h, registry, {
+      classifierCall: () => classifier.call,
+      evidence: () => () => evidenceOf({ authorization: approved("openai-codex") }),
+    });
+    await autoEvents(resumed, messages, "filtered-worker");
+    assert.equal(classifier.prompts.length, 1);
+    assert.equal(registry.calls[0]?.model.id, "gpt-6-sol");
+    assert.deepEqual(h.records().map((record) => record.recordType === "decision" && record.route.outcome === "chosen" && record.route.rung.rung),
+      [`${HAIKU}:low`, "openai-codex/gpt-6-sol:medium"]);
+  } finally { h.cleanup(); }
+});
+
+test("a worker without a recorded decision is classified as a first request", async () => {
+  const h = harness(LIVE);
+  try {
+    const classifier = answering("standard");
+    const registry = fakeSessionRegistry([{ events: answerEvents("first") }]);
+    const stream = await loadAutoProvider(h, registry, { classifierCall: () => classifier.call });
+    await autoEvents(stream, [{ role: "user", content: "Add a retry option", timestamp: 0 }], "unrecorded-worker");
+    assert.equal(classifier.prompts.length, 1);
+    assert.equal(registry.calls[0]?.model.id, "claude-sonnet-5");
+    assert.equal(h.records().length, 1);
+  } finally { h.cleanup(); }
+});
+
+test("a resumed worker uses the latest decision for its delegation id", async () => {
+  const h = harness(LIVE);
+  try {
+    const messages = [{ role: "user", content: "Fix README.md", timestamp: 0 }];
+    await autoEvents(await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("first") }])), messages, "latest-worker");
+    await autoEvents(await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("second") }]), {
+      evidence: () => () => evidenceOf({ authorization: approved("openai-codex") }),
+    }), messages, "latest-worker");
+    const classifier = answering("critical");
+    const registry = fakeSessionRegistry([{ events: answerEvents("third") }]);
+    await autoEvents(await loadAutoProvider(h, registry, { classifierCall: () => classifier.call }), messages, "latest-worker");
+    assert.equal(registry.calls[0]?.model.id, "gpt-6-luna");
+    assert.equal(classifier.prompts.length, 0);
+    assert.equal(h.records().length, 2);
+  } finally { h.cleanup(); }
+});
+
 test("auto model relabels earlier replies inward and streamed replies outward without losing usage", async () => {
   const h = harness(LIVE);
   try {
