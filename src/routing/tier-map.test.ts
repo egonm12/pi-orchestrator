@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import type { ModelInfo } from "../subagents/model-info.ts";
+import type { ModelInfo } from "../models/model-info.ts";
 import { INSTALLED_MODEL_IDS } from "../fixtures/installed-models.ts";
 import { INSTALLED_MODEL_INFO } from "../fixtures/installed-model-info.ts";
 import { HARNESS_ALLOW_PATTERNS, HARNESS_MODEL_SCOPE } from "../policy/model-resolution.ts";

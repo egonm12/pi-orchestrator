@@ -74,12 +74,12 @@ for (const [label, model] of [
   });
 }
 
-test("the real checkModelScope no-ops on a missing model, so the harness must catch it", async () => {
-  // Guards the reason the check above exists. If pi-subagents ever starts
+test("checkModelScope no-ops on a missing model, so the harness must catch it", async () => {
+  // Guards the reason the check above exists. If checkModelScope ever starts
   // rejecting a missing model itself, this fails and the harness check can
-  // be revisited rather than silently duplicating product behaviour.
+  // be revisited rather than silently duplicating it.
   const { checkModelScope } = await import(
-    "../subagents/model-scope.ts"
+    "../models/model-scope.ts"
   );
   assert.equal(checkModelScope(undefined, HARNESS_MODEL_SCOPE, "explicit"), undefined);
   assert.equal(checkModelScope("", HARNESS_MODEL_SCOPE, "explicit"), undefined);
@@ -155,11 +155,11 @@ test("prohibited models are rejected with a thinking suffix and in any case", ()
 
 test("strict mode is what makes an inherited prohibited model an error, not a warning", async () => {
   const { checkModelScope } = await import(
-    "../subagents/model-scope.ts"
+    "../models/model-scope.ts"
   );
   const allow = [...HARNESS_ALLOW_PATTERNS];
   for (const model of ["anthropic/claude-fable-5", "openai-codex/gpt-6-astra"]) {
-    // Without strict, inherited is only a warn (model-scope.js:47) -- that is
+    // Without strict, inherited is only a warn -- that is
     // the hole this ticket closes.
     assert.equal(
       checkModelScope(model, { enforce: true, allow }, "inherited")?.severity,
@@ -174,7 +174,7 @@ test("strict mode is what makes an inherited prohibited model an error, not a wa
 
 test("enforcement is genuinely on: without enforce, nothing is rejected", async () => {
   const { checkModelScope } = await import(
-    "../subagents/model-scope.ts"
+    "../models/model-scope.ts"
   );
   assert.equal(
     checkModelScope("openai-codex/gpt-6-astra", { allow: [...HARNESS_ALLOW_PATTERNS] }, "explicit"),

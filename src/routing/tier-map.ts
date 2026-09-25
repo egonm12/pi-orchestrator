@@ -4,11 +4,11 @@ import {
   THINKING_LEVELS,
   type ModelInfo,
   type ThinkingLevel,
-} from "../subagents/model-info.ts";
+} from "../models/model-info.ts";
 import {
   checkModelScope,
   type ModelScopeCheckRule,
-} from "../subagents/model-scope.ts";
+} from "../models/model-scope.ts";
 import {
   banListsFromSettings,
   isProhibitedModel,

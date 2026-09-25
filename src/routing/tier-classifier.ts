@@ -32,7 +32,7 @@ import type { ModelCatalog } from "../catalog/model-catalog.ts";
 import {
   splitKnownThinkingSuffix,
   THINKING_LEVELS,
-} from "../subagents/model-info.ts";
+} from "../models/model-info.ts";
 import { resolveDelegationModel } from "../policy/model-resolution.ts";
 import {
   classifyTask,

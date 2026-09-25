@@ -1,15 +1,15 @@
-import type { ModelInfo } from "../subagents/model-info.ts";
+import type { ModelInfo } from "../models/model-info.ts";
 
 // Thinking facts for every id in ./installed-models.ts, as pi's model
 // registry defines them. Captured 2026-09-24 from pi-ai 0.87.1's provider
 // data, installed at
 // `~/.bun/install/global/node_modules/@earendil-works/pi-ai/dist/providers/data/`
 // (`anthropic.json` and `openai-codex.json`), keeping only the fields
-// pi-subagents' `getSupportedThinkingLevels` reads: `reasoning` and
-// `thinkingLevelMap`.
+// `getSupportedThinkingLevels` (../models/model-info.ts) reads: `reasoning`
+// and `thinkingLevelMap`.
 //
 // Ticket 22's tier-map loader takes the installed models as an input and asks
-// that pi function which efforts a model supports. `pi --list-models` does not
+// that function which efforts a model supports. `pi --list-models` does not
 // print these fields, so ./installed-models.ts cannot carry them; ticket 27's
 // extension will pass pi's live registry instead of this snapshot.
 //

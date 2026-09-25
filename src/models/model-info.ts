@@ -1,8 +1,6 @@
-// Reimplementation of the parts of pi-subagents' `src/shared/model-info.js`
-// (installed version 0.71.0) that the router needs. pi loads each package from
-// its own module root, and pi-subagents' `exports` map does not expose this
-// file, so it cannot be imported. Behaviour must match 0.71.0; the tests in
-// model-info.test.ts pin it.
+// Model facts from pi's model registry and the thinking levels a model
+// supports, as the tier map, tier router, classifier, ban lists and init read
+// them. model-info.test.ts pins the behaviour.
 
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];

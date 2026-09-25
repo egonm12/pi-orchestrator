@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { splitKnownThinkingSuffix } from "../subagents/model-info.ts";
+import { splitKnownThinkingSuffix } from "../models/model-info.ts";
 
 // Ticket 21, ADR 0002: two owner-configured ban lists read from pi's personal
 // settings under the `orchestrator` key.

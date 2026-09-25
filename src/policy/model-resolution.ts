@@ -2,12 +2,12 @@ import { appendFileSync } from "node:fs";
 import {
   checkModelScope,
   matchesScopePattern,
-} from "../subagents/model-scope.ts";
+} from "../models/model-scope.ts";
 import type {
   ModelScopeConfig,
   ModelSource,
-} from "../subagents/model-scope.ts";
-import { splitKnownThinkingSuffix } from "../subagents/model-info.ts";
+} from "../models/model-scope.ts";
+import { splitKnownThinkingSuffix } from "../models/model-info.ts";
 import type { Availability } from "../fixtures/provider-double.ts";
 import { isProhibitedModel, subagentBanListEntry } from "./ban-lists.ts";
 
@@ -18,25 +18,11 @@ export { isProhibitedModel };
 // Ticket 04: every delegation names the provider and model it goes to, so
 // assignments and failures are explainable.
 //
-// The scope decision is delegated to pi-subagents' real `checkModelScope`
-// (src/runs/shared/model-scope.js:38) rather than reimplemented, so this
-// harness enforces the same rule the product does.
-//
-// Imported by relative file path on purpose. Two things rule out the tidier
-// options, both verified:
-//   - The deep specifier `pi-subagents/src/runs/shared/model-scope.js` fails
-//     with ERR_PACKAGE_PATH_NOT_EXPORTED -- `model-scope` is not in
-//     pi-subagents' package.json `exports` map. A file path bypasses that
-//     encapsulation.
-//   - The bare specifier `pi-subagents` resolves (from agent/npm) but does
-//     not re-export checkModelScope; it comes back undefined.
-// pi-subagents also lives in agent/npm/node_modules, pi's extension install
-// tree, which is not this project's dependency tree -- so neither specifier
-// resolves from this project root at all.
+// The scope decision is the allowed-model match in ../models/model-scope.ts.
 
 // Name-based prohibition (the subagent ban list, ./ban-lists.ts) is
-// independent of model-scope's allow patterns, which have no deny field
-// (`ModelScopeRule`, model-scope.d.ts:15-21).
+// independent of the allow patterns, which have no deny field
+// (`ModelScopeRule` in ../models/model-scope.ts).
 
 // Enumerated deliberately narrowly. `anthropic/*` and `openai-codex/*` are
 // both WRONG here and the audit test proves it: this registry really contains
@@ -57,9 +43,9 @@ export const HARNESS_ALLOW_PATTERNS = [
 ] as const;
 
 // enforce: true  -- scope checks are opt-in; without it checkModelScope is a
-//                   no-op (model-scope.js:39).
+//                   no-op.
 // strict: true   -- without it an INHERITED out-of-scope model is only a
-//                   `warn` (model-scope.js:47). The user's prohibition must
+//                   `warn`. The user's prohibition must
 //                   hold regardless of how the model was reached, so
 //                   inherited must be an error too.
 export const HARNESS_MODEL_SCOPE: ModelScopeConfig = {
@@ -128,7 +114,7 @@ export function resolveDelegationModel(request: DelegationRequest): DelegationDe
   const { source, scope = HARNESS_MODEL_SCOPE } = request;
   const requested = request.model?.trim();
 
-  // checkModelScope returns undefined for a falsy model (model-scope.js:39),
+  // checkModelScope returns undefined for a falsy model,
   // so a missing model would pass the scope check silently and then inherit
   // from agent frontmatter / defaultModel / the parent session. That is the
   // exact fall-through this ticket forbids, so it is rejected here first.

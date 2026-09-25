@@ -1,6 +1,6 @@
 import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@earendil-works/pi-coding-agent";
-import { toModelInfo, splitKnownThinkingSuffix, type ModelInfo } from "../subagents/model-info.ts";
+import { toModelInfo, splitKnownThinkingSuffix, type ModelInfo } from "../models/model-info.ts";
 import { discoverAgents, resolveAgentName, type AgentConfig } from "../subagents/agents.ts";
 import { resolveExecutionAgentScope } from "../subagents/agents.ts";
 import { INHERIT_MODEL, resolveEffectiveSubagentModel } from "../subagents/model-resolution.ts";

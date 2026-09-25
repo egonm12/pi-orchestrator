@@ -1,7 +1,6 @@
-// Reimplementation of the pure scope check in pi-subagents'
-// `src/runs/shared/model-scope.js` (installed version 0.71.0): `checkModelScope`
-// and `matchesScopePattern`. The settings parser is not needed. Behaviour must
-// match 0.71.0; model-scope.test.ts pins it.
+// The allowed-model match: whether a model falls inside a list of allowed
+// `provider/id` glob patterns. The tier map, tier router, init and the
+// delegation model check use it. model-scope.test.ts pins the behaviour.
 
 import { splitKnownThinkingSuffix } from "./model-info.ts";
 

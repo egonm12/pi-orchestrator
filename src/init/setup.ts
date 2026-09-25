@@ -13,8 +13,8 @@ import {
 } from "../recipients/authorization.ts";
 import type { RiskTier } from "../routing/classifier.ts";
 import { tierMapFromSettings } from "../routing/tier-map.ts";
-import { checkModelScope } from "../subagents/model-scope.ts";
-import { getSupportedThinkingLevels, type ModelInfo, type ThinkingLevel } from "../subagents/model-info.ts";
+import { checkModelScope } from "../models/model-scope.ts";
+import { getSupportedThinkingLevels, type ModelInfo, type ThinkingLevel } from "../models/model-info.ts";
 
 // Fresh-install support: what is missing at session start, and the pieces
 // `/pi-orchestrator init` writes. The package ships no tier map, no ban list

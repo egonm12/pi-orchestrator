@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { personalAgentDir } from "../policy/ban-lists.ts";
 import { tierMapFromSettings } from "../routing/tier-map.ts";
-import { toModelInfo, type ModelInfo, type RegistryModelLike } from "../subagents/model-info.ts";
+import { toModelInfo, type ModelInfo, type RegistryModelLike } from "../models/model-info.ts";
 import {
   approveRecipients,
   INIT_COMMAND,

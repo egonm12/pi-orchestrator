@@ -4,7 +4,7 @@
 // options (no scope enforcement), as the router calls it. Behaviour must match
 // 0.71.0; model-resolution.test.ts pins it.
 
-import { splitKnownThinkingSuffix, type ModelInfo } from "./model-info.ts";
+import { splitKnownThinkingSuffix, type ModelInfo } from "../models/model-info.ts";
 
 export const INHERIT_MODEL = "inherit";
 

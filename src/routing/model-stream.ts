@@ -3,8 +3,8 @@
 // (ctx.modelRegistry, @earendil-works/pi-coding-agent) satisfies it, and tests
 // can hand in a fake without building pi's whole registry.
 
-/** One entry of pi's model registry, as `toModelInfo` (pi-subagents,
- *  src/shared/model-info.js) reads it. */
+/** One entry of pi's model registry, as `toModelInfo`
+ *  (../models/model-info.ts) reads it. */
 export interface RegistryModel {
   provider: string;
   id: string;
