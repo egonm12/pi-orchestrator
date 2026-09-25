@@ -46,6 +46,11 @@ export interface WorkerSetup {
   readonly signal?: AbortSignal;
   /** Extensions the worker loads besides the installed ones. */
   readonly extensionFactories?: readonly InlineExtension[];
+  /** An agent definition's instructions, appended to the worker's system prompt. */
+  readonly instructions?: string;
+  /** The only tools the worker may use; without it, pi's default tools and
+   *  every extension tool. */
+  readonly tools?: readonly string[];
 }
 
 /** Where a worker's session is saved: below the orchestrator's session
@@ -82,19 +87,26 @@ export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
   };
   const failed = (error: string): WorkerResult => ({ status: "failed", sessionId, sessionFile: saved(), finalText: "", error });
 
+  const { instructions } = setup;
   let session: Awaited<ReturnType<typeof createAgentSessionFromServices>>["session"];
   try {
     const services = await createAgentSessionServices({
       cwd: setup.cwd,
       agentDir: setup.agentDir,
-      resourceLoaderOptions: { extensionFactories: [...(setup.extensionFactories ?? [])], extensionsOverride: withoutSubagentsTool },
+      resourceLoaderOptions: {
+        extensionFactories: [...(setup.extensionFactories ?? [])],
+        extensionsOverride: withoutSubagentsTool,
+        ...(instructions === undefined ? {} : { appendSystemPromptOverride: (base: string[]) => [...base, instructions] }),
+      },
     });
     const model = services.modelRuntime.getModel(AUTO_PROVIDER, AUTO_MODEL_ID);
     if (model === undefined) {
       const loadErrors = services.diagnostics.filter((diagnostic) => diagnostic.type === "error").map((diagnostic) => diagnostic.message);
       return failed(["orchestrator/auto is not in the worker's model runtime; is the router extension installed?", ...loadErrors].join(" "));
     }
-    session = (await createAgentSessionFromServices({ services, sessionManager, model })).session;
+    session = (await createAgentSessionFromServices({
+      services, sessionManager, model, ...(setup.tools === undefined ? {} : { tools: [...setup.tools] }),
+    })).session;
   } catch (error) {
     return failed(errorText(error));
   }
