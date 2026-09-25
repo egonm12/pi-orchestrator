@@ -79,6 +79,8 @@ type ProviderConfig = NonNullable<Parameters<ExtensionAPI["registerProvider"]>[1
 interface ProviderRequest {
   readonly sessionId: string | undefined;
   readonly tools: readonly string[];
+  /** The system messages' text and sections, as one string. */
+  readonly systemText: string;
 }
 
 /** A fake `anthropic` provider serving claude-haiku-4-5 offline: every
@@ -92,12 +94,15 @@ function fakeAnthropic(reply: string, onRequest?: (finish: () => void) => void) 
     streamSimple(model, context, options) {
       // Provider contexts carry tools in system-message deltas, not context.tools.
       const tools = new Set<string>();
+      const systemText: string[] = [];
       for (const message of context.messages) {
         if (message.role !== "system") continue;
         for (const tool of message.toolsRemoved ?? []) tools.delete(tool.name);
         for (const tool of message.toolsAdded ?? []) tools.add(tool.name);
+        systemText.push(typeof message.content === "string" ? message.content : message.content.map((part) => part.text).join(""));
+        systemText.push(...Object.values(message.sections ?? {}).filter((section) => section !== null));
       }
-      requests.push({ sessionId: options?.sessionId, tools: [...tools] });
+      requests.push({ sessionId: options?.sessionId, tools: [...tools], systemText: systemText.join("\n") });
       const { stream, push, end } = autoStream();
       const message = {
         role: "assistant", content: [{ type: "text", text: reply }], api: model.api, provider: model.provider, model: model.id,
@@ -149,12 +154,46 @@ function routerExtension(): InlineExtension {
 
 type Tool = Parameters<ExtensionAPI["registerTool"]>[0];
 
+/** The orchestrator's active tools in these tests: pi's default built-ins, the probe tool and subagents. */
+const ORCHESTRATOR_TOOLS = ["read", "bash", "edit", "write", "probe", "subagents"];
+
+interface LoadedSubagents {
+  /** The subagents tool as last registered. */
+  tool(): Tool;
+  /** Runs the extension's session_start handlers, as pi does when the orchestrator's session starts. */
+  startSession(ctx: ExtensionContext): Promise<void>;
+}
+
+/** The subagents extension as pi loads it in the orchestrator's session. */
+function loadSubagents(workerExtensions: readonly InlineExtension[]): LoadedSubagents {
+  const tools: Tool[] = [];
+  const sessionStart: ((event: unknown, ctx: ExtensionContext) => unknown)[] = [];
+  createSubagentsExtension({ workerExtensions })({
+    registerTool(tool: Tool) { tools.push(tool); },
+    on(event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) { if (event === "session_start") sessionStart.push(handler); },
+    getActiveTools: () => [...ORCHESTRATOR_TOOLS],
+  } as unknown as ExtensionAPI);
+  return {
+    tool() {
+      assert.ok(tools.length > 0 && tools.every((tool) => tool.name === "subagents"), JSON.stringify(tools.map((tool) => tool.name)));
+      return tools.at(-1)!;
+    },
+    async startSession(ctx) {
+      for (const handler of sessionStart) await handler({ type: "session_start", reason: "startup" }, ctx);
+    },
+  };
+}
+
 /** The subagents tool as pi registers it in the orchestrator's session. */
 function loadSubagentsTool(workerExtensions: readonly InlineExtension[]): Tool {
-  const tools: Tool[] = [];
-  createSubagentsExtension({ workerExtensions })({ registerTool(tool: Tool) { tools.push(tool); } } as unknown as ExtensionAPI);
-  assert.deepEqual(tools.map((tool) => tool.name), ["subagents"]);
-  return tools[0]!;
+  return loadSubagents(workerExtensions).tool();
+}
+
+/** Writes an agent definition file into `dir`. */
+function writeAgentDefinition(dir: string, file: string, frontmatter: Record<string, string>, body: string): void {
+  mkdirSync(dir, { recursive: true });
+  const lines = Object.entries(frontmatter).map(([key, value]) => `${key}: ${value}`);
+  writeFileSync(join(dir, file), ["---", ...lines, "---", "", body, ""].join("\n"));
 }
 
 interface Orchestrator {
@@ -170,8 +209,8 @@ function orchestrator(h: Harness): Orchestrator {
   return { ctx, sessionDir: sessionManager.getSessionDir(), sessionId: sessionManager.getSessionId() };
 }
 
-async function callSubagents(tool: Tool, ctx: ExtensionContext, task: string) {
-  const result = await tool.execute("call-1", { items: [{ task }] } as never, undefined, undefined, ctx);
+async function callSubagents(tool: Tool, ctx: ExtensionContext, task: string, agent?: string) {
+  const result = await tool.execute("call-1", { items: [agent === undefined ? { task } : { task, agent }] } as never, undefined, undefined, ctx);
   const details = result.details as SubagentsDetails;
   assert.equal(details.results.length, 1);
   const text = result.content.map((part) => part.type === "text" ? part.text : "").join("");
@@ -367,4 +406,96 @@ test("the default concurrency is four and project settings need personal permiss
       h.cleanup();
     }
   }
+});
+
+test("agent definitions come from the owner's and the project's agent folders, the project wins by name, and the tool description lists them at session start", async () => {
+  const h = harness();
+  try {
+    const personalAgents = join(h.agentDir, "agents"), projectAgents = join(h.projectDir, ".pi", "agents");
+    writeAgentDefinition(personalAgents, "reviewer.md", { name: "reviewer", description: "The owner's reviewer" }, "OWNER REVIEWER INSTRUCTIONS");
+    writeAgentDefinition(personalAgents, "scout.md", { name: "scout", description: "Finds files fast" }, "SCOUT INSTRUCTIONS");
+    writeAgentDefinition(projectAgents, "review.md", { name: "reviewer", description: "The project's reviewer" }, "PROJECT REVIEWER INSTRUCTIONS");
+    writeFileSync(join(projectAgents, "notes.txt"), "not an agent definition");
+    const provider = fakeAnthropic("Reviewed.");
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    await subagents.startSession(main.ctx);
+
+    const description = subagents.tool().description;
+    assert.match(description, /`agent` is optional/, description);
+    assert.ok(description.includes("reviewer: The project's reviewer"), description);
+    assert.ok(description.includes("scout: Finds files fast"), description);
+    assert.equal(description.includes("The owner's reviewer"), false, `the project's reviewer replaces the owner's: ${description}`);
+
+    const { worker } = await callSubagents(subagents.tool(), main.ctx, "Review the diff.", "reviewer");
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.equal(worker.agent, "reviewer");
+    const systemText = provider.requests[0]?.systemText ?? "";
+    assert.ok(systemText.includes("PROJECT REVIEWER INSTRUCTIONS"), "the worker gets the project definition's instructions");
+    assert.equal(systemText.includes("OWNER REVIEWER INSTRUCTIONS"), false);
+
+    // Without an agent, the worker gets no definition's instructions.
+    await callSubagents(subagents.tool(), main.ctx, "Say done.");
+    assert.equal(provider.requests[1]?.systemText.includes("INSTRUCTIONS"), false, provider.requests[1]?.systemText);
+  } finally { h.cleanup(); }
+});
+
+test("a definition's tools: list narrows the orchestrator's tools and cannot add one", async () => {
+  const h = harness();
+  try {
+    // grep is a pi built-in the orchestrator does not have on; subagents is never a worker's.
+    writeAgentDefinition(join(h.projectDir, ".pi", "agents"), "scout.md",
+      { name: "scout", description: "Reads only", tools: "read, probe, grep, subagents" }, "Read, never write.");
+    const provider = fakeAnthropic("done");
+    const subagents = loadSubagents([routerExtension(), provider.extension, PROBE_TOOL_EXTENSION]);
+    const main = orchestrator(h);
+    await subagents.startSession(main.ctx);
+
+    const { worker } = await callSubagents(subagents.tool(), main.ctx, "Look around.", "scout");
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.deepEqual([...(provider.requests[0]?.tools ?? [])].sort(), ["probe", "read"]);
+  } finally { h.cleanup(); }
+});
+
+test("an unknown agent name fails the item with a reason, and no worker starts", async () => {
+  const h = harness();
+  try {
+    writeAgentDefinition(join(h.agentDir, "agents"), "scout.md", { name: "scout", description: "Finds files fast" }, "Find files.");
+    const provider = fakeAnthropic("done");
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    await subagents.startSession(main.ctx);
+
+    const { text, worker } = await callSubagents(subagents.tool(), main.ctx, "Review the diff.", "reviewr");
+    assert.equal(worker.status, "failed");
+    assert.equal(worker.sessionId, undefined, "no worker session was started");
+    assert.match(worker.error ?? "", /unknown agent "reviewr".*scout/, worker.error);
+    assert.ok(text.includes(worker.error!), text);
+    assert.deepEqual(provider.requests, []);
+    assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")), []);
+  } finally { h.cleanup(); }
+});
+
+test("an unknown agent fails only its own item, and the call's other items still run", async () => {
+  const h = harness();
+  try {
+    writeAgentDefinition(join(h.agentDir, "agents"), "scout.md", { name: "scout", description: "Finds files fast" }, "Find files.");
+    const provider = fakeAnthropic("done");
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    await subagents.startSession(main.ctx);
+
+    const items = [{ task: "Item 1" }, { task: "Item 2", agent: "reviewr" }, { task: "Item 3", agent: "scout" }];
+    const result = await subagents.tool().execute("call-1", { items } as never, undefined, undefined, main.ctx);
+    const details = result.details as SubagentsDetails;
+    assert.deepEqual(details.results.map((item) => item.task), ["Item 1", "Item 2", "Item 3"]);
+    assert.deepEqual(details.results.map((item) => item.status), ["completed", "failed", "completed"], JSON.stringify(details.results));
+    assert.equal(details.results[1]?.agent, "reviewr");
+    assert.equal(details.results[1]?.sessionId, undefined, "no worker session was started for the unknown agent");
+    assert.match(details.results[1]?.error ?? "", /unknown agent "reviewr".*scout/);
+    assert.ok(details.results[0]?.sessionId && details.results[2]?.sessionId);
+    assert.equal(provider.requests.length, 2, "only the two resolvable items start workers");
+    const text = result.content.map((part) => part.type === "text" ? part.text : "").join("");
+    assert.ok(text.includes(details.results[1]!.error!), text);
+  } finally { h.cleanup(); }
 });

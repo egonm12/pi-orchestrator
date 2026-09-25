@@ -56,7 +56,7 @@ Each item's result has a status:
 | Status | Meaning |
 |--------|---------|
 | `completed` | The worker finished and returned its final text |
-| `failed` | The worker's model call or setup failed; the result names why |
+| `failed` | The worker's model call or setup failed, or the item names an unknown agent and no worker started; the result names why |
 | `aborted` | The item's worker was running when the call was aborted |
 | `not-started` | The item was still queued when the call was aborted |
 
