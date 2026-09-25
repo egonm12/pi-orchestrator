@@ -1,0 +1,5 @@
+.beans
+.beans.yml
+.pi
+node_modules/
+src/state/
