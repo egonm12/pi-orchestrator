@@ -62,6 +62,8 @@ Each item's result has a status:
 
 A worker's session is saved under the orchestrator's session folder, and its session id is its delegation id. It loads the same installed extensions as the orchestrator, without the `subagents` tool itself: a worker cannot start workers of its own. A worker's final text over 50 KB is cut, with a pointer to its session file, which keeps the whole text.
 
+While a call runs, pi shows one line per worker: its agent name (`worker` without one), its short task, and its current tool or state: queued, running, done, error, aborted or not started. A worker on a preserved model also shows that model, marked `(ban-list exception)` when the exception let it run. Expanding the result shows each worker's final text or error.
+
 ### Agent definitions
 
 An item's `agent` name picks a named, owner-written kind of worker: its instructions and the tools it may use. Agent definitions are markdown files with frontmatter (`name`, `description`, `tools`) and a body of instructions, read from `~/.pi/agent/agents/` and the project's `.pi/agents/`. A project's definition wins by name. A `tools:` list only narrows the orchestrator's tool set for that worker; it cannot add a tool the orchestrator itself does not have. Each definition's name and description are listed in the subagents tool's description at session start. `agent` is optional in a call: without it, a worker gets the orchestrator's full tool set and no agent-specific instructions. pi-orchestrator ships no built-in definitions; the owner writes them.
