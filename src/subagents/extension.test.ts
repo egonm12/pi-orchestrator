@@ -510,6 +510,21 @@ test("preserve mode uses the named model and effort without routing and records 
     assert.equal(record.model, HAIKU);
     assert.equal(record.effort, "high");
     assert.equal(record.banListException, undefined);
+    assert.equal(process.env.PI_ORCHESTRATOR_SESSION_MODEL, `${HAIKU}:medium`, "the worker's model is not remembered as the orchestrator's session model");
+  } finally { h.cleanup(); }
+});
+
+test("preserve mode runs a named model whose id has a slash after the provider", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { agentDefinitionModel: { use: "preserve" } } } });
+  try {
+    const VENDOR_HAIKU = "anthropic/vendor/claude-haiku-4-5";
+    writeAgentDefinition(join(h.agentDir, "agents"), "scout.md", { name: "scout", description: "Scouts", model: `${VENDOR_HAIKU}:high` }, "Find files.");
+    const provider = fakeAnthropic("done", undefined, ["claude-haiku-4-5", "vendor/claude-haiku-4-5"]);
+    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+    const { worker } = await callSubagents(tool, orchestrator(h).ctx, "Find files", "scout");
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.equal(worker.model, VENDOR_HAIKU);
+    assert.deepEqual(provider.requests.map((request) => [request.model, request.thinkingLevel]), [[VENDOR_HAIKU, "high"]]);
   } finally { h.cleanup(); }
 });
 
@@ -580,6 +595,18 @@ test("a personal definition's banned model runs only with allowBanned on, past t
         timestamp: records[0]?.timestamp, agent: "scout", definitionFile: file, model: HAIKU, effort: "high", banListException: true });
     } finally { h.cleanup(); }
   }
+});
+
+test("the session ban list does not bind a worker, which is not the orchestrator's session", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, sessionBanList: ["haiku"], subagents: { agentDefinitionModel: { use: "preserve" } } } });
+  try {
+    writeAgentDefinition(join(h.agentDir, "agents"), "scout.md", { name: "scout", description: "Scouts", model: HAIKU }, "Find files.");
+    const provider = fakeAnthropic("done");
+    const tool = loadSubagentsTool([GUARD_EXTENSION, routerExtension(), provider.extension]);
+    const { worker } = await callSubagents(tool, orchestrator(h).ctx, "Find files", "scout");
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.deepEqual(provider.requests.map((request) => request.sessionId), [worker.sessionId], "the guard let the worker's request through");
+  } finally { h.cleanup(); }
 });
 
 test("a project definition's banned model runs only with allowBanned and allowProjectOverrides on", async () => {
@@ -665,15 +692,33 @@ test("project settings cannot enable preserve mode for a named definition", asyn
   } finally { h.cleanup(); }
 });
 
-/** Runs `body` with stderr captured, and returns the subagents extension's
- *  lines about ignored project settings keys. */
-async function ignoredKeysLog(body: () => Promise<void>): Promise<string[]> {
+/** Runs `body` with stderr captured, and returns the captured lines. */
+async function stderrLines(body: () => Promise<void>): Promise<string[]> {
   const original = process.stderr.write;
   let output = "";
   process.stderr.write = ((chunk: string | Uint8Array) => { output += String(chunk); return true; }) as typeof process.stderr.write;
   try { await body(); } finally { process.stderr.write = original; }
-  return output.split("\n").filter((line) => line.startsWith("pi-orchestrator subagents: ignored project settings key"));
+  return output.split("\n");
 }
+
+/** Runs `body` with stderr captured, and returns the subagents extension's
+ *  lines about ignored project settings keys. */
+async function ignoredKeysLog(body: () => Promise<void>): Promise<string[]> {
+  return (await stderrLines(body)).filter((line) => line.startsWith("pi-orchestrator subagents: ignored project settings key"));
+}
+
+test("a worker does not print the fresh-install notice, which is the orchestrator's", async () => {
+  const h = harness();
+  try {
+    const provider = fakeAnthropic("done");
+    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+    let worker: SubagentsDetails["results"][number] | undefined;
+    const lines = await stderrLines(async () => { worker = (await callSubagents(tool, orchestrator(h).ctx, "Say done.")).worker; });
+    assert.equal(worker?.status, "completed", JSON.stringify(worker));
+    assert.deepEqual(lines.filter((line) => line.startsWith("pi-orchestrator: not set up")), [],
+      "the state folder has no approved recipients, which the orchestrator's session would report");
+  } finally { h.cleanup(); }
+});
 
 test("without allowProjectOverrides a project's subagents keys are ignored and each is logged once", async () => {
   const h = harness({ orchestrator: { routing: ROUTING, subagents: {} } });

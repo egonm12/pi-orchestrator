@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { appendRoutingRecord, buildAgentModelRecord } from "../routing/decision-record.ts";
 import { stateDir } from "../router/extension.ts";
+import { markWorkerSession } from "./worker-sessions.ts";
 import type { ThinkingLevel } from "../models/model-info.ts";
 import {
   createAgentSessionFromServices,
@@ -116,8 +117,10 @@ export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
       },
     });
     const { namedModel } = setup;
-    const [provider, modelId] = namedModel?.model.split("/") ?? [AUTO_PROVIDER, AUTO_MODEL_ID];
-    const model = services.modelRuntime.getModel(provider!, modelId!);
+    // The provider ends at the first slash; a model id may hold more.
+    const slash = namedModel?.model.indexOf("/") ?? -1;
+    const [provider, modelId] = namedModel ? [namedModel.model.slice(0, slash), namedModel.model.slice(slash + 1)] : [AUTO_PROVIDER, AUTO_MODEL_ID];
+    const model = services.modelRuntime.getModel(provider, modelId);
     if (model === undefined) {
       const loadErrors = services.diagnostics.filter((diagnostic) => diagnostic.type === "error").map((diagnostic) => diagnostic.message);
       return failed([`${namedModel?.model ?? "orchestrator/auto"} is not in the worker's model runtime${namedModel ? "" : "; is the router extension installed?"}`, ...loadErrors].join(" "));
@@ -150,6 +153,8 @@ export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
     else return;
     setup.onTool?.([...runningTools.values()].at(-1));
   });
+  // Before binding, so the extensions see the mark at session_start.
+  const unmarkWorkerSession = markWorkerSession(sessionId);
   try {
     // Binding starts the extensions: the router extension reads its settings
     // at session_start.
@@ -170,5 +175,6 @@ export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
     setup.signal?.removeEventListener("abort", abort);
     unsubscribe();
     session.dispose();
+    unmarkWorkerSession();
   }
 }

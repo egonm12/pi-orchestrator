@@ -3,6 +3,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 type ModelInfo = { provider: string; id: string };
 import { activeBanLists, configureBanLists, loadBanListsOrDefaults, personalAgentDir, sessionBanListRefusal } from "../policy/ban-lists.ts";
 import { toolRefusal } from "./boundaries.ts";
+import { isWorkerSession } from "../subagents/worker-sessions.ts";
 
 export const GUARD_PREFIX = "pi-orchestrator guard:";
 
@@ -42,24 +43,26 @@ export default function personalGuard(pi: ExtensionAPI) {
     // pi-subagents loads ambient extensions, this guard included, into the
     // delegated sessions it hosts, and marks those processes: the async runner
     // with PI_SUBAGENT_CHILD=1, a herdr pane-native child with
-    // PI_SUBAGENTS_HERDR_BRIDGE=1. There the session check is skipped.
+    // PI_SUBAGENTS_HERDR_BRIDGE=1. There the session check is skipped. It is
+    // skipped too in a worker the subagents tool runs in this process, which
+    // is marked per session, since the orchestrator shares the process.
     const hostsDelegatedSessions = process.env.PI_SUBAGENT_CHILD === "1" || process.env.PI_SUBAGENTS_HERDR_BRIDGE === "1";
     let sessionRefusal: string | undefined;
     const report = (message: string, ctx: ExtensionContext) => {
       if (ctx.hasUI && ctx.ui) ctx.ui.notify(`${GUARD_PREFIX} ${message}`, "error");
       else process.stderr.write(`${GUARD_PREFIX} ${message}\n`);
     };
-    const refusalFor = (model: ModelInfo | undefined) => {
-      if (hostsDelegatedSessions || !model) return undefined;
+    const refusalFor = (model: ModelInfo | undefined, ctx: ExtensionContext) => {
+      if (hostsDelegatedSessions || isWorkerSession(ctx) || !model) return undefined;
       const refusal = sessionBanListRefusal(`${model.provider}/${model.id}`);
       return refusal && `${refusal.message}; no turn runs until another model is selected.`;
     };
     const checkSessionModel = (model: ModelInfo | undefined, ctx: ExtensionContext) => {
-      sessionRefusal = refusalFor(model);
+      sessionRefusal = refusalFor(model, ctx);
       if (sessionRefusal) report(sessionRefusal, ctx);
     };
     // The live session model when pi supplies it, else the last selection seen.
-    const currentRefusal = (ctx: ExtensionContext) => ctx.model ? refusalFor(ctx.model) : sessionRefusal;
+    const currentRefusal = (ctx: ExtensionContext) => ctx.model ? refusalFor(ctx.model, ctx) : sessionRefusal;
 
     pi.on("tool_call", (event, ctx) => {
       if (disabled) return;

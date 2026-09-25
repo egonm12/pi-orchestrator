@@ -19,6 +19,7 @@ import { tierMapFromSettings } from "../routing/tier-map.ts";
 import { runInit } from "../init/command.ts";
 import { INIT_COMMAND, setupNotice, setupStatus } from "../init/setup.ts";
 import { stateFolderEvidence, type EvidenceSetup, type RoutingEvidenceSource } from "./evidence.ts";
+import { isWorkerSession } from "../subagents/worker-sessions.ts";
 
 export type { RoutingEvidence, RoutingEvidenceSource, EvidenceSetup } from "./evidence.ts";
 
@@ -179,20 +180,23 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
       },
     });
 
-    const rememberSessionModel = (model: { provider: string; id: string } | undefined, effort: string) => {
+    // The orchestrator's session model, for workers to fall back to. A
+    // subagents worker in this process is not the orchestrator's session.
+    const rememberSessionModel = (model: { provider: string; id: string } | undefined, effort: string, ctx: ExtensionContext) => {
       if (process.env.PI_SUBAGENT_CHILD === "1" || process.env.PI_SUBAGENTS_HERDR_BRIDGE === "1") return;
+      if (isWorkerSession(ctx)) return;
       if (model?.provider === "orchestrator" && model.id === "auto") return;
       if (model) process.env.PI_ORCHESTRATOR_SESSION_MODEL = `${model.provider}/${model.id}:${effort}`;
       else delete process.env.PI_ORCHESTRATOR_SESSION_MODEL;
     };
     let noticeShown = false;
     pi.on("session_start", (_event, ctx) => {
-      rememberSessionModel(ctx.model, ctx.thinkingLevel ?? "off");
+      rememberSessionModel(ctx.model, ctx.thinkingLevel ?? "off", ctx);
       sessionRegistry = ctx.modelRegistry;
       if (disabled) return;
       try {
         // One line on a fresh install, in the owner's session only.
-        if (!noticeShown && process.env.PI_SUBAGENT_CHILD !== "1") {
+        if (!noticeShown && process.env.PI_SUBAGENT_CHILD !== "1" && !isWorkerSession(ctx)) {
           noticeShown = true;
           const personal = readSettingsFile(join(personalAgentDir(), "settings.json")) ?? {};
           const notice = setupNotice(setupStatus(personal, stateDir()), stateDir());
@@ -210,10 +214,10 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
     });
 
     pi.on("model_select", (event, ctx) => {
-      rememberSessionModel(event.model, ctx.thinkingLevel ?? "off");
+      rememberSessionModel(event.model, ctx.thinkingLevel ?? "off", ctx);
     });
     pi.on("thinking_level_select", (event, ctx) => {
-      rememberSessionModel(ctx.model, event.level);
+      rememberSessionModel(ctx.model, event.level, ctx);
     });
 
     if (probe) process.stderr.write(`${ROUTER_PREFIX} loaded\n`);

@@ -194,8 +194,9 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
             let namedModel: NonNullable<WorkerSetup["namedModel"]> | undefined;
             if (modelSettings.use === "preserve" && definition?.model) {
               const { baseModel, thinkingSuffix } = splitKnownThinkingSuffix(definition.model);
-              const [provider, ...parts] = baseModel.split("/");
-              if (!provider || parts.length !== 1 || !parts[0]) {
+              // The provider ends at the first slash; a model id may hold more.
+              const slash = baseModel.indexOf("/");
+              if (slash <= 0 || slash === baseModel.length - 1) {
                 results[index] = { ...item, status: "failed", finalText: "", error: `agent ${definition.name} must name a provider/model` };
                 showProgress(index, results[index]);
                 continue;
