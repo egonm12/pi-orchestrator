@@ -83,7 +83,7 @@ interface ProviderRequest {
 
 /** A fake `anthropic` provider serving claude-haiku-4-5 offline: every
  *  request is recorded and answered with `reply`, as one text part. */
-function fakeAnthropic(reply: string) {
+function fakeAnthropic(reply: string, onRequest?: (finish: () => void) => void) {
   const requests: ProviderRequest[] = [];
   const config: ProviderConfig = {
     name: "Fake Anthropic", baseUrl: "http://localhost/unused", apiKey: "unused", api: "fake-anthropic" as never,
@@ -105,8 +105,12 @@ function fakeAnthropic(reply: string) {
         stopReason: "stop", timestamp: Date.now(),
       };
       push({ type: "start", partial: { ...message, content: [] } } as never);
-      push({ type: "done", reason: "stop", message } as never);
-      end({ api: model.api, provider: model.provider, model: model.id });
+      const finish = () => { push({ type: "done", reason: "stop", message } as never); end({ api: model.api, provider: model.provider, model: model.id }); };
+      if (onRequest) {
+        options?.signal?.addEventListener("abort", finish, { once: true });
+        onRequest(finish);
+      }
+      else finish();
       return stream;
     },
   };
@@ -167,7 +171,7 @@ function orchestrator(h: Harness): Orchestrator {
 }
 
 async function callSubagents(tool: Tool, ctx: ExtensionContext, task: string) {
-  const result = await tool.execute("call-1", { task } as never, undefined, undefined, ctx);
+  const result = await tool.execute("call-1", { items: [{ task }] } as never, undefined, undefined, ctx);
   const details = result.details as SubagentsDetails;
   assert.equal(details.results.length, 1);
   const text = result.content.map((part) => part.type === "text" ? part.text : "").join("");
@@ -265,4 +269,102 @@ test("the subagents extension can be filtered out of the package on its own", as
   const all = ["src/guard/extension.ts", "src/router/extension.ts", "src/subagents/extension.ts"];
   assert.deepEqual(await enabledExtensions(CHECKOUT), all);
   assert.deepEqual(await enabledExtensions({ source: CHECKOUT, extensions: ["!src/subagents/extension.ts"] }), ["src/guard/extension.ts", "src/router/extension.ts"]);
+});
+
+
+test("eight items with maxParallel 2 run at most two workers and return results in item order", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { maxParallel: 2 } } });
+  const pending: (() => void)[] = [];
+  let peak = 0, active = 0;
+  try {
+    const provider = fakeAnthropic("done", (finish) => {
+      active++;
+      peak = Math.max(peak, active);
+      pending.push(() => { active--; finish(); });
+    });
+    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+    const tasks = Array.from({ length: 8 }, (_, index) => `Item ${index + 1}`);
+    const call = tool.execute("call-1", { items: tasks.map((task) => ({ task })) } as never, undefined, undefined, orchestrator(h).ctx);
+    for (let attempt = 0; pending.length < 2 && attempt < 1000; attempt++) await new Promise((resolve) => setTimeout(resolve, 1));
+    assert.ok(pending.length >= 2, "two workers start before either finishes");
+    for (let index = 0; index < 8; index++) {
+      for (let attempt = 0; pending.length === 0 && attempt < 1000; attempt++) await new Promise((resolve) => setTimeout(resolve, 1));
+      assert.ok(pending.length > 0, `item ${index + 1} started`);
+      pending.shift()!();
+    }
+    const details = (await call).details as SubagentsDetails;
+    assert.deepEqual(details.results.map((result) => result.task), tasks);
+    assert.deepEqual(details.results.map((result) => result.status), Array(8).fill("completed"));
+    assert.deepEqual(details.results.map((result) => sessionLines(result.sessionFile!).flatMap((line) =>
+      line.message?.role === "user" ? line.message.content?.map((part) => part.text) ?? [] : [])), tasks.map((task) => [task]));
+    assert.equal(peak, 2);
+    assert.equal(provider.requests.length, 8);
+  } finally {
+    for (const finish of pending) finish();
+    h.cleanup();
+  }
+});
+
+
+test("more than eight items or an empty call is refused before starting workers", async () => {
+  const h = harness();
+  try {
+    const provider = fakeAnthropic("done");
+    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+    for (const count of [0, 9]) {
+      await assert.rejects(
+        tool.execute("call-1", { items: Array.from({ length: count }, (_, index) => ({ task: `Item ${index}` })) } as never, undefined, undefined, orchestrator(h).ctx),
+        /1 to 8 items/,
+      );
+    }
+    assert.equal(provider.requests.length, 0);
+  } finally { h.cleanup(); }
+});
+
+test("abort stops running workers and marks queued items not started", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { maxParallel: 2 } } });
+  const pending: (() => void)[] = [];
+  try {
+    const provider = fakeAnthropic("done", (finish) => pending.push(finish));
+    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+    const controller = new AbortController();
+    const call = tool.execute("call-1", { items: Array.from({ length: 5 }, (_, index) => ({ task: `Item ${index + 1}` })) } as never, controller.signal, undefined, orchestrator(h).ctx);
+    for (let attempt = 0; pending.length < 2 && attempt < 1000; attempt++) await new Promise((resolve) => setTimeout(resolve, 1));
+    assert.equal(pending.length, 2, "two workers are running before abort");
+    controller.abort();
+    const details = (await call).details as SubagentsDetails;
+    assert.deepEqual(details.results.map((result) => result.status), ["aborted", "aborted", "not-started", "not-started", "not-started"]);
+    assert.equal(provider.requests.length, 2, "no queued worker starts");
+    assert.ok(details.results[0]?.sessionId);
+    assert.equal(details.results[2]?.sessionId, undefined);
+  } finally {
+    for (const finish of pending) finish();
+    h.cleanup();
+  }
+});
+
+test("the default concurrency is four and project settings need personal permission to override it", async () => {
+  for (const allowProjectOverrides of [false, true]) {
+    const h = harness({ orchestrator: { routing: ROUTING, subagents: { allowProjectOverrides } } });
+    const pending: (() => void)[] = [];
+    try {
+      mkdirSync(join(h.projectDir, ".pi"));
+      writeFileSync(join(h.projectDir, ".pi", "settings.json"), JSON.stringify({ orchestrator: { subagents: { maxParallel: 2 } } }));
+      const provider = fakeAnthropic("done", (finish) => pending.push(finish));
+      const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+      const controller = new AbortController();
+      const call = tool.execute("call-1", { items: Array.from({ length: 5 }, (_, index) => ({ task: `Item ${index}` })) } as never, controller.signal, undefined, orchestrator(h).ctx);
+      const expected = allowProjectOverrides ? 2 : 4;
+      for (let attempt = 0; pending.length < expected && attempt < 1000; attempt++) await new Promise((resolve) => setTimeout(resolve, 1));
+      assert.equal(pending.length, expected);
+      controller.abort();
+      const details = (await call).details as SubagentsDetails;
+      assert.deepEqual(details.results.map((result) => result.status), [
+        ...Array(expected).fill("aborted"), ...Array(5 - expected).fill("not-started"),
+      ]);
+    } finally {
+      for (const finish of pending) finish();
+      h.cleanup();
+    }
+  }
 });
