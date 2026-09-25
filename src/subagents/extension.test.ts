@@ -11,6 +11,7 @@ import { authorizeRecipient, emptyAuthorization, grantOwnerApproval } from "../r
 import { readRoutingRecords } from "../routing/decision-record.ts";
 import { autoStream } from "../router/auto-stream.ts";
 import { createRouterExtension } from "../router/extension.ts";
+import personalGuard from "../guard/extension.ts";
 import { createSubagentsExtension, MAX_TEXT_BYTES, type SubagentsDetails, type SubagentsProgressDetails } from "./extension.ts";
 
 // The subagents extension as pi loads it. A fake ExtensionAPI records the
@@ -78,20 +79,22 @@ type ProviderConfig = NonNullable<Parameters<ExtensionAPI["registerProvider"]>[1
 
 interface ProviderRequest {
   readonly sessionId: string | undefined;
+  readonly model: string;
   readonly tools: readonly string[];
   /** The system messages' text and sections, as one string. */
   readonly systemText: string;
   readonly thinkingLevel: string | undefined;
 }
 
-/** A fake `anthropic` provider serving claude-haiku-4-5 offline: every
- *  request is recorded and answered with `reply`, as one text part. */
-function fakeAnthropic(reply: string, onRequest?: (finish: () => void) => void) {
+/** A fake `anthropic` provider serving `modelIds` (claude-haiku-4-5 unless
+ *  given) offline: every request is recorded and answered with `reply`, as
+ *  one text part. */
+function fakeAnthropic(reply: string, onRequest?: (finish: () => void) => void, modelIds: readonly string[] = ["claude-haiku-4-5"]) {
   const requests: ProviderRequest[] = [];
   const config: ProviderConfig = {
     name: "Fake Anthropic", baseUrl: "http://localhost/unused", apiKey: "unused", api: "fake-anthropic" as never,
-    models: [{ id: "claude-haiku-4-5", name: "Claude Haiku 4.5", reasoning: true, input: ["text"],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200_000, maxTokens: 64_000 }],
+    models: modelIds.map((id) => ({ id, name: id, reasoning: true, input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200_000, maxTokens: 64_000 })),
     streamSimple(model, context, options) {
       // Provider contexts carry tools in system-message deltas, not context.tools.
       const tools = new Set<string>();
@@ -103,7 +106,7 @@ function fakeAnthropic(reply: string, onRequest?: (finish: () => void) => void) 
         systemText.push(typeof message.content === "string" ? message.content : message.content.map((part) => part.text).join(""));
         systemText.push(...Object.values(message.sections ?? {}).filter((section) => section !== null));
       }
-      requests.push({ sessionId: options?.sessionId, tools: [...tools], systemText: systemText.join("\n"), thinkingLevel: options?.reasoning });
+      requests.push({ sessionId: options?.sessionId, model: `${model.provider}/${model.id}`, tools: [...tools], systemText: systemText.join("\n"), thinkingLevel: options?.reasoning });
       const { stream, push, end } = autoStream();
       const message = {
         role: "assistant", content: [{ type: "text", text: reply }], api: model.api, provider: model.provider, model: model.id,
@@ -140,14 +143,14 @@ function approvedAnthropic() {
 }
 
 /** The router extension as the worker loads it, with a classifier that
- *  always answers mechanical. */
-function routerExtension(): InlineExtension {
+ *  always answers mechanical and a catalog of `modelIds`. */
+function routerExtension(modelIds: readonly string[] = [HAIKU]): InlineExtension {
   const classifierAnswer = JSON.stringify({ tier: "mechanical", risk: { level: "none", reasons: [] }, ambiguity: "clear", complexity: "low", kindOfWork: "implement", why: "fake classifier says mechanical" });
   return {
     name: "router",
     factory: createRouterExtension({
       classifierCall: () => async () => classifierAnswer,
-      evidence: () => () => ({ catalog: buildCatalog({ modelIds: [HAIKU], now: NOW }), refreshState: emptyRefreshState(), authorization: approvedAnthropic() }),
+      evidence: () => () => ({ catalog: buildCatalog({ modelIds: [...modelIds], now: NOW }), refreshState: emptyRefreshState(), authorization: approvedAnthropic() }),
       now: () => NOW,
     }),
   };
@@ -537,6 +540,115 @@ test("preserve mode refuses a definition's banned model before starting a worker
     assert.match(worker.error ?? "", /subagent ban list/);
     assert.deepEqual(provider.requests, []);
     assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")), []);
+  } finally { h.cleanup(); }
+});
+
+/** The guard extension as the worker loads it. */
+const GUARD_EXTENSION: InlineExtension = { name: "guard", factory: personalGuard };
+
+/** Personal settings that ban haiku for workers and preserve definition
+ *  models, with allowBanned and allowProjectOverrides as given. */
+function exceptionSettings(allowBanned: boolean, allowProjectOverrides = false) {
+  return { orchestrator: { routing: ROUTING, subagentBanList: ["haiku"],
+    subagents: { allowProjectOverrides, agentDefinitionModel: { use: "preserve", allowBanned } } } };
+}
+
+test("a personal definition's banned model runs only with allowBanned on, past the guard and the router, and records the exception", async () => {
+  for (const allowBanned of [false, true]) {
+    const h = harness(exceptionSettings(allowBanned));
+    try {
+      const file = join(h.agentDir, "agents", "scout.md");
+      writeAgentDefinition(join(h.agentDir, "agents"), "scout.md", { name: "scout", description: "Scouts", model: HAIKU, thinking: "high" }, "Find files.");
+      const provider = fakeAnthropic("done");
+      const tool = loadSubagentsTool([GUARD_EXTENSION, routerExtension(), provider.extension]);
+      const { worker } = await callSubagents(tool, orchestrator(h).ctx, "Find files", "scout");
+      if (!allowBanned) {
+        assert.equal(worker.status, "failed");
+        assert.equal(worker.sessionId, undefined);
+        assert.match(worker.error ?? "", /subagent ban list/);
+        assert.deepEqual(provider.requests, []);
+        assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")), []);
+        continue;
+      }
+      assert.equal(worker.status, "completed", JSON.stringify(worker));
+      assert.equal(worker.model, HAIKU);
+      assert.equal(worker.banListException, true, "the result details mark the exception for the renderer");
+      assert.deepEqual(provider.requests.map((request) => request.sessionId), [worker.sessionId], "neither the guard nor the router stopped the request");
+      const records = readRoutingRecords(join(h.stateDir, "routing"));
+      assert.equal(records.length, 1);
+      assert.deepEqual(records[0], { recordType: "agent-model", schemaVersion: "decision-record/3", delegationId: worker.sessionId,
+        timestamp: records[0]?.timestamp, agent: "scout", definitionFile: file, model: HAIKU, effort: "high", banListException: true });
+    } finally { h.cleanup(); }
+  }
+});
+
+test("a project definition's banned model runs only with allowBanned and allowProjectOverrides on", async () => {
+  for (const [allowBanned, allowProjectOverrides] of [[true, false], [false, true], [true, true]] as const) {
+    const h = harness(exceptionSettings(allowBanned, allowProjectOverrides));
+    try {
+      writeAgentDefinition(join(h.projectDir, ".pi", "agents"), "scout.md", { name: "scout", description: "Scouts", model: HAIKU }, "Find files.");
+      const provider = fakeAnthropic("done");
+      const tool = loadSubagentsTool([GUARD_EXTENSION, routerExtension(), provider.extension]);
+      const { worker } = await callSubagents(tool, orchestrator(h).ctx, "Find files", "scout");
+      const flags = JSON.stringify({ allowBanned, allowProjectOverrides });
+      if (!(allowBanned && allowProjectOverrides)) {
+        assert.equal(worker.status, "failed", flags);
+        assert.match(worker.error ?? "", /subagent ban list/, flags);
+        assert.deepEqual(provider.requests, [], flags);
+        continue;
+      }
+      assert.equal(worker.status, "completed", JSON.stringify(worker));
+      assert.equal(worker.banListException, true);
+      assert.equal(provider.requests.length, 1);
+      const records = readRoutingRecords(join(h.stateDir, "routing"));
+      assert.ok(records.length === 1 && records[0]?.recordType === "agent-model", JSON.stringify(records));
+      assert.equal(records[0].definitionFile, join(h.projectDir, ".pi", "agents", "scout.md"));
+      assert.equal(records[0].banListException, true);
+    } finally { h.cleanup(); }
+  }
+});
+
+test("with the exception on, the tier map and tool calls still refuse the banned model", async () => {
+  const SONNET = "anthropic/claude-sonnet-4-5";
+  const settings = exceptionSettings(true, true);
+  const tiers = { mechanical: [RUNG, `${SONNET}:low`], standard: [`${SONNET}:low`], elevated: [`${SONNET}:low`], critical: [`${SONNET}:low`] };
+  const h = harness({ orchestrator: { ...settings.orchestrator, routing: { ...ROUTING, classifier: { ...ROUTING.classifier, model: `${SONNET}:low` }, tiers } } });
+  try {
+    writeAgentDefinition(join(h.agentDir, "agents"), "scout.md", { name: "scout", description: "Scouts", model: HAIKU }, "Find files.");
+    const provider = fakeAnthropic("done", undefined, ["claude-haiku-4-5", "claude-sonnet-4-5"]);
+    const tool = loadSubagentsTool([GUARD_EXTENSION, routerExtension([HAIKU, SONNET]), provider.extension]);
+
+    // The tier map path: the banned rung is dropped, and a routed worker runs on the other.
+    const { worker } = await callSubagents(tool, orchestrator(h).ctx, "Find files");
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.equal(worker.banListException, undefined);
+    assert.deepEqual(provider.requests.map((request) => request.model), [SONNET]);
+    const [record] = readRoutingRecords(join(h.stateDir, "routing"));
+    assert.ok(record?.recordType === "decision", JSON.stringify(record));
+    assert.equal(record.ranOn, `${SONNET}:low`);
+    assert.deepEqual(record.tierMap.drops, [{ tier: "mechanical", rung: RUNG, origin: "personal", reason: "subagent ban list" }]);
+
+    // The tool-call path: the guard refuses a delegation tool call naming the banned model.
+    const guard = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    personalGuard({ on(event: string, handler: (event: unknown, ctx: unknown) => unknown) { guard.set(event, handler); } } as unknown as ExtensionAPI);
+    const refusal = await guard.get("tool_call")!({ type: "tool_call", toolCallId: "1", toolName: "subagent", input: { agent: "scout", task: "Find files", model: HAIKU } },
+      { cwd: h.projectDir, hasUI: false });
+    assert.deepEqual(refusal, { block: true, reason: `pi-orchestrator guard: prohibited model: ${HAIKU}` });
+  } finally { h.cleanup(); }
+});
+
+test("route mode with allowBanned on warns once per session that it has no effect", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { agentDefinitionModel: { use: "route", allowBanned: true } } } });
+  try {
+    const provider = fakeAnthropic("done");
+    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    const warnings: string[] = [];
+    const ctx = { ...main.ctx, hasUI: true, ui: { notify: (message: string, level: string) => { if (level === "warning") warnings.push(message); } } } as ExtensionContext;
+    const first = await callSubagents(tool, ctx, "First task");
+    const second = await callSubagents(tool, ctx, "Second task");
+    assert.deepEqual([first.worker.status, second.worker.status], ["completed", "completed"]);
+    assert.deepEqual(warnings, ["pi-orchestrator subagents: agentDefinitionModel.allowBanned has no effect under route mode"]);
   } finally { h.cleanup(); }
 });
 

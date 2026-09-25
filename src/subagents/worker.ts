@@ -55,8 +55,13 @@ export interface WorkerSetup {
   /** The only tools the worker may use; without it, pi's default tools and
    *  every extension tool. */
   readonly tools?: readonly string[];
-  /** A preserved agent definition names a real model, so the auto router is bypassed. */
-  readonly namedModel?: { readonly model: string; readonly effort?: ThinkingLevel; readonly agent: string; readonly definitionFile: string };
+  /** A preserved agent definition names a real model, so the auto router is
+   *  bypassed. `banListException` is set when the model is on the subagent ban
+   *  list and the owner's exception let it run. */
+  readonly namedModel?: {
+    readonly model: string; readonly effort?: ThinkingLevel; readonly agent: string; readonly definitionFile: string;
+    readonly banListException?: boolean;
+  };
   /** Called with a tool's name when the worker starts running it, and with
    *  the name of a tool still running, or `undefined`, when one ends. */
   readonly onTool?: (tool: string | undefined) => void;
@@ -126,6 +131,7 @@ export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
         appendRoutingRecord(join(stateDir(), "routing"), buildAgentModelRecord({
           delegationId: sessionId, agent: namedModel.agent, definitionFile: namedModel.definitionFile,
           model: namedModel.model, effort: session.thinkingLevel,
+          ...(namedModel.banListException ? { banListException: true } : {}),
         }));
       } catch (error) {
         session.dispose();

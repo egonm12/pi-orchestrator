@@ -293,7 +293,8 @@ export interface AgentModelRecord extends RecordCommon {
   readonly definitionFile: string;
   readonly model: string;
   readonly effort: string;
-  /** An owner-approved exception may be recorded by a later policy change. */
+  /** The model is on the subagent ban list and the owner's exception for
+   *  definition-named models let it run (ADR 0002 follow-up). */
   readonly banListException?: boolean;
 }
 
@@ -674,12 +675,14 @@ export function buildAgentModelRecord(input: {
   readonly definitionFile: string;
   readonly model: string;
   readonly effort: string;
+  readonly banListException?: boolean;
   readonly at?: Date;
 }): AgentModelRecord {
   return checkedRecord({
     recordType: "agent-model", schemaVersion: DECISION_RECORD_SCHEMA_VERSION,
     delegationId: input.delegationId, timestamp: (input.at ?? new Date()).toISOString(),
     agent: input.agent, definitionFile: input.definitionFile, model: input.model, effort: input.effort,
+    ...(input.banListException ? { banListException: true } : {}),
   });
 }
 

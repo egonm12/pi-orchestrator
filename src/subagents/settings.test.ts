@@ -4,7 +4,7 @@ import { subagentsSettingsFromSettings } from "./settings.ts";
 
 test("without personal settings the defaults apply and allowProjectOverrides is off", () => {
   assert.deepEqual(subagentsSettingsFromSettings({}), {
-    settings: { maxParallel: 4, agentDefinitionModel: { use: "route" } },
+    settings: { maxParallel: 4, agentDefinitionModel: { use: "route", allowBanned: false } },
     allowProjectOverrides: false,
     ignoredProjectKeys: [],
   });
@@ -14,7 +14,7 @@ test("with allowProjectOverrides a project key replaces the personal value and t
   const personal = { orchestrator: { subagents: { allowProjectOverrides: true, maxParallel: 3, agentDefinitionModel: { use: "preserve" } } } };
   const project = { orchestrator: { subagents: { maxParallel: 6, allowProjectOverrides: false } } };
   assert.deepEqual(subagentsSettingsFromSettings(personal, project), {
-    settings: { maxParallel: 6, agentDefinitionModel: { use: "preserve" } },
+    settings: { maxParallel: 6, agentDefinitionModel: { use: "preserve", allowBanned: false } },
     allowProjectOverrides: true,
     ignoredProjectKeys: ["orchestrator.subagents.allowProjectOverrides"],
   });
@@ -33,4 +33,12 @@ test("a malformed project value fails closed when projects may override", () => 
   assert.throws(() => subagentsSettingsFromSettings(personal, { orchestrator: { subagents: [] } }), /project orchestrator.subagents must be an object/);
   assert.throws(() => subagentsSettingsFromSettings(personal, { orchestrator: { subagents: { maxParallel: 0 } } }), /maxParallel must be a positive integer/);
   assert.throws(() => subagentsSettingsFromSettings(personal, { orchestrator: { subagents: { agentDefinitionModel: { use: "pin" } } } }), /use must be route or preserve/);
+});
+
+test("allowBanned is read from agentDefinitionModel, and a project's agentDefinitionModel replaces it whole", () => {
+  const personal = { orchestrator: { subagents: { allowProjectOverrides: true, agentDefinitionModel: { use: "preserve", allowBanned: true } } } };
+  assert.deepEqual(subagentsSettingsFromSettings(personal).settings.agentDefinitionModel, { use: "preserve", allowBanned: true });
+  const project = { orchestrator: { subagents: { agentDefinitionModel: { use: "preserve" } } } };
+  assert.deepEqual(subagentsSettingsFromSettings(personal, project).settings.agentDefinitionModel, { use: "preserve", allowBanned: false });
+  assert.throws(() => subagentsSettingsFromSettings({ orchestrator: { subagents: { agentDefinitionModel: { allowBanned: "yes" } } } }), /allowBanned must be a boolean/);
 });

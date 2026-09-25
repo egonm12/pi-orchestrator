@@ -1,11 +1,11 @@
-import { join } from "node:path";
-import type { ExtensionAPI, InlineExtension } from "@earendil-works/pi-coding-agent";
+import { dirname, join } from "node:path";
+import type { ExtensionAPI, ExtensionContext, InlineExtension } from "@earendil-works/pi-coding-agent";
 import { banListsFromSettings, personalAgentDir, readSettingsFile, subagentBanListEntry } from "../policy/ban-lists.ts";
 import { THINKING_LEVELS, splitKnownThinkingSuffix, type ThinkingLevel } from "../models/model-info.ts";
 import { agentDefinitionDirs, agentDefinitionListing, loadAgentDefinitions, resolveAgent } from "./agent-definitions.ts";
 import { renderSubagentsCall, renderSubagentsResult } from "./render.ts";
 import { loadSubagentsSettings } from "./settings.ts";
-import { runWorker, SUBAGENTS_TOOL, type WorkerResult } from "./worker.ts";
+import { runWorker, SUBAGENTS_TOOL, type WorkerResult, type WorkerSetup } from "./worker.ts";
 
 // The subagents extension (ADR 0007): a third pi extension, separate from the
 // router and the guard, with a `subagents` tool. Each call starts a worker in
@@ -128,7 +128,15 @@ const DESCRIPTION = "Hand 1 to 8 tasks to workers. At most orchestrator.subagent
 export function createSubagentsExtension(overrides: Partial<SubagentsDependencies> = {}) {
   const deps: SubagentsDependencies = { workerExtensions: [], ...overrides };
   return function subagents(pi: ExtensionAPI): void {
-    const warnedSessions = new Set<string>();
+    // Each warning is shown once per orchestrator session.
+    const warned = new Set<string>();
+    const warnOnce = (ctx: ExtensionContext, warning: string) => {
+      const key = `${ctx.sessionManager.getSessionId()}\n${warning}`;
+      if (warned.has(key)) return;
+      warned.add(key);
+      if (ctx.hasUI && ctx.ui) ctx.ui.notify(warning, "warning");
+      else process.stderr.write(`${warning}\n`);
+    };
     const logged = new Set<string>();
     const logOnce = (line: string) => {
       if (logged.has(line)) return;
@@ -144,11 +152,15 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
         const { items } = params as { items: SubagentItem[] };
         if (!Array.isArray(items) || items.length < 1 || items.length > 8) throw new Error("subagents requires 1 to 8 items per call");
         const agentDir = personalAgentDir();
-        const { settings, ignoredProjectKeys } = loadSubagentsSettings(agentDir, ctx.cwd);
+        const { settings, allowProjectOverrides, ignoredProjectKeys } = loadSubagentsSettings(agentDir, ctx.cwd);
         for (const key of ignoredProjectKeys) logOnce(`ignored project settings key ${key}`);
         const limit = settings.maxParallel;
-        const modelSettings = { use: settings.agentDefinitionModel.use, banned: personalSubagentBanList(agentDir) };
-        const definitions = loadAgentDefinitions(agentDefinitionDirs(agentDir, ctx.cwd));
+        const modelSettings = { ...settings.agentDefinitionModel, banned: personalSubagentBanList(agentDir) };
+        if (modelSettings.use === "route" && modelSettings.allowBanned) {
+          warnOnce(ctx, "pi-orchestrator subagents: agentDefinitionModel.allowBanned has no effect under route mode");
+        }
+        const definitionDirs = agentDefinitionDirs(agentDir, ctx.cwd);
+        const definitions = loadAgentDefinitions(definitionDirs);
         const orchestratorTools = pi.getActiveTools();
         const results: SubagentResult[] = new Array(items.length);
         const progress: SubagentProgress[] = items.map(({ task, agent }) => ({ task, ...(agent === undefined ? {} : { agent }), status: "queued" }));
@@ -177,15 +189,9 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
             }
             const definition = resolution.definition;
             if (modelSettings.use === "route" && definition && (definition.model || definition.thinking)) {
-              const sessionId = ctx.sessionManager.getSessionId();
-              if (!warnedSessions.has(sessionId)) {
-                warnedSessions.add(sessionId);
-                const warning = "pi-orchestrator subagents: agent definition model and thinking are ignored under route mode";
-                if (ctx.hasUI && ctx.ui) ctx.ui.notify(warning, "warning");
-                else process.stderr.write(`${warning}\n`);
-              }
+              warnOnce(ctx, "pi-orchestrator subagents: agent definition model and thinking are ignored under route mode");
             }
-            let namedModel: { model: string; effort?: ThinkingLevel; agent: string; definitionFile: string } | undefined;
+            let namedModel: NonNullable<WorkerSetup["namedModel"]> | undefined;
             if (modelSettings.use === "preserve" && definition?.model) {
               const { baseModel, thinkingSuffix } = splitKnownThinkingSuffix(definition.model);
               const [provider, ...parts] = baseModel.split("/");
@@ -195,7 +201,10 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
                 continue;
               }
               const banned = subagentBanListEntry(baseModel, { subagentBanList: modelSettings.banned, sessionBanList: [] });
-              if (banned) {
+              // The ban-list exception (ADR 0002 follow-up): a project's definition also needs allowProjectOverrides.
+              const banListException = banned !== undefined && modelSettings.allowBanned &&
+                (dirname(definition.file) === definitionDirs.personal || allowProjectOverrides);
+              if (banned && !banListException) {
                 results[index] = { ...item, status: "failed", finalText: "", error: `agent ${definition.name} model ${baseModel} is on the subagent ban list (entry '${banned}')` };
                 showProgress(index, results[index]);
                 continue;
@@ -206,9 +215,11 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
                 showProgress(index, results[index]);
                 continue;
               }
-              namedModel = { model: baseModel, ...(effort === undefined ? {} : { effort: effort as ThinkingLevel }), agent: definition.name, definitionFile: definition.file };
+              namedModel = { model: baseModel, ...(effort === undefined ? {} : { effort: effort as ThinkingLevel }), agent: definition.name, definitionFile: definition.file,
+                ...(banListException ? { banListException: true } : {}) };
             }
-            const preservedModel = namedModel === undefined ? {} : { model: namedModel.model };
+            const preservedModel: PreservedModel = namedModel === undefined ? {}
+              : { model: namedModel.model, ...(namedModel.banListException ? { banListException: true } : {}) };
             showProgress(index, { ...item, ...preservedModel, status: "running" });
             const worker = await runWorker({
               task, cwd: ctx.cwd, agentDir, orchestratorSession: ctx.sessionManager, signal,

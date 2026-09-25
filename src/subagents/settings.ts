@@ -12,7 +12,11 @@ type AgentDefinitionModelUse = "route" | "preserve";
 
 export interface SubagentsSettings {
   readonly maxParallel: number;
-  readonly agentDefinitionModel: { readonly use: AgentDefinitionModelUse };
+  readonly agentDefinitionModel: {
+    readonly use: AgentDefinitionModelUse;
+    /** Under "preserve", a definition-named model may be on the subagent ban list (ADR 0002 follow-up). */
+    readonly allowBanned: boolean;
+  };
 }
 
 export interface LoadedSubagentsSettings {
@@ -73,9 +77,11 @@ export function subagentsSettingsFromSettings(personal: unknown, project?: unkno
   }
   const use = agentDefinitionModel?.use ?? "route";
   if (use !== "route" && use !== "preserve") throw new Error(`${SUBAGENTS_KEY}.agentDefinitionModel.use must be route or preserve`);
+  const allowBanned = agentDefinitionModel?.allowBanned ?? false;
+  if (typeof allowBanned !== "boolean") throw new Error(`${SUBAGENTS_KEY}.agentDefinitionModel.allowBanned must be a boolean`);
 
   return {
-    settings: { maxParallel: Math.min(maxParallel, 8), agentDefinitionModel: { use } },
+    settings: { maxParallel: Math.min(maxParallel, 8), agentDefinitionModel: { use, allowBanned } },
     allowProjectOverrides,
     ignoredProjectKeys,
   };
