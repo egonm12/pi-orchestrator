@@ -13,6 +13,7 @@ import { livePiModelAvailability, PI_LIST_MODELS_TIMEOUT_MS, selectedLivePiModel
 import { authorizeRecipient, emptyAuthorization, grantOwnerApproval, saveAuthorization } from "../recipients/authorization.ts";
 import { ROUTER_PREFIX } from "../router/extension.ts";
 import { readRoutingRecords, type DecisionRecord } from "../routing/decision-record.ts";
+import { SUBAGENTS_TOOL } from "../subagents/worker.ts";
 
 // Bean pi-orchestrator-ngf0: the built-in `subagents` tool (ADR 0007) on a
 // real pi session, with the owner's package (this checkout, no pi-subagents)
@@ -70,9 +71,27 @@ interface SubagentsResultItem {
   readonly error?: string;
 }
 
-function subagentsResults(events: readonly PiEvent[]): { readonly isError: boolean | undefined; readonly items: readonly SubagentsResultItem[] } {
-  const start = events.find((event) => event.type === "tool_execution_start" && event.toolName === "subagents" && event.toolCallId);
-  assert.ok(start, `no subagents call: ${JSON.stringify(events.filter((e) => e.type?.startsWith("tool_"))).slice(0, 2000)}`);
+/** What the orchestrator session did instead, for a failure message: every
+ *  event type in order, the assistant's text and error messages, and pi's
+ *  stderr tail (extension load errors and the probe lines land there). */
+function sessionDiagnostics(events: readonly PiEvent[], stderr: string): string {
+  const assistant = events
+    .filter((event) => event.type === "message_end" && event.message?.role === "assistant")
+    .map((event) => {
+      const message = event.message as { content?: readonly { type?: string; text?: string; name?: string }[]; stopReason?: string; errorMessage?: string };
+      const parts = (message.content ?? []).map((part) => part.type === "text" ? part.text : `[${part.type}${part.name ? ` ${part.name}` : ""}]`);
+      return `${message.stopReason ?? "?"}${message.errorMessage ? ` (${message.errorMessage})` : ""}: ${parts.join(" ")}`;
+    });
+  return [
+    `event types: ${events.map((event) => event.type).join(", ")}`,
+    `assistant messages: ${JSON.stringify(assistant).slice(0, 2000)}`,
+    `stderr tail: ${stderr.slice(-2000)}`,
+  ].join("\n");
+}
+
+function subagentsResults(events: readonly PiEvent[], stderr: string): { readonly isError: boolean | undefined; readonly items: readonly SubagentsResultItem[] } {
+  const start = events.find((event) => event.type === "tool_execution_start" && event.toolName === SUBAGENTS_TOOL && event.toolCallId);
+  assert.ok(start, `no ${SUBAGENTS_TOOL} call: ${JSON.stringify(events.filter((e) => e.type?.startsWith("tool_"))).slice(0, 2000)}\n${sessionDiagnostics(events, stderr)}`);
   const end = events.find((event) => event.type === "tool_execution_end" && event.toolCallId === start!.toolCallId);
   const items = (end?.result?.details?.results ?? []) as unknown as SubagentsResultItem[];
   return { isError: end?.isError, items };
@@ -153,7 +172,9 @@ test(`live ${HAIKU} session: two parallel workers through the built-in subagents
 
     const run = spawnSync(
       "pi",
-      ["-p", prompt, "--mode", "json", "-t", "subagent", "--model", HAIKU, "--thinking", "off"],
+      // The allowlist names the built-in tool, `subagents`; pi-subagents'
+      // `subagent` (routing-acceptance.test.ts) would leave no tool active.
+      ["-p", prompt, "--mode", "json", "-t", SUBAGENTS_TOOL, "--model", HAIKU, "--thinking", "off"],
       {
         cwd: project.dir,
         env: agent.env({
@@ -181,7 +202,7 @@ test(`live ${HAIKU} session: two parallel workers through the built-in subagents
     assert.match(stderr, new RegExp(`${ROUTER_PREFIX} routing enabled, mode live`), stderr.slice(-2000));
 
     const events = piEvents(stdout);
-    const { isError, items: results } = subagentsResults(events);
+    const { isError, items: results } = subagentsResults(events, stderr);
     assert.equal(isError, false, JSON.stringify(results).slice(0, 2000));
     assert.equal(results.length, 2, JSON.stringify(results).slice(0, 2000));
     assert.deepEqual(results.map((result) => result.task), [TASK_A, TASK_B], "results keep item order");
