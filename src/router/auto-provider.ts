@@ -116,7 +116,8 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
           const slash = pin.model.indexOf("/");
           const rung = registry.find(pin.model.slice(0, slash), pin.model.slice(slash + 1));
           if (!rung) throw new Error(`pinned rung ${pin.model} is missing from the session model registry`);
-          const { apiKey: _apiKey, headers: _headers, ...rest } = options ?? {};
+          // The rung sets the effort; a caller's thinking level never reaches it (ADR 0006).
+          const { apiKey: _apiKey, headers: _headers, reasoning: _reasoning, ...rest } = options ?? {};
           const inward = { ...context, messages: context.messages.map((message) =>
             message.role === "assistant" && message.provider === model.provider && message.model === model.id
               ? { ...message, provider: rung.provider, model: rung.id, api: rung.api } : message) };

@@ -201,9 +201,9 @@ async function loadAutoProviderWith(h: Harness, registry: SessionModelRegistry, 
   return provider.streamSimple;
 }
 
-async function autoEvents(stream: AutoStream, messages: unknown[], sessionId?: string) {
+async function autoEvents(stream: AutoStream, messages: unknown[], sessionId?: string, options: Partial<Parameters<AutoStream>[2]> = {}) {
   const events = [];
-  for await (const event of stream(AUTO_MODEL, { messages } as unknown as Parameters<AutoStream>[1], { sessionId })) events.push(event);
+  for await (const event of stream(AUTO_MODEL, { messages } as unknown as Parameters<AutoStream>[1], { ...options, sessionId })) events.push(event);
   return events;
 }
 
@@ -604,12 +604,14 @@ test("the auto model reads the agent role from system text parts", async () => {
   } finally { h.cleanup(); }
 });
 
-test("the auto model sends no reasoning option for an off rung", async () => {
+// pi-subagents puts the agent's thinking level on the requested model, so
+// the caller passes `reasoning`; the rung's effort replaces it (ADR 0006).
+test("the auto model sends no reasoning option for an off rung, whatever the caller asked", async () => {
   const h = harness({ ...LIVE, tiers: { ...TEST_TIERS, mechanical: [`${HAIKU}:off`] } });
   try {
     const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
     const stream = await loadAutoProvider(h, registry);
-    await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "off-worker");
+    await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "off-worker", { reasoning: "high" });
     assert.equal(Object.hasOwn(registry.calls[0]?.options ?? {}, "reasoning"), false);
   } finally { h.cleanup(); }
 });
@@ -623,7 +625,7 @@ test("the auto model clamps the rung's effort to the current model's supported l
       return model?.id === "claude-haiku-4-5" ? { ...model, reasoning: false } : model;
     } };
     const stream = await loadAutoProvider(h, currentRegistry);
-    await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "clamped-worker");
+    await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "clamped-worker", { reasoning: "low" });
     assert.equal(Object.hasOwn(registry.calls[0]?.options ?? {}, "reasoning"), false);
   } finally { h.cleanup(); }
 });
