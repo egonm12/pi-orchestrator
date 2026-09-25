@@ -3,6 +3,7 @@ import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@earendil-wo
 import { toModelInfo, splitKnownThinkingSuffix, type ModelInfo } from "../models/model-info.ts";
 import { autoProviderConfig } from "./auto-provider.ts";
 import { autoModelLimits, withAutoModelLimits } from "./auto-model-limits.ts";
+import { refuseAutoModelForMainThread } from "./main-thread.ts";
 import { routeTask, type ActiveRouter } from "./route-task.ts";
 import { discoverAgents, resolveAgentName, type AgentConfig } from "../subagents/agents.ts";
 import { resolveExecutionAgentScope } from "../subagents/agents.ts";
@@ -269,6 +270,7 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
       disable: (error) => disable(error),
     });
     if (typeof pi.registerProvider === "function") pi.registerProvider("orchestrator", autoConfig);
+    refuseAutoModelForMainThread(pi);
     const disable = (error: unknown) => {
       active = undefined;
       if (disabled) return;

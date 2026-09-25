@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -21,7 +21,7 @@ import { resetBanLists } from "../policy/ban-lists.ts";
 import { authorizeRecipient, emptyAuthorization, grantOwnerApproval, type RecipientAuthorization } from "../recipients/authorization.ts";
 import { readRoutingRecords, type RoutingRecord } from "../routing/decision-record.ts";
 import { answerEvents, errorEvents, fakeSessionRegistry, assistantMessage } from "../fixtures/session-model-registry.ts";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { SettingsManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { TestContext as ExtensionContext } from "../fixtures/extension-context.ts";
 import type { SessionModelRegistry } from "../routing/model-stream.ts";
 import { createRouterExtension, type RouterDependencies, type RoutingEvidence } from "./extension.ts";
@@ -131,6 +131,25 @@ function harness(routing: unknown, extra: Record<string, unknown> = {}): Harness
 
 type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
 
+/** The handlers a fake ExtensionAPI collects, run the way pi's runner runs
+ *  them (extensions/runner.js emit): every handler for the event, in
+ *  registration order. `get` returns undefined when none is registered. */
+function piHandlers() {
+  const lists = new Map<string, Handler[]>();
+  return {
+    on(event: string, handler: Handler) { lists.set(event, [...(lists.get(event) ?? []), handler]); },
+    get(event: string): Handler | undefined {
+      const handlers = lists.get(event);
+      if (handlers === undefined) return undefined;
+      return async (payload, ctx) => {
+        let result: unknown;
+        for (const handler of handlers) result = await handler(payload, ctx) ?? result;
+        return result;
+      };
+    },
+  };
+}
+
 interface LoadedRouter {
   readonly ctx: ExtensionContext;
   toolCall(input: Record<string, unknown>, toolCallId?: string): Promise<unknown>;
@@ -156,14 +175,14 @@ async function loadRouter(h: Harness, deps: Partial<RouterDependencies> = {}, mo
 /** The router with the classifier call it would use in pi (unless `deps`
  *  replaces it): the in-session call over `modelRegistry`. */
 async function loadRouterWith(h: Harness, deps: Partial<RouterDependencies>, model: typeof SESSION_MODEL | undefined, modelRegistry: SessionModelRegistry): Promise<LoadedRouter> {
-  const handlers = new Map<string, Handler>();
+  const handlers = piHandlers();
   const createIsolatedRouterExtension = await isolatedRouterExtension();
   const factory = createIsolatedRouterExtension({
     evidence: () => () => evidenceOf(),
     now: () => NOW,
     ...deps,
   });
-  await factory({ on(event: string, handler: Handler) { handlers.set(event, handler); } } as unknown as ExtensionAPI);
+  await factory({ on(event: string, handler: Handler) { handlers.on(event, handler); } } as unknown as ExtensionAPI);
   const ctx: ExtensionContext = {
     cwd: h.projectDir,
     hasUI: false,
@@ -778,11 +797,11 @@ function classifierAnswer(tier: string): string {
 
 async function loadAutoProvider(h: Harness, registry: SessionModelRegistry, deps: Partial<RouterDependencies> = {}): Promise<AutoStream> {
   let provider: ProviderConfigInput | undefined;
-  const handlers = new Map<string, Handler>();
+  const handlers = piHandlers();
   const createIsolatedRouterExtension = await isolatedRouterExtension();
   createIsolatedRouterExtension({ classifierCall: () => answering("mechanical").call, evidence: () => () => evidenceOf(), now: () => NOW, ...deps })({
     registerProvider(name: string, config: ProviderConfigInput) { assert.equal(name, "orchestrator"); provider = config; },
-    on(event: string, handler: Handler) { handlers.set(event, handler); },
+    on(event: string, handler: Handler) { handlers.on(event, handler); },
   } as unknown as ExtensionAPI);
   await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, {
     cwd: h.projectDir, hasUI: false, model: SESSION_MODEL, modelRegistry: registry, thinkingLevel: "medium",
@@ -812,8 +831,8 @@ test("the main session exports its model and effort at startup", async () => {
 test("model selections update the session model, but auto and delegated sessions cannot replace it", async () => {
   const h = harness(LIVE);
   try {
-    const handlers = new Map<string, Handler>();
-    createRouterExtension()({ on(event: string, handler: Handler) { handlers.set(event, handler); } } as unknown as ExtensionAPI);
+    const handlers = piHandlers();
+    createRouterExtension()({ on(event: string, handler: Handler) { handlers.on(event, handler); } } as unknown as ExtensionAPI);
     const ctx = { cwd: h.projectDir, hasUI: false, model: SESSION_MODEL, thinkingLevel: "low" as const, modelRegistry: fakeSessionRegistry([]) };
     const select = handlers.get("model_select");
     assert.ok(select);
@@ -929,11 +948,11 @@ test("provider, startup and hook failures across extension instances print one d
       const { createRouterExtension: fresh } = await import(`./extension.ts?disable-process-${failure}-${++isolatedModule}`);
       process.env.PI_CODING_AGENT_DIR = h.agentDir;
       process.env.PI_ORCHESTRATOR_STATE_DIR = h.stateDir;
-      const handlers = new Map<string, Handler>();
+      const handlers = piHandlers();
       let provider: ProviderConfigInput | undefined;
       fresh({ classifierCall: () => answering("mechanical").call,
         evidence: () => () => { if (failure !== "startup") throw new Error(`${failure} evidence exploded`); return evidenceOf(); }, now: () => NOW })({
-        on(event: string, handler: Handler) { handlers.set(event, handler); },
+        on(event: string, handler: Handler) { handlers.on(event, handler); },
         registerProvider(_name: string, config: ProviderConfigInput) { provider = config; },
       } as unknown as ExtensionAPI);
       await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, {
@@ -1047,6 +1066,152 @@ async function autoScenario(h: Harness) {
   return { classifier, real, usage, registry, previous, signal, onPayload, onResponse, options, first, second };
 }
 
+// ---------------------------------------------------------------------------
+// The main thread stays on the model picked in /model (ADR 0006): a user's
+// selection of orchestrator/auto is undone with one line, a session that
+// starts on it, as a worker does, is left alone.
+// ---------------------------------------------------------------------------
+
+const OPUS_MODEL = { provider: "anthropic", id: "claude-opus-5" };
+
+async function loadMainThread(h: Harness, hasUI: boolean) {
+  const handlers = piHandlers();
+  const setModelCalls: unknown[] = [];
+  const notices: string[] = [];
+  createRouterExtension({ classifierCall: () => answering("mechanical").call, evidence: () => () => evidenceOf(), now: () => NOW })({
+    registerProvider() {},
+    on(event: string, handler: Handler) { handlers.on(event, handler); },
+    // pi's setModel emits its own model_select, source set (agent-session.js).
+    async setModel(model: unknown) {
+      setModelCalls.push(model);
+      await handlers.get("model_select")?.({ type: "model_select", model, previousModel: AUTO_MODEL, source: "set" }, ctx);
+      return true;
+    },
+  } as unknown as ExtensionAPI);
+  const ctx: ExtensionContext = { cwd: h.projectDir, hasUI, model: SESSION_MODEL, thinkingLevel: "high", modelRegistry: fakeSessionRegistry([]),
+    sessionManager: { getSessionId: () => "main" }, ui: { notify: (message) => { notices.push(message); } } };
+  const select = (model: unknown, previousModel: unknown, source: string) =>
+    handlers.get("model_select")?.({ type: "model_select", model, previousModel, source }, ctx);
+  return { handlers, ctx, setModelCalls, notices, select };
+}
+
+for (const source of ["set", "cycle"]) {
+  test(`selecting orchestrator/auto for the main thread (source ${source}) restores the previous model with one line`, async () => {
+    const h = harness(LIVE);
+    try {
+      const main = await loadMainThread(h, true);
+      await main.select(AUTO_MODEL, SESSION_MODEL, source);
+      assert.deepEqual(main.setModelCalls, [SESSION_MODEL]);
+      assert.deepEqual(main.notices, ["pi-orchestrator router: orchestrator/auto is for workers; restored anthropic/claude-haiku-4-5 for the main thread."]);
+    } finally { h.cleanup(); }
+  });
+}
+
+test("after the refusal the orchestrator's model names the restored model, never orchestrator/auto", async () => {
+  const h = harness(LIVE);
+  try {
+    const main = await loadMainThread(h, true);
+    process.env.PI_ORCHESTRATOR_SESSION_MODEL = "anthropic/claude-sonnet-5:low";
+    await main.select(AUTO_MODEL, OPUS_MODEL, "set");
+    assert.equal(process.env.PI_ORCHESTRATOR_SESSION_MODEL, "anthropic/claude-opus-5:high");
+  } finally { delete process.env.PI_ORCHESTRATOR_SESSION_MODEL; h.cleanup(); }
+});
+
+test("without a UI the orchestrator/auto refusal line goes to stderr", async () => {
+  const h = harness(LIVE);
+  try {
+    const main = await loadMainThread(h, false);
+    const stderr = await stderrOf(async () => { await main.select(AUTO_MODEL, OPUS_MODEL, "set"); });
+    assert.deepEqual(main.setModelCalls, [OPUS_MODEL]);
+    assert.equal(stderr, "pi-orchestrator router: orchestrator/auto is for workers; restored anthropic/claude-opus-5 for the main thread.\n");
+    assert.deepEqual(main.notices, []);
+  } finally { h.cleanup(); }
+});
+
+test("when the previous model cannot be restored the refusal line asks for another model", async () => {
+  const h = harness(LIVE);
+  try {
+    const main = await loadMainThread(h, true);
+    await main.select(AUTO_MODEL, undefined, "set");
+    assert.deepEqual(main.setModelCalls, []);
+    assert.deepEqual(main.notices, ["pi-orchestrator router: orchestrator/auto is for workers; pick another model in /model for the main thread."]);
+  } finally { h.cleanup(); }
+});
+
+/** What pi does on "set as default" in /model, with pi's own SettingsManager:
+ *  it queues a write of the default to the agent dir's settings.json before
+ *  it emits model_select. Returns pi's in-memory settings for later saves. */
+function piSavesDefault(h: Harness, provider: string, id: string): SettingsManager {
+  const settings = SettingsManager.create(h.projectDir, h.agentDir);
+  settings.setDefaultModelAndProvider(provider, id);
+  return settings;
+}
+
+test("setting orchestrator/auto as the default in /model restores the previous model as the default too", async () => {
+  const h = harness(LIVE, { sessionBanList: ["opus"] });
+  try {
+    const main = await loadMainThread(h, true);
+    const piSettings = piSavesDefault(h, "orchestrator", "auto");
+    await main.select(AUTO_MODEL, SESSION_MODEL, "set");
+    // A later save by pi writes only its own field over the file.
+    piSettings.setDefaultThinkingLevel("high");
+    await piSettings.flush();
+    assert.deepEqual(main.setModelCalls, [SESSION_MODEL]);
+    assert.deepEqual(main.notices, ["pi-orchestrator router: orchestrator/auto is for workers; restored anthropic/claude-haiku-4-5 for the main thread and as the default model."]);
+    const settings = JSON.parse(readFileSync(join(h.agentDir, "settings.json"), "utf8"));
+    assert.deepEqual([settings.defaultProvider, settings.defaultModel, settings.defaultThinkingLevel], ["anthropic", "claude-haiku-4-5", "high"]);
+    assert.deepEqual(settings.orchestrator, { routing: LIVE, sessionBanList: ["opus"] });
+  } finally { h.cleanup(); }
+});
+
+test("a saved default other than orchestrator/auto is left alone by the refusal", async () => {
+  const h = harness(LIVE);
+  try {
+    const main = await loadMainThread(h, true);
+    piSavesDefault(h, "anthropic", "claude-opus-5");
+    await main.select(AUTO_MODEL, SESSION_MODEL, "set");
+    assert.deepEqual(main.notices, ["pi-orchestrator router: orchestrator/auto is for workers; restored anthropic/claude-haiku-4-5 for the main thread."]);
+    const settings = JSON.parse(readFileSync(join(h.agentDir, "settings.json"), "utf8"));
+    assert.deepEqual([settings.defaultProvider, settings.defaultModel], ["anthropic", "claude-opus-5"]);
+  } finally { h.cleanup(); }
+});
+
+test("when no model can be restored a saved orchestrator/auto default is named in the one line", async () => {
+  const h = harness(LIVE);
+  try {
+    const main = await loadMainThread(h, true);
+    piSavesDefault(h, "orchestrator", "auto");
+    await main.select(AUTO_MODEL, undefined, "set");
+    assert.deepEqual(main.notices, ["pi-orchestrator router: orchestrator/auto is for workers; pick another model in /model for the main thread; the saved default is still orchestrator/auto, set another default in /model."]);
+    const settings = JSON.parse(readFileSync(join(h.agentDir, "settings.json"), "utf8"));
+    assert.deepEqual([settings.defaultProvider, settings.defaultModel], ["orchestrator", "auto"]);
+  } finally { h.cleanup(); }
+});
+
+test("a session that starts or is restored on orchestrator/auto is left on it", async () => {
+  const h = harness(LIVE);
+  try {
+    const main = await loadMainThread(h, false);
+    const stderr = await stderrOf(async () => {
+      await main.handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, { ...main.ctx, model: AUTO_MODEL });
+      await main.select(AUTO_MODEL, SESSION_MODEL, "restore");
+    });
+    assert.deepEqual(main.setModelCalls, []);
+    assert.doesNotMatch(stderr, /for workers/);
+    assert.deepEqual(main.notices, []);
+  } finally { h.cleanup(); }
+});
+
+test("selecting any other model for the main thread is not affected", async () => {
+  const h = harness(LIVE);
+  try {
+    const main = await loadMainThread(h, true);
+    for (const source of ["set", "cycle", "restore"]) await main.select(OPUS_MODEL, SESSION_MODEL, source);
+    assert.deepEqual(main.setModelCalls, []);
+    assert.deepEqual(main.notices, []);
+  } finally { h.cleanup(); }
+});
+
 test("a worker on the auto model forwards with the rung's effort and credentials", async () => {
   const h = harness(LIVE);
   try {
@@ -1156,10 +1321,10 @@ test("the auto model declares the largest context window and output limit among 
     };
     const registry = fakeSessionRegistry([], INSTALLED_MODEL_INFO.map((entry) => ({ ...entry, ...limits[entry.fullId] })));
     const registered: ProviderConfigInput[] = [];
-    const handlers = new Map<string, Handler>();
+    const handlers = piHandlers();
     createRouterExtension({ classifierCall: () => answering("mechanical").call, evidence: () => () => evidenceOf(), now: () => NOW })({
       registerProvider(name: string, config: ProviderConfigInput) { assert.equal(name, "orchestrator"); registered.push(config); },
-      on(event: string, handler: Handler) { handlers.set(event, handler); },
+      on(event: string, handler: Handler) { handlers.on(event, handler); },
     } as unknown as ExtensionAPI);
     await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, {
       cwd: h.projectDir, hasUI: false, model: SESSION_MODEL, modelRegistry: registry, sessionManager: { getSessionId: () => "parent" },
@@ -1234,11 +1399,11 @@ test("the auto model probe reports the rung, pin and time for each request", asy
   try {
     const registry = fakeSessionRegistry([{ events: answerEvents("first") }, { events: answerEvents("second") }]);
     let provider: ProviderConfigInput | undefined;
-    const handlers = new Map<string, Handler>();
+    const handlers = piHandlers();
     const lines = await stderrOf(async () => {
       createRouterExtension({ classifierCall: () => answering("mechanical").call, evidence: () => () => evidenceOf(), now: () => NOW })({
         registerProvider(_name: string, config: ProviderConfigInput) { provider = config; },
-        on(event: string, handler: Handler) { handlers.set(event, handler); },
+        on(event: string, handler: Handler) { handlers.on(event, handler); },
       } as unknown as ExtensionAPI);
       await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, {
         cwd: h.projectDir, hasUI: false, model: SESSION_MODEL, modelRegistry: registry,
