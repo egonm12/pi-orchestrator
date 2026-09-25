@@ -128,7 +128,7 @@ The guard protects against accidental mistakes, not a determined agent. It refus
 
 - `workflowScript` calls and named workflows are not routed. The children a script starts choose their models in code the router cannot see.
 - The allowance is per session ($5 by default), not per orchestrator task.
-- The router reimplements the parts of pi-subagents 0.71.0 it needs to find agent definitions (pi loads packages with separate module roots). It does not scan the global npm root for agent packages.
+- The router reimplements the parts of pi-subagents 0.71.0 it needs to find agent definitions (pi loads packages with separate module roots). It scans the global npm root for agent packages as 0.71.0 does, except when `PI_OFFLINE` is set.
 
 ## Development
 

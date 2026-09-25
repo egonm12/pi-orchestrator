@@ -1,3 +1,4 @@
+import { execSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -25,9 +26,9 @@ import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep 
 // - Settings: `agentOverrides`, `agentOverridesByProvider`, `defaultModel`,
 //   `defaultProvider`, `disableBuiltins` and `agentExcludeDirs`, project over
 //   user.
-// Not covered: the global npm root (`npm root -g`), which 0.71.0 also scans
-// for packages unless PI_OFFLINE is set. Runtime agents are not visible from
-// a separate module root either.
+// - The global npm root (`npm root -g`, or %APPDATA%/npm/node_modules on
+//   Windows), skipped when PI_OFFLINE is set.
+// Not covered: runtime agents, which are not visible from a separate module root.
 
 export type AgentScope = "user" | "project" | "both";
 export type AgentSource = "builtin" | "package" | "user" | "project";
@@ -491,6 +492,25 @@ function nodeModulesRoots(dir: string): string[] {
   return roots;
 }
 
+let cachedGlobalNpmRoot: string | null | undefined;
+
+/** The global npm root, or null when offline or npm is unavailable. Cached for
+ *  the process, as 0.71.0 caches it. */
+export function globalNpmRoot(): string | null {
+  const offline = process.env.PI_OFFLINE?.toLowerCase();
+  if (offline === "1" || offline === "true" || offline === "yes") return null;
+  if (cachedGlobalNpmRoot !== undefined) return cachedGlobalNpmRoot;
+  const windowsRoot = process.platform === "win32" && process.env.APPDATA ? join(process.env.APPDATA, "npm", "node_modules") : undefined;
+  if (windowsRoot && isDirectory(windowsRoot)) return (cachedGlobalNpmRoot = canonical(windowsRoot));
+  try {
+    const root = execSync("npm root -g", { encoding: "utf-8", timeout: 5000, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] }).trim();
+    cachedGlobalNpmRoot = root ? canonical(root) : null;
+  } catch {
+    cachedGlobalNpmRoot = null;
+  }
+  return cachedGlobalNpmRoot;
+}
+
 function settingsPackageRoots(settingsFile: string, baseDir: string): string[] {
   const packages = readSettings(settingsFile).packages;
   if (!Array.isArray(packages)) return [];
@@ -530,6 +550,8 @@ function packageAgentPaths(cwd: string, scope: AgentScope): string[] {
     const dir = agentDir();
     roots.push(...nodeModulesRoots(join(dir, "npm", "node_modules")));
     roots.push(...safe(() => settingsPackageRoots(join(dir, "settings.json"), dir)));
+    const global = globalNpmRoot();
+    if (global) roots.push(...nodeModulesRoots(global));
   }
   const seenRoots = new Set<string>();
   const dirs: string[] = [];

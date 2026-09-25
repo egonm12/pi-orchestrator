@@ -44,9 +44,9 @@ function fixture(settings: { user?: unknown; project?: unknown } = {}): Fixture 
   return { home, agentDir, project, cleanup: () => rmSync(home, { recursive: true, force: true }) };
 }
 
-const NAMES = ["pinned", "loose", "lax", "inherits", "my-pkg.tool", "tool", "worker", "developer", "oracle", "advisor", "reviewer", "chain", "missing"];
+const NAMES = ["global-agent", "pinned", "loose", "lax", "inherits", "my-pkg.tool", "tool", "worker", "developer", "oracle", "advisor", "reviewer", "chain", "missing"];
 
-function probe(module: string, fx: Fixture, scope: string, provider?: string): unknown {
+function probe(module: string, fx: Fixture, scope: string, provider?: string, env: NodeJS.ProcessEnv = { PI_OFFLINE: "1" }): unknown {
   const script =
     `const m = await import(${JSON.stringify(module)});` +
     `const scope = m.resolveExecutionAgentScope(${JSON.stringify(scope)});` +
@@ -58,7 +58,7 @@ function probe(module: string, fx: Fixture, scope: string, provider?: string): u
   const run = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
     encoding: "utf8",
     cwd: fx.project,
-    env: { PATH: process.env.PATH, HOME: fx.home, PI_CODING_AGENT_DIR: fx.agentDir, PI_OFFLINE: "1" },
+    env: { PATH: process.env.PATH, HOME: fx.home, PI_CODING_AGENT_DIR: fx.agentDir, ...env },
     timeout: 30_000,
   });
   assert.equal(run.status, 0, run.stderr);
@@ -116,6 +116,49 @@ test(`the lookup matches the installed pi-subagents ${PI_SUBAGENTS_VERSION}`, (t
           } finally { fx.cleanup(); }
         }
       }
+    }
+  } finally { rmSync(shimDir, { recursive: true, force: true }); }
+});
+
+/** A fake `npm` whose `root -g` names a global root holding one agent package. */
+function fakeGlobalNpm(fx: Fixture): NodeJS.ProcessEnv {
+  const bin = join(fx.home, "bin");
+  const root = join(fx.home, "global", "node_modules");
+  const pkg = join(root, "global-agents");
+  mkdirSync(join(pkg, "agents"), { recursive: true });
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(pkg, "package.json"), JSON.stringify({ name: "global-agents", pi: { subagents: { agents: ["./agents"] } } }));
+  writeFileSync(join(pkg, "agents", "global-agent.md"), agentFile("global-agent", { model: "anthropic/claude-haiku-4-5" }));
+  writeFileSync(join(bin, "npm"), `#!/bin/sh\necho ${root}\n`, { mode: 0o755 });
+  return { PATH: `${bin}:${process.env.PATH}` };
+}
+
+test("agent packages in the global npm root are found, except offline", { skip: process.platform === "win32" }, () => {
+  const fx = fixture();
+  try {
+    const env = fakeGlobalNpm(fx);
+    const online = probe(OURS, fx, "both", undefined, env) as { out: Record<string, { source: string; model?: string } | null> };
+    assert.deepEqual(online.out["global-agent"], { name: "global-agent", source: "package", model: "anthropic/claude-haiku-4-5" });
+    const offline = probe(OURS, fx, "both", undefined, { ...env, PI_OFFLINE: "1" }) as { out: Record<string, unknown> };
+    assert.equal(offline.out["global-agent"], null);
+    const projectOnly = probe(OURS, fx, "project", undefined, env) as { out: Record<string, unknown> };
+    assert.equal(projectOnly.out["global-agent"], null, "the global root is a user source");
+  } finally { fx.cleanup(); }
+});
+
+test(`the global npm root lookup matches the installed pi-subagents ${PI_SUBAGENTS_VERSION}`, { skip: process.platform === "win32" }, (t) => {
+  const src = installedPiSubagentsSrc();
+  if (!src) return t.skip("pi-subagents is not installed in ~/.pi/agent");
+  const shimDir = mkdtempSync(join(tmpdir(), "pi-orchestrator-agents-shim-"));
+  try {
+    const shim = join(shimDir, "shim.mjs");
+    writeFileSync(shim, `export { discoverAgents, resolveAgentName } from ${JSON.stringify(join(src, "agents", "agents.js"))};\nexport { resolveExecutionAgentScope } from ${JSON.stringify(join(src, "agents", "agent-scope.js"))};\n`);
+    for (const scope of ["both", "user", "project"]) {
+      const fx = fixture();
+      try {
+        const env = fakeGlobalNpm(fx);
+        assert.deepEqual(probe(OURS, fx, scope, undefined, env), probe(shim, fx, scope, undefined, env), `scope ${scope}`);
+      } finally { fx.cleanup(); }
     }
   } finally { rmSync(shimDir, { recursive: true, force: true }); }
 });
