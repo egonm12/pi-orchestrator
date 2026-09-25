@@ -10,7 +10,7 @@ The router extension filled in the model on pi-subagents' `subagent` calls. That
 ## Considered options
 
 - **Rewrite `subagent` calls (the old design).** Works only with pi-subagents and needs a copy of its internals that can drift from the installed version.
-- **An own `delegate` tool and worker runtime.** The orchestrator owns the whole path, but it has to build and maintain a subagent runtime, and other subagent tools bypass it unless they are hidden.
+- **An own `delegate` tool and worker runtime.** The orchestrator owns the whole path, but it has to build and maintain a subagent runtime, and other subagent tools bypass it unless they are hidden. (Adopted later for starting workers, with the auto model kept for routing: ADR 0007.)
 - **The auto model (chosen).** Any subagent extension that starts a worker on `orchestrator/auto` is routed, without an adapter.
 - **The main thread on the auto model too (rejected).** Each prompt can switch model, and each switch rereads the whole history without a cache: 138k against 29k uncached tokens in the prototype's walkthroughs (branch `prototype/auto-model`).
 

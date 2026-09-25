@@ -7,7 +7,11 @@ The role the main session takes. It owns clarification, task decomposition, dele
 
 **Worker**:
 An agent the orchestrator hands one bounded piece of investigation, implementation or verification work to. It reports to the orchestrator, never to the user.
-_Avoid_: Execution agent, subagent (that is pi-subagents' mechanism and tool name, not the role)
+_Avoid_: Execution agent, subagent (that is the tool that starts workers, not the role)
+
+**Agent definition**:
+A named, owner-written description of a kind of worker: its instructions and the tools it may use. Read from the owner's and the project's agent folders; pi-orchestrator ships none.
+_Avoid_: Role (that is the orchestrator/worker split), persona
 
 **Delegation**:
 One handing of one piece of work from the orchestrator to a worker. Each attempt has a delegation id: the id of the worker's pi session.
@@ -64,7 +68,7 @@ Older harness text uses "escalation" more loosely: for ticket 06's low-confidenc
 _Avoid_: Fallback (ticket 06's low-confidence fallback tier is a different rule), downgrade
 
 **Subagent ban list**:
-The owner's list of model names that no worker may run on, matched by name regardless of provider or tier map. Does not bind the orchestrator's own session.
+The owner's list of model names that no worker may run on, matched by name regardless of provider or tier map. The one exception is a model an agent definition names, when the owner has switched that exception on. Does not bind the orchestrator's own session.
 _Avoid_: Prohibited patterns, Fable/Astra rule, ban list (alone)
 
 **Session ban list**:
