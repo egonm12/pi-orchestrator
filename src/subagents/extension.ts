@@ -1,11 +1,12 @@
+import { join } from "node:path";
 import type { ExtensionAPI, InlineExtension } from "@earendil-works/pi-coding-agent";
-import { personalAgentDir } from "../policy/ban-lists.ts";
+import { personalAgentDir, personalOrchestrator, readSettingsFile } from "../policy/ban-lists.ts";
 import { runWorker, SUBAGENTS_TOOL, type WorkerResult } from "./worker.ts";
 
 // The subagents extension (ADR 0007): a third pi extension, separate from the
 // router and the guard, with a `subagents` tool. Each call starts a worker in
 // this pi process on the auto model `orchestrator/auto`, and the router
-// extension routes it. This first version runs one task per call.
+// extension routes it. A call queues up to eight tasks.
 
 type ToolParameters = Parameters<ExtensionAPI["registerTool"]>[0]["parameters"];
 
@@ -14,9 +15,13 @@ type ToolParameters = Parameters<ExtensionAPI["registerTool"]>[0]["parameters"];
 const PARAMETERS = {
   type: "object",
   properties: {
-    task: { type: "string", description: "The whole task for the worker, with every fact it needs. The worker sees nothing else." },
+    items: { type: "array", minItems: 1, maxItems: 8, items: {
+      type: "object", properties: {
+        task: { type: "string", description: "The whole task for the worker, with every fact it needs. The worker sees nothing else." },
+      }, required: ["task"], additionalProperties: false,
+    } },
   },
-  required: ["task"],
+  required: ["items"],
   additionalProperties: false,
 } as unknown as ToolParameters;
 
@@ -32,9 +37,13 @@ export function cutText(text: string, sessionFile: string | undefined): string {
   return `${kept}\n\n[Cut at 50 KB. ${where}]`;
 }
 
-export interface SubagentResult extends WorkerResult {
+export type SubagentResult = ({ readonly task: string } & WorkerResult) | {
   readonly task: string;
-}
+  readonly status: "not-started";
+  readonly sessionId?: never;
+  readonly sessionFile?: never;
+  readonly finalText: "";
+};
 
 /** The tool result's `details`. */
 export interface SubagentsDetails {
@@ -42,6 +51,7 @@ export interface SubagentsDetails {
 }
 
 function resultText(result: SubagentResult): string {
+  if (result.status === "not-started") return `Worker not started: ${result.task}`;
   const outcome = result.status === "completed" ? "completed." : `${result.status}${result.error ? `: ${result.error}` : "."}`;
   return [
     `Worker ${result.sessionId} ${outcome}`,
@@ -49,6 +59,25 @@ function resultText(result: SubagentResult): string {
     "",
     result.finalText,
   ].join("\n");
+}
+
+function maxParallel(agentDir: string, cwd: string): number {
+  const personal = personalOrchestrator(readSettingsFile(join(agentDir, "settings.json")) ?? {})?.subagents;
+  if (personal !== undefined && (typeof personal !== "object" || personal === null || Array.isArray(personal))) {
+    throw new Error("orchestrator.subagents must be an object");
+  }
+  const personalOptions = personal as Record<string, unknown> | undefined;
+  const allowProjectOverrides = personalOptions?.allowProjectOverrides === true;
+  const project = allowProjectOverrides ? readSettingsFile(join(cwd, ".pi", "settings.json")) : undefined;
+  const projectOptions = project === undefined ? undefined : personalOrchestrator(project)?.subagents;
+  if (projectOptions !== undefined && (typeof projectOptions !== "object" || projectOptions === null || Array.isArray(projectOptions))) {
+    throw new Error("project orchestrator.subagents must be an object");
+  }
+  const limit = (projectOptions as Record<string, unknown> | undefined)?.maxParallel ?? personalOptions?.maxParallel ?? 4;
+  if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1) {
+    throw new Error("orchestrator.subagents.maxParallel must be a positive integer");
+  }
+  return Math.min(limit, 8);
 }
 
 export interface SubagentsDependencies {
@@ -62,18 +91,35 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
     pi.registerTool({
       name: SUBAGENTS_TOOL,
       label: "Subagents",
-      description: "Hand one task to a worker. The worker runs to its end and returns its final text, " +
-        "its status and its session file. It sees only the task text, so put every fact it needs in it.",
+      description: "Hand 1 to 8 tasks to workers. At most orchestrator.subagents.maxParallel run at once. " +
+        "Results keep item order; abort stops running workers and leaves queued workers not started. " +
+        "Each worker sees only its task text, so put every fact it needs in it.",
       parameters: PARAMETERS,
       async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-        const { task } = params as { task: string };
-        const worker = await runWorker({
-          task, cwd: ctx.cwd, agentDir: personalAgentDir(), orchestratorSession: ctx.sessionManager, signal,
-          extensionFactories: deps.workerExtensions,
-        });
-        const result: SubagentResult = { task, ...worker, finalText: cutText(worker.finalText, worker.sessionFile) };
-        const details: SubagentsDetails = { results: [result] };
-        return { content: [{ type: "text", text: resultText(result) }], details };
+        const { items } = params as { items: { task: string }[] };
+        if (!Array.isArray(items) || items.length < 1 || items.length > 8) throw new Error("subagents requires 1 to 8 items per call");
+        const agentDir = personalAgentDir();
+        const limit = maxParallel(agentDir, ctx.cwd);
+        const results: SubagentResult[] = new Array(items.length);
+        let next = 0;
+        const runQueue = async () => {
+          while (next < items.length) {
+            if (signal?.aborted) return;
+            const index = next++;
+            const task = items[index]!.task;
+            const worker = await runWorker({
+              task, cwd: ctx.cwd, agentDir, orchestratorSession: ctx.sessionManager, signal,
+              extensionFactories: deps.workerExtensions,
+            });
+            results[index] = { task, ...worker, finalText: cutText(worker.finalText, worker.sessionFile) };
+          }
+        };
+        await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => runQueue()));
+        for (let index = 0; index < items.length; index++) {
+          results[index] ??= { task: items[index]!.task, status: "not-started", finalText: "" };
+        }
+        const details: SubagentsDetails = { results };
+        return { content: [{ type: "text", text: results.map(resultText).join("\n\n") }], details };
       },
     });
   };

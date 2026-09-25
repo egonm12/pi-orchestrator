@@ -80,7 +80,9 @@ export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
     const file = sessionManager.getSessionFile();
     return file !== undefined && existsSync(file) ? file : undefined;
   };
-  const failed = (error: string): WorkerResult => ({ status: "failed", sessionId, sessionFile: saved(), finalText: "", error });
+  const failed = (error: string): WorkerResult => setup.signal?.aborted
+    ? { status: "aborted", sessionId, sessionFile: saved(), finalText: "" }
+    : { status: "failed", sessionId, sessionFile: saved(), finalText: "", error };
 
   let session: Awaited<ReturnType<typeof createAgentSessionFromServices>>["session"];
   try {
@@ -104,8 +106,8 @@ export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
     // Binding starts the extensions: the router extension reads its settings
     // at session_start.
     await session.bindExtensions({});
-    if (setup.signal?.aborted) return { status: "aborted", sessionId, sessionFile: saved(), finalText: "" };
     setup.signal?.addEventListener("abort", abort, { once: true });
+    if (setup.signal?.aborted) return { status: "aborted", sessionId, sessionFile: saved(), finalText: "" };
     await session.prompt(setup.task);
     const replies = session.messages.filter((message) => (message as Reply).role === "assistant") as Reply[];
     const last = replies.at(-1);
