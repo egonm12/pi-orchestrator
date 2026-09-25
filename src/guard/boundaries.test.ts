@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { configureBanLists, resetBanLists } from "../policy/ban-lists.ts";
-import { launchesUnguardedPi, toolRefusal, withinAgentDir } from "./boundaries.ts";
+import { launchesUnguardedPi, toolRefusal, protectedAgentPath } from "./boundaries.ts";
 import { useOwnerBanLists } from "../fixtures/owner-ban-lists.ts";
 
 useOwnerBanLists();
@@ -59,15 +59,45 @@ test("write and edit reject canonical symlink, tilde, and case-equivalent agent 
     }
     assert.match(toolRefusal("bash", { command: "PI_CODING_AGENT_DIR=$HOME/other pi -p hi" }, scene)!, /nested pi/);
     for (const path of [join(agentDir, "new.txt"), "alias/new.txt", ".pi/agent/new.txt", "~/.pi/agent/new.txt"]) {
-      assert.equal(withinAgentDir(path, scene), true, path);
+      assert.equal(protectedAgentPath(path, scene), true, path);
       for (const tool of ["write", "edit"]) assert.match(toolRefusal(tool, { path }, scene)!, /agent directory/);
     }
     const alternate = join(home, ".PI", "AGENT", "new.txt");
     const caseEquivalent = existsSync(join(home, ".PI", "AGENT"));
-    assert.equal(withinAgentDir(alternate, scene), caseEquivalent);
+    assert.equal(protectedAgentPath(alternate, scene), caseEquivalent);
     assert.equal(toolRefusal("bash", { command: "PI_CODING_AGENT_DIR=~/.PI/agent pi -p hi" }, scene) === undefined, caseEquivalent);
     assert.equal(toolRefusal("write", { path: alternate }, scene) !== undefined, caseEquivalent);
     assert.equal(toolRefusal("write", { path: join(home, "project.txt") }, scene), undefined);
+  } finally {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("write and edit may use the agent directory's sessions subtree, where subagent extensions keep artifacts, and nothing else there", () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-harness-guard-sessions-"));
+  const originalHome = process.env.HOME;
+  try {
+    process.env.HOME = home;
+    const agentDir = join(home, ".pi", "agent");
+    const artifacts = join(agentDir, "sessions", "--project--", "subagent-artifacts", "outputs", "run-1");
+    mkdirSync(artifacts, { recursive: true });
+    symlinkSync(agentDir, join(home, "alias"));
+    symlinkSync(agentDir, join(agentDir, "sessions", "escape"));
+    const scene = { agentDir, cwd: home };
+    for (const path of [join(artifacts, "standard.md"), "alias/sessions/--project--/subagent-artifacts/outputs/run-1/standard.md", "~/.pi/agent/sessions/new.md"]) {
+      for (const tool of ["write", "edit"]) assert.equal(toolRefusal(tool, { path }, scene), undefined, `${tool} ${path}`);
+    }
+    for (const path of [join(agentDir, "sessions"), join(agentDir, "sessions", "..", "settings.json"), join(agentDir, "sessions", "escape", "settings.json"),
+      join(agentDir, "settings.json"), join(agentDir, "pi-orchestrator", "authorized-recipients.json"), join(agentDir, "sessions-backup", "x.md")]) {
+      for (const tool of ["write", "edit"]) assert.match(toolRefusal(tool, { path }, scene) ?? "", /agent directory/, `${tool} ${path}`);
+    }
+    // A sessions/ that points back at the agent directory opens nothing.
+    const looped = join(home, "looped");
+    mkdirSync(looped);
+    symlinkSync(looped, join(looped, "sessions"));
+    assert.match(toolRefusal("write", { path: join(looped, "sessions", "settings.json") }, { agentDir: looped, cwd: home }) ?? "", /agent directory/);
   } finally {
     if (originalHome === undefined) delete process.env.HOME;
     else process.env.HOME = originalHome;

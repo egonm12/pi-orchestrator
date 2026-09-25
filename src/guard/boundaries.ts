@@ -1,6 +1,6 @@
 import { statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, isAbsolute, resolve, sep } from "node:path";
+import { basename, isAbsolute, join, resolve, sep } from "node:path";
 import { isProhibitedModel } from "../policy/model-resolution.ts";
 import { canonicalPath } from "../policy/canonical-path.ts";
 
@@ -18,13 +18,20 @@ function caseInsensitiveVolume(path: string): boolean {
   } catch { return false; }
 }
 
-/** Canonicalise existing ancestors (including symlinks) before comparing a tool path. */
-export function withinAgentDir(path: string, ctx: BoundaryContext, home = homedir()): boolean {
+/** A path write and edit may not touch: inside the agent directory, outside its
+ *  sessions/ subtree. Canonicalises existing ancestors (including symlinks) first. */
+export function protectedAgentPath(path: string, ctx: BoundaryContext, home = homedir()): boolean {
   const root = canonicalPath(ctx.agentDir);
   const expanded = path === "~" || path.startsWith("~/") ? `${home}${path.slice(1)}` : path;
   const target = canonicalPath(isAbsolute(expanded) ? expanded : resolve(ctx.cwd, expanded));
   const fold = caseInsensitiveVolume(root) ? (value: string) => value.toLowerCase() : (value: string) => value;
-  return fold(target) === fold(root) || fold(target).startsWith(`${fold(root)}${sep}`);
+  if (fold(target) !== fold(root) && !fold(target).startsWith(`${fold(root)}${sep}`)) return false;
+  // Subagent extensions keep run artifacts below sessions/ (pi-subagents:
+  // subagent-artifacts/), so that subtree is writable. A sessions/ that
+  // resolves outside, or back to, the agent directory opens nothing.
+  const sessions = canonicalPath(join(ctx.agentDir, "sessions"));
+  const sessionsInside = fold(sessions).startsWith(`${fold(root)}${sep}`);
+  return !(sessionsInside && fold(target).startsWith(`${fold(sessions)}${sep}`));
 }
 
 export interface DelegationObject {
@@ -154,7 +161,7 @@ export function toolRefusal(toolName: string, input: Record<string, unknown>, ct
   const { command: _command, ...fields } = toolName === "bash" ? input : { ...input };
   const prohibited = prohibitedModelIn(fields, toolName === "subagent");
   if (prohibited) return `prohibited model: ${prohibited}`;
-  if ((toolName === "write" || toolName === "edit") && typeof input.path === "string" && withinAgentDir(input.path, ctx)) {
+  if ((toolName === "write" || toolName === "edit") && typeof input.path === "string" && protectedAgentPath(input.path, ctx)) {
     return `cannot modify the agent directory ${ctx.agentDir}`;
   }
   if (toolName === "bash" && typeof input.command === "string" && launchesUnguardedPi(input.command, ctx)) {
