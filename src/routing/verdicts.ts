@@ -7,14 +7,14 @@
 //      `verdictFromReviewResult` reads that field and nothing else: a result
 //      without it, or with a value outside the enum, is `missing`. Prose is
 //      never parsed.
-//   2. Attaching. `attachVerdict` looks the dispatch attempt id up in the
+//   2. Attaching. `attachVerdict` looks the delegation id up in the
 //      record folder. A known id appends a `verdict` record linked to the
 //      decision; an unknown id appends an `orphaned-verdict` record. Both go
 //      into the day file of the verdict's own timestamp.
 //   3. Learning data. An `accept` or `request_changes` attached to a decision
 //      that chose a rung is also recorded in ticket 08's observation ledger as
 //      a `verified-task-outcome`: taskType is the classifier's kind of work,
-//      instance is the attempt id, so a second attach replaces rather than
+//      instance is the delegation id, so a second attach replaces rather than
 //      adds (the ledger dedupes on model, taskType and instance). The model is
 //      the one that ran the work: the chosen rung's model in live mode, the
 //      hand-picked model in shadow mode (owner decision, 2026-09-25), with the
@@ -86,8 +86,8 @@ export function verdictFromReviewResult(result: unknown): Verdict {
 
 export interface AttachVerdictInput {
   readonly recordDir: string;
-  /** Ticket 18's dispatch attempt id of the reviewed work. */
-  readonly attemptId: string;
+  /** Ticket 18's delegation id of the reviewed work. */
+  readonly delegationId: string;
   readonly verdict: Verdict;
   /** Defaults to now. */
   readonly at?: Date;
@@ -114,7 +114,7 @@ function observationFor(decision: RoutedDecisionRecord, verdict: Verdict, observ
   return {
     model,
     taskType: decision.classification.kindOfWork,
-    instance: decision.attemptId,
+    instance: decision.delegationId,
     source: "verified-task-outcome",
     outcome: verdict === "accept" ? "pass" : "fail",
     observedAt,
@@ -127,14 +127,14 @@ function observationFor(decision: RoutedDecisionRecord, verdict: Verdict, observ
 export function attachVerdict(input: AttachVerdictInput): AttachVerdictOutcome {
   const timestamp = (input.at ?? new Date()).toISOString();
   const decisions = readRoutingRecordEntries(input.recordDir).filter(
-    (entry) => isRoutedDecision(entry.record) && entry.record.attemptId === input.attemptId,
+    (entry) => isRoutedDecision(entry.record) && entry.record.delegationId === input.delegationId,
   );
   const latest = decisions.at(-1);
   if (latest === undefined) {
     const recordPath = appendRoutingRecord(input.recordDir, {
       recordType: "orphaned-verdict",
       schemaVersion: DECISION_RECORD_SCHEMA_VERSION,
-      attemptId: input.attemptId,
+      delegationId: input.delegationId,
       timestamp,
       verdict: input.verdict,
     });
@@ -144,7 +144,7 @@ export function attachVerdict(input: AttachVerdictInput): AttachVerdictOutcome {
   const recordPath = appendRoutingRecord(input.recordDir, {
     recordType: "verdict",
     schemaVersion: DECISION_RECORD_SCHEMA_VERSION,
-    attemptId: input.attemptId,
+    delegationId: input.delegationId,
     timestamp,
     verdict: input.verdict,
     decisionFile: latest.file,

@@ -21,10 +21,10 @@
 // `reassignRun` is reachable ONLY from `reconciled`. From `started` it fails.
 //
 // WHY "NO DUPLICATED EFFECTS" IS STRUCTURAL HERE
-// `markStarted` is the only function that appends to `dispatches`. Reassignment
-// does not dispatch; it returns a run ready to be started again. So while the
-// first dispatch is unreconciled, `reassignRun` fails, `markStarted` is never
-// reached for the second model, and `dispatches.length` stays 1. The absence of
+// `markStarted` is the only function that appends to `delegations`. Reassignment
+// does not delegate; it returns a run ready to be started again. So while the
+// first delegation is unreconciled, `reassignRun` fails, `markStarted` is never
+// reached for the second model, and `delegations.length` stays 1. The absence of
 // a duplicate is a consequence of where the append lives, not of a convention
 // asking callers to be careful.
 //
@@ -58,8 +58,8 @@ export interface RunEvent {
   readonly detail?: string;
 }
 
-/** An actual dispatch: work handed to a model. Appended only by markStarted. */
-export interface RunDispatch {
+/** An actual delegation: work handed to a model. Appended only by markStarted. */
+export interface RunDelegation {
   readonly model: string;
   readonly startedAt: string;
 }
@@ -77,7 +77,7 @@ export interface RunState {
   readonly phase: RunPhase;
   /** The model this run is currently assigned to. */
   readonly model: string;
-  readonly dispatches: readonly RunDispatch[];
+  readonly delegations: readonly RunDelegation[];
   readonly history: readonly RunEvent[];
   readonly checkpoint?: Checkpoint;
   /** Set by reconcileRun. Reassignment requires it. */
@@ -133,13 +133,13 @@ export function planRun(input: {
     taskId: input.taskId,
     phase: "planned",
     model: input.model,
-    dispatches: [],
+    delegations: [],
     history: [event("planned", input.model, at)],
   };
 }
 
 /**
- * Hand the work to the model. The ONLY function that records a dispatch, which
+ * Hand the work to the model. The ONLY function that records a delegation, which
  * is what makes a duplicate structurally impossible while a run is
  * unreconciled.
  */
@@ -159,7 +159,7 @@ export function markStarted(state: RunState, at?: string): RunTransition {
       state,
       message:
         `pi-orchestration-harness: run ${state.runId} is already started on ` +
-        `'${state.model}'. Starting it again would dispatch the same task twice.`,
+        `'${state.model}'. Starting it again would delegate the same task twice.`,
     };
   }
   if (state.phase === "completed") {
@@ -186,7 +186,7 @@ export function markStarted(state: RunState, at?: string): RunTransition {
     state: {
       ...state,
       phase: "started",
-      dispatches: [...state.dispatches, { model: state.model, startedAt: stamp }],
+      delegations: [...state.delegations, { model: state.model, startedAt: stamp }],
       history: [...state.history, event("started", state.model, stamp)],
     },
   };
@@ -292,12 +292,12 @@ export function reconcileRun(state: RunState, at?: string): RunTransition {
  * Assign the task to a different model.
  *
  * Refused from `started`: the first model is still holding the work, and a
- * second dispatch would duplicate whatever it has already done. Refused from
+ * second delegation would duplicate whatever it has already done. Refused from
  * `stopped`/`checkpointed` too -- halting is not the same as knowing what was
  * already done, and the ticket asks for both.
  *
- * Returns a run in `planned` on the new model, with the dispatch history and
- * the reconciled actions intact. It does NOT dispatch: `markStarted` does that,
+ * Returns a run in `planned` on the new model, with the delegation history and
+ * the reconciled actions intact. It does NOT delegation: `markStarted` does that,
  * and keeping the append in one place is what makes the no-duplicate guarantee
  * structural.
  */
@@ -392,7 +392,7 @@ export function formatRunRecord(state: RunState): string {
     taskId: state.taskId,
     phase: state.phase,
     model: state.model,
-    dispatches: state.dispatches,
+    delegations: state.delegations,
     reconciledActions: state.reconciledActions ?? null,
     canReassign: canReassign(state),
   })}`;

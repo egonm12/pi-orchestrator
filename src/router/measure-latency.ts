@@ -132,7 +132,7 @@ function measureMode(mode: "shadow" | "live", calls: number, authExtension: stri
     if (run.status !== 0) throw new Error(`${mode}: pi exited ${run.status}: ${stderr.slice(-1000)}`);
     validateLatencyRun({ calls, rung, mode, events, records, lines, launches: launches.read() });
     for (const [index, end] of ends.entries()) {
-      const record = records.find((entry) => entry.attemptId === end.toolCallId);
+      const record = records.find((entry) => entry.delegationId === end.toolCallId);
       const text = (end.result?.content ?? []).map((block) => block.text ?? "").join(" ");
       const routed = record?.recordType === "decision" ? `decision ${record.classification.cause} -> ${record.route.outcome}` : `record ${record?.recordType ?? "missing"}`;
       process.stdout.write(`${mode} call ${index + 1}: ${end.toolCallId} ${routed}; hook ${hookMs[index]?.toFixed(1) ?? "?"} ms; tool error=${String(end.isError)}: ${text.slice(0, 80)}\n`);
@@ -176,7 +176,7 @@ export interface LatencyEvidence {
   readonly rung: string;
   readonly mode: "shadow" | "live";
   readonly events: readonly PiEvent[];
-  readonly records: readonly { attemptId: string; recordType: string; classification?: { cause: string } }[];
+  readonly records: readonly { delegationId: string; recordType: string; classification?: { cause: string } }[];
   readonly lines: readonly string[];
   readonly launches: readonly { kind: string }[];
 }
@@ -191,7 +191,7 @@ export function validateLatencyRun(input: LatencyEvidence): void {
   require(records.length === calls, "unexpected record count");
   for (const end of ends) {
     require(typeof end.toolCallId === "string" && end.toolCallId.length > 0, "missing result ID");
-    const matching = records.filter((record) => record.attemptId === end.toolCallId);
+    const matching = records.filter((record) => record.delegationId === end.toolCallId);
     require(matching.length === 1, "missing or duplicate matching record");
     require(matching[0]?.recordType === "decision", "not a decision record");
     require(matching[0]?.classification?.cause === `model:${rung}`, "wrong classifier cause");

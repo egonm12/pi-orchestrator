@@ -11,7 +11,7 @@ import {
   providerOf,
   type BudgetPreflightConstraint,
   type RefusedAlternative,
-} from "../recipients/authorized-dispatch.ts";
+} from "../recipients/authorized-delegation.ts";
 import { RISK_TIERS, type RiskTier } from "./classifier.ts";
 import type { RemovalReason } from "./skip-reasons.ts";
 import type { ResolvedTierMap, TierRung } from "./tier-map.ts";
@@ -90,7 +90,7 @@ export interface TierRouteChoice {
 
 /**
  * Every tier from the classified one up to critical emptied. The shape is
- * ticket 07's dispatch refusal (`AuthorizedDispatchOutcome` with `ok: false`)
+ * ticket 07's delegation refusal (`AuthorizedDelegationOutcome` with `ok: false`)
  * plus the router's own fields. It carries no model and no rung, so nothing
  * can be written into the call from it.
  */

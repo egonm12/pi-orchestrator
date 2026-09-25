@@ -11,7 +11,7 @@ import {
   HARNESS_ALLOW_PATTERNS,
   HARNESS_MODEL_SCOPE,
   isProhibitedModel,
-  resolveDispatchModel,
+  resolveDelegationModel,
 } from "./model-resolution.ts";
 import { useOwnerBanLists } from "../fixtures/owner-ban-lists.ts";
 
@@ -35,8 +35,8 @@ const GOOD = SUBSCRIPTION_TEST_MODEL;
 // Explicit provider + model identity
 // ---------------------------------------------------------------------------
 
-test("a dispatch resolves to an explicit provider and model identity", () => {
-  const decision = resolveDispatchModel({
+test("a delegation resolves to an explicit provider and model identity", () => {
+  const decision = resolveDelegationModel({
     model: "anthropic/claude-sonnet-5:medium",
     source: "explicit",
   });
@@ -50,7 +50,7 @@ test("a dispatch resolves to an explicit provider and model identity", () => {
 });
 
 test("a model with no provider prefix is rejected, not guessed", () => {
-  const decision = resolveDispatchModel({ model: "claude-sonnet-5", source: "explicit" });
+  const decision = resolveDelegationModel({ model: "claude-sonnet-5", source: "explicit" });
   assert.equal(decision.ok, false);
   assert.ok(!decision.ok);
   assert.equal(decision.code, "out_of_scope");
@@ -65,8 +65,8 @@ for (const [label, model] of [
   ["empty string", ""],
   ["blank", "   "],
 ] as const) {
-  test(`a dispatch with no model selection (${label}) fails rather than inheriting`, () => {
-    const decision = resolveDispatchModel({ model, source: "explicit" });
+  test(`a delegation with no model selection (${label}) fails rather than inheriting`, () => {
+    const decision = resolveDelegationModel({ model, source: "explicit" });
     assert.equal(decision.ok, false);
     assert.ok(!decision.ok);
     assert.equal(decision.code, "missing_model");
@@ -91,8 +91,8 @@ test("the real checkModelScope no-ops on a missing model, so the harness must ca
 
 for (const model of PROHIBITED_IDS) {
   for (const source of ["explicit", "inherited"] as const) {
-    test(`a dispatch naming ${model} is rejected (${source})`, () => {
-      const decision = resolveDispatchModel({ model, source });
+    test(`a delegation naming ${model} is rejected (${source})`, () => {
+      const decision = resolveDelegationModel({ model, source });
       assert.equal(decision.ok, false);
       assert.ok(!decision.ok);
       assert.equal(decision.code, "out_of_scope");
@@ -112,7 +112,7 @@ test("prohibited names inside allowed families are refused before scope matching
   ];
   for (const model of hypothetical) {
     for (const source of ["explicit", "inherited"] as const) {
-      const decision = resolveDispatchModel({ model, source });
+      const decision = resolveDelegationModel({ model, source });
       assert.ok(!decision.ok, `${model} should be refused (${source})`);
       assert.equal(decision.code, "out_of_scope");
       assert.equal(decision.requestedModel, model);
@@ -123,7 +123,7 @@ test("prohibited names inside allowed families are refused before scope matching
 
 test("an exact allow-list entry cannot authorize a prohibited name", () => {
   const model = "anthropic/claude-opus-fable-6";
-  const decision = resolveDispatchModel({
+  const decision = resolveDelegationModel({
     model,
     source: "explicit",
     scope: { enforce: true, strict: true, allow: [model] },
@@ -133,9 +133,9 @@ test("an exact allow-list entry cannot authorize a prohibited name", () => {
   assert.match(decision.message, /prohibited by name/);
 });
 
-test("safe ids in allowed families remain dispatchable", () => {
+test("safe ids in allowed families remain delegatable", () => {
   for (const model of ["anthropic/claude-opus-5", "openai-codex/gpt-6-sol"]) {
-    assert.ok(resolveDispatchModel({ model, source: "explicit" }).ok, model);
+    assert.ok(resolveDelegationModel({ model, source: "explicit" }).ok, model);
   }
 });
 
@@ -147,7 +147,7 @@ test("prohibited models are rejected with a thinking suffix and in any case", ()
     "ANTHROPIC/CLAUDE-FABLE-5",
     "OpenAI-Codex/GPT-6-ASTRA",
   ]) {
-    const decision = resolveDispatchModel({ model, source: "inherited" });
+    const decision = resolveDelegationModel({ model, source: "inherited" });
     assert.ok(!decision.ok, `${model} should be rejected`);
     assert.equal(decision.code, "out_of_scope");
   }
@@ -224,7 +224,7 @@ test("the audit catches the obvious-but-wrong allow patterns", () => {
 
 test("the allow list refuses exactly the prohibited models in the real registry", () => {
   const refused = INSTALLED_MODEL_IDS.filter(
-    (id) => !resolveDispatchModel({ model: id, source: "explicit" }).ok,
+    (id) => !resolveDelegationModel({ model: id, source: "explicit" }).ok,
   );
   assert.deepEqual(refused, [
     "anthropic/claude-fable-5",
@@ -236,15 +236,15 @@ test("the allow list refuses exactly the prohibited models in the real registry"
   }
 
   // Every Claude route the subscription install exposes, apart from Fable,
-  // stays dispatchable -- this is the route the harness actually runs on.
+  // stays delegatable -- this is the route the harness actually runs on.
   const claudeRoutes = INSTALLED_MODEL_IDS.filter(
     (id) => id.startsWith("anthropic/") && !isProhibitedModel(id),
   );
   assert.equal(claudeRoutes.length, 13);
   for (const id of claudeRoutes) {
     assert.ok(
-      resolveDispatchModel({ model: id, source: "explicit" }).ok,
-      `${id} should be dispatchable`,
+      resolveDelegationModel({ model: id, source: "explicit" }).ok,
+      `${id} should be delegatable`,
     );
   }
 });
@@ -256,7 +256,7 @@ test("the gpt-6 routes are granted by exact id, and the family pattern stays ref
       (HARNESS_ALLOW_PATTERNS as readonly string[]).includes(id),
       `${id} must be granted as an exact id, not through a pattern`,
     );
-    assert.ok(resolveDispatchModel({ model: id, source: "explicit" }).ok, `${id} is dispatchable`);
+    assert.ok(resolveDelegationModel({ model: id, source: "explicit" }).ok, `${id} is delegatable`);
   }
 
   // The family pattern that would have covered them is absent from the allow
@@ -273,7 +273,7 @@ test("the gpt-6 routes are granted by exact id, and the family pattern stays ref
   // So Astra is still rejected under the real allow list, explicitly and
   // inherited alike, even though its two siblings are now granted.
   for (const source of ["explicit", "inherited"] as const) {
-    const decision = resolveDispatchModel({ model: "openai-codex/gpt-6-astra", source });
+    const decision = resolveDelegationModel({ model: "openai-codex/gpt-6-astra", source });
     assert.equal(decision.ok, false);
     assert.ok(!decision.ok);
     assert.equal(decision.code, "out_of_scope");
@@ -310,7 +310,7 @@ for (const [label, condition, expectedCode] of UNAVAILABLE_CASES) {
       "anthropic/claude-opus-5": { kind: "available" },
     });
 
-    const decision = resolveDispatchModel({
+    const decision = resolveDelegationModel({
       model: GOOD,
       source: "explicit",
       availability: (m) => double.call(m),
@@ -333,7 +333,7 @@ test("throttling reports its retry hint rather than swapping models", () => {
   const double = createProviderDouble({
     [GOOD]: { kind: "throttled", retryAfterSeconds: 30, detail: "slow down." },
   });
-  const decision = resolveDispatchModel({
+  const decision = resolveDelegationModel({
     model: GOOD,
     source: "explicit",
     availability: (m) => double.call(m),
@@ -344,7 +344,7 @@ test("throttling reports its retry hint rather than swapping models", () => {
 
 test("an available model resolves through the double unchanged", () => {
   const double = createProviderDouble({ [GOOD]: { kind: "available" } });
-  const decision = resolveDispatchModel({
+  const decision = resolveDelegationModel({
     model: GOOD,
     source: "explicit",
     availability: (m) => double.call(m),

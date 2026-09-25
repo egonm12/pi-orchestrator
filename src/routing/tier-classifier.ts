@@ -33,7 +33,7 @@ import {
   splitKnownThinkingSuffix,
   THINKING_LEVELS,
 } from "../subagents/model-info.ts";
-import { resolveDispatchModel } from "../policy/model-resolution.ts";
+import { resolveDelegationModel } from "../policy/model-resolution.ts";
 import {
   classifyTask,
   tierRank,
@@ -130,7 +130,7 @@ export function classifierConfigFromSettings(personal: unknown): ClassifierConfi
 }
 
 // ---------------------------------------------------------------------------
-// Load: every classifier rung is held to the same rules as any dispatch
+// Load: every classifier rung is held to the same rules as any delegation
 // ---------------------------------------------------------------------------
 
 export interface ClassifierChainEntry {
@@ -158,8 +158,8 @@ function loadRefusal(rung: string): string | undefined {
     return refused(`a rung must be written provider/model:effort, with effort one of ${THINKING_LEVELS.join(", ")}`);
   }
   // The subagent ban list and the allowed-model list, through the same
-  // resolver every dispatch uses (ticket 04, ticket 21).
-  const decision = resolveDispatchModel({ model: rung, source: "explicit" });
+  // resolver every delegation uses (ticket 04, ticket 21).
+  const decision = resolveDelegationModel({ model: rung, source: "explicit" });
   return decision.ok ? undefined : refused(decision.message);
 }
 

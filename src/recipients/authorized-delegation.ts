@@ -1,4 +1,4 @@
-// Ticket 07: the dispatch boundary, and the reported pre-dispatch switch.
+// Ticket 07: the delegation boundary, and the reported pre-delegation switch.
 //
 // Composition, not reimplementation. Three existing layers stay where they are:
 //
@@ -8,7 +8,7 @@
 //   ticket 06 stage 2  Picker               -- the preference. The switch below
 //       asks the SAME picker for its next preference instead of inventing a
 //       second ordering, so there is one place that decides what "better" means.
-//   ticket 04 resolveDispatchModel()        -- identity and the prohibition.
+//   ticket 04 resolveDelegationModel()        -- identity and the prohibition.
 //       Still the single enforcement point for the subagent ban list and for
 //       explicit provider/model identity.
 //
@@ -19,7 +19,7 @@
 // substitutes -- that is the failure mode it was built to design out. So the
 // decision to use a different model cannot be hidden inside it. It belongs in
 // a layer that makes the substitution an explicit, reported event, which is
-// what `dispatchWithSwitch` is. A switch is a decision with a record, never a
+// what `delegateWithSwitch` is. A switch is a decision with a record, never a
 // silent retry on another model.
 //
 // No network I/O, no model call. Availability comes from an injected probe
@@ -27,11 +27,11 @@
 
 import { appendFileSync } from "node:fs";
 import {
-  resolveDispatchModel,
-  validatedDispatchAttemptId,
-  type DispatchAttemptIdentity,
-  type DispatchDecision,
-  type ResolvedDispatch,
+  resolveDelegationModel,
+  validatedDelegationId,
+  type DelegationIdentity,
+  type DelegationDecision,
+  type ResolvedDelegation,
 } from "../policy/model-resolution.ts";
 import type { Availability } from "../fixtures/provider-double.ts";
 import {
@@ -54,7 +54,7 @@ import {
 } from "./authorization.ts";
 
 // ---------------------------------------------------------------------------
-// Budget: preflight is observation; dispatch admission is reservation
+// Budget: preflight is observation; delegation admission is reservation
 // ---------------------------------------------------------------------------
 
 export interface BudgetVerdict {
@@ -62,7 +62,7 @@ export interface BudgetVerdict {
   readonly why?: string;
 }
 
-/** A check-only view for UI/reporting. Passing this verdict does not admit a dispatch. */
+/** A check-only view for UI/reporting. Passing this verdict does not admit a delegation. */
 export interface BudgetPreflightConstraint {
   readonly describe: string;
   check(model: string): BudgetVerdict;
@@ -78,7 +78,7 @@ export interface BudgetReconciliation {
  * close over the authoritative owner and reservation id, so callers do not
  * choose which hold to release or reconcile after a failed or completed call.
  */
-export interface DispatchReservationBinding {
+export interface DelegationReservationBinding {
   readonly kind: "reservation";
   readonly reservationId: string;
   readonly model: string;
@@ -92,7 +92,7 @@ export interface DispatchReservationBinding {
 }
 
 export type BudgetAdmission =
-  | DispatchReservationBinding
+  | DelegationReservationBinding
   | { readonly kind: "no-budget-constraint" };
 
 export type BudgetAdmissionVerdict =
@@ -100,17 +100,17 @@ export type BudgetAdmissionVerdict =
   | { readonly ok: false; readonly why?: string };
 
 /**
- * A dispatch-capable spending constraint composes a check-only preflight with
- * an explicitly named admission operation. `dispatchNamedModel` uses only
- * `admitDispatch`; a caller cannot pass a preflight-only constraint and have a
+ * A delegation-capable spending constraint composes a check-only preflight with
+ * an explicitly named admission operation. `delegateNamedModel` uses only
+ * `admitDelegation`; a caller cannot pass a preflight-only constraint and have a
  * successful check mistaken for a reservation.
  *
- * A stable `dispatchId` makes duplicate delivery fail closed while its first
+ * A stable `delegationKey` makes duplicate delivery fail closed while its first
  * hold is live. Callers must release that binding if the provider never starts,
  * or reconcile it when the provider did run, before retrying.
  */
 export interface BudgetConstraint extends BudgetPreflightConstraint {
-  admitDispatch(model: string, dispatchId?: string): BudgetAdmissionVerdict;
+  admitDelegation(model: string, delegationKey?: string): BudgetAdmissionVerdict;
 }
 
 /** The absence of a constraint, stated rather than implied. Recorded in the
@@ -119,7 +119,7 @@ export interface BudgetConstraint extends BudgetPreflightConstraint {
 export const NO_BUDGET_CONSTRAINT: BudgetConstraint = {
   describe: "no spending constraint applied (ticket 09 owns allowance accounting)",
   check: () => ({ ok: true }),
-  admitDispatch: () => ({ ok: true, admission: { kind: "no-budget-constraint" } }),
+  admitDelegation: () => ({ ok: true, admission: { kind: "no-budget-constraint" } }),
 };
 
 // ---------------------------------------------------------------------------
@@ -151,7 +151,7 @@ export function checkRecipient(
       provider,
       message:
         `pi-orchestration-harness: '${provider}' is not an approved data ` +
-        "recipient, so no dispatch was sent to it. Being present in the " +
+        "recipient, so no delegation was sent to it. Being present in the " +
         "catalog or the installed registry establishes only that it exists. " +
         `Approved recipients: ${approved.length > 0 ? approved.join(", ") : "none"}. ` +
         "Adding one requires explicit owner approval via grantOwnerApproval.",
@@ -161,28 +161,28 @@ export function checkRecipient(
 }
 
 // ---------------------------------------------------------------------------
-// Direct dispatch of an already-chosen model
+// Direct delegation of an already-chosen model
 // ---------------------------------------------------------------------------
 
-export type DirectDispatchOutcome =
+export type DirectDelegationOutcome =
   | {
       readonly ok: true;
-      readonly dispatch: ResolvedDispatch;
+      readonly delegation: ResolvedDelegation;
       readonly approval: AuthorizedRecipient;
-      /** The admission that made this dispatch acceptable. */
+      /** The admission that made this delegation acceptable. */
       readonly budgetAdmission: BudgetAdmission;
     }
   | {
       readonly ok: false;
       readonly code: "unauthorized_recipient" | "resolver_rejected" | "over_budget";
       readonly message: string;
-      readonly dispatch?: DispatchDecision;
+      readonly delegation?: DelegationDecision;
     };
 
 /**
- * The narrow gate: a model is already chosen, may it be dispatched?
+ * The narrow gate: a model is already chosen, may it be delegated?
  *
- * Deliberately independent of routing, because "a dispatch to an unapproved
+ * Deliberately independent of routing, because "a delegate to an unapproved
  * recipient does not execute" has to hold for any caller, not only for one
  * that came through stage 1. Routing narrowing its candidate set is the first
  * line; this is the boundary that still refuses if routing is bypassed.
@@ -191,44 +191,44 @@ export type DirectDispatchOutcome =
  * rejected as prohibited even if its provider happens to be approved. The
  * prohibition is not a recipient question.
  */
-export function dispatchNamedModel(input: {
+export function delegateNamedModel(input: {
   readonly model?: string;
   readonly authorization: RecipientAuthorization;
   readonly budget?: BudgetConstraint;
   /** Stable identity for retry/deduplication within one task allowance owner. */
-  readonly dispatchId?: string;
+  readonly delegationKey?: string;
   readonly availability?: (baseModel: string) => Availability;
-}): DirectDispatchOutcome {
-  const dispatch = resolveDispatchModel({
+}): DirectDelegationOutcome {
+  const delegation = resolveDelegationModel({
     model: input.model,
     source: "explicit",
     ...(input.availability ? { availability: input.availability } : {}),
   });
-  if (!dispatch.ok) {
-    return { ok: false, code: "resolver_rejected", message: dispatch.message, dispatch };
+  if (!delegation.ok) {
+    return { ok: false, code: "resolver_rejected", message: delegation.message, delegation };
   }
 
-  const recipient = checkRecipient(dispatch.provider, input.authorization);
+  const recipient = checkRecipient(delegation.provider, input.authorization);
   if (!recipient.ok) {
-    return { ok: false, code: "unauthorized_recipient", message: recipient.message, dispatch };
+    return { ok: false, code: "unauthorized_recipient", message: recipient.message, delegation };
   }
 
   const budget = input.budget ?? NO_BUDGET_CONSTRAINT;
-  const admission = budget.admitDispatch(dispatch.baseModel, input.dispatchId);
+  const admission = budget.admitDelegation(delegation.baseModel, input.delegationKey);
   if (!admission.ok) {
     return {
       ok: false,
       code: "over_budget",
       message:
-        `pi-orchestration-harness: dispatch to '${dispatch.baseModel}' was not sent. ` +
+        `pi-orchestration-harness: delegate to '${delegation.baseModel}' was not sent. ` +
         `${admission.why ?? "the spending constraint refused admission"} (${budget.describe}).`,
-      dispatch,
+      delegation,
     };
   }
 
   return {
     ok: true,
-    dispatch,
+    delegation,
     approval: recipient.approval,
     budgetAdmission: admission.admission,
   };
@@ -265,7 +265,7 @@ export function privacyConstraintFor(
 }
 
 // ---------------------------------------------------------------------------
-// The reported pre-dispatch switch
+// The reported pre-delegation switch
 // ---------------------------------------------------------------------------
 
 export interface RefusedAlternative {
@@ -288,7 +288,7 @@ export interface SwitchReport {
   readonly capabilityBasis: string;
 }
 
-export type AuthorizedDispatchFailureCode =
+export type AuthorizedDelegationFailureCode =
   | "no_authorized_candidate"
   | "selector_error"
   | "unauthorized_recipient"
@@ -296,44 +296,44 @@ export type AuthorizedDispatchFailureCode =
   | "resolver_rejected"
   | "no_authorized_alternative";
 
-export type AuthorizedDispatchOutcome =
+export type AuthorizedDelegationOutcome =
   | {
       readonly ok: true;
       readonly model: string;
       readonly provider: string;
-      readonly dispatch: ResolvedDispatch;
+      readonly delegation: ResolvedDelegation;
       readonly routing: RoutingDecision;
       /** Present only when the first choice was replaced. */
       readonly switched?: SwitchReport;
       readonly approvedRecipients: readonly string[];
       readonly budgetApplied: string;
-      /** The reservation/no-budget admission bound to the accepted dispatch. */
+      /** The reservation/no-budget admission bound to the accepted delegation. */
       readonly budgetAdmission: BudgetAdmission;
     }
   | {
       readonly ok: false;
-      readonly code: AuthorizedDispatchFailureCode;
+      readonly code: AuthorizedDelegationFailureCode;
       readonly message: string;
       readonly routing?: RoutingDecision;
-      readonly dispatch?: DispatchDecision;
+      readonly delegation?: DelegationDecision;
       readonly consideredAndRefused?: readonly RefusedAlternative[];
       readonly approvedRecipients: readonly string[];
     };
 
-export interface AuthorizedDispatchInput {
+export interface AuthorizedDelegationInput {
   readonly stage1: Stage1Input;
   readonly authorization: RecipientAuthorization;
   readonly picker?: Picker;
   readonly budget?: BudgetConstraint;
   /** Stable across a delivery retry or pre-start provider switch. */
-  readonly dispatchId?: string;
+  readonly delegationKey?: string;
   /**
-   * Availability AT DISPATCH TIME, which is a different question from
+   * Availability AT DELEGATION TIME, which is a different question from
    * `stage1.availability` (the boundary's view when the candidate set was
-   * computed). Capacity exhausted between planning and dispatch is exactly the
+   * computed). Capacity exhausted between planning and delegate is exactly the
    * case the switch exists for.
    */
-  readonly dispatchAvailability?: (baseModel: string) => Availability;
+  readonly delegationAvailability?: (baseModel: string) => Availability;
 }
 
 /** Stage 1's output with some candidates removed. Used to ask the picker for
@@ -345,14 +345,14 @@ function withoutModels(
   return { ...allowed, admitted: allowed.admitted.filter((c) => !exclude.has(c.model)) };
 }
 
-function describeUnusable(decision: DispatchDecision): string {
+function describeUnusable(decision: DelegationDecision): string {
   return decision.ok ? "resolved" : `${decision.code}: ${decision.message}`;
 }
 
 /**
  * Refuse a pick stage 1 never admitted, and say so as a selector error.
  *
- * Deliberately runs AFTER `dispatchNamedModel` rather than before it, so the
+ * Deliberately runs AFTER `delegateNamedModel` rather than before it, so the
  * existing precedence is untouched: a prohibited model is still reported as
  * prohibited by ticket 04's resolver, and an unapproved recipient still as
  * unauthorized by the recipient gate. What is left for this check is the case
@@ -361,15 +361,15 @@ function describeUnusable(decision: DispatchDecision): string {
  * Without it, a picker could widen the capability ceiling even though it cannot
  * widen the recipient list.
  *
- * The admission that was just taken is released, because the dispatch it was
+ * The admission that was just taken is released, because the delegation it was
  * held for is not going to happen.
  */
 function outOfSetRefusal(
   routing: RoutedDecision,
-  accepted: Extract<DirectDispatchOutcome, { readonly ok: true }>,
+  accepted: Extract<DirectDelegationOutcome, { readonly ok: true }>,
   approved: readonly string[],
-): AuthorizedDispatchOutcome | undefined {
-  const model = accepted.dispatch.baseModel;
+): AuthorizedDelegationOutcome | undefined {
+  const model = accepted.delegation.baseModel;
   if (isAdmittedCandidate(routing.allowed, model)) return undefined;
   if (accepted.budgetAdmission.kind === "reservation") accepted.budgetAdmission.release();
   return {
@@ -382,14 +382,14 @@ function outOfSetRefusal(
       `widened to accommodate it: a picker decides preference, never permission. ` +
       `Admitted candidates were: ${routing.allowed.admitted.map((c) => c.model).join(", ") || "none"}.`,
     routing,
-    dispatch: accepted.dispatch,
+    delegation: accepted.delegation,
     approvedRecipients: approved,
   };
 }
 
 /**
  * Route, resolve, and -- if the chosen model turns out to be unusable at
- * dispatch time -- switch to an authorized alternative and report it.
+ * delegation time -- switch to an authorized alternative and report it.
  *
  * Legacy path (ticket 24): it routes through ticket 06's catalog-wide
  * `route`, not the router (`routeTier` in routing/tier-router.ts), so it still
@@ -400,14 +400,14 @@ function outOfSetRefusal(
  * function's refusal shape.
  *
  * Recipient authorization is applied twice on purpose: once as stage 1's
- * candidate narrowing, and again at the dispatch boundary for whatever the
+ * candidate narrowing, and again at the delegation boundary for whatever the
  * picker returned. The second check is not redundant defensiveness; it is the
  * check that still holds if a future picker, or a caller assembling its own
  * `AllowedCandidates`, produces a candidate stage 1 never admitted.
  */
-export function dispatchWithSwitch(
-  input: AuthorizedDispatchInput,
-): AuthorizedDispatchOutcome {
+export function delegateWithSwitch(
+  input: AuthorizedDelegationInput,
+): AuthorizedDelegationOutcome {
   const picker = input.picker ?? correctnessFirstPicker;
   const budget = input.budget ?? NO_BUDGET_CONSTRAINT;
   const approved = approvedRecipients(input.authorization);
@@ -432,13 +432,13 @@ export function dispatchWithSwitch(
     };
   }
 
-  const attempt = (model: string): { outcome: DirectDispatchOutcome } => ({
-    outcome: dispatchNamedModel({
+  const attempt = (model: string): { outcome: DirectDelegationOutcome } => ({
+    outcome: delegateNamedModel({
       model,
       authorization: input.authorization,
       budget,
-      ...(input.dispatchId === undefined ? {} : { dispatchId: input.dispatchId }),
-      ...(input.dispatchAvailability ? { availability: input.dispatchAvailability } : {}),
+      ...(input.delegationKey === undefined ? {} : { delegationKey: input.delegationKey }),
+      ...(input.delegationAvailability ? { availability: input.delegationAvailability } : {}),
     }),
   });
 
@@ -448,9 +448,9 @@ export function dispatchWithSwitch(
     if (outOfSet) return outOfSet;
     return {
       ok: true,
-      model: first.dispatch.baseModel,
-      provider: first.dispatch.provider,
-      dispatch: first.dispatch,
+      model: first.delegation.baseModel,
+      provider: first.delegation.provider,
+      delegation: first.delegation,
       routing,
       approvedRecipients: approved,
       budgetApplied: budget.describe,
@@ -467,7 +467,7 @@ export function dispatchWithSwitch(
       code: "unauthorized_recipient",
       message: first.message,
       routing,
-      ...(first.dispatch ? { dispatch: first.dispatch } : {}),
+      ...(first.delegation ? { delegation: first.delegation } : {}),
       approvedRecipients: approved,
     };
   }
@@ -476,11 +476,11 @@ export function dispatchWithSwitch(
   // Only capacity/reachability is.
   const unusableForCapacity =
     first.code === "resolver_rejected" &&
-    first.dispatch !== undefined &&
-    !first.dispatch.ok &&
-    (first.dispatch.code === "unavailable" ||
-      first.dispatch.code === "throttled" ||
-      first.dispatch.code === "call_failure");
+    first.delegation !== undefined &&
+    !first.delegation.ok &&
+    (first.delegation.code === "unavailable" ||
+      first.delegation.code === "throttled" ||
+      first.delegation.code === "call_failure");
 
   if (!unusableForCapacity && first.code !== "over_budget") {
     return {
@@ -488,7 +488,7 @@ export function dispatchWithSwitch(
       code: "resolver_rejected",
       message: first.message,
       routing,
-      ...(first.dispatch ? { dispatch: first.dispatch } : {}),
+      ...(first.delegation ? { delegation: first.delegation } : {}),
       approvedRecipients: approved,
     };
   }
@@ -501,7 +501,7 @@ export function dispatchWithSwitch(
       why:
         first.code === "over_budget"
           ? first.message
-          : describeUnusable(first.dispatch ?? { ok: false, code: "unavailable", message: first.message, source: "explicit" }),
+          : describeUnusable(first.delegation ?? { ok: false, code: "unavailable", message: first.message, source: "explicit" }),
     },
   ];
   const tried = new Set<string>([routing.model]);
@@ -517,9 +517,9 @@ export function dispatchWithSwitch(
       if (outOfSet) return outOfSet;
       const switched: SwitchReport = {
         from: routing.model,
-        to: alternative.dispatch.baseModel,
+        to: alternative.delegation.baseModel,
         reason:
-          `'${routing.model}' was not usable at dispatch time (` +
+          `'${routing.model}' was not usable at delegation time (` +
           `${refused[0]?.why ?? "unusable"}). Switched to the next preference ` +
           `from the same allowed-candidate set, which is an approved recipient, ` +
           `has fresh suitability evidence for '${routing.allowed.taskType}', and within the ` +
@@ -531,9 +531,9 @@ export function dispatchWithSwitch(
       };
       return {
         ok: true,
-        model: alternative.dispatch.baseModel,
-        provider: alternative.dispatch.provider,
-        dispatch: alternative.dispatch,
+        model: alternative.delegation.baseModel,
+        provider: alternative.delegation.provider,
+        delegation: alternative.delegation,
         routing,
         switched,
         approvedRecipients: approved,
@@ -548,7 +548,7 @@ export function dispatchWithSwitch(
         alternative.code === "unauthorized_recipient" || alternative.code === "over_budget"
           ? alternative.message
           : describeUnusable(
-              alternative.dispatch ?? {
+              alternative.delegation ?? {
                 ok: false,
                 code: "unavailable",
                 message: alternative.message,
@@ -582,23 +582,23 @@ export const RECIPIENT_RECORD_PREFIX = "RECIPIENT=";
 
 export function formatSwitchRecord(
   report: SwitchReport,
-  identity?: DispatchAttemptIdentity,
+  identity?: DelegationIdentity,
 ): string {
-  const attemptId = validatedDispatchAttemptId(identity);
-  const record = attemptId === undefined ? report : { ...report, attemptId };
+  const delegationId = validatedDelegationId(identity);
+  const record = delegationId === undefined ? report : { ...report, delegationId };
   return `${SWITCH_RECORD_PREFIX}${JSON.stringify(record)}`;
 }
 
-/** One line per dispatch outcome, switch included. Tests read this from
+/** One line per delegation outcome, switch included. Tests read this from
  *  outside instead of inspecting internals. */
 export function formatRecipientRecord(
-  outcome: AuthorizedDispatchOutcome,
-  identity?: DispatchAttemptIdentity,
+  outcome: AuthorizedDelegationOutcome,
+  identity?: DelegationIdentity,
 ): string {
-  const attemptId = validatedDispatchAttemptId(identity);
+  const delegationId = validatedDelegationId(identity);
   const summary = outcome.ok
     ? {
-        ...(attemptId === undefined ? {} : { attemptId }),
+        ...(delegationId === undefined ? {} : { delegationId }),
         ok: true,
         model: outcome.model,
         provider: outcome.provider,
@@ -615,7 +615,7 @@ export function formatRecipientRecord(
             : outcome.budgetAdmission,
       }
     : {
-        ...(attemptId === undefined ? {} : { attemptId }),
+        ...(delegationId === undefined ? {} : { delegationId }),
         ok: false,
         code: outcome.code,
         message: outcome.message,
@@ -628,15 +628,15 @@ export function formatRecipientRecord(
 export function recordSwitch(
   path: string,
   report: SwitchReport,
-  identity?: DispatchAttemptIdentity,
+  identity?: DelegationIdentity,
 ): void {
   appendFileSync(path, `${formatSwitchRecord(report, identity)}\n`);
 }
 
 export function recordRecipientOutcome(
   path: string,
-  outcome: AuthorizedDispatchOutcome,
-  identity?: DispatchAttemptIdentity,
+  outcome: AuthorizedDelegationOutcome,
+  identity?: DelegationIdentity,
 ): void {
   appendFileSync(path, `${formatRecipientRecord(outcome, identity)}\n`);
 }

@@ -72,18 +72,18 @@ async function knownFolder(): Promise<Known> {
     },
   });
   const decide = async (
-    attemptId: string,
+    delegationId: string,
     at: Date,
     tier: RiskTier,
     extra: Partial<DecisionRecordInput> & { mode?: "live" | "shadow"; handPickedModel?: string },
   ) => {
     writeDecisionRecord(records, {
-      attemptId,
+      delegationId,
       at,
       mode: "live",
-      taskText: `task ${attemptId}`,
+      taskText: `task ${delegationId}`,
       agentRole: "worker",
-      classification: await fixtureClassification(`task ${attemptId}`, tier),
+      classification: await fixtureClassification(`task ${delegationId}`, tier),
       tierMap,
       route: fixtureRoute(tier, tierMap),
       ...extra,
@@ -95,8 +95,8 @@ async function knownFolder(): Promise<Known> {
   await decide("d4", day2, "standard", { mode: "shadow", handPickedModel: OPUS, tierMap: onlyCodexStandard, route: fixtureRoute("standard", onlyCodexStandard) });
   await decide("d5", day2, "mechanical", {});
   await decide("d6", day2, "elevated", { mode: "shadow", handPickedModel: OPUS, route: fixtureRefusal("elevated", tierMap) });
-  const attach = (attemptId: string, verdict: "accept" | "request_changes" | "missing", at: Date) =>
-    attachVerdict({ recordDir: records, attemptId, verdict, at, refreshStatePath: ledger });
+  const attach = (delegationId: string, verdict: "accept" | "request_changes" | "missing", at: Date) =>
+    attachVerdict({ recordDir: records, delegationId, verdict, at, refreshStatePath: ledger });
   attach("d1", "accept", later(day1));
   attach("d2", "request_changes", later(day1));
   attach("d4", "missing", later(day2));
@@ -108,7 +108,7 @@ async function knownFolder(): Promise<Known> {
   return { home, records, cleanup: () => rmSync(home, { recursive: true, force: true }) };
 }
 
-/** Hand-computed from the table above. A second verdict for one attempt id
+/** Hand-computed from the table above. A second verdict for one delegation id
  *  replaces the first, as in the ledger (d5 counts as request_changes). */
 function expectedReport(folder: string): string {
   return [
@@ -141,7 +141,7 @@ test("an explicit-model record (ticket 27) is neither a decision row nor an orph
   const known = await knownFolder();
   try {
     appendRoutingRecord(known.records, buildExplicitModelRecord({
-      attemptId: "e1", at: new Date("2026-09-26T10:00:00.000Z"), mode: "live", slot: "model",
+      delegationId: "e1", at: new Date("2026-09-26T10:00:00.000Z"), mode: "live", slot: "model",
       model: "anthropic/claude-opus-5-5:high", taskText: "Review the change", agentRole: "reviewer",
     }));
     assert.equal(renderRoutingReport(known.records, buildRoutingReport(known.records)), expectedReport(known.records));

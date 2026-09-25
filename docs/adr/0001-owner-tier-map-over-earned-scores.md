@@ -11,10 +11,10 @@ Tickets 06 and 08 admitted a model to a task only once it had earned a task-suit
 
 - **Earned scores only** (the ticket 06/08 design): honest about evidence, but deadlocked at the start and blind to effort level.
 - **Run LiteLLM's proxy**: the design fits, but the proxy needs metered API keys and the owner's Claude and Codex access are subscription sign-ins inside pi.
-- **Owner tier map with optional adaptation** (chosen): works from the first dispatch, encodes the owner's preferences and subscriptions, and leaves room to learn.
+- **Owner tier map with optional adaptation** (chosen): works from the first delegation, encodes the owner's preferences and subscriptions, and leaves room to learn.
 
 ## Consequences
 
-- The ticket 06 suitability floor and the ticket 08 promotion bar stop gating dispatch. They remain as recorded evidence, not as admission rules.
+- The ticket 06 suitability floor and the ticket 08 promotion bar stop gating delegation. They remain as recorded evidence, not as admission rules.
 - A wrong tier map is the owner's mistake, not the router's: the router records which tier, which rung and why, so a wrong map is visible.
 - A project may override the tier map, so a client project can pin its own models. The ban list and the other hard filters cannot be relaxed by a project.

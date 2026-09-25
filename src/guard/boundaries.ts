@@ -47,7 +47,7 @@ export function isModelField(key: string): boolean {
 /** Every object that can carry a `model` field, parents before children: the
  *  input itself and, for a delegation input, every object nested in it at any
  *  depth, directly or as an array item. The guard reads `model` on each; the
- *  router (ticket 27) keeps the dispatch slots among them. */
+ *  router (ticket 27) keeps the delegation slots among them. */
 export function delegationObjects(input: unknown, delegation = false): DelegationObject[] {
   const found: DelegationObject[] = [];
   const visit = (value: unknown, path: string) => {

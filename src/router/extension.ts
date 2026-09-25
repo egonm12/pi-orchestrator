@@ -177,12 +177,12 @@ function text(value: unknown): string | undefined {
 }
 
 /**
- * The dispatch slots of a `subagent` call, over the guard's walk
+ * The delegation slots of a `subagent` call, over the guard's walk
  * (`delegationObjects`): the top level when it names an agent, a task or a
  * model, then each `tasks[i]`, `chain[i]` and `workflow.steps[i]`. A model
  * named at the top level covers the nested slots, so they are not routed.
  */
-function dispatchSlots(input: Record<string, unknown>): Slot[] {
+function delegationSlots(input: Record<string, unknown>): Slot[] {
   if (namedModel(input) !== undefined) return [{ path: "", object: input }];
   const top = text(input.agent) !== undefined || text(input.task) !== undefined;
   const nested = delegationObjects(input, true).filter((entry) => NESTED_SLOT.test(entry.path));
@@ -224,7 +224,7 @@ async function planSlot(
   router: ActiveRouter,
   input: Record<string, unknown>,
   slot: Slot,
-  attemptId: string,
+  delegationId: string,
   at: Date,
   ctx: ExtensionContext,
 ): Promise<SlotPlan> {
@@ -232,7 +232,7 @@ async function planSlot(
   const agentName = text(slot.object.agent) ?? text(input.agent);
   const agentRole = agentName ?? "unknown";
   const explicit = (slotLabel: string, model: string): SlotPlan => ({
-    record: buildExplicitModelRecord({ attemptId, at, mode: router.mode, slot: slotLabel, model, taskText, agentRole }),
+    record: buildExplicitModelRecord({ delegationId, at, mode: router.mode, slot: slotLabel, model, taskText, agentRole }),
   });
   const model = namedModel(slot.object);
   if (model !== undefined) return explicit(slotName(slot.path), model);
@@ -257,7 +257,7 @@ async function planSlot(
       banLists: router.banLists,
     },
   });
-  const common = { attemptId, at, taskText, agentRole, classification, tierMap: router.tierMap, route };
+  const common = { delegationId, at, taskText, agentRole, classification, tierMap: router.tierMap, route };
   if (router.mode === "live") {
     const record = buildDecisionRecord({ ...common, mode: "live" });
     return route.ok ? { record, write: { object: slot.object, rung: route.rung.rung } } : { record };
@@ -352,9 +352,9 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
         const router = active;
         const at = deps.now();
         const plans: SlotPlan[] = [];
-        for (const slot of dispatchSlots(event.input)) {
-          const attemptId = slot.path === "" ? event.toolCallId : `${event.toolCallId}:${slot.path}`;
-          plans.push(await planSlot(router, event.input, slot, attemptId, at, ctx));
+        for (const slot of delegationSlots(event.input)) {
+          const delegationId = slot.path === "" ? event.toolCallId : `${event.toolCallId}:${slot.path}`;
+          plans.push(await planSlot(router, event.input, slot, delegationId, at, ctx));
         }
         // Every record is written before the call changes, so a failed write
         // leaves the call exactly as the orchestrator made it.

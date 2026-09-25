@@ -46,7 +46,7 @@ import {
 import {
   NO_BUDGET_CONSTRAINT,
   type BudgetPreflightConstraint,
-} from "../recipients/authorized-dispatch.ts";
+} from "../recipients/authorized-delegation.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 

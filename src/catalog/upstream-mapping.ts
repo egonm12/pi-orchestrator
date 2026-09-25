@@ -50,7 +50,7 @@ export interface UpstreamMapping {
 //     not entirely wrong": interactive turns, compaction and
 //     `ctx.modelRegistry.streamSimple()` are shaped, while an extension that
 //     calls pi-ai's `compat.streamSimple` directly is not. This harness
-//     dispatches through ordinary pi sessions, so its calls are on the shaped,
+//     delegations through ordinary pi sessions, so its calls are on the shaped,
 //     plan-billed path.
 //
 // So the billing SHAPE is subscription, and no per-call dollar amount exists

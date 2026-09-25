@@ -8,7 +8,7 @@
 //
 // The writer copies each field it records by name from the values it is
 // given: ticket 23's classification, ticket 22's resolved tier map, ticket
-// 24's router decision, and the dispatch facts (attempt id, mode, task text,
+// 24's router decision, and the delegation facts (delegation id, mode, task text,
 // agent role, the hand-picked model in shadow mode). Nothing else an input
 // object carries (a parsed settings file, a token) can reach the file.
 //
@@ -35,7 +35,7 @@ import type { LadderSkippedRung } from "./effort-ladder.ts";
 import { LADDER_SKIP_REASONS } from "./skip-reasons.ts";
 import type { RemovedRung, TierRouteDecision } from "./tier-router.ts";
 
-export const DECISION_RECORD_SCHEMA_VERSION = "decision-record/1";
+export const DECISION_RECORD_SCHEMA_VERSION = "decision-record/2";
 
 /** Records hold at most this many characters of task text (story 34). */
 export const TASK_TEXT_PREFIX_LIMIT = 200;
@@ -217,8 +217,8 @@ export type RecordedRoute = RecordedRouteChoice | RecordedRouteRefusal;
 
 interface RecordCommon {
   readonly schemaVersion: string;
-  /** Ticket 18's dispatch attempt id: the key verdicts attach by. */
-  readonly attemptId: string;
+  /** Ticket 18's delegation id: the key verdicts attach by. */
+  readonly delegationId: string;
   /** ISO-8601, UTC. */
   readonly timestamp: string;
 }
@@ -242,7 +242,7 @@ export interface VerdictRecord extends RecordCommon {
   readonly decisionFile: string;
 }
 
-/** A verdict whose attempt id matches no decision in the folder. Kept, not
+/** A verdict whose delegation id matches no decision in the folder. Kept, not
  *  dropped (story 32), and counted by the report. */
 export interface OrphanedVerdictRecord extends RecordCommon {
   readonly recordType: "orphaned-verdict";
@@ -263,8 +263,8 @@ export interface EffortLadderRecord extends RecordCommon {
   readonly route: RecordedRouteChoice;
 }
 
-/** Ticket 27: a dispatch slot that named its own model, which the router left
- *  alone (story 38). An additive record type under `decision-record/1`, with a
+/** Ticket 27: a delegation slot that named its own model, which the router left
+ *  alone (story 38). An additive record type under `decision-record/2`, with a
  *  top-level `cause` as the ladder record has. It is not a routing decision:
  *  it has no tier and no rung, so it is not a report row and
  *  `isRoutedDecision` does not accept it. */
@@ -450,7 +450,7 @@ function checkRoute(record: Json): void {
 }
 
 const DAY_FILE = /^\d{4}-\d{2}-\d{2}\.jsonl$/;
-const COMMON_KEYS = ["recordType", "schemaVersion", "attemptId", "timestamp"] as const;
+const COMMON_KEYS = ["recordType", "schemaVersion", "delegationId", "timestamp"] as const;
 
 /** First of all checks: a record of another version may have other fields
  *  and record types, so the version is reported before anything else. */
@@ -464,7 +464,7 @@ function checkSchemaVersion(record: Json): void {
 }
 
 function checkCommon(record: Json): void {
-  stringAt(record, "attemptId", "", { nonBlank: true });
+  stringAt(record, "delegationId", "", { nonBlank: true });
   const timestamp = stringAt(record, "timestamp", "", { nonBlank: true });
   if (Number.isNaN(Date.parse(timestamp))) throw new RoutingRecordError("timestamp", `must be an ISO-8601 time; got ${JSON.stringify(timestamp)}`);
 }
@@ -499,7 +499,7 @@ export function validateRoutingRecord(value: unknown): RoutingRecord {
     oneOf(value, "step", "", ["effort", "same-tier", "next-tier"]);
     oneOf(value, "mode", "", ["live"]);
     for (const key of ["previousDecisionId", "agentRole", "kindOfWork"]) stringAt(value, key, "", { nonBlank: true });
-    if (value.previousDecisionId === value.attemptId) throw new RoutingRecordError("previousDecisionId", "must name a different attempt");
+    if (value.previousDecisionId === value.delegationId) throw new RoutingRecordError("previousDecisionId", "must name a different attempt");
     stringAt(value, "taskTextPrefix", "");
     checkTierMap(value);
     checkRoute(value);
@@ -531,7 +531,7 @@ export function validateRoutingRecord(value: unknown): RoutingRecord {
 // ---------------------------------------------------------------------------
 
 interface DecisionRecordInputCommon {
-  readonly attemptId: string;
+  readonly delegationId: string;
   /** Defaults to now. */
   readonly at?: Date;
   readonly taskText: string;
@@ -615,7 +615,7 @@ function recordedRoute(route: TierRouteDecision): RecordedRoute {
 }
 
 export function buildEffortLadderRecord(input: {
-  readonly attemptId: string;
+  readonly delegationId: string;
   readonly at: Date;
   readonly previousDecisionId: string;
   readonly step: EffortLadderRecord["step"];
@@ -629,7 +629,7 @@ export function buildEffortLadderRecord(input: {
   const record: EffortLadderRecord = {
     recordType: "effort-ladder", schemaVersion: DECISION_RECORD_SCHEMA_VERSION,
     skipped: input.skipped.map((entry) => ({ tier: entry.tier, rung: entry.rung, model: entry.model, reason: entry.reason, detail: entry.detail })),
-    cause: "effort-ladder", mode: "live", attemptId: input.attemptId,
+    cause: "effort-ladder", mode: "live", delegationId: input.delegationId,
     timestamp: input.at.toISOString(), previousDecisionId: input.previousDecisionId, step: input.step,
     taskTextPrefix: input.taskText, agentRole: input.agentRole, kindOfWork: input.kindOfWork,
     tierMap: recordedTierMap(input.tierMap), route: recordedRoute(input.route) as RecordedRouteChoice,
@@ -641,7 +641,7 @@ export function buildDecisionRecord(input: DecisionRecordInput): DecisionRecord 
   const record: DecisionRecord = {
     recordType: "decision",
     schemaVersion: DECISION_RECORD_SCHEMA_VERSION,
-    attemptId: input.attemptId,
+    delegationId: input.delegationId,
     timestamp: (input.at ?? new Date()).toISOString(),
     mode: input.mode,
     taskTextPrefix: input.taskText,
@@ -689,7 +689,7 @@ export interface WrittenDecisionRecord {
 }
 
 export interface ExplicitModelRecordInput {
-  readonly attemptId: string;
+  readonly delegationId: string;
   readonly at: Date;
   readonly mode: RoutingMode;
   readonly slot: string;
@@ -702,7 +702,7 @@ export function buildExplicitModelRecord(input: ExplicitModelRecordInput): Expli
   const record: ExplicitModelRecord = {
     recordType: "explicit",
     schemaVersion: DECISION_RECORD_SCHEMA_VERSION,
-    attemptId: input.attemptId,
+    delegationId: input.delegationId,
     timestamp: input.at.toISOString(),
     cause: "explicit",
     mode: input.mode,

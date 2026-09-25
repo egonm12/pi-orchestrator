@@ -36,7 +36,7 @@ function evidence() {
       { type: "tool_execution_start", toolName: "subagent", toolCallId: "call-1", args },
       { type: "tool_execution_end", toolName: "subagent", toolCallId: "call-1", isError: true, result: { content: [{ text: "Unknown agent: router-latency-absent" }] } },
     ],
-    records: [{ attemptId: "call-1", recordType: "decision", classification: { cause: `model:${rung}` } }],
+    records: [{ delegationId: "call-1", recordType: "decision", classification: { cause: `model:${rung}` } }],
     lines: [`pi-orchestrator router: hook 10.0 ms for 1 slot(s), mode shadow`, `pi-orchestrator router: classifier ${rung} first token 1.0 ms, total 9.0 ms, tokens 20, reported cost $0.00100`],
     launches: [{ kind: "parent" }, { kind: "list-models" }],
   };
@@ -51,7 +51,7 @@ const invalidEvidence: [string, (e: ReturnType<typeof evidence>) => void][] = [
   ["failed probe replacing success", (e) => { e.lines[1] = `pi-orchestrator router: classifier ${rung} failed after 1.0 ms: timeout`; }],
   ["missing parent launch", (e) => { e.launches = [{ kind: "list-models" }]; }],
   ["extra parent launch", (e) => { e.launches.push({ kind: "parent" }); }],
-  ["missing result ID", (e) => { e.events[1]!.toolCallId = ""; e.records[0]!.attemptId = ""; e.events[0]!.toolCallId = ""; }],
+  ["missing result ID", (e) => { e.events[1]!.toolCallId = ""; e.records[0]!.delegationId = ""; e.events[0]!.toolCallId = ""; }],
   ["arguments for another call", (e) => { e.events[0]!.toolCallId = "other"; }],
   ["duplicate matching record with correct total", (e) => {
     e.calls = 2; e.events.push({ ...e.events[1]!, toolCallId: "call-2" });
@@ -59,10 +59,10 @@ const invalidEvidence: [string, (e: ReturnType<typeof evidence>) => void][] = [
   }],
   ["arbitrary error suffix", (e) => { e.events[1]!.result!.content[0]!.text += " plus permission denied"; }],
   ["malformed successful probe", (e) => { e.lines[1] = e.lines[1]!.replace("total 9.0 ms", "total invalid"); }],
-  ["extra unrelated record", (e) => { e.records.push({ ...e.records[0]!, attemptId: "other" }); }],
+  ["extra unrelated record", (e) => { e.records.push({ ...e.records[0]!, delegationId: "other" }); }],
   ["duplicate results with distinct records", (e) => {
     e.calls = 2; e.events.push(e.events[1]!);
-    e.records.push({ ...e.records[0]!, attemptId: "call-2" }); e.lines.push(...e.lines);
+    e.records.push({ ...e.records[0]!, delegationId: "call-2" }); e.lines.push(...e.lines);
   }],
   ["duplicate records hiding a missing correspondence", (e) => {
     e.calls = 2; e.events.push({ ...e.events[1]!, toolCallId: "call-2" });
@@ -78,7 +78,7 @@ const invalidEvidence: [string, (e: ReturnType<typeof evidence>) => void][] = [
   ["successful tool result", (e) => { e.events[1]!.isError = false; }],
   ["duplicate record", (e) => { e.records.push(e.records[0]!); }],
   ["missing record", (e) => { e.records = []; }],
-  ["unmatched record", (e) => { e.records[0]!.attemptId = "other"; }],
+  ["unmatched record", (e) => { e.records[0]!.delegationId = "other"; }],
   ["nondecision record", (e) => { e.records[0]!.recordType = "explicit"; }],
   ["classifier launch", (e) => { e.launches.push({ kind: "classifier" }); }],
   ["other launch", (e) => { e.launches.push({ kind: "other" }); }],

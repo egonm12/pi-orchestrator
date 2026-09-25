@@ -35,7 +35,7 @@ import { attachVerdict, installVerdictReviewer, VERDICT_REVIEWER_AGENT, verdictF
 // settings in two temporary git repositories.
 //
 // Every model that runs is Haiku. The surviving rungs are Haiku at different
-// efforts, so each tier's dispatch is visible in the child's model string:
+// efforts, so each tier's delegation is visible in the child's model string:
 //
 //   mechanical  anthropic/claude-haiku-4-5:minimal
 //   standard    openai-codex/gpt-6-luna:low (out of usage, removed),
@@ -53,16 +53,16 @@ import { attachVerdict, installVerdictReviewer, VERDICT_REVIEWER_AGENT, verdictF
 //
 // Four parent sessions (one parent Haiku each):
 //
-//   A   shadow, project 1  one critical-floor dispatch: the record's rung
+//   A   shadow, project 1  one critical-floor delegation: the record's rung
 //                          differs from the model the child runs on
-//   B1  live, project 1    mechanical, standard, critical dispatch, each
+//   B1  live, project 1    mechanical, standard, critical delegation, each
 //                          followed by a verdict-reviewer review
 //   B2  live, project 1    the second mechanical, standard and critical
 //   C   live, project 2    project 2 replaces critical with Codex rungs only,
 //                          so a critical task is refused; then a call naming
 //                          a banned model, which the guard refuses
 //
-// Launches: 1 `pi --list-models`, 4 parents, 14 children (8 dispatches, 6
+// Launches: 1 `pi --list-models`, 4 parents, 14 children (8 delegations, 6
 // reviews): 19. The 8 classifier calls run inside the parent sessions (ADR
 // 0004) and start no `pi`; their tokens and cost are in the router's probe
 // lines. Every `pi` started through PATH is logged by
@@ -140,7 +140,7 @@ const SUBAGENT_CONFIG = { intercomBridge: { mode: "off" } };
 
 const REVIEW_PREFIX = "There are no files to read: judge only the description in this task. ";
 
-interface Dispatch {
+interface Delegation {
   readonly label: string;
   readonly task: string;
   readonly tier: RiskTier;
@@ -153,7 +153,7 @@ interface Dispatch {
 // test (tier-classifier.test.ts, LIVE_CASES); the second of each changes only
 // the names. Critical tasks carry a credential and a data-loss keyword, so
 // the keyword floor makes them critical whatever the model answers.
-const DISPATCHES: readonly Dispatch[] = [
+const DELEGATIONS: readonly Delegation[] = [
   {
     label: "mechanical 1",
     task: "Reformat src/report.ts with prettier: fix the indentation and add the missing trailing commas. No behaviour change.",
@@ -218,7 +218,7 @@ const SHADOW_TASK = "Rotate the service account password and drop table tokens_a
 const REFUSED_TASK = "Remove the stored password column and drop table legacy_accounts.";
 const BANNED_TASK = "Reply with the single word PONG.";
 
-function dispatchCall(task: string): Record<string, unknown> {
+function delegationCall(task: string): Record<string, unknown> {
   return { agent: WORKER_AGENT, task, context: "fresh", async: false };
 }
 
@@ -286,7 +286,7 @@ function runRoutingReport(folder: string): { status: number | null; stdout: stri
 
 // Seam 1 companion of checkbox 7: the report check above, against a folder
 // whose counts are known by construction. No pi. This is where a change to
-// the report's counting (verdicts once per attempt id, newest wins; orphans
+// the report's counting (verdicts once per delegation id, newest wins; orphans
 // once; explicit records nowhere; shadow agreement) is caught without spend.
 test("the gate's hand-computed report equals routing-report.ts over a folder with known counts", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-harness-acceptance-report-"));
@@ -300,24 +300,24 @@ test("the gate's hand-computed report equals routing-report.ts over a folder wit
     const task = "Reformat src/report.ts with prettier.";
     const mechanical = await fixtureClassification(task, "mechanical", "implement");
     const common = { at, taskText: task, agentRole: "worker", classification: mechanical, tierMap };
-    writeDecisionRecord(records, { ...common, attemptId: "m-live", mode: "live", route: fixtureRoute("mechanical", tierMap) });
-    writeDecisionRecord(records, { ...common, attemptId: "m-shadow-agrees", mode: "shadow", handPickedModel: FIXTURE_HAIKU, route: fixtureRoute("mechanical", tierMap) });
-    writeDecisionRecord(records, { ...common, attemptId: "m-shadow-differs", mode: "shadow", handPickedModel: OPUS, route: fixtureRoute("mechanical", tierMap) });
+    writeDecisionRecord(records, { ...common, delegationId: "m-live", mode: "live", route: fixtureRoute("mechanical", tierMap) });
+    writeDecisionRecord(records, { ...common, delegationId: "m-shadow-agrees", mode: "shadow", handPickedModel: FIXTURE_HAIKU, route: fixtureRoute("mechanical", tierMap) });
+    writeDecisionRecord(records, { ...common, delegationId: "m-shadow-differs", mode: "shadow", handPickedModel: OPUS, route: fixtureRoute("mechanical", tierMap) });
     writeDecisionRecord(records, {
       ...common,
-      attemptId: "s-live",
+      delegationId: "s-live",
       mode: "live",
       classification: await fixtureClassification(task, "standard", "implement"),
       route: fixtureRoute("standard", tierMap),
     });
     writeDecisionRecord(records, {
       ...common,
-      attemptId: "e-refused",
+      delegationId: "e-refused",
       mode: "live",
       classification: await fixtureClassification(task, "elevated", "implement"),
       route: fixtureRefusal("elevated", tierMap),
     });
-    const attach = (attemptId: string, verdict: Verdict, when: Date) => attachVerdict({ recordDir: records, attemptId, verdict, at: when, refreshStatePath: ledger });
+    const attach = (delegationId: string, verdict: Verdict, when: Date) => attachVerdict({ recordDir: records, delegationId, verdict, at: when, refreshStatePath: ledger });
     attach("m-live", "accept", later);
     attach("m-shadow-agrees", "request_changes", later);
     attach("m-shadow-agrees", "accept", latest);
@@ -417,9 +417,9 @@ function callFor(session: SessionRun, args: Record<string, unknown>): SubagentCa
   return call;
 }
 
-function decisionFor(records: readonly RoutingRecord[], attemptId: string): DecisionRecord {
-  const matching = records.filter((record) => record.attemptId === attemptId);
-  assert.equal(matching.length > 0 ? matching[0]!.recordType : "none", "decision", `records for ${attemptId}: ${JSON.stringify(matching)}`);
+function decisionFor(records: readonly RoutingRecord[], delegationId: string): DecisionRecord {
+  const matching = records.filter((record) => record.delegationId === delegationId);
+  assert.equal(matching.length > 0 ? matching[0]!.recordType : "none", "decision", `records for ${delegationId}: ${JSON.stringify(matching)}`);
   return matching[0] as DecisionRecord;
 }
 
@@ -446,7 +446,7 @@ function describeDecision(record: RoutingRecord | undefined): string {
   return `${record.mode} ${c.tier} (model ${c.modelTier ?? "-"}, floor ${c.floor}, cause ${c.cause}) -> ${outcome}; removed ${JSON.stringify(route.removed.map((r) => [r.tier, r.rung, r.reason]))}; why: ${c.why}`;
 }
 
-test(`routing acceptance gate on ${HAIKU}: six routed dispatches with verdicts, project override, out of usage, emptied top tier, shadow then live, banned model, report`, async (t: TestContext) => {
+test(`routing acceptance gate on ${HAIKU}: six routed delegations with verdicts, project override, out of usage, emptied top tier, shadow then live, banned model, report`, async (t: TestContext) => {
   const liveModel = selectedLivePiModel();
   if (liveModel !== HAIKU) return t.skip(`the routing acceptance runs on ${HAIKU} only; PI_ORCHESTRATOR_LIVE_MODEL selected ${liveModel}`);
   const authExtension = liveAuthExtensionPath();
@@ -551,13 +551,13 @@ test(`routing acceptance gate on ${HAIKU}: six routed dispatches with verdicts, 
     };
 
     // Shadow, then flip `mode` to live in the throwaway settings.
-    const firstHalf = DISPATCHES.slice(0, 3);
-    const secondHalf = DISPATCHES.slice(3);
-    const steps = (dispatches: readonly Dispatch[]) => dispatches.flatMap((d) => [dispatchCall(d.task), reviewCall(d.review)]);
+    const firstHalf = DELEGATIONS.slice(0, 3);
+    const secondHalf = DELEGATIONS.slice(3);
+    const steps = (delegations: readonly Delegation[]) => delegations.flatMap((d) => [delegationCall(d.task), reviewCall(d.review)]);
     const { sessions, refused } = runSessionsUntilRefusal([
       () => {
         writePersonalSettings("shadow");
-        return runSession("A shadow", project.dir, [dispatchCall(SHADOW_TASK)], SESSION_TIMEOUTS_MS.shadow);
+        return runSession("A shadow", project.dir, [delegationCall(SHADOW_TASK)], SESSION_TIMEOUTS_MS.shadow);
       },
       () => {
         writePersonalSettings("live");
@@ -565,7 +565,7 @@ test(`routing acceptance gate on ${HAIKU}: six routed dispatches with verdicts, 
       },
       () => runSession("B2 live", project.dir, steps(secondHalf), SESSION_TIMEOUTS_MS.live2),
       () => runSession("C live, emptied critical", emptiedProject.dir, [
-        dispatchCall(REFUSED_TASK),
+        delegationCall(REFUSED_TASK),
         { agent: WORKER_AGENT, task: BANNED_TASK, model: FABLE, context: "fresh", async: false },
       ], SESSION_TIMEOUTS_MS.emptied),
     ]);
@@ -610,18 +610,18 @@ test(`routing acceptance gate on ${HAIKU}: six routed dispatches with verdicts, 
     const [shadow, live1, live2, emptied] = sessions as readonly [SessionRun, SessionRun, SessionRun, SessionRun];
 
     const records = readRoutingRecords(recordDir);
-    for (const record of records) t.diagnostic(`record ${record.attemptId}: ${record.recordType} ${describeDecision(record)}`);
+    for (const record of records) t.diagnostic(`record ${record.delegationId}: ${record.recordType} ${describeDecision(record)}`);
 
-    // Verdicts: each dispatch's review, read from the structured field only,
-    // attached by the dispatch's attempt id.
-    const reviewed: { dispatch: Dispatch; attemptId: string; verdict: Verdict; outcome: AttachVerdictOutcome }[] = [];
-    for (const [session, dispatches] of [[live1, firstHalf], [live2, secondHalf]] as const) {
-      for (const dispatch of dispatches) {
-        const work = session.calls.find((call) => call.args.agent === WORKER_AGENT && call.args.task === dispatch.task);
-        const review = session.calls.find((call) => call.args.agent === VERDICT_REVIEWER_AGENT && call.args.task === reviewCall(dispatch.review).task);
+    // Verdicts: each delegation's review, read from the structured field only,
+    // attached by the delegation's delegation id.
+    const reviewed: { delegation: Delegation; delegationId: string; verdict: Verdict; outcome: AttachVerdictOutcome }[] = [];
+    for (const [session, delegations] of [[live1, firstHalf], [live2, secondHalf]] as const) {
+      for (const delegation of delegations) {
+        const work = session.calls.find((call) => call.args.agent === WORKER_AGENT && call.args.task === delegation.task);
+        const review = session.calls.find((call) => call.args.agent === VERDICT_REVIEWER_AGENT && call.args.task === reviewCall(delegation.review).task);
         if (!work || !review) continue;
         const verdict = verdictFromReviewResult(review.children[0]);
-        reviewed.push({ dispatch, attemptId: work.id, verdict, outcome: attachVerdict({ recordDir, attemptId: work.id, verdict, refreshStatePath }) });
+        reviewed.push({ delegation, delegationId: work.id, verdict, outcome: attachVerdict({ recordDir, delegationId: work.id, verdict, refreshStatePath }) });
       }
     }
     const report = runRoutingReport(recordDir);
@@ -652,32 +652,32 @@ test(`routing acceptance gate on ${HAIKU}: six routed dispatches with verdicts, 
       assert.ok(logged.length + children.length <= 22, `launch cap: ${logged.length + children.length}`);
     });
 
-    await t.test("checkbox 1: six live dispatches, two per tier, each with a complete decision record and a structured verdict from a real review", () => {
+    await t.test("checkbox 1: six live delegations, two per tier, each with a complete decision record and a structured verdict from a real review", () => {
       const problems: string[] = [];
-      for (const [session, dispatches] of [[live1, firstHalf], [live2, secondHalf]] as const) {
-        for (const dispatch of dispatches) {
-          const work = callFor(session, dispatchCall(dispatch.task));
+      for (const [session, delegations] of [[live1, firstHalf], [live2, secondHalf]] as const) {
+        for (const delegation of delegations) {
+          const work = callFor(session, delegationCall(delegation.task));
           const record = decisionFor(records, work.id);
-          assertCompleteDecision(record, dispatch.label);
+          assertCompleteDecision(record, delegation.label);
           assert.equal(record.mode, "live");
-          if (record.classification.tier !== dispatch.tier) problems.push(`${dispatch.label}: classified ${describeDecision(record)}`);
-          assert.equal(record.route.outcome === "chosen" && record.route.rung.rung, dispatch.rung, `${dispatch.label}: ${describeDecision(record)}`);
-          assert.equal(childModel(work), dispatch.rung, `${dispatch.label}: the child ran on the record's rung`);
-          const review = callFor(session, reviewCall(dispatch.review));
+          if (record.classification.tier !== delegation.tier) problems.push(`${delegation.label}: classified ${describeDecision(record)}`);
+          assert.equal(record.route.outcome === "chosen" && record.route.rung.rung, delegation.rung, `${delegation.label}: ${describeDecision(record)}`);
+          assert.equal(childModel(work), delegation.rung, `${delegation.label}: the child ran on the record's rung`);
+          const review = callFor(session, reviewCall(delegation.review));
           assert.equal(review.isError, false, review.text.slice(0, 1000));
         }
       }
       assert.deepEqual(problems, [], "a task landed on a neighbouring tier; the assertion is not loosened");
       assert.equal(reviewed.length, 6);
       for (const entry of reviewed) {
-        assert.notEqual(entry.verdict, "missing", `${entry.dispatch.label}: the review returned no structured verdict`);
-        assert.equal(entry.outcome.status, "attached", entry.dispatch.label);
-        assert.equal(entry.outcome.status === "attached" && entry.outcome.decision.attemptId, entry.attemptId);
+        assert.notEqual(entry.verdict, "missing", `${entry.delegation.label}: the review returned no structured verdict`);
+        assert.equal(entry.outcome.status, "attached", entry.delegation.label);
+        assert.equal(entry.outcome.status === "attached" && entry.outcome.decision.delegationId, entry.delegationId);
       }
       const afterAttach = readRoutingRecords(recordDir);
       const verdicts = afterAttach.filter((record) => record.recordType === "verdict");
-      assert.deepEqual(verdicts.map((record) => record.attemptId).sort(), reviewed.map((entry) => entry.attemptId).sort());
-      assert.deepEqual(DISPATCHES.map((d) => d.tier), ["mechanical", "standard", "critical", "mechanical", "standard", "critical"]);
+      assert.deepEqual(verdicts.map((record) => record.delegationId).sort(), reviewed.map((entry) => entry.delegationId).sort());
+      assert.deepEqual(DELEGATIONS.map((d) => d.tier), ["mechanical", "standard", "critical", "mechanical", "standard", "critical"]);
     });
 
     await t.test("checkbox 2: the project's Fable rung is dropped by the ban list and the personal tier inherited, as the record's tier map says", () => {
@@ -693,9 +693,9 @@ test(`routing acceptance gate on ${HAIKU}: six routed dispatches with verdicts, 
     });
 
     await t.test("checkbox 3: Codex out of usage falls through to the Claude rung in the same tier, with no tier move", () => {
-      for (const [session, dispatches] of [[live1, firstHalf], [live2, secondHalf]] as const) {
-        for (const dispatch of dispatches.filter((d) => d.tier === "standard")) {
-          const work = callFor(session, dispatchCall(dispatch.task));
+      for (const [session, delegations] of [[live1, firstHalf], [live2, secondHalf]] as const) {
+        for (const delegation of delegations.filter((d) => d.tier === "standard")) {
+          const work = callFor(session, delegationCall(delegation.task));
           const record = decisionFor(records, work.id);
           assert.equal(record.route.outcome, "chosen", describeDecision(record));
           if (record.route.outcome !== "chosen") continue;
@@ -711,7 +711,7 @@ test(`routing acceptance gate on ${HAIKU}: six routed dispatches with verdicts, 
     });
 
     await t.test("checkbox 4: an emptied top tier refuses, listing every removed rung, and no model is written", () => {
-      const work = callFor(emptied, dispatchCall(REFUSED_TASK));
+      const work = callFor(emptied, delegationCall(REFUSED_TASK));
       const record = decisionFor(records, work.id);
       assertCompleteDecision(record, "refused critical");
       assert.equal(record.mode, "live");
@@ -730,8 +730,8 @@ test(`routing acceptance gate on ${HAIKU}: six routed dispatches with verdicts, 
       assert.equal(childModel(work), `${HAIKU}:off`);
     });
 
-    await t.test("checkbox 5: shadow records without changing the dispatched model; after the flip to live the next session's child runs on the record's rung", () => {
-      const shadowCall = callFor(shadow, dispatchCall(SHADOW_TASK));
+    await t.test("checkbox 5: shadow records without changing the delegated model; after the flip to live the next session's child runs on the record's rung", () => {
+      const shadowCall = callFor(shadow, delegationCall(SHADOW_TASK));
       const record = decisionFor(records, shadowCall.id);
       assertCompleteDecision(record, "shadow");
       assert.equal(record.mode, "shadow");
@@ -741,7 +741,7 @@ test(`routing acceptance gate on ${HAIKU}: six routed dispatches with verdicts, 
       assert.match(shadow.stderr, new RegExp(`${ROUTER_PREFIX} routing enabled, mode shadow`));
 
       assert.match(live1.stderr, new RegExp(`${ROUTER_PREFIX} routing enabled, mode live`));
-      const first = callFor(live1, dispatchCall(firstHalf[0]!.task));
+      const first = callFor(live1, delegationCall(firstHalf[0]!.task));
       const liveRecord = decisionFor(records, first.id);
       assert.equal(liveRecord.mode, "live");
       assert.equal(childModel(first), liveRecord.route.outcome === "chosen" ? liveRecord.route.rung.rung : "refused");
@@ -753,17 +753,17 @@ test(`routing acceptance gate on ${HAIKU}: six routed dispatches with verdicts, 
       assert.equal(banned.isError, true);
       assert.match(banned.text, /prohibited model: anthropic\/claude-fable-5/);
       assert.deepEqual(banned.children, [], "no child ran");
-      const forIt = records.filter((record) => record.attemptId === banned.id || record.attemptId.startsWith(`${banned.id}:`));
+      const forIt = records.filter((record) => record.delegationId === banned.id || record.delegationId.startsWith(`${banned.id}:`));
       t.diagnostic(`records for the banned call: ${JSON.stringify(forIt.map((record) => record.recordType))}`);
       assert.ok(forIt.every((record) => record.recordType === "explicit"), JSON.stringify(forIt));
     });
 
     await t.test("checkbox 7: routing-report.ts over the records folder prints the hand-computed counts", () => {
-      const verdictOf = (label: string) => reviewed.find((entry) => entry.dispatch.label === label)?.verdict ?? "missing";
+      const verdictOf = (label: string) => reviewed.find((entry) => entry.delegation.label === label)?.verdict ?? "missing";
       const expected = expectedReport(recordDir, [
         { tier: "mechanical", rung: RUNG.mechanical, decisions: 2, verdicts: [verdictOf("mechanical 1"), verdictOf("mechanical 2")], shadowDecisions: 0, shadowAgreements: 0 },
         { tier: "standard", rung: RUNG.standard, decisions: 2, verdicts: [verdictOf("standard 1"), verdictOf("standard 2")], shadowDecisions: 0, shadowAgreements: 0 },
-        // The shadow dispatch (no review) and the two live critical ones.
+        // The shadow delegation (no review) and the two live critical ones.
         { tier: "critical", rung: RUNG.critical, decisions: 3, verdicts: [verdictOf("critical 1"), verdictOf("critical 2")], shadowDecisions: 1, shadowAgreements: 1 },
         { tier: "critical", rung: null, decisions: 1, verdicts: [], shadowDecisions: 0, shadowAgreements: 0 },
       ], 0);

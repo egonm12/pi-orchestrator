@@ -47,7 +47,7 @@ function tempDir(): { dir: string; cleanup(): void } {
 async function liveInput(overrides: Partial<DecisionRecordInput> = {}): Promise<DecisionRecordInput> {
   const tierMap = fixtureTierMap();
   return {
-    attemptId: "attempt-live-1",
+    delegationId: "attempt-live-1",
     at: NOW,
     mode: "live",
     taskText: TASK,
@@ -60,7 +60,7 @@ async function liveInput(overrides: Partial<DecisionRecordInput> = {}): Promise<
 }
 
 async function shadowInput(overrides: Partial<DecisionRecordInput> = {}): Promise<DecisionRecordInput> {
-  return { ...(await liveInput()), attemptId: "attempt-shadow-1", mode: "shadow", handPickedModel: SONNET, ...overrides } as DecisionRecordInput;
+  return { ...(await liveInput()), delegationId: "attempt-shadow-1", mode: "shadow", handPickedModel: SONNET, ...overrides } as DecisionRecordInput;
 }
 
 function linesOf(path: string): Record<string, unknown>[] {
@@ -121,8 +121,8 @@ test("one shadow write and one live write leave exactly two records, each carryi
       assert.deepEqual(record.route.removed.map((entry) => [entry.rung, entry.reason]), [["openai-codex/gpt-6-luna:medium", "provider out of usage"]]);
       assert.deepEqual(record.route.rung, { rung: `${SONNET}:medium`, model: SONNET, effort: "medium", origin: "personal" });
     }
-    assert.equal(first.attemptId, "attempt-shadow-1");
-    assert.equal(second.attemptId, "attempt-live-1");
+    assert.equal(first.delegationId, "attempt-shadow-1");
+    assert.equal(second.delegationId, "attempt-live-1");
   } finally {
     cleanup();
   }
@@ -135,8 +135,8 @@ test("an escalation and a refusal are both recorded with the tiers tried and eve
     const settings = fixturePersonalSettings();
     const tiers = { ...(settings.orchestrator as { routing: { tiers: Record<string, string[]> } }).routing.tiers, standard: ["openai-codex/gpt-6-luna:medium"] };
     const tierMap = fixtureTierMap({ orchestrator: { routing: { enabled: true, tiers } } }, FIXTURE_PROJECT_SETTINGS);
-    writeDecisionRecord(dir, await liveInput({ attemptId: "attempt-escalated", tierMap, route: fixtureRoute("standard", tierMap) }));
-    writeDecisionRecord(dir, await liveInput({ attemptId: "attempt-refused", tierMap, route: fixtureRefusal("elevated", tierMap) }));
+    writeDecisionRecord(dir, await liveInput({ delegationId: "attempt-escalated", tierMap, route: fixtureRoute("standard", tierMap) }));
+    writeDecisionRecord(dir, await liveInput({ delegationId: "attempt-refused", tierMap, route: fixtureRefusal("elevated", tierMap) }));
     const [escalated, refused] = readRoutingRecords(dir) as [DecisionRecord, DecisionRecord];
 
     assert.equal(escalated.route.outcome, "chosen");
@@ -176,7 +176,7 @@ test("a record with a missing or an unknown field fails validation on read, nami
     const unknown = "is not a known field";
     const cases: { readonly mutate: (copy: Record<string, unknown>) => void; readonly field: string; readonly problem: string }[] = [
       { mutate: (copy) => delete copy.agentRole, field: "agentRole", problem: missing },
-      { mutate: (copy) => delete copy.attemptId, field: "attemptId", problem: missing },
+      { mutate: (copy) => delete copy.delegationId, field: "delegationId", problem: missing },
       { mutate: (copy) => { copy.surprise = 1; }, field: "surprise", problem: unknown },
       { mutate: (copy) => { copy.handPickedModel = SONNET; }, field: "handPickedModel", problem: unknown },
       { mutate: (copy) => delete (copy.classification as Record<string, unknown>).rubricVersion, field: "classification.rubricVersion", problem: missing },
@@ -211,18 +211,18 @@ test("a record with a missing or an unknown field fails validation on read, nami
     delete shadow.handPickedModel;
     assert.throws(() => validateRoutingRecord(shadow), { name: "RoutingRecordError", message: /'handPickedModel'/ });
 
-    const versioned = { ...base, schemaVersion: "decision-record/0" };
+    const versioned = { ...base, schemaVersion: "decision-record/1" };
     assert.throws(() => validateRoutingRecord(versioned), { message: /'schemaVersion'/ });
 
     // A later version with a new field reports the version, not the field.
-    const future = { ...base, schemaVersion: "decision-record/2", cause: "explicit" };
+    const future = { ...base, schemaVersion: "decision-record/3", cause: "explicit" };
     assert.throws(() => validateRoutingRecord(future), (error: unknown) => {
       assert.ok(error instanceof RoutingRecordError, String(error));
       assert.equal(error.field, "schemaVersion", error.message);
-      assert.match(error.message, /decision-record\/2/);
+      assert.match(error.message, /decision-record\/3/);
       return true;
     });
-    const futureVerdict = { recordType: "verdict", schemaVersion: "decision-record/2", attemptId: "a", timestamp: NOW.toISOString(), verdict: "accept", extra: 1 };
+    const futureVerdict = { recordType: "verdict", schemaVersion: "decision-record/3", delegationId: "a", timestamp: NOW.toISOString(), verdict: "accept", extra: 1 };
     assert.throws(() => validateRoutingRecord(futureVerdict), { name: "RoutingRecordError", message: /field 'schemaVersion'/ });
   } finally {
     cleanup();
@@ -232,7 +232,7 @@ test("a record with a missing or an unknown field fails validation on read, nami
 test("an explicit record with a missing or an unknown field fails validation on write and on read, naming the field", async () => {
   const { dir, cleanup } = tempDir();
   try {
-    const record = buildExplicitModelRecord({ attemptId: "attempt-explicit", at: NOW, mode: "shadow", slot: "tasks[1].model", model: SONNET, taskText: TASK, agentRole: "reviewer" });
+    const record = buildExplicitModelRecord({ delegationId: "attempt-explicit", at: NOW, mode: "shadow", slot: "tasks[1].model", model: SONNET, taskText: TASK, agentRole: "reviewer" });
     const cases: readonly (readonly [(copy: Record<string, unknown>) => void, string, string])[] = [
       [(copy) => delete copy.slot, "slot", "is missing"],
       [(copy) => delete copy.cause, "cause", "is missing"],
@@ -334,9 +334,9 @@ test("credential-shaped text in the task and in hop details, route messages and 
       message: `no rung survived; token=${BEARER}`,
       removed: refusal.removed.map((removed) => ({ ...removed, detail: `Bearer ${BEARER}` })),
     } as typeof refusal;
-    writeDecisionRecord(dir, await liveInput({ attemptId: "attempt-leaky", taskText: task, classification: leaky, route: leakyRefusal }));
+    writeDecisionRecord(dir, await liveInput({ delegationId: "attempt-leaky", taskText: task, classification: leaky, route: leakyRefusal }));
     appendRoutingRecord(dir, buildExplicitModelRecord({
-      attemptId: "attempt-leaky-explicit", at: NOW, mode: "live", slot: "model", model: SONNET, taskText: task, agentRole: "worker",
+      delegationId: "attempt-leaky-explicit", at: NOW, mode: "live", slot: "model", model: SONNET, taskText: task, agentRole: "worker",
     }));
 
     const files = readdirSync(dir);
@@ -366,7 +366,7 @@ test("a key that straddles the task-text or hop-detail limit is redacted before 
     const detail = `${"y".repeat(494)} ${API_KEY}`;
     const classification = await fixtureClassification(TASK, "standard");
     const input = await liveInput({
-      attemptId: "attempt-straddle",
+      delegationId: "attempt-straddle",
       taskText: task,
       classification: { ...classification, hops: classification.hops.map((hop) => ({ ...hop, detail })) },
     });
@@ -393,9 +393,9 @@ test("a quoted password value longer than the redaction window, or never closed,
     const unterminated = "password: \"hunter2 and the rest of the line";
     assert.ok(longQuoted.length > TASK_TEXT_PREFIX_LIMIT + 1_000 && longQuoted.length > FREE_TEXT_LIMIT + 1_000);
     const classification = await fixtureClassification(TASK, "standard");
-    for (const [attemptId, text] of [["attempt-long-quote", longQuoted], ["attempt-open-quote", unterminated]] as const) {
+    for (const [delegationId, text] of [["attempt-long-quote", longQuoted], ["attempt-open-quote", unterminated]] as const) {
       writeDecisionRecord(dir, await liveInput({
-        attemptId,
+        delegationId,
         taskText: text,
         classification: { ...classification, hops: classification.hops.map((hop) => ({ ...hop, detail: text })) },
       }));
@@ -421,7 +421,7 @@ test("a key cut by the redaction window end does not slide into the kept task te
     // over 1,000 characters.
     const task = `password: "${"a".repeat(1_180)}" sk-proj1234567890`;
     assert.equal(task.indexOf("sk-proj") + 7, TASK_TEXT_PREFIX_LIMIT + 1_000);
-    writeDecisionRecord(dir, await liveInput({ attemptId: "attempt-cut-key", taskText: task }));
+    writeDecisionRecord(dir, await liveInput({ delegationId: "attempt-cut-key", taskText: task }));
 
     for (const file of readdirSync(dir)) {
       assert.equal(readFileSync(join(dir, file), "utf8").includes("sk-proj"), false, `${file} holds a fragment of the key`);
@@ -438,7 +438,7 @@ test("a 200,000-character unbroken a-b-c run in the task text is redacted and cu
   try {
     const run = Array.from({ length: 200_000 }, (_, index) => (index % 2 === 1 ? "-" : String.fromCharCode(97 + ((index / 2) % 26)))).join("");
     assert.equal(run.length, 200_000);
-    const input = await liveInput({ attemptId: "attempt-long-run", taskText: `Deploy with ${API_KEY} then ${run}` });
+    const input = await liveInput({ delegationId: "attempt-long-run", taskText: `Deploy with ${API_KEY} then ${run}` });
     const started = performance.now();
     writeDecisionRecord(dir, input);
     const elapsed = performance.now() - started;
@@ -485,7 +485,7 @@ test("an auth token in a settings key next to orchestrator never appears in any 
     // Everything a hook could have at hand is passed in, including the parsed
     // settings object and copies of the values with the token spliced in.
     const input = {
-      attemptId: "attempt-token",
+      delegationId: "attempt-token",
       at: NOW,
       mode: "shadow",
       handPickedModel: SONNET,
@@ -498,7 +498,7 @@ test("an auth token in a settings key next to orchestrator never appears in any 
       route: { ...route, settings, ...(route.ok ? { rung: { ...route.rung, token: TOKEN } } : {}) },
     } as unknown as DecisionRecordInput;
     writeDecisionRecord(dir, input);
-    writeDecisionRecord(dir, { ...input, attemptId: "attempt-token-live", mode: "live", handPickedModel: undefined } as unknown as DecisionRecordInput);
+    writeDecisionRecord(dir, { ...input, delegationId: "attempt-token-live", mode: "live", handPickedModel: undefined } as unknown as DecisionRecordInput);
     for (const file of readdirSync(dir)) {
       const text = readFileSync(join(dir, file), "utf8");
       assert.equal(text.includes(TOKEN), false, `${file} holds the token`);

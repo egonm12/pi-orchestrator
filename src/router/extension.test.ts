@@ -64,7 +64,7 @@ const NOW = new Date("2026-09-26T12:00:00.000Z");
 function approved(...providers: string[]): RecipientAuthorization {
   let authorization = emptyAuthorization();
   for (const provider of providers) {
-    const approval = grantOwnerApproval({ approvedBy: "owner", scope: "data-recipient", acknowledgement: `send dispatch data to ${provider}` });
+    const approval = grantOwnerApproval({ approvedBy: "owner", scope: "data-recipient", acknowledgement: `send delegation data to ${provider}` });
     authorization = authorizeRecipient(authorization, provider, approval);
   }
   return authorization;
@@ -184,8 +184,8 @@ test("a subagent call naming a model is left unchanged and recorded as explicit"
     assert.deepEqual(input, { agent: "worker", task: "Rename the helper in src/util.ts", model: "anthropic/claude-opus-5-5:high" });
     assert.deepEqual(h.records(), [{
       recordType: "explicit",
-      schemaVersion: "decision-record/1",
-      attemptId: "call-1",
+      schemaVersion: "decision-record/2",
+      delegationId: "call-1",
       timestamp: "2026-09-26T12:00:00.000Z",
       cause: "explicit",
       mode: "live",
@@ -199,11 +199,11 @@ test("a subagent call naming a model is left unchanged and recorded as explicit"
 
 /** The fields of a record that say what was decided, for compact assertions. */
 function summary(record: RoutingRecord): Record<string, unknown> {
-  if (record.recordType === "explicit") return { recordType: record.recordType, attemptId: record.attemptId, mode: record.mode, slot: record.slot, model: record.model };
-  if (record.recordType !== "decision") return { recordType: record.recordType, attemptId: record.attemptId };
+  if (record.recordType === "explicit") return { recordType: record.recordType, delegationId: record.delegationId, mode: record.mode, slot: record.slot, model: record.model };
+  if (record.recordType !== "decision") return { recordType: record.recordType, delegationId: record.delegationId };
   return {
     recordType: record.recordType,
-    attemptId: record.attemptId,
+    delegationId: record.delegationId,
     mode: record.mode,
     tier: record.classification.tier,
     cause: record.classification.cause,
@@ -226,8 +226,8 @@ test("a model in tasks[1] is left alone and recorded as explicit while tasks[0],
       { agent: "reviewer", task: "Review the typo fix", model: "anthropic/claude-opus-5-5:high" },
     ] });
     assert.deepEqual(h.records().map(summary), [
-      { recordType: "decision", attemptId: "call-1:tasks[0]", mode: "live", tier: "mechanical", cause: "model:anthropic/claude-haiku-4-5:low", route: "anthropic/claude-haiku-4-5:low" },
-      { recordType: "explicit", attemptId: "call-1:tasks[1]", mode: "live", slot: "tasks[1].model", model: "anthropic/claude-opus-5-5:high" },
+      { recordType: "decision", delegationId: "call-1:tasks[0]", mode: "live", tier: "mechanical", cause: "model:anthropic/claude-haiku-4-5:low", route: "anthropic/claude-haiku-4-5:low" },
+      { recordType: "explicit", delegationId: "call-1:tasks[1]", mode: "live", slot: "tasks[1].model", model: "anthropic/claude-opus-5-5:high" },
     ]);
   } finally { h.cleanup(); }
 });
@@ -240,7 +240,7 @@ test("a model named at the top level covers the nested tasks, which are not rout
     await router.toolCall(input);
     assert.deepEqual(input, { model: "anthropic/claude-opus-5-5:high", tasks: [{ agent: "worker", task: "Fix the typo in README.md" }] });
     assert.deepEqual(h.records().map(summary), [
-      { recordType: "explicit", attemptId: "call-1", mode: "live", slot: "model", model: "anthropic/claude-opus-5-5:high" },
+      { recordType: "explicit", delegationId: "call-1", mode: "live", slot: "model", model: "anthropic/claude-opus-5-5:high" },
     ]);
   } finally { h.cleanup(); }
 });
@@ -257,7 +257,7 @@ test("in shadow mode a call with no model proceeds unchanged and the record show
     assert.equal(await router.toolCall(input), undefined);
     assert.deepEqual(input, { agent: "worker", task: "Add a retry option to the fetch helper" });
     assert.deepEqual(h.records().map(summary), [
-      { recordType: "decision", attemptId: "call-1", mode: "shadow", tier: "standard", cause: "model:anthropic/claude-haiku-4-5:low", route: "anthropic/claude-sonnet-5:medium", handPickedModel: "anthropic/claude-haiku-4-5" },
+      { recordType: "decision", delegationId: "call-1", mode: "shadow", tier: "standard", cause: "model:anthropic/claude-haiku-4-5:low", route: "anthropic/claude-sonnet-5:medium", handPickedModel: "anthropic/claude-haiku-4-5" },
     ]);
   } finally { h.cleanup(); }
 });
@@ -270,7 +270,7 @@ test("in live mode the same call runs on the router's rung, written into its mod
     assert.equal(await router.toolCall(input), undefined);
     assert.deepEqual(input, { agent: "worker", task: "Add a retry option to the fetch helper", model: "anthropic/claude-sonnet-5:medium" });
     assert.deepEqual(h.records().map(summary), [
-      { recordType: "decision", attemptId: "call-1", mode: "live", tier: "standard", cause: "model:anthropic/claude-haiku-4-5:low", route: "anthropic/claude-sonnet-5:medium" },
+      { recordType: "decision", delegationId: "call-1", mode: "live", tier: "standard", cause: "model:anthropic/claude-haiku-4-5:low", route: "anthropic/claude-sonnet-5:medium" },
     ]);
   } finally { h.cleanup(); }
 });
@@ -288,7 +288,7 @@ test("chain steps and workflow steps with no model are routed the same way (stor
       chain: [{ agent: "scout", task: "List the files under docs/", model: "anthropic/claude-haiku-4-5:low" }],
       workflow: { steps: [{ agent: "worker", task: "Fix the typo in README.md", model: "anthropic/claude-haiku-4-5:low" }] },
     });
-    assert.deepEqual(h.records().map((record) => record.attemptId), ["call-1:chain[0]", "call-1:workflow.steps[0]"]);
+    assert.deepEqual(h.records().map((record) => record.delegationId), ["call-1:chain[0]", "call-1:workflow.steps[0]"]);
   } finally { h.cleanup(); }
 });
 
@@ -323,7 +323,7 @@ for (const routing of [LIVE, SHADOW]) {
       assert.equal(await router.toolCall(input), undefined);
       assert.deepEqual(input, { agent: "pinned-reviewer", task: "Review the typo fix in README.md" });
       assert.deepEqual(h.records().map(summary), [
-        { recordType: "explicit", attemptId: "call-1", mode: routing.mode, slot: "agent:pinned-reviewer.model", model: "anthropic/claude-opus-5" },
+        { recordType: "explicit", delegationId: "call-1", mode: routing.mode, slot: "agent:pinned-reviewer.model", model: "anthropic/claude-opus-5" },
       ]);
     } finally { h.cleanup(); }
   });
@@ -341,7 +341,7 @@ test("a subagents.defaultModel in settings is routed over: the rung is written w
       assert.equal(input.model, routing.mode === "live" ? `${HAIKU}:low` : undefined);
       assert.deepEqual(h.records().map(summary), [
         {
-          recordType: "decision", attemptId: "call-1", mode: routing.mode, tier: "mechanical", cause: `model:${HAIKU}:low`, route: `${HAIKU}:low`,
+          recordType: "decision", delegationId: "call-1", mode: routing.mode, tier: "mechanical", cause: `model:${HAIKU}:low`, route: `${HAIKU}:low`,
           ...(routing.mode === "shadow" ? { handPickedModel: "anthropic/claude-sonnet-5" } : {}),
         },
       ]);
@@ -591,7 +591,7 @@ test("the state folder's approved-recipients store decides whether a rung surviv
     const second: Record<string, unknown> = { agent: "worker", task: "Fix the typo in README.md" };
     await withStore.toolCall(second, "call-2");
     assert.equal(second.model, `${HAIKU}:low`);
-    assert.deepEqual(h.records().map((record) => record.attemptId), ["call-1", "call-2"]);
+    assert.deepEqual(h.records().map((record) => record.delegationId), ["call-1", "call-2"]);
   } finally { h.cleanup(); }
   assert.deepEqual(existsSync(worktreeState) ? readdirSync(worktreeState) : [], before);
 });
@@ -647,7 +647,7 @@ for (const [label, installGuard, order] of BANNED_CASES) {
       const result = await runInstalledEntries(agent.dir, order, input, ctx);
       assert.deepEqual(input, { agent: "worker", task: "say hello", model: "anthropic/claude-fable-5" }, "nobody changed the call");
       const records = readRoutingRecords(join(stateDir, "routing")).map(summary);
-      const explicit = [{ recordType: "explicit", attemptId: "call-banned", mode: "live", slot: "model", model: "anthropic/claude-fable-5" }];
+      const explicit = [{ recordType: "explicit", delegationId: "call-banned", mode: "live", slot: "model", model: "anthropic/claude-fable-5" }];
       if (installGuard) {
         assert.deepEqual(result, { block: true, reason: "pi-orchestrator guard: prohibited model: anthropic/claude-fable-5" });
         // An explicit record says the router saw the call, not that it ran.

@@ -65,7 +65,7 @@ function folder(): Folder {
 async function decide(records: string, overrides: Partial<DecisionRecordInput> = {}) {
   const tierMap = fixtureTierMap();
   return writeDecisionRecord(records, {
-    attemptId: "attempt-1",
+    delegationId: "attempt-1",
     at: DECIDED_AT,
     mode: "live",
     taskText: TASK,
@@ -136,24 +136,24 @@ test("the reviewer agent definition declares outputSchema with a required verdic
 });
 
 // ---------------------------------------------------------------------------
-// Checkbox 6 (story 32): attach by attempt id, orphans kept
+// Checkbox 6 (story 32): attach by delegation id, orphans kept
 // ---------------------------------------------------------------------------
 
-test("a verdict with a known attempt id is attached to that decision and one with an unknown id is stored as orphaned", async () => {
+test("a verdict with a known delegation id is attached to that decision and one with an unknown id is stored as orphaned", async () => {
   const f = folder();
   try {
     const decided = await decide(f.records);
-    const attached = attachVerdict({ recordDir: f.records, attemptId: "attempt-1", verdict: "accept", at: REVIEWED_AT, refreshStatePath: f.ledger });
+    const attached = attachVerdict({ recordDir: f.records, delegationId: "attempt-1", verdict: "accept", at: REVIEWED_AT, refreshStatePath: f.ledger });
     assert.equal(attached.status, "attached");
     if (attached.status !== "attached") return;
-    assert.equal(attached.decision.attemptId, "attempt-1");
+    assert.equal(attached.decision.delegationId, "attempt-1");
     assert.equal(attached.recordPath, decided.path, "same day, same file");
 
-    const orphaned = attachVerdict({ recordDir: f.records, attemptId: "attempt-unknown", verdict: "request_changes", at: REVIEWED_AT, refreshStatePath: f.ledger });
+    const orphaned = attachVerdict({ recordDir: f.records, delegationId: "attempt-unknown", verdict: "request_changes", at: REVIEWED_AT, refreshStatePath: f.ledger });
     assert.equal(orphaned.status, "orphaned");
 
     const records = readRoutingRecords(f.records);
-    assert.deepEqual(records.map((record) => [record.recordType, record.attemptId]), [
+    assert.deepEqual(records.map((record) => [record.recordType, record.delegationId]), [
       ["decision", "attempt-1"],
       ["verdict", "attempt-1"],
       ["orphaned-verdict", "attempt-unknown"],
@@ -177,7 +177,7 @@ test("an attached verdict puts one verified-task-outcome in the ledger for that 
   const f = folder();
   try {
     await decide(f.records);
-    attachVerdict({ recordDir: f.records, attemptId: "attempt-1", verdict: "request_changes", at: REVIEWED_AT, refreshStatePath: f.ledger });
+    attachVerdict({ recordDir: f.records, delegationId: "attempt-1", verdict: "request_changes", at: REVIEWED_AT, refreshStatePath: f.ledger });
     let outcomes = verifiedOutcomes(f.ledger);
     assert.equal(outcomes.length, 1);
     assert.deepEqual(
@@ -194,9 +194,9 @@ test("an attached verdict puts one verified-task-outcome in the ledger for that 
     );
     assert.match(outcomes[0]!.note ?? "", /rung anthropic\/claude-sonnet-5:medium/);
 
-    attachVerdict({ recordDir: f.records, attemptId: "attempt-1", verdict: "accept", at: REVIEWED_AT, refreshStatePath: f.ledger });
+    attachVerdict({ recordDir: f.records, delegationId: "attempt-1", verdict: "accept", at: REVIEWED_AT, refreshStatePath: f.ledger });
     outcomes = verifiedOutcomes(f.ledger);
-    assert.equal(outcomes.length, 1, "the ledger dedupes on the attempt id");
+    assert.equal(outcomes.length, 1, "the ledger dedupes on the delegation id");
     assert.equal(outcomes[0]!.outcome, "pass", "the newest verdict is kept");
     assert.equal(loadRefreshState(f.ledger).observations.length, 1);
   } finally {
@@ -208,7 +208,7 @@ test("a missing verdict is attached but records no observation", async () => {
   const f = folder();
   try {
     await decide(f.records);
-    const outcome = attachVerdict({ recordDir: f.records, attemptId: "attempt-1", verdict: "missing", at: REVIEWED_AT, refreshStatePath: f.ledger });
+    const outcome = attachVerdict({ recordDir: f.records, delegationId: "attempt-1", verdict: "missing", at: REVIEWED_AT, refreshStatePath: f.ledger });
     assert.equal(outcome.status, "attached");
     assert.equal(outcome.status === "attached" ? outcome.observation : "wrong", undefined);
     assert.deepEqual(verifiedOutcomes(f.ledger), []);
@@ -225,8 +225,8 @@ test("a missing verdict is attached but records no observation", async () => {
 test("a shadow verdict credits the hand-picked model that ran the work, with the router's rung in the note", async () => {
   const f = folder();
   try {
-    await decide(f.records, { attemptId: "attempt-shadow", mode: "shadow", handPickedModel: OPUS } as Partial<DecisionRecordInput>);
-    attachVerdict({ recordDir: f.records, attemptId: "attempt-shadow", verdict: "accept", at: REVIEWED_AT, refreshStatePath: f.ledger });
+    await decide(f.records, { delegationId: "attempt-shadow", mode: "shadow", handPickedModel: OPUS } as Partial<DecisionRecordInput>);
+    attachVerdict({ recordDir: f.records, delegationId: "attempt-shadow", verdict: "accept", at: REVIEWED_AT, refreshStatePath: f.ledger });
     const [outcome] = verifiedOutcomes(f.ledger);
     assert.equal(outcome?.model, OPUS);
     assert.equal(outcome?.outcome, "pass");
@@ -240,8 +240,8 @@ test("a shadow verdict credits the hand-picked model that ran the work, with the
 test("a verdict on a refused decision is attached but records no observation", async () => {
   const f = folder();
   try {
-    await decide(f.records, { attemptId: "attempt-refused", route: fixtureRefusal("elevated") });
-    const outcome = attachVerdict({ recordDir: f.records, attemptId: "attempt-refused", verdict: "accept", at: REVIEWED_AT, refreshStatePath: f.ledger });
+    await decide(f.records, { delegationId: "attempt-refused", route: fixtureRefusal("elevated") });
+    const outcome = attachVerdict({ recordDir: f.records, delegationId: "attempt-refused", verdict: "accept", at: REVIEWED_AT, refreshStatePath: f.ledger });
     assert.equal(outcome.status, "attached");
     assert.deepEqual(verifiedOutcomes(f.ledger), []);
     assert.equal(existsSync(f.ledger), false);
@@ -363,8 +363,8 @@ test("live review on anthropic/claude-haiku-4-5 returns a structured verdict equ
     assert.ok(lines.every((line) => line === verdict), `verdict lines ${JSON.stringify(lines)} differ from the structured ${verdict}`);
 
     // End to end: the live verdict attaches to a decision and reaches the ledger.
-    await decide(f.records, { attemptId: "attempt-live-review" });
-    const attached = attachVerdict({ recordDir: f.records, attemptId: "attempt-live-review", verdict, refreshStatePath: f.ledger });
+    await decide(f.records, { delegationId: "attempt-live-review" });
+    const attached = attachVerdict({ recordDir: f.records, delegationId: "attempt-live-review", verdict, refreshStatePath: f.ledger });
     assert.equal(attached.status, "attached");
     assert.deepEqual(verifiedOutcomes(f.ledger).map((o) => [o.instance, o.outcome]), [["attempt-live-review", verdict === "accept" ? "pass" : "fail"]]);
   } finally {

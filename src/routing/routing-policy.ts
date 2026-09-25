@@ -5,7 +5,7 @@
 // `route`, `correctnessFirstPicker`) is not the router. Ticket 24's
 // `routeTier` (tier-router.ts) is, and ticket 19's candidate computation and
 // ticket 27's extension use it. This file still feeds ticket 07's
-// `dispatchWithSwitch`, `routeAndResolve` and ticket 11's recovery, and is
+// `delegateWithSwitch`, `routeAndResolve` and ticket 11's recovery, and is
 // scheduled for retirement when ticket 26 moves bounded recovery onto
 // `nextRungAfterFailure` and ticket 27 wires the extension onto the router.
 // Ticket 24 removed its numeric suitability floor per tier; the rule that a
@@ -58,8 +58,8 @@ import {
 import type { Availability } from "../fixtures/provider-double.ts";
 import {
   isProhibitedModel,
-  validatedDispatchAttemptId,
-  type DispatchAttemptIdentity,
+  validatedDelegationId,
+  type DelegationIdentity,
 } from "../policy/model-resolution.ts";
 import { subagentBanListReason } from "../policy/ban-lists.ts";
 import {
@@ -227,7 +227,7 @@ export interface Stage1Input {
   readonly availability?: (model: string) => Availability;
   /**
    * Check-only view of ticket 09's authoritative shared task allowance.
-   * Candidate computation uses it to narrow the set; dispatch still performs
+   * Candidate computation uses it to narrow the set; delegation still performs
    * the reserving admission, because a preflight is never a reservation.
    */
   readonly allowance?: AllowancePreflight;
@@ -388,7 +388,7 @@ export function allowedCandidates(input: Stage1Input): AllowedCandidates {
     }
 
     // Remaining shared task allowance. Observation only: ticket 09's reserving
-    // admission (`admitDispatch`) stays the dispatch-time authority, because a
+    // admission (`admitDelegation`) stays the delegation-time authority, because a
     // preflight that passed is not a reservation and two candidates can both
     // pass the same check before either has held anything.
     if (input.allowance) {
@@ -533,7 +533,7 @@ export type RoutingDecision = RoutedDecision | RoutingBlocker;
  *
  * Stage 2 is handed the set as a plain value, so it has nothing to widen it
  * WITH -- but a picker can still fabricate a model id, and TypeScript's return
- * type is not an authorization boundary. Exported so the dispatch boundary
+ * type is not an authorization boundary. Exported so the delegation boundary
  * (ticket 07) and the agent selection seam (ticket 19) answer this question
  * from one definition rather than two.
  */
@@ -587,12 +587,12 @@ export const ROUTING_RECORD_PREFIX = "ROUTING=";
  *  escalation is visible without reading internals. */
 export function formatRoutingRecord(
   decision: RoutingDecision,
-  identity?: DispatchAttemptIdentity,
+  identity?: DelegationIdentity,
 ): string {
   const { allowed } = decision;
-  const attemptId = validatedDispatchAttemptId(identity);
+  const delegationId = validatedDelegationId(identity);
   const summary = {
-    ...(attemptId === undefined ? {} : { attemptId }),
+    ...(delegationId === undefined ? {} : { delegationId }),
     ok: decision.ok,
     model: decision.ok ? decision.model : null,
     code: decision.ok ? null : decision.code,

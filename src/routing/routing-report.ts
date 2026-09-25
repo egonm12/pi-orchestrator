@@ -10,12 +10,12 @@
 //
 //   - A decision's row is the tier and rung it chose, or `<classified tier>,
 //     refused` when the router refused.
-//   - Verdicts count once per attempt id, the newest winning, as ticket 08's
+//   - Verdicts count once per delegation id, the newest winning, as ticket 08's
 //     ledger does. A decision with no verdict yet counts in no verdict column.
 //   - Shadow agreement: of the shadow decisions in the row, the share whose
 //     chosen rung's model equals the hand-picked model. A refused shadow
 //     decision chose no rung, so it does not agree.
-//   - Orphaned verdicts count once per attempt id.
+//   - Orphaned verdicts count once per delegation id.
 //   - Ticket 27's `explicit` records (a call that named its own model) are
 //     not routing decisions and are not counted.
 //
@@ -81,9 +81,9 @@ export function buildRoutingReport(folder: string, reader?: RecordFolderReader):
   const verdicts = new Map<string, Verdict>();
   const orphans = new Set<string>();
   for (const record of records) {
-    if (isRoutedDecision(record)) decisions.set(record.attemptId, record);
-    else if (record.recordType === "verdict") verdicts.set(record.attemptId, record.verdict);
-    else if (record.recordType === "orphaned-verdict") orphans.add(record.attemptId);
+    if (isRoutedDecision(record)) decisions.set(record.delegationId, record);
+    else if (record.recordType === "verdict") verdicts.set(record.delegationId, record.verdict);
+    else if (record.recordType === "orphaned-verdict") orphans.add(record.delegationId);
     // An `explicit` record (ticket 27) routed nothing: no row, no orphan.
   }
 
@@ -94,7 +94,7 @@ export function buildRoutingReport(folder: string, reader?: RecordFolderReader):
     const key = `${tier}\u0000${rung ?? ""}`;
     const row = rows.get(key) ?? { tier, rung, ...emptyCounts() };
     rows.set(key, row);
-    const verdict = verdicts.get(decision.attemptId);
+    const verdict = verdicts.get(decision.delegationId);
     for (const counts of [row, totals]) {
       counts.decisions += 1;
       if (verdict !== undefined) counts.verdicts[verdict] += 1;
@@ -135,7 +135,7 @@ export function renderRoutingReport(folder: string, report: RoutingReport): stri
   lines.push(`all: ${counts(report.totals)}`);
   lines.push(`orphaned verdicts: ${report.orphanedVerdicts}`);
   for (const ladder of report.ladders) {
-    lines.push(`effort ladder: ${ladder.previousDecisionId} -> ${ladder.attemptId}; ${ladder.step}; ${ladder.route.tier} ${ladder.route.rung.rung}`);
+    lines.push(`effort ladder: ${ladder.previousDecisionId} -> ${ladder.delegationId}; ${ladder.step}; ${ladder.route.tier} ${ladder.route.rung.rung}`);
   }
   return `${lines.join("\n")}\n`;
 }

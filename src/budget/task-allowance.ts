@@ -47,8 +47,8 @@ import {
 import type {
   BudgetConstraint,
   BudgetVerdict,
-  DispatchReservationBinding,
-} from "../recipients/authorized-dispatch.ts";
+  DelegationReservationBinding,
+} from "../recipients/authorized-delegation.ts";
 
 export const ALLOWANCE_SCHEMA_VERSION = 1;
 
@@ -80,7 +80,7 @@ export const OVERSHOOT_CAVEAT =
  * owns the current ledger for one task and synchronously serializes reserve,
  * reconcile and release operations against that current state. Pure ledger
  * transforms remain exported for testing and recovery tooling, but the
- * dispatch-facing constraint accepts an owner, never a snapshot.
+ * delegation-facing constraint accepts an owner, never a snapshot.
  *
  * Two processes sharing one ledger file are still NOT serialized. Atomic
  * replacement prevents torn files, but it is not a cross-process compare-and-
@@ -379,7 +379,7 @@ export interface SettledCharge {
   readonly label?: string;
 }
 
-/** An over-allowance dispatch that the owner explicitly approved, recorded so
+/** An over-allowance delegation that the owner explicitly approved, recorded so
  *  the overrun is auditable rather than merely permitted. */
 export interface RecordedOverrunApproval {
   readonly approvedBy: string;
@@ -606,7 +606,7 @@ export interface ReserveOptions {
  * Estimate this call's maximum cost, hold it against the allowance, and refuse
  * if it would not fit.
  *
- * The refusal is the point: approval is required BEFORE dispatching, not after
+ * The refusal is the point: approval is required BEFORE delegating, not after
  * spending. A refused reservation returns the ledger unchanged, so a rejected
  * call cannot leave a phantom hold behind.
  */
@@ -646,7 +646,7 @@ export function reserve(
       ok: false,
       code: "would_exceed_allowance",
       message:
-        `pi-orchestration-harness: dispatch to '${request.model}' was not reserved. ` +
+        `pi-orchestration-harness: delegate to '${request.model}' was not reserved. ` +
         `Its estimated maximum $${estimate.maxUsd.toFixed(4)} exceeds the $${remaining.toFixed(4)} ` +
         `remaining on task '${ledger.taskId}' (allowance $${ledger.allowanceUsd.toFixed(2)}). ` +
         "Approval is required before this runs, not after it spends.",
@@ -845,7 +845,7 @@ export function reconcile(ledger: TaskLedger, input: ReconcileInput): TaskLedger
 }
 
 /**
- * Drop a reservation whose call never happened (a refused dispatch, an
+ * Drop a reservation whose call never happened (a refused delegation, an
  * infrastructure failure). Releases the hold without recording a charge, so a
  * call that never ran does not consume the allowance.
  */
@@ -925,15 +925,15 @@ export class TaskAllowanceOwner {
 // Ticket 07's BudgetConstraint seam, now filled in
 // ---------------------------------------------------------------------------
 
-export interface AllowanceDispatchCall {
+export interface AllowanceDelegationCall {
   readonly role: ChargeRole;
   readonly maxInputTokens: number;
   readonly maxOutputTokens?: number;
   readonly label?: string;
   /**
-   * A genuine, allowance-scoped owner approval for a dispatch that the normal
+   * A genuine, allowance-scoped owner approval for a delegation that the normal
    * admission cannot bound or fit. The constraint still reserves through this
-   * owner; approval never creates a second, unreserved dispatch path.
+   * owner; approval never creates a second, unreserved delegation path.
    */
   readonly overrunApproval?: OwnerApproval;
 }
@@ -941,8 +941,8 @@ export interface AllowanceDispatchCall {
 /**
  * The real spending constraint that ticket 07 left a seam for.
  *
- * `check` is deliberately observation-only for UI/reporting. Dispatch code
- * calls `admitDispatch`, which synchronously reserves through the same owner
+ * `check` is deliberately observation-only for UI/reporting. Delegation code
+ * calls `admitDelegation`, which synchronously reserves through the same owner
  * before it can return success. A successful admission returns a closure-bound
  * capability for releasing a call that never started or reconciling one that
  * did; callers never supply a reservation id to those mutations.
@@ -958,19 +958,19 @@ export function sharesTaskAllowance(a: BudgetConstraint, b: BudgetConstraint): b
 export function allowanceConstraint(
   owner: TaskAllowanceOwner,
   catalog: ModelCatalog,
-  call: AllowanceDispatchCall,
+  call: AllowanceDelegationCall,
   options: EstimateOptions = {},
 ): BudgetConstraint {
   if (!mintedAllowanceOwners.has(owner)) {
     throw new TypeError("task allowance constraint requires a genuine TaskAllowanceOwner");
   }
-  const requestFor = (model: string, dispatchId?: string): ReserveRequest => ({
+  const requestFor = (model: string, delegationKey?: string): ReserveRequest => ({
     model,
     role: call.role,
     maxInputTokens: call.maxInputTokens,
     ...(call.maxOutputTokens === undefined ? {} : { maxOutputTokens: call.maxOutputTokens }),
     ...(call.label === undefined ? {} : { label: call.label }),
-    ...(dispatchId === undefined ? {} : { reservationId: dispatchId }),
+    ...(delegationKey === undefined ? {} : { reservationId: delegationKey }),
   });
   const reserveOptions: ReserveOptions = {
     ...(options.freshness === undefined ? {} : { freshness: options.freshness }),
@@ -1007,16 +1007,16 @@ export function allowanceConstraint(
       );
     },
     check: preflight,
-    admitDispatch(model: string, dispatchId?: string) {
+    admitDelegation(model: string, delegationKey?: string) {
       if (isProhibitedModel(model)) {
         return { ok: false, why: `model '${model}' is prohibited by name` };
       }
       let outcome: ReserveOutcome;
       try {
         outcome = call.overrunApproval === undefined
-          ? owner.reserve(requestFor(model, dispatchId), catalog, reserveOptions)
+          ? owner.reserve(requestFor(model, delegationKey), catalog, reserveOptions)
           : owner.reserveWithApproval(
-              requestFor(model, dispatchId),
+              requestFor(model, delegationKey),
               catalog,
               call.overrunApproval,
               reserveOptions,
@@ -1026,7 +1026,7 @@ export function allowanceConstraint(
           return {
             ok: false,
             why:
-              `dispatch id '${dispatchId}' already has an open or settled reservation on ` +
+              `delegation id '${delegationKey}' already has an open or settled reservation on ` +
               `task '${owner.taskId}'; duplicate delivery was not admitted`,
           };
         }
@@ -1035,7 +1035,7 @@ export function allowanceConstraint(
       if (!outcome.ok) return { ok: false, why: outcome.message };
 
       const { reservation } = outcome;
-      const admission: DispatchReservationBinding = {
+      const admission: DelegationReservationBinding = {
         kind: "reservation",
         reservationId: reservation.reservationId,
         model: reservation.model,
@@ -1050,7 +1050,7 @@ export function allowanceConstraint(
           if (!owner.snapshot().open.includes(reservation)) {
             throw new ReconciliationError(
               "unknown_reservation",
-              `pi-orchestration-harness: dispatch reservation '${reservation.reservationId}' ` +
+              `pi-orchestration-harness: delegation reservation '${reservation.reservationId}' ` +
                 "is no longer the open reservation bound to this admission.",
             );
           }

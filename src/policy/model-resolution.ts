@@ -15,7 +15,7 @@ import { isProhibitedModel, subagentBanListEntry } from "./ban-lists.ts";
 // definition, and the settings it reads, live in ./ban-lists.ts.
 export { isProhibitedModel };
 
-// Ticket 04: every dispatch names the provider and model it goes to, so
+// Ticket 04: every delegation names the provider and model it goes to, so
 // assignments and failures are explainable.
 //
 // The scope decision is delegated to pi-subagents' real `checkModelScope`
@@ -68,14 +68,14 @@ export const HARNESS_MODEL_SCOPE: ModelScopeConfig = {
   allow: [...HARNESS_ALLOW_PATTERNS],
 };
 
-export type DispatchFailureCode =
+export type DelegationFailureCode =
   | "missing_model"
   | "out_of_scope"
   | "unavailable"
   | "throttled"
   | "call_failure";
 
-export interface ResolvedDispatch {
+export interface ResolvedDelegation {
   ok: true;
   /** Always explicit. Never inherited, never defaulted. */
   provider: string;
@@ -88,9 +88,9 @@ export interface ResolvedDispatch {
   source: ModelSource;
 }
 
-export interface RejectedDispatch {
+export interface RejectedDelegation {
   ok: false;
-  code: DispatchFailureCode;
+  code: DelegationFailureCode;
   /** The model the caller asked for, echoed back so a failure names its
    *  subject. `undefined` only for `missing_model`. */
   requestedModel?: string;
@@ -100,7 +100,7 @@ export interface RejectedDispatch {
   retryAfterSeconds?: number;
 }
 
-export type DispatchDecision = ResolvedDispatch | RejectedDispatch;
+export type DelegationDecision = ResolvedDelegation | RejectedDelegation;
 
 /** Audit helper: does `allow` admit any model on the subagent ban list?
  *  Returns the offending ids. Empty means the allow list is safe. */
@@ -115,7 +115,7 @@ export function allowListAdmitsProhibitedModel(
   );
 }
 
-export interface DispatchRequest {
+export interface DelegationRequest {
   /** Absent/blank is a hard failure, never an inherited or default model. */
   model?: string;
   source: ModelSource;
@@ -124,7 +124,7 @@ export interface DispatchRequest {
   availability?: (baseModel: string) => Availability;
 }
 
-export function resolveDispatchModel(request: DispatchRequest): DispatchDecision {
+export function resolveDelegationModel(request: DelegationRequest): DelegationDecision {
   const { source, scope = HARNESS_MODEL_SCOPE } = request;
   const requested = request.model?.trim();
 
@@ -138,7 +138,7 @@ export function resolveDispatchModel(request: DispatchRequest): DispatchDecision
       code: "missing_model",
       source,
       message:
-        "pi-orchestration-harness: dispatch specified no model. Every dispatch " +
+        "pi-orchestration-harness: delegation specified no model. Every delegation " +
         "must name an explicit provider/model; inheriting from the parent " +
         "session, agent frontmatter or defaultModel is not permitted.",
     };
@@ -153,7 +153,7 @@ export function resolveDispatchModel(request: DispatchRequest): DispatchDecision
       source,
       message:
         `pi-orchestration-harness: model '${requested}' is prohibited by name ` +
-        `(subagent ban list entry '${subagentBanListEntry(baseModel)}'); it is never dispatched.`,
+        `(subagent ban list entry '${subagentBanListEntry(baseModel)}'); it is never delegated.`,
       allowedPatterns: [...(scope.allow ?? [])],
     };
   }
@@ -180,7 +180,7 @@ export function resolveDispatchModel(request: DispatchRequest): DispatchDecision
       source,
       message:
         `pi-orchestration-harness: model '${requested}' does not name a ` +
-        "provider. Dispatches must use an explicit 'provider/id' identity.",
+        "provider. Delegations must use an explicit 'provider/id' identity.",
     };
   }
 
@@ -189,7 +189,7 @@ export function resolveDispatchModel(request: DispatchRequest): DispatchDecision
     // No substitution. A model that cannot be reached is reported as itself;
     // silently swapping in a working model is the failure being designed out.
     if (probe.status !== "available") {
-      const code: DispatchFailureCode =
+      const code: DelegationFailureCode =
         probe.status === "throttled"
           ? "throttled"
           : probe.status === "call-failure"
@@ -223,46 +223,46 @@ export function resolveDispatchModel(request: DispatchRequest): DispatchDecision
   };
 }
 
-export const DISPATCH_RECORD_PREFIX = "DISPATCH=";
+export const DELEGATION_RECORD_PREFIX = "DELEGATION=";
 
 /**
  * Stable caller-supplied identity shared by every trace record for one
- * dispatch attempt. It is optional at the formatter boundary so old callers
+ * delegation attempt. It is optional at the formatter boundary so old callers
  * and old JSONL remain readable, but a recipient success without it cannot
- * prove that it belongs to a failed dispatch and therefore cannot override
+ * prove that it belongs to a failed delegation and therefore cannot override
  * that failure.
  */
-export interface DispatchAttemptIdentity {
-  readonly attemptId: string;
+export interface DelegationIdentity {
+  readonly delegationId: string;
 }
 
 /** Shared validation keeps all record emitters from writing blank identities. */
-export function validatedDispatchAttemptId(
-  identity?: DispatchAttemptIdentity,
+export function validatedDelegationId(
+  identity?: DelegationIdentity,
 ): string | undefined {
   if (identity === undefined) return undefined;
-  const attemptId = identity.attemptId.trim();
-  if (attemptId.length === 0) {
-    throw new Error("dispatch attempt identity must be a non-blank string");
+  const delegationId = identity.delegationId.trim();
+  if (delegationId.length === 0) {
+    throw new Error("delegation id must be a non-blank string");
   }
-  return attemptId;
+  return delegationId;
 }
 
 /** Observable output: one JSONL line per decision. Tests read this from
  *  outside the harness instead of inspecting internals. */
-export function formatDispatchRecord(
-  decision: DispatchDecision,
-  identity?: DispatchAttemptIdentity,
+export function formatDelegationRecord(
+  decision: DelegationDecision,
+  identity?: DelegationIdentity,
 ): string {
-  const attemptId = validatedDispatchAttemptId(identity);
-  const record = attemptId === undefined ? decision : { ...decision, attemptId };
-  return `${DISPATCH_RECORD_PREFIX}${JSON.stringify(record)}`;
+  const delegationId = validatedDelegationId(identity);
+  const record = delegationId === undefined ? decision : { ...decision, delegationId };
+  return `${DELEGATION_RECORD_PREFIX}${JSON.stringify(record)}`;
 }
 
-export function recordDispatchDecision(
+export function recordDelegationDecision(
   path: string,
-  decision: DispatchDecision,
-  identity?: DispatchAttemptIdentity,
+  decision: DelegationDecision,
+  identity?: DelegationIdentity,
 ): void {
-  appendFileSync(path, `${formatDispatchRecord(decision, identity)}\n`);
+  appendFileSync(path, `${formatDelegationRecord(decision, identity)}\n`);
 }

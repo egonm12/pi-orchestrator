@@ -7,7 +7,7 @@
 //                   read. It answers "what exists", and nothing else.
 //
 //   AUTHORIZED   -- providers the owner has explicitly approved to RECEIVE
-//                   dispatch data. Every entry carries who approved it, when,
+//                   delegation data. Every entry carries who approved it, when,
 //                   and what they approved.
 //
 // The default is empty. A provider that appears in discovery is not a
@@ -85,7 +85,7 @@ export function discoverProvidersFromModelIds(
  * cannot be spent on another.
  *
  * `capability-research` and `active-benchmark` are ticket 08's paid refresh
- * activities. `allowance-overrun` is ticket 09's gate for dispatching past a
+ * activities. `allowance-overrun` is ticket 09's gate for delegating past a
  * task's spending allowance. `tracker-operations` is ticket 12's external
  * planning-tracker authorization (wayfinder). They are listed here rather than
  * given separate approval registries so the harness keeps ONE unforgeable
@@ -415,7 +415,7 @@ export function loadAuthorization(path: string): RecipientAuthorization {
  *
  * Fails CLOSED: a missing or unreadable store yields no approved recipients,
  * never all discovered ones. An unparseable store is the same answer -- the
- * harness would rather dispatch nothing than dispatch to a provider whose
+ * harness would rather delegation nothing than delegate to a provider whose
  * approval it cannot read.
  */
 export function loadAuthorizationOrEmpty(path: string): RecipientAuthorization {

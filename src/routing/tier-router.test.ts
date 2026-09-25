@@ -12,7 +12,7 @@ import { INSTALLED_MODEL_INFO } from "../fixtures/installed-model-info.ts";
 import { DEFAULT_BAN_LISTS } from "../policy/ban-lists.ts";
 import { HARNESS_MODEL_SCOPE } from "../policy/model-resolution.ts";
 import { authorizeRecipient, emptyAuthorization, grantOwnerApproval, type RecipientAuthorization } from "../recipients/authorization.ts";
-import { NO_BUDGET_CONSTRAINT, type AuthorizedDispatchOutcome } from "../recipients/authorized-dispatch.ts";
+import { NO_BUDGET_CONSTRAINT, type AuthorizedDelegationOutcome } from "../recipients/authorized-delegation.ts";
 import { tierMapFromSettings, type ResolvedTierMap } from "./tier-map.ts";
 import { routeTier, type RouterEvidence, type TierRouteDecision, type TierRouteInput } from "./tier-router.ts";
 
@@ -335,8 +335,8 @@ test("an emptied critical tier yields a blocker naming every tier tried and ever
   assert.equal(decision.ok, false);
   if (decision.ok) return;
 
-  // The same shape ticket 07's dispatch boundary returns for a refusal.
-  const blocker: Extract<AuthorizedDispatchOutcome, { readonly ok: false }> = decision;
+  // The same shape ticket 07's delegation boundary returns for a refusal.
+  const blocker: Extract<AuthorizedDelegationOutcome, { readonly ok: false }> = decision;
   assert.equal(blocker.code, "no_authorized_candidate");
   assert.deepEqual(blocker.approvedRecipients, []);
 

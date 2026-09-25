@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { buildCatalog, loadCatalog, type ModelCatalog, type UsageHeadroom } from "../catalog/model-catalog.ts";
 import { emptyRefreshState, loadRefreshState, type RefreshState, type ThrottlingObservation } from "../catalog/refresh-lifecycle.ts";
-import { providerOf } from "../recipients/authorized-dispatch.ts";
+import { providerOf } from "../recipients/authorized-delegation.ts";
 import { loadAuthorizationOrEmpty, type RecipientAuthorization } from "../recipients/authorization.ts";
 import type { ProviderUsage } from "../routing/tier-router.ts";
 

@@ -5,7 +5,7 @@ import { MAX_NOT_LISTED, type LadderSkipReason } from "./skip-reasons.ts";
 import { checkEstimatedPromptTokens, failedHardFilter, refusedAlternatives, routeTier, type RouterEvidence, type RemovedRung, type TierRouteChoice, type TierRouteRefusal } from "./tier-router.ts";
 
 export interface FailedDecision {
-  readonly attemptId: string;
+  readonly delegationId: string;
   readonly tier: RiskTier;
   readonly rung: TierRung;
 }

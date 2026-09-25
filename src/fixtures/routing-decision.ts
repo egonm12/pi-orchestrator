@@ -3,7 +3,7 @@ import { newTaskLedger, TaskAllowanceOwner } from "../budget/task-allowance.ts";
 import { buildCatalog } from "../catalog/model-catalog.ts";
 import { HARNESS_MODEL_SCOPE } from "../policy/model-resolution.ts";
 import { authorizeRecipient, emptyAuthorization, grantOwnerApproval } from "../recipients/authorization.ts";
-import { NO_BUDGET_CONSTRAINT } from "../recipients/authorized-dispatch.ts";
+import { NO_BUDGET_CONSTRAINT } from "../recipients/authorized-delegation.ts";
 import type { RiskTier } from "../routing/classifier.ts";
 import { classifyTier, loadClassifierChain, type TierClassification } from "../routing/tier-classifier.ts";
 import type { KindOfWork } from "../routing/tier-answer-schema.ts";

@@ -176,7 +176,7 @@ test("a schema-valid standard from the primary is recorded with cause, the four 
 
 test("the model sees the task text, the role and the named paths, and never the conversation", async () => {
   const fake = fakeModel({ [LUNA]: { answer: answer("standard") } });
-  const dispatch = {
+  const delegation = {
     task: "Rename the helper in src/util/strings.ts and update its callers in src/app.ts.",
     role: "worker",
     paths: ["src/util/strings.ts", "src/app.ts"],
@@ -185,16 +185,16 @@ test("the model sees the task text, the role and the named paths, and never the 
       { role: "assistant", content: "CONVERSATION-MARKER-BETA I will delegate this" },
     ],
   };
-  await classifyTier(dispatch, {
+  await classifyTier(delegation, {
     chain: loadClassifierChain(DEFAULT_CLASSIFIER_CONFIG),
     callModel: fake.call,
     allowance: allowance(),
   });
   assert.equal(fake.calls.length, 1);
   const prompt = fake.calls[0]!.prompt;
-  assert.ok(prompt.includes(dispatch.task), prompt);
+  assert.ok(prompt.includes(delegation.task), prompt);
   assert.match(prompt, /Agent role: worker/);
-  for (const path of dispatch.paths) assert.ok(prompt.includes(path), `missing ${path}`);
+  for (const path of delegation.paths) assert.ok(prompt.includes(path), `missing ${path}`);
   assert.doesNotMatch(prompt, /CONVERSATION-MARKER/);
   assert.doesNotMatch(prompt, /launch plan|I will delegate/);
 });

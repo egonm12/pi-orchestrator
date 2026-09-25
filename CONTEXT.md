@@ -50,7 +50,7 @@ _Avoid_: Self-report, attestation, score
 
 **Decision record**:
 The append-only record of one routing decision: the tier and why, the resolved tier map, every removed rung, any escalation, the chosen rung or the refusal, the mode, and in shadow mode the model chosen by hand. Keyed by the delegation id, which is how a verdict is attached to it.
-_Avoid_: Log entry, trace (a trace is ticket 18's detailed dispatch record)
+_Avoid_: Log entry, trace (a trace is ticket 18's detailed delegation record)
 
 **Orphaned verdict**:
 A verdict whose delegation id matches no decision record. Kept and counted, never dropped or guessed onto a decision.

@@ -24,7 +24,7 @@ import {
 import {
   allowListAdmitsProhibitedModel,
   isProhibitedModel,
-  resolveDispatchModel,
+  resolveDelegationModel,
 } from "./model-resolution.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -82,12 +82,12 @@ test("with no orchestrator key both ban lists are empty: the package ships no ba
   assert.deepEqual(DEFAULT_BAN_LISTS, { subagentBanList: [], sessionBanList: [] });
 });
 
-test("a personal subagent ban list of fable and astra makes resolveDispatchModel refuse the real Fable and Astra ids", () => {
+test("a personal subagent ban list of fable and astra makes resolveDelegationModel refuse the real Fable and Astra ids", () => {
   const dirs = tempSettings({ orchestrator: { subagentBanList: ["fable", "astra"] } });
   try {
     configureBanLists(loadBanLists({ agentDir: dirs.agentDir, projectCwd: dirs.projectCwd }).banLists);
     for (const model of ["anthropic/claude-fable-5", "anthropic/claude-fable-5-1", "openai-codex/gpt-6-astra"]) {
-      const decision = resolveDispatchModel({ model, source: "explicit" });
+      const decision = resolveDelegationModel({ model, source: "explicit" });
       assert.ok(!decision.ok, `${model} should be refused`);
       assert.equal(decision.code, "out_of_scope");
       assert.match(decision.message, /prohibited by name/);
@@ -102,11 +102,11 @@ test("a personal subagent ban list of fable and astra makes resolveDispatchModel
 // A new name binds with no code change (story 1)
 // ---------------------------------------------------------------------------
 
-test("adding sonnet to the subagent ban list refuses anthropic/claude-sonnet-5 at dispatch resolution, and removing it admits it again", () => {
+test("adding sonnet to the subagent ban list refuses anthropic/claude-sonnet-5 at delegation resolution, and removing it admits it again", () => {
   const dirs = tempSettings({ orchestrator: { subagentBanList: ["fable", "astra", "sonnet"] } });
   try {
     configureBanLists(loadBanLists({ agentDir: dirs.agentDir }).banLists);
-    const refused = resolveDispatchModel({ model: "anthropic/claude-sonnet-5", source: "explicit" });
+    const refused = resolveDelegationModel({ model: "anthropic/claude-sonnet-5", source: "explicit" });
     assert.ok(!refused.ok);
     assert.equal(refused.code, "out_of_scope");
     assert.match(refused.message, /subagent ban list/);
@@ -115,7 +115,7 @@ test("adding sonnet to the subagent ban list refuses anthropic/claude-sonnet-5 a
 
     writeFileSync(join(dirs.agentDir, "settings.json"), JSON.stringify({ orchestrator: { subagentBanList: ["fable", "astra"] } }));
     configureBanLists(loadBanLists({ agentDir: dirs.agentDir }).banLists);
-    assert.ok(resolveDispatchModel({ model: "anthropic/claude-sonnet-5", source: "explicit" }).ok);
+    assert.ok(resolveDelegationModel({ model: "anthropic/claude-sonnet-5", source: "explicit" }).ok);
     assert.equal(isProhibitedModel("anthropic/claude-sonnet-5"), false);
   } finally {
     dirs.cleanup();
@@ -145,7 +145,7 @@ test("a configured name is refused by routing and budget admission too, with no 
   const owner = new TaskAllowanceOwner(newTaskLedger({ taskId: "ban-list-sonnet" }));
   const constraint = allowanceConstraint(owner, buildCatalog({ modelIds: [sonnet] }), { role: "subtask", maxInputTokens: 1000 });
   assert.equal(constraint.check(sonnet).ok, false);
-  assert.equal(constraint.admitDispatch(sonnet).ok, false);
+  assert.equal(constraint.admitDelegation(sonnet).ok, false);
   assert.equal(owner.snapshot().open.length, 0);
 
   resetBanLists();
@@ -154,7 +154,7 @@ test("a configured name is refused by routing and budget admission too, with no 
 
 test("matching is case-insensitive substring on the model id with the thinking suffix stripped", () => {
   configureBanLists(WITH_SONNET);
-  const decision = resolveDispatchModel({ model: "ANTHROPIC/CLAUDE-SONNET-5:high", source: "explicit" });
+  const decision = resolveDelegationModel({ model: "ANTHROPIC/CLAUDE-SONNET-5:high", source: "explicit" });
   assert.ok(!decision.ok);
   assert.equal(decision.code, "out_of_scope");
   assert.match(decision.message, /'sonnet'/);
@@ -192,10 +192,10 @@ test("sessionBanList opus refuses anthropic/claude-opus-5-5 as the session model
   assert.equal(refusal.entry, "opus");
   assert.match(refusal.message, /session ban list/);
   assert.match(refusal.message, /'opus'/);
-  // The session list binds only the session: a subagent on Opus is still dispatchable.
+  // The session list binds only the session: a subagent on Opus is still delegatable.
   assert.equal(isProhibitedModel("anthropic/claude-opus-5-5", banLists), false);
   configureBanLists(banLists);
-  assert.ok(resolveDispatchModel({ model: "anthropic/claude-opus-5-5", source: "explicit" }).ok);
+  assert.ok(resolveDelegationModel({ model: "anthropic/claude-opus-5-5", source: "explicit" }).ok);
   assert.equal(isSessionBannedModel("anthropic/claude-opus-5-5"), true);
 });
 
@@ -210,7 +210,7 @@ test("the default empty session ban list refuses no installed model", () => {
 // Prose is not a model field (story 4)
 // ---------------------------------------------------------------------------
 
-test("a banned name in task text, a commit message, a path or shell text does not refuse a dispatch on an allowed model", () => {
+test("a banned name in task text, a commit message, a path or shell text does not refuse a delegation on an allowed model", () => {
   configureBanLists(WITH_SONNET);
   const allowed = "anthropic/claude-opus-5-5";
   const catalog = withTaskSuitability(
@@ -229,9 +229,9 @@ test("a banned name in task text, a commit message, a path or shell text does no
   assert.equal(result.ok, true, JSON.stringify(result));
   assert.ok(result.ok);
   assert.equal(result.model, allowed);
-  const dispatch = resolveDispatchModel({ model: result.model, source: "explicit" });
-  assert.ok(dispatch.ok);
-  assert.equal(dispatch.baseModel, allowed);
+  const delegation = resolveDelegationModel({ model: result.model, source: "explicit" });
+  assert.ok(delegation.ok);
+  assert.equal(delegation.baseModel, allowed);
 });
 
 // ---------------------------------------------------------------------------
@@ -248,7 +248,7 @@ test("a project settings file carrying either ban list changes nothing and the l
     assert.deepEqual(loaded.banLists, { subagentBanList: ["fable", "astra"], sessionBanList: ["opus"] });
     assert.deepEqual(loaded.ignoredProjectKeys, ["orchestrator.subagentBanList", "orchestrator.sessionBanList"]);
     configureBanLists(loaded.banLists);
-    assert.ok(!resolveDispatchModel({ model: "anthropic/claude-fable-5", source: "explicit" }).ok);
+    assert.ok(!resolveDelegationModel({ model: "anthropic/claude-fable-5", source: "explicit" }).ok);
   } finally {
     dirs.cleanup();
   }

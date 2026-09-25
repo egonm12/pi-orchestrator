@@ -12,7 +12,7 @@ import {
   type OwnerApproval,
   type RecipientAuthorization,
 } from "../recipients/authorization.ts";
-import { dispatchNamedModel } from "../recipients/authorized-dispatch.ts";
+import { delegateNamedModel } from "../recipients/authorized-delegation.ts";
 import {
   ALLOWANCE_SCHEMA_VERSION,
   ATOMICITY_SCOPE,
@@ -58,7 +58,7 @@ const METERED_CHEAP = "other-co/priced-mini";
 const UNPRICED = "metered-co/unpriced-1";
 const SUBSCRIPTION = "anthropic/claude-sonnet-5";
 /** An id ticket 04's allow list actually admits, priced as metered here so the
- *  real dispatch gate can be driven to its budget check. */
+ *  real delegation gate can be driven to its budget check. */
 const ALLOWED_METERED = "openai-codex/gpt-5.6-luna";
 
 const NOW = new Date("2026-09-21T12:00:00.000Z");
@@ -107,7 +107,7 @@ const CATALOG = testCatalog();
 
 /** 100k in + 10k out against METERED = $1.30 exactly. */
 const CALL = { maxInputTokens: 100_000, maxOutputTokens: 10_000 } as const;
-const DISPATCH_CALL = { role: "subtask", ...CALL } as const;
+const DELEGATION_CALL = { role: "subtask", ...CALL } as const;
 
 function ledgerWith(allowanceUsd = DEFAULT_ALLOWANCE_USD): TaskLedger {
   return newTaskLedger({ taskId: "task-alpha", allowanceUsd, now: NOW });
@@ -137,7 +137,7 @@ function overrunApproval(): OwnerApproval {
   return grantOwnerApproval({
     approvedBy: "owner",
     scope: "allowance-overrun",
-    acknowledgement: "spend past the $5 task allowance for this dispatch",
+    acknowledgement: "spend past the $5 task allowance for this delegation",
   });
 }
 
@@ -226,9 +226,9 @@ test("the authoritative owner serializes parallel children against current state
   assert.equal(remainingUsd(owner.snapshot()), 0.7);
 });
 
-test("a long-lived dispatch constraint reads the owner's current ledger", () => {
+test("a long-lived delegation constraint reads the owner's current ledger", () => {
   const owner = ownerWith(ledgerWith(2));
-  const constraint = allowanceConstraint(owner, CATALOG, DISPATCH_CALL);
+  const constraint = allowanceConstraint(owner, CATALOG, DELEGATION_CALL);
   assert.equal(constraint.check(METERED).ok, true);
 
   const first = owner.reserve(
@@ -316,7 +316,7 @@ test("the budget constraint applies the same remaining allowance to a switched-t
   // $1.40 left: enough for the cheap model ($0.13), not the expensive one ($1.30 ... which fits)
   let ledger = ledgerWith(5);
   ledger = spend(ledger, "subtask", METERED, 4.5); // $0.50 remaining
-  const constraint = allowanceConstraint(ownerWith(ledger), CATALOG, DISPATCH_CALL);
+  const constraint = allowanceConstraint(ownerWith(ledger), CATALOG, DELEGATION_CALL);
 
   assert.equal(constraint.check(METERED).ok, false, "$1.30 does not fit in $0.50");
   assert.equal(constraint.check(METERED_CHEAP).ok, true, "$0.13 does fit");
@@ -815,11 +815,11 @@ test("a ledger requires a task id and a sane allowance", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Checklist 8: a dispatch known to exceed the remaining allowance requires
+// Checklist 8: a delegation known to exceed the remaining allowance requires
 // approval BEFORE it runs
 // ---------------------------------------------------------------------------
 
-test("a dispatch that would exceed the remaining allowance is refused before it runs", () => {
+test("a delegation that would exceed the remaining allowance is refused before it runs", () => {
   let ledger = ledgerWith(5);
   ledger = spend(ledger, "subtask", METERED, 4.5);
 
@@ -937,7 +937,7 @@ test("approvals are not fungible: another scope cannot buy spending headroom", (
   }
 });
 
-test("an in-budget dispatch needs no approval at all", () => {
+test("an in-budget delegation needs no approval at all", () => {
   const outcome = reserve(ledgerWith(5), { role: "subtask", model: METERED, ...CALL }, CATALOG);
   assert.ok(outcome.ok, "routine work inside the allowance is not gated");
 });
@@ -996,7 +996,7 @@ test("the rendering states this is a stop threshold, not a billing ceiling", () 
   assert.match(ATOMICITY_SCOPE, /serialized by one TaskAllowanceOwner within a process/);
   assert.match(ATOMICITY_SCOPE, /concurrent processes.*not serialized/);
   assert.match(
-    allowanceConstraint(ownerWith(ledgerWith(5)), CATALOG, DISPATCH_CALL).describe,
+    allowanceConstraint(ownerWith(ledgerWith(5)), CATALOG, DELEGATION_CALL).describe,
     /not a guaranteed billing ceiling/,
   );
 });
@@ -1007,7 +1007,7 @@ test("the schema version is pinned so a future format cannot be misread", () => 
 });
 
 // ---------------------------------------------------------------------------
-// The seam is actually filled: ticket 07's real dispatch gate enforces this
+// The seam is actually filled: ticket 07's real delegation gate enforces this
 // ledger. Without these, the constraint would only be proven in isolation --
 // a budget that composes in theory and never runs.
 // ---------------------------------------------------------------------------
@@ -1021,7 +1021,7 @@ function authorizedForProviders(...providers: readonly string[]): RecipientAutho
       grantOwnerApproval({
         approvedBy: "owner",
         scope: "data-recipient",
-        acknowledgement: `send dispatch data to ${provider}`,
+        acknowledgement: `send delegation data to ${provider}`,
       }),
     );
   }
@@ -1036,28 +1036,28 @@ function authorizedForMeteredProvider(): RecipientAuthorization {
   return authorizedForProviders("openai-codex");
 }
 
-test("preflight is check-only, while competing real dispatch admissions reserve atomically", async () => {
+test("preflight is check-only, while competing real delegation admissions reserve atomically", async () => {
   const owner = ownerWith(ledgerWith(2));
-  const budget = allowanceConstraint(owner, CATALOG, DISPATCH_CALL, { now: NOW.getTime() });
+  const budget = allowanceConstraint(owner, CATALOG, DELEGATION_CALL, { now: NOW.getTime() });
 
   assert.equal(budget.check(ALLOWED_METERED).ok, true);
   assert.equal(owner.snapshot().open.length, 0, "preflight must not be mistaken for admission");
 
-  const admit = (dispatchId: string) =>
+  const admit = (delegationKey: string) =>
     Promise.resolve().then(() =>
-      dispatchNamedModel({
+      delegateNamedModel({
         model: ALLOWED_METERED,
         authorization: authorizedForMeteredProvider(),
         budget,
-        dispatchId,
+        delegationKey,
         availability: () => ({ status: "available" }),
       }),
     );
-  const outcomes = await Promise.all([admit("dispatch-a"), admit("dispatch-b")]);
+  const outcomes = await Promise.all([admit("delegation-a"), admit("delegation-b")]);
   const accepted = outcomes.filter((outcome) => outcome.ok);
   const refused = outcomes.filter((outcome) => !outcome.ok);
 
-  assert.equal(accepted.length, 1, "two $1.30 dispatches cannot both enter a $2 allowance");
+  assert.equal(accepted.length, 1, "two $1.30 delegations cannot both enter a $2 allowance");
   assert.equal(refused.length, 1);
   assert.equal(owner.snapshot().open.length, 1, "exactly one live owner reservation exists");
   assert.equal(reservedUsd(owner.snapshot()), 1.3);
@@ -1070,33 +1070,33 @@ test("preflight is check-only, while competing real dispatch admissions reserve 
   assert.strictEqual(
     success.budgetAdmission.reservation,
     owner.snapshot().open[0],
-    "accepted dispatch exposes the exact reservation registered by the owner",
+    "accepted delegation exposes the exact reservation registered by the owner",
   );
   success.budgetAdmission.reconcile({ reportedUsd: 0.4, now: NOW });
   assert.equal(owner.snapshot().open.length, 0, "bound reconciliation closes that live hold");
   assert.equal(committedUsd(owner.snapshot()), 0.4);
 });
 
-test("a dispatch that fails before start leaks no hold, and its bound hold can be released", () => {
+test("a delegation that fails before start leaks no hold, and its bound hold can be released", () => {
   const owner = ownerWith(ledgerWith(2));
-  const budget = allowanceConstraint(owner, CATALOG, DISPATCH_CALL, { now: NOW.getTime() });
+  const budget = allowanceConstraint(owner, CATALOG, DELEGATION_CALL, { now: NOW.getTime() });
   const authorization = authorizedForMeteredProvider();
 
-  const unavailable = dispatchNamedModel({
+  const unavailable = delegateNamedModel({
     model: ALLOWED_METERED,
     authorization,
     budget,
-    dispatchId: "never-admitted",
+    delegationKey: "never-admitted",
     availability: () => ({ status: "unavailable", detail: "provider never started" }),
   });
   assert.equal(unavailable.ok, false);
   assert.equal(owner.snapshot().open.length, 0, "resolver failure happens before reservation");
 
-  const acceptedButNotStarted = dispatchNamedModel({
+  const acceptedButNotStarted = delegateNamedModel({
     model: ALLOWED_METERED,
     authorization,
     budget,
-    dispatchId: "accepted-but-not-started",
+    delegationKey: "accepted-but-not-started",
     availability: () => ({ status: "available" }),
   });
   assert.ok(acceptedButNotStarted.ok);
@@ -1122,36 +1122,36 @@ test("provider switches and delivery retries keep one shared owner accounting", 
     },
   };
   const owner = ownerWith(ledgerWith(2));
-  const budget = allowanceConstraint(owner, meteredAcrossProviders, DISPATCH_CALL, {
+  const budget = allowanceConstraint(owner, meteredAcrossProviders, DELEGATION_CALL, {
     now: NOW.getTime(),
   });
   const authorization = authorizedForProviders("openai-codex", "anthropic");
 
-  const first = dispatchNamedModel({
+  const first = delegateNamedModel({
     model: ALLOWED_METERED,
     authorization,
     budget,
-    dispatchId: "logical-dispatch",
+    delegationKey: "logical-delegation",
     availability: () => ({ status: "available" }),
   });
   assert.ok(first.ok);
   assert.equal(first.budgetAdmission.kind, "reservation");
 
-  const duplicateRetry = dispatchNamedModel({
+  const duplicateRetry = delegateNamedModel({
     model: ALLOWED_METERED,
     authorization,
     budget,
-    dispatchId: "logical-dispatch",
+    delegationKey: "logical-delegation",
     availability: () => ({ status: "available" }),
   });
-  assert.equal(duplicateRetry.ok, false, "a live dispatch id cannot acquire a duplicate hold");
+  assert.equal(duplicateRetry.ok, false, "a live delegation id cannot acquire a duplicate hold");
   assert.equal(owner.snapshot().open.length, 1);
 
-  const bypassAttempt = dispatchNamedModel({
+  const bypassAttempt = delegateNamedModel({
     model: SUBSCRIPTION,
     authorization,
     budget,
-    dispatchId: "provider-switch-before-release",
+    delegationKey: "provider-switch-before-release",
     availability: () => ({ status: "available" }),
   });
   assert.equal(bypassAttempt.ok, false, "changing provider cannot reset the $0.70 headroom");
@@ -1159,11 +1159,11 @@ test("provider switches and delivery retries keep one shared owner accounting", 
 
   assert.ok(first.budgetAdmission.kind === "reservation");
   first.budgetAdmission.release();
-  const switchedRetry = dispatchNamedModel({
+  const switchedRetry = delegateNamedModel({
     model: SUBSCRIPTION,
     authorization,
     budget,
-    dispatchId: "logical-dispatch",
+    delegationKey: "logical-delegation",
     availability: () => ({ status: "available" }),
   });
   assert.ok(switchedRetry.ok, "after a never-started call releases, its id can be retried");
@@ -1178,13 +1178,13 @@ test("provider switches and delivery retries keep one shared owner accounting", 
   );
 });
 
-test("an exhausted allowance stops a dispatch at ticket 07's real gate", () => {
+test("an exhausted allowance stops a delegation at ticket 07's real gate", () => {
   // Real gate, real authorization, real resolver -- only the budget is ours.
   const exhausted = newTaskLedger({ taskId: "task-alpha", allowanceUsd: 0, now: NOW });
-  const outcome = dispatchNamedModel({
+  const outcome = delegateNamedModel({
     model: SUBSCRIPTION,
     authorization: authorizedForSubscriptionProvider(),
-    budget: allowanceConstraint(ownerWith(exhausted), CATALOG, DISPATCH_CALL),
+    budget: allowanceConstraint(ownerWith(exhausted), CATALOG, DELEGATION_CALL),
   });
 
   // A subscription route costs no metered dollars, so an exhausted dollar
@@ -1193,7 +1193,7 @@ test("an exhausted allowance stops a dispatch at ticket 07's real gate", () => {
   assert.equal(outcome.ok, true, "unmetered work is not blocked by a dollar allowance");
 });
 
-test("a metered dispatch past the allowance is refused by the real gate, not merely by us", () => {
+test("a metered delegation past the allowance is refused by the real gate, not merely by us", () => {
   // ALLOWED_METERED is an allow-listed id (ticket 04 permits `openai-codex/gpt-5.*`)
   // that this test catalog prices as metered. A fictional provider cannot be
   // used here: ticket 04's resolver rejects an out-of-scope model BEFORE the
@@ -1212,7 +1212,7 @@ test("a metered dispatch past the allowance is refused by the real gate, not mer
     now: NOW,
   });
 
-  const outcome = dispatchNamedModel({
+  const outcome = delegateNamedModel({
     model: ALLOWED_METERED,
     authorization: authorizeRecipient(
       emptyAuthorization(),
@@ -1220,10 +1220,10 @@ test("a metered dispatch past the allowance is refused by the real gate, not mer
       grantOwnerApproval({
         approvedBy: "owner",
         scope: "data-recipient",
-        acknowledgement: "send dispatch data to this provider",
+        acknowledgement: "send delegation data to this provider",
       }),
     ),
-    budget: allowanceConstraint(ownerWith(spent), CATALOG, DISPATCH_CALL),
+    budget: allowanceConstraint(ownerWith(spent), CATALOG, DELEGATION_CALL),
     availability: () => ({ status: "available" }),
   });
 
@@ -1238,10 +1238,10 @@ test("a prohibited model is reported as prohibited even when the allowance is ex
   // Order matters: ticket 04 runs first, so an exhausted budget cannot mask a
   // prohibition, and a prohibition is never reported as a money problem.
   const exhausted = newTaskLedger({ taskId: "task-alpha", allowanceUsd: 0, now: NOW });
-  const outcome = dispatchNamedModel({
+  const outcome = delegateNamedModel({
     model: "anthropic/claude-fable-5",
     authorization: authorizedForSubscriptionProvider(),
-    budget: allowanceConstraint(ownerWith(exhausted), CATALOG, DISPATCH_CALL),
+    budget: allowanceConstraint(ownerWith(exhausted), CATALOG, DELEGATION_CALL),
   });
   assert.equal(outcome.ok, false);
   assert.ok(!outcome.ok);

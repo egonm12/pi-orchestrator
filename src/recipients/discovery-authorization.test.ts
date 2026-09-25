@@ -34,8 +34,8 @@ import {
 } from "./authorization.ts";
 import {
   checkRecipient,
-  dispatchNamedModel,
-  dispatchWithSwitch,
+  delegateNamedModel,
+  delegateWithSwitch,
   formatRecipientRecord,
   formatSwitchRecord,
   NO_BUDGET_CONSTRAINT,
@@ -46,7 +46,7 @@ import {
   SWITCH_RECORD_PREFIX,
   type BudgetConstraint,
   type BudgetVerdict,
-} from "./authorized-dispatch.ts";
+} from "./authorized-delegation.ts";
 import {
   canReassign,
   checkpointRun,
@@ -172,7 +172,7 @@ function tempStateDir(): { dir: string; path: string; cleanup(): void } {
   };
 }
 
-/** Check-driven ticket-07 fixture that explicitly implements dispatch admission. */
+/** Check-driven ticket-07 fixture that explicitly implements delegation admission. */
 function testBudget(
   describe: string,
   check: (model: string) => BudgetVerdict,
@@ -180,7 +180,7 @@ function testBudget(
   return {
     describe,
     check,
-    admitDispatch(model) {
+    admitDelegation(model) {
       const verdict = check(model);
       return verdict.ok
         ? { ok: true, admission: { kind: "no-budget-constraint" } }
@@ -333,11 +333,11 @@ test("the default store path is runtime state, and git-ignores it", () => {
 });
 
 // ===========================================================================
-// Checklist 2: a dispatch to an unapproved recipient does not execute
+// Checklist 2: a delegate to an unapproved recipient does not execute
 // ===========================================================================
 
-test("a dispatch to an unapproved recipient is refused at the boundary", () => {
-  const outcome = dispatchNamedModel({
+test("a delegate to an unapproved recipient is refused at the boundary", () => {
+  const outcome = delegateNamedModel({
     model: CODEX,
     authorization: authorizedFor([CLAUDE]),
   });
@@ -354,22 +354,22 @@ test("the refusal names what discovery does and does not establish", () => {
   assert.match(check.message, /requires explicit owner approval/);
 });
 
-test("an approved recipient does dispatch, so the gate is not refusing everything", () => {
-  const outcome = dispatchNamedModel({
+test("an approved recipient does delegation, so the gate is not refusing everything", () => {
+  const outcome = delegateNamedModel({
     model: SONNET,
     authorization: authorizedFor([CLAUDE]),
   });
   assert.equal(outcome.ok, true);
   assert.ok(outcome.ok);
-  assert.equal(outcome.dispatch.provider, CLAUDE);
-  assert.equal(outcome.dispatch.baseModel, SONNET);
+  assert.equal(outcome.delegation.provider, CLAUDE);
+  assert.equal(outcome.delegation.baseModel, SONNET);
   assert.equal(outcome.approval.approvedBy, "owner (test fixture)");
 });
 
-test("with nothing approved, nothing dispatches", () => {
+test("with nothing approved, nothing delegations", () => {
   for (const model of [SONNET, CODEX, HAIKU, LUNA]) {
-    const outcome = dispatchNamedModel({ model, authorization: emptyAuthorization() });
-    assert.equal(outcome.ok, false, `${model} must not dispatch with an empty authorization`);
+    const outcome = delegateNamedModel({ model, authorization: emptyAuthorization() });
+    assert.equal(outcome.ok, false, `${model} must not delegate with an empty authorization`);
     assert.equal(outcome.code, "unauthorized_recipient");
     assert.match(outcome.message, /Approved recipients: none/);
   }
@@ -377,17 +377,17 @@ test("with nothing approved, nothing dispatches", () => {
 
 test("an explicitly named prohibited model is rejected without probing or substitution", () => {
   let availabilityCalls = 0;
-  const outcome = dispatchNamedModel({
+  const outcome = delegateNamedModel({
     model: PROHIBITED,
     authorization: authorizedFor([CLAUDE]),
     availability: () => { availabilityCalls++; return { status: "available" }; },
   });
   assert.equal(outcome.ok, false);
   assert.equal(outcome.code, "resolver_rejected");
-  assert.equal(outcome.dispatch?.ok, false);
-  if (outcome.dispatch?.ok === false) {
-    assert.equal(outcome.dispatch.code, "out_of_scope");
-    assert.equal(outcome.dispatch.requestedModel, PROHIBITED);
+  assert.equal(outcome.delegation?.ok, false);
+  if (outcome.delegation?.ok === false) {
+    assert.equal(outcome.delegation.code, "out_of_scope");
+    assert.equal(outcome.delegation.requestedModel, PROHIBITED);
   }
   assert.equal(availabilityCalls, 0, "a prohibited explicit model is not replaced with another model");
 });
@@ -395,28 +395,28 @@ test("an explicitly named prohibited model is rejected without probing or substi
 test("the recipient gate does not become the prohibition gate: ticket 04 still rejects first", () => {
   // The provider IS approved. The model is still prohibited, and it is
   // reported as prohibited rather than as a recipient problem.
-  const outcome = dispatchNamedModel({
+  const outcome = delegateNamedModel({
     model: PROHIBITED,
     authorization: authorizedFor([CLAUDE]),
   });
   assert.equal(outcome.ok, false);
   assert.equal(outcome.code, "resolver_rejected");
-  assert.ok(outcome.dispatch && !outcome.dispatch.ok);
-  assert.equal(outcome.dispatch.code, "out_of_scope");
+  assert.ok(outcome.delegation && !outcome.delegation.ok);
+  assert.equal(outcome.delegation.code, "out_of_scope");
 });
 
 test("a missing model is still rejected as missing, not as unauthorized", () => {
-  const outcome = dispatchNamedModel({
+  const outcome = delegateNamedModel({
     model: undefined,
     authorization: authorizedFor([CLAUDE, OPENAI]),
   });
   assert.equal(outcome.ok, false);
   assert.equal(outcome.code, "resolver_rejected");
-  assert.ok(outcome.dispatch && !outcome.dispatch.ok);
-  assert.equal(outcome.dispatch.code, "missing_model");
+  assert.ok(outcome.delegation && !outcome.delegation.ok);
+  assert.equal(outcome.delegation.code, "missing_model");
 });
 
-test("a rogue picker cannot smuggle an unauthorized recipient past the dispatch boundary", () => {
+test("a rogue picker cannot smuggle an unauthorized recipient past the delegation boundary", () => {
   // Stage 1 narrowing is the first line. This proves the SECOND check is real:
   // a picker that returns a model stage 1 never admitted is still refused.
   const rogue: Picker = () => ({
@@ -424,7 +424,7 @@ test("a rogue picker cannot smuggle an unauthorized recipient past the dispatch 
     reason: "rogue picker returning a model stage 1 rejected",
     cheapenedOnCostEvidence: false,
   });
-  const outcome = dispatchWithSwitch({
+  const outcome = delegateWithSwitch({
     stage1: stage1For({ [SONNET]: 0.95, [CODEX]: 0.99 }),
     authorization: authorizedFor([CLAUDE]),
     picker: rogue,
@@ -441,7 +441,7 @@ test("an unauthorized recipient is reported as itself, never switched around", (
     reason: "rogue",
     cheapenedOnCostEvidence: false,
   });
-  const outcome = dispatchWithSwitch({
+  const outcome = delegateWithSwitch({
     stage1: stage1For({ [SONNET]: 0.95, [CODEX]: 0.99 }),
     authorization: authorizedFor([CLAUDE]),
     picker: rogue,
@@ -461,7 +461,7 @@ test("a rogue picker cannot widen the capability ceiling either, even at an appr
     reason: "rogue picker returning a model stage 1 rejected on capability",
     cheapenedOnCostEvidence: false,
   });
-  const outcome = dispatchWithSwitch({
+  const outcome = delegateWithSwitch({
     stage1: stage1RejectingHaiku(),
     authorization: authorizedFor([CLAUDE]),
     picker: rogue,
@@ -479,7 +479,7 @@ test("a spending hold taken for an out-of-set pick is released, not left open", 
   const budget: BudgetConstraint = {
     describe: "test allowance that records its releases",
     check: () => ({ ok: true }),
-    admitDispatch(model) {
+    admitDelegation(model) {
       issued += 1;
       return {
         ok: true,
@@ -489,7 +489,7 @@ test("a spending hold taken for an out-of-set pick is released, not left open", 
           model,
           reservation: { reservationId: `res-${issued}`, model },
           release: () => void released.push(model),
-          reconcile: () => assert.fail("a refused dispatch must not reconcile"),
+          reconcile: () => assert.fail("a refused delegation must not reconcile"),
         },
       };
     },
@@ -499,7 +499,7 @@ test("a spending hold taken for an out-of-set pick is released, not left open", 
     reason: "rogue",
     cheapenedOnCostEvidence: false,
   });
-  const outcome = dispatchWithSwitch({
+  const outcome = delegateWithSwitch({
     stage1: stage1RejectingHaiku(),
     authorization: authorizedFor([CLAUDE]),
     picker: rogue,
@@ -511,7 +511,7 @@ test("a spending hold taken for an out-of-set pick is released, not left open", 
 });
 
 test("routing through the store blocks entirely when no recipient is approved", () => {
-  const outcome = dispatchWithSwitch({
+  const outcome = delegateWithSwitch({
     stage1: stage1For({ [SONNET]: 0.95, [CODEX]: 0.99 }),
     authorization: emptyAuthorization(),
   });
@@ -615,7 +615,7 @@ test("approving an integration is not approving it as a data recipient", () => {
   assert.equal(auth.recipients.length, 1, "the integration approval was recorded");
   assert.equal(isAuthorizedRecipient(auth, OPENAI), false);
   assert.deepEqual(approvedRecipients(auth), []);
-  const outcome = dispatchNamedModel({ model: CODEX, authorization: auth });
+  const outcome = delegateNamedModel({ model: CODEX, authorization: auth });
   assert.equal(outcome.ok, false);
   assert.equal(outcome.code, "unauthorized_recipient");
 });
@@ -623,7 +623,7 @@ test("approving an integration is not approving it as a data recipient", () => {
 test("approving a credential is not approving it as a data recipient either", () => {
   const auth = authorizedFor([OPENAI], "credential");
   assert.equal(isAuthorizedRecipient(auth, OPENAI), false);
-  const outcome = dispatchNamedModel({ model: CODEX, authorization: auth });
+  const outcome = delegateNamedModel({ model: CODEX, authorization: auth });
   assert.equal(outcome.ok, false);
   assert.equal(outcome.code, "unauthorized_recipient");
 });
@@ -679,7 +679,7 @@ test("the approval registry is module-private, so no import can reach it", () =>
 });
 
 // ===========================================================================
-// Checklist 4: a permitted pre-dispatch switch happens, is reported, and still
+// Checklist 4: a permitted pre-delegation switch happens, is reported, and still
 //              satisfies recipient, capability and budget constraints
 // ===========================================================================
 
@@ -690,27 +690,27 @@ function doubleFor(spec: Readonly<Record<string, ModelCondition>>) {
   return { double, probe: (model: string) => double.call(model) };
 }
 
-test("capacity exhausted before dispatch switches to an authorized alternative", () => {
+test("capacity exhausted before delegation switches to an authorized alternative", () => {
   const { double, probe } = doubleFor({
     [OPUS]: { kind: "unavailable", detail: "quota exhausted for this billing period" },
     [SONNET]: { kind: "available", inputUsdPerMTok: 2 },
   });
-  const outcome = dispatchWithSwitch({
+  const outcome = delegateWithSwitch({
     // OPUS scores higher, so the picker chooses it first.
     stage1: stage1For({ [OPUS]: 0.98, [SONNET]: 0.9 }),
     authorization: authorizedFor([CLAUDE]),
-    dispatchAvailability: probe,
+    delegationAvailability: probe,
   });
 
-  assert.ok(outcome.ok, `expected a switched dispatch, got ${JSON.stringify(outcome)}`);
+  assert.ok(outcome.ok, `expected a switched delegation, got ${JSON.stringify(outcome)}`);
   assert.equal(outcome.routing.ok && outcome.routing.model, OPUS, "the first choice was OPUS");
-  assert.equal(outcome.model, SONNET, "the dispatch went to the alternative");
+  assert.equal(outcome.model, SONNET, "the delegation went to the alternative");
 
   const report = outcome.switched;
   assert.ok(report, "a switch must be reported, never silent");
   assert.equal(report.from, OPUS);
   assert.equal(report.to, SONNET);
-  assert.match(report.reason, /not usable at dispatch time/);
+  assert.match(report.reason, /not usable at delegation time/);
   assert.ok(
     report.consideredAndRefused.some(
       (r) => r.model === OPUS && r.why.includes("quota exhausted"),
@@ -731,10 +731,10 @@ test("the switch report names the recipient, capability and budget constraints i
     [OPUS]: { kind: "unavailable", detail: "exhausted" },
     [SONNET]: { kind: "available", inputUsdPerMTok: 2 },
   });
-  const outcome = dispatchWithSwitch({
+  const outcome = delegateWithSwitch({
     stage1: stage1For({ [OPUS]: 0.98, [SONNET]: 0.9 }),
     authorization: authorizedFor([CLAUDE]),
-    dispatchAvailability: probe,
+    delegationAvailability: probe,
     budget,
   });
   assert.ok(outcome.ok);
@@ -755,10 +755,10 @@ test("throttling and call failure are switch triggers too", () => {
       [OPUS]: condition,
       [SONNET]: { kind: "available", inputUsdPerMTok: 2 },
     });
-    const outcome = dispatchWithSwitch({
+    const outcome = delegateWithSwitch({
       stage1: stage1For({ [OPUS]: 0.98, [SONNET]: 0.9 }),
       authorization: authorizedFor([CLAUDE]),
-      dispatchAvailability: probe,
+      delegationAvailability: probe,
     });
     assert.ok(outcome.ok, `${condition.kind} should permit a switch`);
     assert.equal(outcome.model, SONNET);
@@ -774,10 +774,10 @@ test("a capability-suitable alternative at an unapproved recipient is refused, n
     [SONNET]: { kind: "available", inputUsdPerMTok: 2 },
     [CODEX]: { kind: "available", inputUsdPerMTok: 4 },
   });
-  const outcome = dispatchWithSwitch({
+  const outcome = delegateWithSwitch({
     stage1: stage1For({ [OPUS]: 0.98, [SONNET]: 0.9, [CODEX]: 0.99 }),
     authorization: authorizedFor([CLAUDE]),
-    dispatchAvailability: probe,
+    delegationAvailability: probe,
   });
 
   assert.ok(outcome.ok);
@@ -808,10 +808,10 @@ test("the switch respects the budget constraint it is given", () => {
         ? { ok: false, why: "remaining allowance cannot cover this model" }
         : { ok: true },
   );
-  const outcome = dispatchWithSwitch({
+  const outcome = delegateWithSwitch({
     stage1: stage1For({ [OPUS]: 0.98, [SONNET]: 0.9, [HAIKU]: 0.85 }),
     authorization: authorizedFor([CLAUDE]),
-    dispatchAvailability: probe,
+    delegationAvailability: probe,
     budget,
   });
 
@@ -837,10 +837,10 @@ test("an over-budget first choice can itself trigger a reported switch", () => {
     "test allowance that refuses OPUS",
     (model) => (model === OPUS ? { ok: false, why: "over the allowance" } : { ok: true }),
   );
-  const outcome = dispatchWithSwitch({
+  const outcome = delegateWithSwitch({
     stage1: stage1For({ [OPUS]: 0.98, [SONNET]: 0.9 }),
     authorization: authorizedFor([CLAUDE]),
-    dispatchAvailability: probe,
+    delegationAvailability: probe,
     budget,
   });
   assert.ok(outcome.ok);
@@ -857,10 +857,10 @@ test("no authorized alternative produces a blocker, not a weakened assignment", 
     [SONNET]: { kind: "unavailable", detail: "exhausted" },
     [CODEX]: { kind: "available", inputUsdPerMTok: 4 },
   });
-  const outcome = dispatchWithSwitch({
+  const outcome = delegateWithSwitch({
     stage1: stage1For({ [OPUS]: 0.98, [SONNET]: 0.9, [CODEX]: 0.99 }),
     authorization: authorizedFor([CLAUDE]),
-    dispatchAvailability: probe,
+    delegationAvailability: probe,
   });
   assert.equal(outcome.ok, false);
   assert.equal(outcome.code, "no_authorized_alternative");
@@ -872,10 +872,10 @@ test("no authorized alternative produces a blocker, not a weakened assignment", 
 
 test("no switch is reported when the first choice worked", () => {
   const { probe } = doubleFor({ [SONNET]: { kind: "available", inputUsdPerMTok: 2 } });
-  const outcome = dispatchWithSwitch({
+  const outcome = delegateWithSwitch({
     stage1: stage1For({ [SONNET]: 0.95 }),
     authorization: authorizedFor([CLAUDE]),
-    dispatchAvailability: probe,
+    delegationAvailability: probe,
   });
   assert.ok(outcome.ok);
   assert.equal(outcome.model, SONNET);
@@ -887,10 +887,10 @@ test("the absence of a budget constraint is stated, not implied to be an approva
     [OPUS]: { kind: "unavailable", detail: "exhausted" },
     [SONNET]: { kind: "available", inputUsdPerMTok: 2 },
   });
-  const outcome = dispatchWithSwitch({
+  const outcome = delegateWithSwitch({
     stage1: stage1For({ [OPUS]: 0.98, [SONNET]: 0.9 }),
     authorization: authorizedFor([CLAUDE]),
-    dispatchAvailability: probe,
+    delegationAvailability: probe,
   });
   assert.ok(outcome.ok);
   assert.equal(outcome.budgetApplied, NO_BUDGET_CONSTRAINT.describe);
@@ -906,45 +906,45 @@ test("a switch cannot land on a prohibited model even with the best evidence", (
     [OPUS]: { kind: "unavailable", detail: "exhausted" },
     [PROHIBITED]: { kind: "available", inputUsdPerMTok: 10 },
   });
-  const outcome = dispatchWithSwitch({
+  const outcome = delegateWithSwitch({
     stage1: stage1For({ [OPUS]: 0.99, [PROHIBITED]: 0.98 }),
     authorization: authorizedFor([CLAUDE]),
-    dispatchAvailability: probe,
+    delegationAvailability: probe,
   });
   assert.equal(outcome.ok, false);
   assert.equal(outcome.code, "no_authorized_alternative");
   assert.ok(outcome.consideredAndRefused?.every((candidate) => candidate.model !== PROHIBITED));
 });
 
-test("a prohibited first choice is excluded before dispatch or switching", () => {
+test("a prohibited first choice is excluded before delegation or switching", () => {
   // The allowed OPUS candidate remains usable; exclusion must not block or
   // substitute when an ordinary candidate is available.
   const { probe } = doubleFor({
     [PROHIBITED]: { kind: "available", inputUsdPerMTok: 10 },
     [OPUS]: { kind: "available", inputUsdPerMTok: 5 },
   });
-  const outcome = dispatchWithSwitch({
+  const outcome = delegateWithSwitch({
     stage1: stage1For({ [PROHIBITED]: 0.99, [OPUS]: 0.98 }),
     authorization: authorizedFor([CLAUDE]),
-    dispatchAvailability: probe,
+    delegationAvailability: probe,
   });
   assert.equal(outcome.ok, true);
   if (!outcome.ok) return;
-  assert.equal(outcome.dispatch.baseModel, OPUS);
-  assert.notEqual(outcome.dispatch.baseModel, PROHIBITED);
+  assert.equal(outcome.delegation.baseModel, OPUS);
+  assert.notEqual(outcome.delegation.baseModel, PROHIBITED);
 });
 
-test("the switch and dispatch records are observable JSONL", () => {
+test("the switch and delegate records are observable JSONL", () => {
   const state = tempStateDir();
   try {
     const { probe } = doubleFor({
       [OPUS]: { kind: "unavailable", detail: "exhausted" },
       [SONNET]: { kind: "available", inputUsdPerMTok: 2 },
     });
-    const outcome = dispatchWithSwitch({
+    const outcome = delegateWithSwitch({
       stage1: stage1For({ [OPUS]: 0.98, [SONNET]: 0.9 }),
       authorization: authorizedFor([CLAUDE]),
-      dispatchAvailability: probe,
+      delegationAvailability: probe,
     });
     assert.ok(outcome.ok);
     assert.ok(outcome.switched);
@@ -976,7 +976,7 @@ test("the switch and dispatch records are observable JSONL", () => {
 });
 
 test("a refusal record is observable too", () => {
-  const outcome = dispatchWithSwitch({
+  const outcome = delegateWithSwitch({
     stage1: stage1For({ [SONNET]: 0.95 }),
     authorization: emptyAuthorization(),
   });
@@ -1015,22 +1015,22 @@ function startedRun() {
   return started.state;
 }
 
-test("a started run records exactly one dispatch", () => {
+test("a started run records exactly one delegation", () => {
   const run = startedRun();
   assert.equal(run.phase, "started");
-  assert.deepEqual(run.dispatches, [{ model: OPUS, startedAt: "2026-09-21T10:00:01.000Z" }]);
+  assert.deepEqual(run.delegations, [{ model: OPUS, startedAt: "2026-09-21T10:00:01.000Z" }]);
 });
 
-test("starting the same run twice is refused, so a dispatch cannot be duplicated", () => {
+test("starting the same run twice is refused, so a delegation cannot be duplicated", () => {
   const run = startedRun();
   const again = markStarted(run);
   assert.equal(again.ok, false);
   assert.ok(!again.ok);
   assert.equal(again.code, "already_started");
-  assert.equal(again.state.dispatches.length, 1, "the refused start must add no dispatch");
+  assert.equal(again.state.delegations.length, 1, "the refused start must add no delegation");
 });
 
-test("reassigning started work is refused, with no second dispatch", () => {
+test("reassigning started work is refused, with no second delegation", () => {
   const run = startedRun();
   const attempt = reassignRun(run, SONNET);
   assert.equal(attempt.ok, false);
@@ -1038,10 +1038,10 @@ test("reassigning started work is refused, with no second dispatch", () => {
   assert.equal(attempt.code, "unreconciled_work");
   assert.match(attempt.message, /Stop or checkpoint it and reconcile/);
   assert.match(attempt.message, /would repeat actions the first one may already have taken/);
-  // Nothing changed: same phase, same model, same single dispatch.
+  // Nothing changed: same phase, same model, same single delegation.
   assert.equal(attempt.state.phase, "started");
   assert.equal(attempt.state.model, OPUS);
-  assert.deepEqual(attempt.state.dispatches, run.dispatches);
+  assert.deepEqual(attempt.state.delegations, run.delegations);
   assert.equal(canReassign(attempt.state), false);
 });
 
@@ -1054,7 +1054,7 @@ test("stopping alone is not enough: reconciliation is still required", () => {
   assert.equal(attempt.ok, false);
   assert.ok(!attempt.ok);
   assert.equal(attempt.code, "not_reconciled");
-  assert.equal(attempt.state.dispatches.length, 1);
+  assert.equal(attempt.state.delegations.length, 1);
 });
 
 test("checkpointing alone is not enough either", () => {
@@ -1082,13 +1082,13 @@ test("stop or checkpoint, then reconcile, then reassignment is permitted", () =>
   assert.ok(reassigned.ok);
   assert.equal(reassigned.state.phase, "planned");
   assert.equal(reassigned.state.model, SONNET);
-  // Reassignment does not dispatch. The count is still 1 until the new run
+  // Reassignment does not delegate. The count is still 1 until the new run
   // is actually started.
-  assert.equal(reassigned.state.dispatches.length, 1);
+  assert.equal(reassigned.state.delegations.length, 1);
 
   const restarted = markStarted(reassigned.state, "2026-09-21T10:07:01.000Z");
   assert.ok(restarted.ok);
-  assert.deepEqual(restarted.state.dispatches, [
+  assert.deepEqual(restarted.state.delegations, [
     { model: OPUS, startedAt: "2026-09-21T10:00:01.000Z" },
     { model: SONNET, startedAt: "2026-09-21T10:07:01.000Z" },
   ]);
@@ -1128,7 +1128,7 @@ test("a completed run cannot be started again", () => {
   assert.equal(again.ok, false);
   assert.ok(!again.ok);
   assert.equal(again.code, "already_completed");
-  assert.equal(again.state.dispatches.length, 1);
+  assert.equal(again.state.delegations.length, 1);
 });
 
 test("run state rejects prohibited models at plan, start and reassignment boundaries", () => {
