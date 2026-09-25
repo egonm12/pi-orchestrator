@@ -228,7 +228,7 @@ test("text another extension appends after the delegated prompt sets no keyword 
   } finally { h.cleanup(); }
 });
 
-test("the router extension's fresh-install notice tells the owner to set the auto model", async () => {
+test("the router extension's fresh-install notice names what is missing", async () => {
   const h = harness(undefined);
   try {
     const notices: string[] = [];
@@ -242,7 +242,8 @@ test("the router extension's fresh-install notice tells the owner to set the aut
       ui: { notify: (message: string) => { notices.push(message); } },
     } as ExtensionContext);
     assert.equal(notices.length, 1);
-    assert.match(notices[0]!, /make orchestrator\/auto the default worker model in your subagent extension.*subagents\.defaultModel/);
+    assert.match(notices[0]!, /no tier map/);
+    assert.match(notices[0]!, /\/pi-orchestrator init/);
   } finally { h.cleanup(); }
 });
 

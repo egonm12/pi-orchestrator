@@ -24,7 +24,6 @@ import { getSupportedThinkingLevels, type ModelInfo, type ThinkingLevel } from "
 
 export const INIT_COMMAND = "pi-orchestrator";
 export const RECIPIENTS_FILE = "authorized-recipients.json";
-export const AUTO_MODEL_SETUP_LINE = "pi-orchestrator: make orchestrator/auto the default worker model in your subagent extension (for example, subagents.defaultModel in pi-subagents settings).";
 
 export interface SetupStatus {
   readonly tiersMissing: boolean;
@@ -60,7 +59,7 @@ export function setupNotice(status: SetupStatus, stateDir: string): string | und
     ...(status.recipientsMissing ? [`no approved recipients (${join(stateDir, RECIPIENTS_FILE)})`] : []),
   ];
   if (missing.length === 0) return undefined;
-  return `pi-orchestrator: not set up: ${missing.join(", ")}. Run /${INIT_COMMAND} init.\n${AUTO_MODEL_SETUP_LINE}`;
+  return `pi-orchestrator: not set up: ${missing.join(", ")}. Run /${INIT_COMMAND} init.`;
 }
 
 // ---------------------------------------------------------------------------

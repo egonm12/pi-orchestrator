@@ -4,7 +4,6 @@ import { tierMapFromSettings } from "../routing/tier-map.ts";
 import { toModelInfo, type ModelInfo, type RegistryModelLike } from "../models/model-info.ts";
 import {
   approveRecipients,
-  AUTO_MODEL_SETUP_LINE,
   INIT_COMMAND,
   planSettings,
   readPersonalSettings,
@@ -101,6 +100,5 @@ export async function runInit(args: string, ctx: InitContext, options: InitOptio
       (declined.length ? `; not approved: ${declined.join(", ")} (their rungs are skipped)` : "") +
       `. Store: ${storePath}. Start a new session to route.`,
   );
-  say(AUTO_MODEL_SETUP_LINE);
   return lines;
 }

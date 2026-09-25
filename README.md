@@ -1,11 +1,12 @@
 # pi-orchestrator
 
-A [pi](https://pi.dev) package with two extensions for sessions that delegate work to workers:
+A [pi](https://pi.dev) package with three extensions for sessions that delegate work to workers:
 
+- **Subagents**: the built-in `subagents` tool. It starts workers in the orchestrator's own process, on the auto model `orchestrator/auto`.
 - **Router extension**: serves the auto model `orchestrator/auto`. It classifies a worker's first request into a tier and routes it to a rung from your tier map.
 - **Guard**: enforces a personal subagent ban list for workers and an optional session ban list for the orchestrator.
 
-The two are independent. You can switch either off without touching the other.
+The three are independent. You can switch any one off without touching the others.
 
 ## Install
 
@@ -19,15 +20,14 @@ Or from a local checkout:
 pi install ~/path/to/pi-orchestrator
 ```
 
-Use any subagent extension that can start workers on `orchestrator/auto`. For background workers, install pi-orchestrator as a package, not just with `pi -e`: their separate process loads installed packages. The package has no runtime dependencies of its own.
+The package ships its own `subagents` tool (see below), so an orchestrator session needs no separate subagent extension to start workers. Other subagent extensions that start workers on `orchestrator/auto` still work and are still routed; use one for background workers, chains, resume or nested delegation, which the built-in tool does not do yet. For background workers, install pi-orchestrator as a package, not just with `pi -e`: their separate process loads installed packages. The package has no runtime dependencies of its own.
 
 ## Set up with `init`
 
-A fresh install ships no tier map, no ban list and no approved recipients, so routing is not enabled yet. At session start the notice names what is missing and shows the worker setup step:
+A fresh install ships no tier map, no ban list and no approved recipients, so routing is not enabled yet. At session start the notice names what is missing:
 
 ```text
 pi-orchestrator: not set up: no tier map (...), no approved recipients (...). Run /pi-orchestrator init.
-pi-orchestrator: make orchestrator/auto the default worker model in your subagent extension (for example, subagents.defaultModel in pi-subagents settings).
 ```
 
 Run `/pi-orchestrator init` in an interactive session. It:
@@ -35,9 +35,57 @@ Run `/pi-orchestrator init` in an interactive session. It:
 1. Asks which models workers may never use (comma-separated substrings, such as `fable, astra`, or empty for none).
 2. Writes a starter tier map from your installed models into personal settings, in **shadow** mode, together with the ban list. An existing tier map, classifier or ban list is never replaced.
 3. Asks you to approve each provider the map would send task text to. Only the providers you say yes to are approved. A declined provider's rungs are skipped.
-4. Tells you to make `orchestrator/auto` the default worker model in your subagent extension, for example `subagents.defaultModel` in pi-subagents settings. Init does not edit that extension's settings.
 
-Review the written map in `~/.pi/agent/settings.json`, set the default worker model in your subagent extension, then start a new session.
+Review the written map in `~/.pi/agent/settings.json`, then start a new session. Workers started through the built-in `subagents` tool always run on `orchestrator/auto` already; nothing else needs setting up for them.
+
+## Subagents tool
+
+The `subagents` tool starts workers in the orchestrator's own process, on the auto model `orchestrator/auto`. One call takes 1 to 8 items:
+
+```json
+{ "items": [
+  { "task": "Fix the typo in README.md" },
+  { "task": "Add a test for the new validation rule", "agent": "reviewer" }
+] }
+```
+
+Each item's `task` is the whole task for that worker, with every fact it needs: a worker sees nothing else. `agent` is optional; see Agent definitions below. At most `orchestrator.subagents.maxParallel` items (default 4) run at once, the rest queue. The orchestrator waits for every item; Ctrl+C aborts running workers and drops queued ones.
+
+Each item's result has a status:
+
+| Status | Meaning |
+|--------|---------|
+| `completed` | The worker finished and returned its final text |
+| `failed` | The worker's model call or setup failed; the result names why |
+| `aborted` | The item's worker was running when the call was aborted |
+| `not-started` | The item was still queued when the call was aborted |
+
+A worker's session is saved under the orchestrator's session folder, and its session id is its delegation id. It loads the same installed extensions as the orchestrator, without the `subagents` tool itself: a worker cannot start workers of its own. A worker's final text over 50 KB is cut, with a pointer to its session file, which keeps the whole text.
+
+### Agent definitions
+
+An item's `agent` name picks a named, owner-written kind of worker: its instructions and the tools it may use. Agent definitions are markdown files with frontmatter (`name`, `description`, `tools`) and a body of instructions, read from `~/.pi/agent/agents/` and the project's `.pi/agents/`. A project's definition wins by name. A `tools:` list only narrows the orchestrator's tool set for that worker; it cannot add a tool the orchestrator itself does not have. Each definition's name and description are listed in the subagents tool's description at session start. `agent` is optional in a call: without it, a worker gets the orchestrator's full tool set and no agent-specific instructions. pi-orchestrator ships no built-in definitions; the owner writes them.
+
+### `orchestrator.subagents` settings
+
+```json
+{
+  "orchestrator": {
+    "subagents": {
+      "maxParallel": 4,
+      "agentDefinitionModel": { "use": "route", "allowBanned": false },
+      "allowProjectOverrides": false
+    }
+  }
+}
+```
+
+| Key | Meaning |
+|-----|---------|
+| `subagents.maxParallel` | At most this many of one call's items run at once; the rest queue. Default 4 |
+| `subagents.agentDefinitionModel.use` | `"route"` (the default) ignores an agent definition's `model` and `thinking`, with one warning, and routes the worker as usual. `"preserve"` runs a worker whose definition names a model on that model and thinking, unrouted, and writes an agent-model record (delegation id, agent name, definition file, model, effort). A definition without a model is routed either way |
+| `subagents.agentDefinitionModel.allowBanned` | With `"preserve"`, lets a definition-named model be on the subagent ban list. For a project's agent definition this also needs `allowProjectOverrides`. The agent-model record then gets `banListException: true`. Under `"route"`, a `true` value only warns once. Every other path still refuses a banned model |
+| `subagents.allowProjectOverrides` | Personal settings only, default `false`. Lets a project's `.pi/settings.json` set every `orchestrator.subagents` key except this one. Ignored project keys are logged once, as the guard does for the ban lists |
 
 ## Settings
 
@@ -106,7 +154,7 @@ Decision records keep the first 200 characters of the task text, with credential
   { "packages": [{ "source": "git:github.com/egonm12/pi-orchestrator", "extensions": ["!src/router/extension.ts"] }] }
   ```
 
-  Use `!src/guard/extension.ts` to keep the router and drop the guard.
+  Use `!src/guard/extension.ts` to keep the router and drop the guard, or `!src/subagents/extension.ts` to drop only the built-in `subagents` tool and keep routing for other subagent extensions.
 - **Everything, for one run**: `pi --no-extensions`.
 - **Uninstall**: `pi remove git:github.com/egonm12/pi-orchestrator`.
 
@@ -130,6 +178,7 @@ The guard protects against accidental mistakes, not a determined agent. It refus
 
 - A worker started on a real model is not routed. A workflow's workers are routed only if the subagent extension starts them on `orchestrator/auto`.
 - The task allowance is per session ($5 by default), not shared between the orchestrator and background workers.
+- The built-in `subagents` tool runs one call to its end in the orchestrator's own process; it has no background workers, chains, resume or nested delegation yet (workers do not get the `subagents` tool). Use another subagent extension for those.
 
 ## Development
 

@@ -19,15 +19,14 @@ function tempDirs() {
   return { root, agentDir, stateDir, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
-test("a fresh install names both missing pieces, the init command and the auto model setup step", () => {
+test("a fresh install names both missing pieces and the init command", () => {
   const dirs = tempDirs();
   try {
     const status = setupStatus({}, dirs.stateDir);
     assert.deepEqual(status, { tiersMissing: true, recipientsMissing: true });
     const notice = setupNotice(status, dirs.stateDir)!;
-    assert.equal(notice.split("\n").length, 2);
+    assert.equal(notice.split("\n").length, 1);
     assert.match(notice, /no tier map/);
-    assert.match(notice.split("\n")[1]!, /make orchestrator\/auto the default worker model in your subagent extension.*subagents\.defaultModel/);
     assert.match(notice, /no approved recipients/);
     assert.match(notice, /\/pi-orchestrator init/);
     mkdirSync(dirs.stateDir, { recursive: true });
@@ -92,20 +91,18 @@ test("init writes settings and approves only the providers the owner said yes to
     assert.ok(settings.orchestrator.routing.tiers);
     const store = loadAuthorization(join(dirs.stateDir, RECIPIENTS_FILE));
     assert.deepEqual(store.recipients.map((r) => r.provider), [first]);
-    for (const provider of rest) assert.match(notes.at(-2)!, new RegExp(`not approved: .*${provider}`));
+    for (const provider of rest) assert.match(notes.at(-1)!, new RegExp(`not approved: .*${provider}`));
   } finally { dirs.cleanup(); }
 });
 
-test("init tells the owner to set the auto model without editing another extension's settings", async () => {
+test("init does not add or edit another extension's settings", async () => {
   const dirs = tempDirs();
   try {
     const settingsPath = join(dirs.agentDir, "settings.json");
     const subagents = { defaultModel: "anthropic/claude-haiku-4-5", asyncByDefault: true };
     writeFileSync(settingsPath, JSON.stringify({ subagents }));
     const notes: string[] = [];
-    const lines = await runInit("init", fakeCtx({ banList: "", approve: {} }, notes), { stateDir: dirs.stateDir, agentDir: dirs.agentDir });
-    assert.match(lines.at(-1)!, /make orchestrator\/auto the default worker model in your subagent extension.*subagents\.defaultModel/);
-    assert.deepEqual(notes, lines);
+    await runInit("init", fakeCtx({ banList: "", approve: {} }, notes), { stateDir: dirs.stateDir, agentDir: dirs.agentDir });
     assert.deepEqual(JSON.parse(readFileSync(settingsPath, "utf8")).subagents, subagents);
 
     const fresh = tempDirs();
