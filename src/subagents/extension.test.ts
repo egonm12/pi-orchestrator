@@ -81,6 +81,7 @@ interface ProviderRequest {
   readonly tools: readonly string[];
   /** The system messages' text and sections, as one string. */
   readonly systemText: string;
+  readonly thinkingLevel: string | undefined;
 }
 
 /** A fake `anthropic` provider serving claude-haiku-4-5 offline: every
@@ -102,7 +103,7 @@ function fakeAnthropic(reply: string, onRequest?: (finish: () => void) => void) 
         systemText.push(typeof message.content === "string" ? message.content : message.content.map((part) => part.text).join(""));
         systemText.push(...Object.values(message.sections ?? {}).filter((section) => section !== null));
       }
-      requests.push({ sessionId: options?.sessionId, tools: [...tools], systemText: systemText.join("\n") });
+      requests.push({ sessionId: options?.sessionId, tools: [...tools], systemText: systemText.join("\n"), thinkingLevel: options?.reasoning });
       const { stream, push, end } = autoStream();
       const message = {
         role: "assistant", content: [{ type: "text", text: reply }], api: model.api, provider: model.provider, model: model.id,
@@ -454,6 +455,98 @@ test("a definition's tools: list narrows the orchestrator's tools and cannot add
     const { worker } = await callSubagents(subagents.tool(), main.ctx, "Look around.", "scout");
     assert.equal(worker.status, "completed", JSON.stringify(worker));
     assert.deepEqual([...(provider.requests[0]?.tools ?? [])].sort(), ["probe", "read"]);
+  } finally { h.cleanup(); }
+});
+
+test("route mode ignores a definition's model and thinking and warns once per session", async () => {
+  const h = harness();
+  try {
+    writeAgentDefinition(join(h.agentDir, "agents"), "scout.md",
+      { name: "scout", description: "Scouts", model: HAIKU, thinking: "high" }, "Find files.");
+    const provider = fakeAnthropic("done");
+    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    const warnings: string[] = [];
+    const ctx = { ...main.ctx, hasUI: true, ui: { notify: (message: string, level: string) => { if (level === "warning") warnings.push(message); } } } as ExtensionContext;
+    const first = await callSubagents(tool, ctx, "First task", "scout");
+    const second = await callSubagents(tool, ctx, "Second task", "scout");
+    assert.equal(first.worker.status, "completed", JSON.stringify(first.worker));
+    assert.equal(second.worker.status, "completed", JSON.stringify(second.worker));
+    assert.equal(warnings.length, 1, JSON.stringify(warnings));
+    assert.match(warnings[0]!, /model.*thinking.*ignored/i);
+    assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")).map((record) => record.recordType), ["decision", "decision"]);
+    assert.deepEqual(sessionLines(first.worker.sessionFile!).filter((line) => line.type === "model_change").map((line) => `${line.provider}/${line.modelId}`), ["orchestrator/auto"]);
+    assert.notEqual(provider.requests[0]?.thinkingLevel, "high");
+  } finally { h.cleanup(); }
+});
+
+test("preserve mode uses the named model and effort without routing and records its definition", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { agentDefinitionModel: { use: "preserve" } } } });
+  try {
+    const file = join(h.agentDir, "agents", "scout.md");
+    writeAgentDefinition(join(h.agentDir, "agents"), "scout.md",
+      { name: "scout", description: "Scouts", model: HAIKU, thinking: "high" }, "Find files.");
+    const provider = fakeAnthropic("done");
+    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+    const { worker } = await callSubagents(tool, orchestrator(h).ctx, "Find files", "scout");
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.deepEqual(sessionLines(worker.sessionFile!).filter((line) => line.type === "model_change").map((line) => `${line.provider}/${line.modelId}`), [HAIKU]);
+    assert.equal(provider.requests[0]?.thinkingLevel, "high");
+    const records = readRoutingRecords(join(h.stateDir, "routing"));
+    assert.equal(records.length, 1, "preserved models do not produce router decisions");
+    const [record] = records;
+    assert.ok(record?.recordType === "agent-model");
+    assert.equal(record.schemaVersion, "decision-record/3");
+    assert.equal(record.delegationId, worker.sessionId);
+    assert.ok(Number.isFinite(Date.parse(record.timestamp)));
+    assert.equal(record.agent, "scout");
+    assert.equal(record.definitionFile, file);
+    assert.equal(record.model, HAIKU);
+    assert.equal(record.effort, "high");
+    assert.equal(record.banListException, undefined);
+  } finally { h.cleanup(); }
+});
+
+test("preserve mode still routes definitions without a model, and ignores project model settings", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { agentDefinitionModel: { use: "preserve" } } } });
+  try {
+    writeAgentDefinition(join(h.agentDir, "agents"), "scout.md", { name: "scout", description: "Scouts", thinking: "high" }, "Find files.");
+    mkdirSync(join(h.projectDir, ".pi"));
+    writeFileSync(join(h.projectDir, ".pi", "settings.json"), JSON.stringify({ orchestrator: { subagents: { agentDefinitionModel: { use: "route" } } } }));
+    const provider = fakeAnthropic("done");
+    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+    const { worker } = await callSubagents(tool, orchestrator(h).ctx, "Find files", "scout");
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")).map((record) => record.recordType), ["decision"]);
+    assert.deepEqual(sessionLines(worker.sessionFile!).filter((line) => line.type === "model_change").map((line) => `${line.provider}/${line.modelId}`), ["orchestrator/auto"]);
+  } finally { h.cleanup(); }
+});
+
+test("preserve mode refuses a definition's banned model before starting a worker", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagentBanList: ["haiku"], subagents: { agentDefinitionModel: { use: "preserve" } } } });
+  try {
+    writeAgentDefinition(join(h.agentDir, "agents"), "scout.md",
+      { name: "scout", description: "Scouts", model: HAIKU }, "Find files.");
+    const provider = fakeAnthropic("done");
+    const { worker } = await callSubagents(loadSubagentsTool([routerExtension(), provider.extension]), orchestrator(h).ctx, "Find files", "scout");
+    assert.equal(worker.status, "failed");
+    assert.equal(worker.sessionId, undefined);
+    assert.match(worker.error ?? "", /subagent ban list/);
+    assert.deepEqual(provider.requests, []);
+    assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")), []);
+  } finally { h.cleanup(); }
+});
+
+test("project settings cannot enable preserve mode for a named definition", async () => {
+  const h = harness();
+  try {
+    writeAgentDefinition(join(h.projectDir, ".pi", "agents"), "scout.md",
+      { name: "scout", description: "Scouts", model: HAIKU, thinking: "high" }, "Find files.");
+    writeFileSync(join(h.projectDir, ".pi", "settings.json"), JSON.stringify({ orchestrator: { subagents: { agentDefinitionModel: { use: "preserve" } } } }));
+    const provider = fakeAnthropic("done");
+    const { worker } = await callSubagents(loadSubagentsTool([routerExtension(), provider.extension]), orchestrator(h).ctx, "Find files", "scout");
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")).map((record) => record.recordType), ["decision"]);
   } finally { h.cleanup(); }
 });
 

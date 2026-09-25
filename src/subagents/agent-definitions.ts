@@ -4,7 +4,7 @@ import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { SUBAGENTS_TOOL } from "./worker.ts";
 
 // Agent definitions (ADR 0007, CONTEXT.md): owner-written markdown files with
-// frontmatter (name, description, tools) and a body of instructions, in
+// frontmatter (name, description, tools, model, thinking) and a body of instructions, in
 // ~/.pi/agent/agents/ and the project's .pi/agents/. A project file wins by
 // name. pi-orchestrator ships none.
 
@@ -16,6 +16,8 @@ export interface AgentDefinition {
   /** The file's body. */
   readonly instructions: string;
   readonly file: string;
+  readonly model?: string;
+  readonly thinking?: string;
 }
 
 export interface AgentDefinitionDirs {
@@ -34,6 +36,8 @@ type AgentFrontmatter = {
   name?: unknown;
   description?: unknown;
   tools?: unknown;
+  model?: unknown;
+  thinking?: unknown;
 };
 
 /** `tools: read, bash` and `tools: [read, bash]` are both a list. */
@@ -66,6 +70,8 @@ function readAgentFolder(dir: string): AgentDefinition[] {
     const tools = toolList(frontmatter.tools);
     definitions.push({
       name: frontmatter.name.trim(), description: frontmatter.description.trim(), instructions: body.trim(), file: path,
+      ...(typeof frontmatter.model === "string" && frontmatter.model.trim() !== "" ? { model: frontmatter.model.trim() } : {}),
+      ...(typeof frontmatter.thinking === "string" && frontmatter.thinking.trim() !== "" ? { thinking: frontmatter.thinking.trim() } : {}),
       ...(tools === undefined ? {} : { tools }),
     });
   }
@@ -87,7 +93,7 @@ export function agentDefinitionListing(definitions: readonly AgentDefinition[]):
 
 /** What a task item's `agent` gives its worker. */
 export type AgentResolution =
-  | { readonly ok: true; readonly instructions?: string; readonly tools?: readonly string[] }
+  | { readonly ok: true; readonly instructions?: string; readonly tools?: readonly string[]; readonly definition?: AgentDefinition }
   | { readonly ok: false; readonly error: string };
 
 /** Resolve a task item's `agent` against the definitions. No agent gives the
@@ -105,6 +111,7 @@ export function resolveAgent(
   const tools = definition.tools?.filter((tool) => tool !== SUBAGENTS_TOOL && orchestratorTools.includes(tool));
   return {
     ok: true,
+    definition,
     ...(definition.instructions === "" ? {} : { instructions: definition.instructions }),
     ...(tools === undefined ? {} : { tools }),
   };

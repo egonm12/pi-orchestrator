@@ -1,5 +1,8 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { appendRoutingRecord, buildAgentModelRecord } from "../routing/decision-record.ts";
+import { stateDir } from "../router/extension.ts";
+import type { ThinkingLevel } from "../models/model-info.ts";
 import {
   createAgentSessionFromServices,
   createAgentSessionServices,
@@ -10,7 +13,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 // One worker (ADR 0007): a pi session in the orchestrator's process, started
-// through the SDK on the auto model. pi's ModelRegistry keeps its runtime
+// through the SDK on the auto model unless an agent definition's model is
+// preserved. pi's ModelRegistry keeps its runtime
 // private, so the worker cannot reuse the orchestrator's. It gets its own
 // model runtime instead, which pi builds from the same agent dir's auth.json
 // and models.json, and it loads the same installed extensions. The router
@@ -51,6 +55,8 @@ export interface WorkerSetup {
   /** The only tools the worker may use; without it, pi's default tools and
    *  every extension tool. */
   readonly tools?: readonly string[];
+  /** A preserved agent definition names a real model, so the auto router is bypassed. */
+  readonly namedModel?: { readonly model: string; readonly effort?: ThinkingLevel; readonly agent: string; readonly definitionFile: string };
 }
 
 /** Where a worker's session is saved: below the orchestrator's session
@@ -101,14 +107,28 @@ export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
         ...(instructions === undefined ? {} : { appendSystemPromptOverride: (base: string[]) => [...base, instructions] }),
       },
     });
-    const model = services.modelRuntime.getModel(AUTO_PROVIDER, AUTO_MODEL_ID);
+    const { namedModel } = setup;
+    const [provider, modelId] = namedModel?.model.split("/") ?? [AUTO_PROVIDER, AUTO_MODEL_ID];
+    const model = services.modelRuntime.getModel(provider!, modelId!);
     if (model === undefined) {
       const loadErrors = services.diagnostics.filter((diagnostic) => diagnostic.type === "error").map((diagnostic) => diagnostic.message);
-      return failed(["orchestrator/auto is not in the worker's model runtime; is the router extension installed?", ...loadErrors].join(" "));
+      return failed([`${namedModel?.model ?? "orchestrator/auto"} is not in the worker's model runtime${namedModel ? "" : "; is the router extension installed?"}`, ...loadErrors].join(" "));
     }
     session = (await createAgentSessionFromServices({
-      services, sessionManager, model, ...(setup.tools === undefined ? {} : { tools: [...setup.tools] }),
+      services, sessionManager, model, ...(namedModel?.effort === undefined ? {} : { thinkingLevel: namedModel.effort }),
+      ...(setup.tools === undefined ? {} : { tools: [...setup.tools] }),
     })).session;
+    if (namedModel) {
+      try {
+        appendRoutingRecord(join(stateDir(), "routing"), buildAgentModelRecord({
+          delegationId: sessionId, agent: namedModel.agent, definitionFile: namedModel.definitionFile,
+          model: namedModel.model, effort: session.thinkingLevel,
+        }));
+      } catch (error) {
+        session.dispose();
+        throw error;
+      }
+    }
   } catch (error) {
     return failed(errorText(error));
   }
