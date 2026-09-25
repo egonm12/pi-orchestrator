@@ -75,5 +75,13 @@ The step that assigns a tier to a task. A general instruction model applies a fi
 _Avoid_: Decision engine, Jev, scorer, System One
 
 **Router extension**:
-The personal pi extension that fills in the model on `subagent` calls that name none: it classifies the task, routes it through the tier map and records the decision. In shadow mode it classifies and records but never writes a model; in live mode it writes the chosen rung into the call. A named model always wins and is recorded as explicit. It never blocks a call and fails open with one line; refusing banned models stays the guard's job.
-_Avoid_: Router (alone, when the extension is meant), proxy, auto-model
+The part of pi-orchestrator that serves the auto model: it classifies a worker's first request, routes it through the tier map, pins the worker and records the decision. When routing refuses, and in shadow mode, the worker runs on the orchestrator's own session model. A worker that names a real model is not routed; refusing banned models stays the guard's job.
+_Avoid_: Router (alone, when the extension is meant), proxy
+
+**Auto model**:
+The virtual model `orchestrator/auto` that workers run on. Each request to it goes to the rung the router extension chose for that worker. The orchestrator's own session never runs on it.
+_Avoid_: Smart router, proxy model, auto-routing model
+
+**Pin**:
+The rung a worker keeps for all of its requests, chosen at its first request. It holds through compaction and ends with the worker.
+_Avoid_: Session affinity, sticky model
