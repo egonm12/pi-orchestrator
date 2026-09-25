@@ -209,6 +209,25 @@ async function autoEvents(stream: AutoStream, messages: unknown[], sessionId?: s
 
 const FIX_README = [{ role: "user", content: "Fix the typo in README.md", timestamp: 0 }];
 
+// context-mode's pi adapter appends this as a plain user message through the
+// `context` hook, after the delegated prompt and before the first reply.
+const CONTEXT_MODE_ANCHOR = "context-mode active. Hierarchy: ctx_batch_execute > ctx_execute > ctx_execute_file > ctx_search. " +
+  "Stats → ctx_stats. Doctor → ctx_doctor. Upgrade → ctx_upgrade. Purge → ctx_purge.";
+
+test("text another extension appends after the delegated prompt sets no keyword floor", async () => {
+  const h = harness(LIVE);
+  try {
+    const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
+    const stream = await loadAutoProvider(h, registry);
+    await autoEvents(stream, [...FIX_README, { role: "user", content: CONTEXT_MODE_ANCHOR }], "injected-worker");
+    const [record] = h.records();
+    assert.ok(record?.recordType === "decision");
+    assert.deepEqual(record.classification.floorSignals, []);
+    assert.equal(record.classification.tier, "mechanical");
+    assert.equal(record.ranOn, `${HAIKU}:low`);
+  } finally { h.cleanup(); }
+});
+
 test("the router extension's fresh-install notice tells the owner to set the auto model", async () => {
   const h = harness(undefined);
   try {

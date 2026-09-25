@@ -36,10 +36,8 @@ function latestDecision(dir: string, sessionId: string): DecisionRecord | undefi
 
 function firstTaskAndRole(context: Context): { taskText: string; agentRole: string } {
   const messages = context.messages;
-  const firstAssistant = messages.findIndex((message) => message.role === "assistant");
-  const taskText = messages.slice(0, firstAssistant < 0 ? messages.length : firstAssistant)
-    .filter((message) => message.role === "user")
-    .map((message) => contentText(message.content)).join("\n");
+  const first = messages.find((message) => message.role === "user");
+  const taskText = first ? contentText(first.content) : "";
   // pi's buildSystemPromptState puts ordinary prompts in sections, not content.
   // A forced prompt or later system update can use string or text-part content.
   const prompt = ["systemPrompt" in context && typeof context.systemPrompt === "string" ? context.systemPrompt : "",
