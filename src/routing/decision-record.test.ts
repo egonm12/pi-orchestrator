@@ -15,6 +15,7 @@ import {
 } from "../fixtures/routing-decision.ts";
 import {
   appendRoutingRecord,
+  buildAgentModelRecord,
   buildEffortLadderRecord,
   DECISION_RECORD_SCHEMA_VERSION,
   decisionRecordPath,
@@ -252,6 +253,23 @@ test("a folder reads legacy decisions, explicit records and verdicts beside new 
     assert.throws(() => validateRoutingRecord({ ...oldDecision, ranOn: SONNET }), /field 'ranOn' is not a known field/);
     assert.throws(() => validateRoutingRecord({ ...explicit, surprise: true }), /field 'surprise' is not a known field/);
     assert.throws(() => validateRoutingRecord({ ...verdict, surprise: true }), /field 'surprise' is not a known field/);
+  } finally { cleanup(); }
+});
+
+test("an agent-model record shares the routing day file, validates on read, and rejects unknown fields", async () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    const record = buildAgentModelRecord({
+      delegationId: "worker-1", at: NOW, agent: "reviewer", definitionFile: "/owner/agents/reviewer.md",
+      model: "anthropic/claude-haiku-4-5", effort: "high",
+    });
+    assert.equal(appendRoutingRecord(dir, record), decisionRecordPath(dir, NOW));
+    assert.deepEqual(readRoutingRecords(dir), [record]);
+    assert.throws(() => validateRoutingRecord({ ...record, surprise: true }), /field 'surprise' is not a known field/);
+    assert.throws(() => validateRoutingRecord({ ...record, effort: "" }), /field 'effort'/);
+    assert.throws(() => validateRoutingRecord({ ...record, schemaVersion: "decision-record\/2" }), /field 'schemaVersion'/);
+    assert.deepEqual(validateRoutingRecord({ ...record, banListException: true }), { ...record, banListException: true });
+    assert.throws(() => validateRoutingRecord({ ...record, banListException: "true" }), /field 'banListException'/);
   } finally { cleanup(); }
 });
 

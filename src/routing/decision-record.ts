@@ -287,8 +287,18 @@ export interface ExplicitModelRecord extends RecordCommon {
   readonly agentRole: string;
 }
 
+export interface AgentModelRecord extends RecordCommon {
+  readonly recordType: "agent-model";
+  readonly agent: string;
+  readonly definitionFile: string;
+  readonly model: string;
+  readonly effort: string;
+  /** An owner-approved exception may be recorded by a later policy change. */
+  readonly banListException?: boolean;
+}
+
 export type RoutedDecisionRecord = DecisionRecord | EffortLadderRecord;
-export type RoutingRecord = RoutedDecisionRecord | ExplicitModelRecord | VerdictRecord | OrphanedVerdictRecord;
+export type RoutingRecord = RoutedDecisionRecord | AgentModelRecord | ExplicitModelRecord | VerdictRecord | OrphanedVerdictRecord;
 
 /** A record a verdict can attach to: a ticket 25 decision or a ladder climb. */
 export function isRoutedDecision(record: RoutingRecord): record is RoutedDecisionRecord {
@@ -481,7 +491,7 @@ function checkCommon(record: Json): void {
 export function validateRoutingRecord(value: unknown): RoutingRecord {
   if (!isObject(value)) throw new RoutingRecordError("(record)", `must be a JSON object; got ${JSON.stringify(value)}`);
   checkSchemaVersion(value);
-  const recordType = oneOf(value, "recordType", "", ["decision", "effort-ladder", "explicit", "verdict", "orphaned-verdict"] as const);
+  const recordType = oneOf(value, "recordType", "", ["decision", "effort-ladder", "agent-model", "explicit", "verdict", "orphaned-verdict"] as const);
   if (value.schemaVersion === DECISION_RECORD_SCHEMA_VERSION && recordType === "explicit") {
     throw new RoutingRecordError("schemaVersion", `is unsupported for ${recordType} records`);
   }
@@ -516,6 +526,14 @@ export function validateRoutingRecord(value: unknown): RoutingRecord {
     checkTierMap(value);
     checkRoute(value);
     oneOf(objectAt(value, "route", ""), "outcome", "route", ["chosen"]);
+  } else if (recordType === "agent-model") {
+    if (value.schemaVersion !== DECISION_RECORD_SCHEMA_VERSION) throw new RoutingRecordError("schemaVersion", `is unsupported for ${recordType} records`);
+    checkKeys(value, "", [...COMMON_KEYS, "agent", "definitionFile", "model", "effort"], ["banListException"]);
+    checkCommon(value);
+    for (const key of ["agent", "definitionFile", "model", "effort"]) stringAt(value, key, "", { nonBlank: true });
+    if (value.banListException !== undefined && typeof value.banListException !== "boolean") {
+      throw new RoutingRecordError("banListException", "must be a boolean");
+    }
   } else if (recordType === "explicit") {
     checkKeys(value, "", [...COMMON_KEYS, "cause", "mode", "slot", "model", "taskTextPrefix", "agentRole"]);
     checkCommon(value);
@@ -648,6 +666,21 @@ export function buildEffortLadderRecord(input: {
     tierMap: recordedTierMap(input.tierMap), route: recordedRoute(input.route) as RecordedRouteChoice,
   };
   return checkedRecord(record);
+}
+
+export function buildAgentModelRecord(input: {
+  readonly delegationId: string;
+  readonly agent: string;
+  readonly definitionFile: string;
+  readonly model: string;
+  readonly effort: string;
+  readonly at?: Date;
+}): AgentModelRecord {
+  return checkedRecord({
+    recordType: "agent-model", schemaVersion: DECISION_RECORD_SCHEMA_VERSION,
+    delegationId: input.delegationId, timestamp: (input.at ?? new Date()).toISOString(),
+    agent: input.agent, definitionFile: input.definitionFile, model: input.model, effort: input.effort,
+  });
 }
 
 export function buildDecisionRecord(input: DecisionRecordInput): DecisionRecord {

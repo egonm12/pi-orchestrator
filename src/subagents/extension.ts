@@ -1,13 +1,14 @@
 import { join } from "node:path";
 import type { ExtensionAPI, InlineExtension } from "@earendil-works/pi-coding-agent";
-import { personalAgentDir, personalOrchestrator, readSettingsFile } from "../policy/ban-lists.ts";
+import { banListsFromSettings, personalAgentDir, personalOrchestrator, readSettingsFile, subagentBanListEntry } from "../policy/ban-lists.ts";
+import { THINKING_LEVELS, splitKnownThinkingSuffix, type ThinkingLevel } from "../models/model-info.ts";
 import { agentDefinitionDirs, agentDefinitionListing, loadAgentDefinitions, resolveAgent } from "./agent-definitions.ts";
 import { runWorker, SUBAGENTS_TOOL, type WorkerResult } from "./worker.ts";
 
 // The subagents extension (ADR 0007): a third pi extension, separate from the
 // router and the guard, with a `subagents` tool. Each call starts a worker in
-// this pi process on the auto model `orchestrator/auto`, and the router
-// extension routes it. A call queues up to eight tasks. A task may name an
+// this pi process, normally on the auto model `orchestrator/auto`, and the
+// router extension routes it. A call queues up to eight tasks. A task may name an
 // agent definition, which gives the worker its instructions and narrows its
 // tools.
 
@@ -103,6 +104,21 @@ function maxParallel(agentDir: string, cwd: string): number {
   return Math.min(limit, 8);
 }
 
+function agentModelSettings(agentDir: string): { use: "route" | "preserve"; banned: readonly string[] } {
+  const personal = readSettingsFile(join(agentDir, "settings.json")) ?? {};
+  const options = personalOrchestrator(personal)?.subagents;
+  if (options !== undefined && (typeof options !== "object" || options === null || Array.isArray(options))) {
+    throw new Error("orchestrator.subagents must be an object");
+  }
+  const config = (options as Record<string, unknown> | undefined)?.agentDefinitionModel;
+  if (config !== undefined && (typeof config !== "object" || config === null || Array.isArray(config))) {
+    throw new Error("orchestrator.subagents.agentDefinitionModel must be an object");
+  }
+  const use = (config as Record<string, unknown> | undefined)?.use ?? "route";
+  if (use !== "route" && use !== "preserve") throw new Error("orchestrator.subagents.agentDefinitionModel.use must be route or preserve");
+  return { use, banned: banListsFromSettings(personal).banLists.subagentBanList };
+}
+
 export interface SubagentsDependencies {
   /** Extensions each worker loads besides the installed ones. */
   readonly workerExtensions: readonly InlineExtension[];
@@ -117,6 +133,7 @@ const DESCRIPTION = "Hand 1 to 8 tasks to workers. At most orchestrator.subagent
 export function createSubagentsExtension(overrides: Partial<SubagentsDependencies> = {}) {
   const deps: SubagentsDependencies = { workerExtensions: [], ...overrides };
   return function subagents(pi: ExtensionAPI): void {
+    const warnedSessions = new Set<string>();
     const registerSubagentsTool = (description: string) => pi.registerTool({
       name: SUBAGENTS_TOOL,
       label: "Subagents",
@@ -127,6 +144,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
         if (!Array.isArray(items) || items.length < 1 || items.length > 8) throw new Error("subagents requires 1 to 8 items per call");
         const agentDir = personalAgentDir();
         const limit = maxParallel(agentDir, ctx.cwd);
+        const modelSettings = agentModelSettings(agentDir);
         const definitions = loadAgentDefinitions(agentDefinitionDirs(agentDir, ctx.cwd));
         const orchestratorTools = pi.getActiveTools();
         const results: SubagentResult[] = new Array(items.length);
@@ -142,9 +160,40 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               results[index] = { ...item, status: "failed", finalText: "", error: resolution.error };
               continue;
             }
+            const definition = resolution.definition;
+            if (modelSettings.use === "route" && definition && (definition.model || definition.thinking)) {
+              const sessionId = ctx.sessionManager.getSessionId();
+              if (!warnedSessions.has(sessionId)) {
+                warnedSessions.add(sessionId);
+                const warning = "pi-orchestrator subagents: agent definition model and thinking are ignored under route mode";
+                if (ctx.hasUI && ctx.ui) ctx.ui.notify(warning, "warning");
+                else process.stderr.write(`${warning}\n`);
+              }
+            }
+            let namedModel: { model: string; effort?: ThinkingLevel; agent: string; definitionFile: string } | undefined;
+            if (modelSettings.use === "preserve" && definition?.model) {
+              const { baseModel, thinkingSuffix } = splitKnownThinkingSuffix(definition.model);
+              const [provider, ...parts] = baseModel.split("/");
+              if (!provider || parts.length !== 1 || !parts[0]) {
+                results[index] = { ...item, status: "failed", finalText: "", error: `agent ${definition.name} must name a provider/model` };
+                continue;
+              }
+              const banned = subagentBanListEntry(baseModel, { subagentBanList: modelSettings.banned, sessionBanList: [] });
+              if (banned) {
+                results[index] = { ...item, status: "failed", finalText: "", error: `agent ${definition.name} model ${baseModel} is on the subagent ban list (entry '${banned}')` };
+                continue;
+              }
+              const effort = definition.thinking ?? (thinkingSuffix ? thinkingSuffix.slice(1) : undefined);
+              if (effort !== undefined && !THINKING_LEVELS.includes(effort as ThinkingLevel)) {
+                results[index] = { ...item, status: "failed", finalText: "", error: `agent ${definition.name} has invalid thinking level ${effort}` };
+                continue;
+              }
+              namedModel = { model: baseModel, ...(effort === undefined ? {} : { effort: effort as ThinkingLevel }), agent: definition.name, definitionFile: definition.file };
+            }
             const worker = await runWorker({
               task, cwd: ctx.cwd, agentDir, orchestratorSession: ctx.sessionManager, signal,
               extensionFactories: deps.workerExtensions, instructions: resolution.instructions, tools: resolution.tools,
+              ...(namedModel === undefined ? {} : { namedModel }),
             });
             results[index] = { ...item, ...worker, finalText: cutText(worker.finalText, worker.sessionFile) };
           }

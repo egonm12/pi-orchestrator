@@ -40,7 +40,7 @@ Review the written map in `~/.pi/agent/settings.json`, then start a new session.
 
 ## Subagents tool
 
-The `subagents` tool starts workers in the orchestrator's own process, on the auto model `orchestrator/auto`. One call takes 1 to 8 items:
+The `subagents` tool starts workers in the orchestrator's own process, by default on the auto model `orchestrator/auto`. One call takes 1 to 8 items:
 
 ```json
 { "items": [
@@ -64,7 +64,7 @@ A worker's session is saved under the orchestrator's session folder, and its ses
 
 ### Agent definitions
 
-An item's `agent` name picks a named, owner-written kind of worker: its instructions and the tools it may use. Agent definitions are markdown files with frontmatter (`name`, `description`, `tools`) and a body of instructions, read from `~/.pi/agent/agents/` and the project's `.pi/agents/`. A project's definition wins by name. A `tools:` list only narrows the orchestrator's tool set for that worker; it cannot add a tool the orchestrator itself does not have. Each definition's name and description are listed in the subagents tool's description at session start. `agent` is optional in a call: without it, a worker gets the orchestrator's full tool set and no agent-specific instructions. pi-orchestrator ships no built-in definitions; the owner writes them.
+An item's `agent` name picks a named, owner-written kind of worker: its instructions and the tools it may use. Agent definitions are markdown files with frontmatter (`name`, `description`, `tools`) and a body of instructions, read from `~/.pi/agent/agents/` and the project's `.pi/agents/`. A project's definition wins by name. A `tools:` list only narrows the orchestrator's tool set for that worker; it cannot add a tool the orchestrator itself does not have. Each definition's name and description are listed in the subagents tool's description at session start. `agent` is optional in a call: without it, a worker gets pi's default tools plus extension tools (except `subagents`) and no agent-specific instructions. pi-orchestrator ships no built-in definitions; the owner writes them.
 
 ### `orchestrator.subagents` settings
 
