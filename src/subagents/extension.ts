@@ -235,13 +235,24 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
           if (!background) onUpdate?.({ content: [{ type: "text", text: `${done}/${items.length} workers done` }], details: update });
         };
         const board = workerBoard();
+        // Each item can be stopped alone from the transcript view (x), foreground,
+        // background or nested; a nested worker's stop leaves its parent running.
+        const itemStops = items.map(() => new AbortController());
         const feeds = items.map(({ task, agent, resume }, index) => {
           const fork = forks[index];
           const delegationId = delegationIds?.[index] ?? resume;
           return board.add({ callId: toolCallId, background, task, ...(agent === undefined ? {} : { agent }),
             ...(delegationId === undefined ? {} : { delegationId }), ...(parentDelegationId === undefined ? {} : { parentDelegationId }),
-            model: fork?.model === undefined ? { kind: "routed" } : { kind: "fork", model: fork.model, effort: fork.effort } });
+            model: fork?.model === undefined ? { kind: "routed" } : { kind: "fork", model: fork.model, effort: fork.effort } },
+          { stop: () => stopItem(index) });
         });
+        /** An item that never got a worker: its result, with a copied fork session removed. */
+        const notStarted = (index: number): SubagentResult => {
+          const { task, agent, fork, resume } = items[index]!;
+          const file = forks[index]?.sessionManager?.getSessionFile();
+          if (file !== undefined) rmSync(file, { force: true });
+          return { task, ...(agent === undefined ? {} : { agent }), ...(fork === true ? { fork: true } : {}), ...(resume === undefined ? {} : { resume }), status: "not-started", finalText: "" };
+        };
         const showProgress = (index: number, state: SubagentProgress) => {
           progress[index] = state;
           if (state.status !== "queued" && state.status !== "running") {
@@ -254,7 +265,18 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
         // A background call's workers stop on its own signals, not on the tool's.
         const backgroundCall = background ? backgroundCalls.start({ callId: toolCallId, progress, delegationIds: delegationIds! }) : undefined;
         const callSignal = backgroundCall ? backgroundCall.callSignal : signal;
-        const itemSignals = backgroundCall?.itemSignals;
+        const itemSignals = items.map((_, index) => {
+          const outer = backgroundCall?.itemSignals[index] ?? callSignal;
+          return outer === undefined ? itemStops[index]!.signal : AbortSignal.any([outer, itemStops[index]!.signal]);
+        });
+        function stopItem(index: number): void {
+          itemStops[index]!.abort();
+          // A queued item ends at once, not when the queue reaches it.
+          if (progress[index]?.status === "queued" && results[index] === undefined) {
+            results[index] = notStarted(index);
+            showProgress(index, results[index]);
+          }
+        }
         // Only a background call's workers may ask a question (ADR 0008).
         const callReports = workerReports(pi, ctx, backgroundCall === undefined ? undefined : backgroundCalls);
         const { question } = callReports;
@@ -268,7 +290,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
           while (next < items.length) {
             if (callSignal?.aborted) return;
             const index = next++;
-            if (itemSignals?.[index]?.aborted) continue;
+            if (itemSignals[index]!.aborted || results[index] !== undefined) continue;
             const { task, agent, fork, resume } = items[index]!;
             const item: SubagentItem = { task, ...(agent === undefined ? {} : { agent }), ...(fork === true ? { fork: true } : {}),
               ...(resume === undefined ? {} : { resume }) };
@@ -282,7 +304,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
                 feeds[index]!.started(prepared.namedModel ? preservedModel(prepared.namedModel)
                   : prepared.fork ? { kind: "fork", ...prepared.pin } : { kind: "routed", pin: prepared.pin });
                 const worker = await runWorker({ task, resume: prepared, cwd: ctx.cwd, agentDir, orchestratorSession: ctx.sessionManager,
-                  signal: itemSignals?.[index] ?? callSignal, extensionFactories: deps.workerExtensions, instructions: prepared.instructions, tools: prepared.tools,
+                  signal: itemSignals[index], extensionFactories: deps.workerExtensions, instructions: prepared.instructions, tools: prepared.tools,
                   onActivity: backgroundCall?.onActivity[index], reports, onSession: feeds[index]!.session,
                   onTool: (tool) => showProgress(index, { ...item, status: "running", ...(tool === undefined ? {} : { tool }) }),
                   ...(backgroundCall === undefined ? {} : { onMessageReady: (receive) => backgroundCalls.registerWorker(backgroundCall.delegationIds[index]!, receive) }),
@@ -347,7 +369,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
             showProgress(index, { ...item, ...workerModel, status: "running" });
             feeds[index]!.started(namedModel === undefined ? undefined : preservedModel(namedModel));
             const worker = await runWorker({
-              task, cwd: ctx.cwd, agentDir, orchestratorSession: ctx.sessionManager, signal: itemSignals?.[index] ?? callSignal,
+              task, cwd: ctx.cwd, agentDir, orchestratorSession: ctx.sessionManager, signal: itemSignals[index],
               ...(backgroundCall === undefined ? {} : { sessionId: backgroundCall.delegationIds[index]! }),
               extensionFactories: deps.workerExtensions, instructions: resolution.instructions, tools: resolution.tools,
               ...(namedModel === undefined ? {} : { namedModel }),
@@ -366,11 +388,8 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
         const finishCall = async (): Promise<BackgroundCallResult> => {
           await lanes;
           for (let index = 0; index < items.length; index++) {
-            const { task, agent, fork, resume } = items[index]!;
             if (results[index] === undefined) {
-              const file = forks[index]?.sessionManager?.getSessionFile();
-              if (file !== undefined) rmSync(file, { force: true });
-              results[index] = { task, ...(agent === undefined ? {} : { agent }), ...(fork === true ? { fork: true } : {}), ...(resume === undefined ? {} : { resume }), status: "not-started", finalText: "" };
+              results[index] = notStarted(index);
               feeds[index]!.ended({ state: "aborted" });
             }
           }

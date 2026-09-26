@@ -7,7 +7,7 @@ import type { SubagentProgress, SubagentsProgressDetails } from "./extension.ts"
 // follows its line. The text is built by pure functions; the component only
 // wraps it to the render width.
 
-type Component = ReturnType<NonNullable<ToolDefinition["renderCall"]>>;
+export type Component = ReturnType<NonNullable<ToolDefinition["renderCall"]>>;
 
 /** The label of a worker whose item names no agent definition. */
 const NO_AGENT = "worker";
@@ -15,7 +15,7 @@ const SHORT_TASK_LENGTH = 60;
 
 /** A plain text component. pi-tui's Text does not resolve from here, so this
  *  wraps through pi's truncateToVisualLines, which uses it. */
-function textComponent(text: string): Component {
+export function textComponent(text: string): Component {
   return { render: (width) => truncateToVisualLines(text, Number.POSITIVE_INFINITY, width).visualLines, invalidate() {} };
 }
 

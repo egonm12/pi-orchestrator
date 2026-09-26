@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import type { AgentSession, AgentSessionEvent, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { watchServedRungs, type RungEscalation, type ServedRung } from "../router/served-rungs.ts";
 
 // The worker board: one in-process record of every worker of the
@@ -7,8 +7,9 @@ import { watchServedRungs, type RungEscalation, type ServedRung } from "../route
 // worker view (epic a338). The subagents extension feeds it; it reads each
 // worker's own session events for turns, tokens, cost and activity, and the
 // router's served rungs (src/router/served-rungs.ts) for a routed worker's
-// model. Views read it and get a change signal. It only observes: nothing
-// here steers a worker.
+// model. Views read it and get a change signal. It only observes, with one
+// exception: the transcript view's stop (x) reaches a worker through stop(),
+// which calls the stop the subagents extension handed over for it.
 
 /** CONTEXT.md, Worker state. Only a background worker can be asking. */
 export type WorkerState = "queued" | "running" | "asking" | "completed" | "failed" | "aborted";
@@ -72,6 +73,8 @@ export interface WorkerSession {
   readonly messages: () => AgentSession["messages"];
   /** The worker's session events as they come, until the returned function is called. */
   readonly subscribe: (listener: (event: AgentSessionEvent) => void) => () => void;
+  /** A tool's definition in the worker's session, for its renderers in a transcript. */
+  readonly toolDefinition?: (name: string) => ToolDefinition | undefined;
 }
 
 /** One worker on the board. Each run is one entry: a resumed delegation is a
@@ -112,7 +115,13 @@ export interface WorkerTokens {
 }
 
 /** A running worker's session for a view: its messages so far and its events as they come. */
-export type LiveWorker = Pick<WorkerSession, "messages" | "subscribe">;
+export type LiveWorker = Pick<WorkerSession, "messages" | "subscribe" | "toolDefinition">;
+
+/** What the subagents extension hands the board to act on one worker. */
+export interface WorkerControl {
+  /** Stops this worker alone: a running one aborts, a queued one never starts. */
+  readonly stop: () => void;
+}
 
 /** Called with the worker that changed, or with `undefined` when the whole
  *  board did, as when a new orchestrator session starts. */
@@ -144,7 +153,7 @@ export interface WorkerFeed {
 
 /** The board as views read it (the worker widget, the transcript view, the
  *  /subagents picker): they observe, and never feed or steer. */
-export type WorkerBoardView = Pick<WorkerBoard, "workers" | "worker" | "byDelegation" | "subscribe" | "live">;
+export type WorkerBoardView = Pick<WorkerBoard, "workers" | "worker" | "byDelegation" | "subscribe" | "live" | "unsavedMessages">;
 
 export interface WorkerBoardOptions {
   /** Epoch milliseconds. */
@@ -173,6 +182,9 @@ interface Entry {
   text: string;
   session: WorkerSession | undefined;
   unsubscribe: (() => void) | undefined;
+  readonly stop: (() => void) | undefined;
+  /** A finished worker's last messages when its session was not saved. */
+  unsaved: AgentSession["messages"] | undefined;
 }
 
 interface Usage {
@@ -238,6 +250,11 @@ function applyEvent(entry: Entry, event: AgentSessionEvent): boolean {
 
 const ENDED: readonly WorkerState[] = ["completed", "failed", "aborted"];
 
+/** Whether `worker` has reached its end state. */
+export function hasEnded(worker: Pick<BoardWorker, "state">): boolean {
+  return ENDED.includes(worker.state);
+}
+
 export class WorkerBoard {
   readonly #entries: Entry[] = [];
   readonly #listeners = new Set<BoardListener>();
@@ -248,15 +265,15 @@ export class WorkerBoard {
     this.#now = options.now ?? Date.now;
   }
 
-  /** Puts a queued worker on the board. */
-  add(setup: NewWorker): WorkerFeed {
+  /** Puts a queued worker on the board, with the way to stop it when there is one. */
+  add(setup: NewWorker, control?: WorkerControl): WorkerFeed {
     const parent = setup.parentDelegationId === undefined ? undefined : this.#entryOf(setup.parentDelegationId);
     const { model, ...rest } = setup;
     const entry: Entry = { id: randomUUID(), setup: rest, model, parentId: parent?.id, state: "queued", delegationId: setup.delegationId,
       sessionFile: undefined, queuedAt: this.#now(), startedAt: undefined, endedAt: undefined, error: undefined,
       rungs: pinned(model, this.#now()),
       turns: 0, tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0, tools: new Map(), text: "",
-      session: undefined, unsubscribe: undefined };
+      session: undefined, unsubscribe: undefined, stop: control?.stop, unsaved: undefined };
     this.#entries.push(entry);
     this.#changed(entry);
     return {
@@ -285,6 +302,9 @@ export class WorkerBoard {
         if (ENDED.includes(entry.state)) return;
         entry.unsubscribe?.();
         entry.unsubscribe = undefined;
+        // Nothing on disk, as when the orchestrator's session is in memory: the
+        // transcript view has nothing else to read once the worker ends.
+        if (end.sessionFile === undefined) entry.unsaved = entry.session?.messages();
         entry.session = undefined;
         entry.tools.clear();
         entry.state = end.state;
@@ -317,7 +337,23 @@ export class WorkerBoard {
    *  before its session exists and once it has ended, when its session file holds it. */
   live(id: string): LiveWorker | undefined {
     const session = this.#entries.find((entry) => entry.id === id)?.session;
-    return session === undefined ? undefined : { messages: session.messages, subscribe: session.subscribe };
+    if (session === undefined) return undefined;
+    return { messages: session.messages, subscribe: session.subscribe, ...(session.toolDefinition === undefined ? {} : { toolDefinition: session.toolDefinition }) };
+  }
+
+  /** A finished worker's last messages when its session was not saved, as
+   *  when the orchestrator's session is in memory; `undefined` otherwise. */
+  unsavedMessages(id: string): AgentSession["messages"] | undefined {
+    return this.#entries.find((entry) => entry.id === id)?.unsaved;
+  }
+
+  /** Stops one unfinished worker, for the transcript view's x; whether a stop
+   *  was sent. The worker's end state follows when it has ended. */
+  stop(id: string): boolean {
+    const entry = this.#entries.find((candidate) => candidate.id === id);
+    if (entry?.stop === undefined || ENDED.includes(entry.state)) return false;
+    entry.stop();
+    return true;
   }
 
   /** A background worker's question waits on the orchestrator's answer, or no longer does. */

@@ -231,7 +231,8 @@ async function runWorkerSession(setup: WorkerSetup, activity: ActivitySoFar, rep
 
   try {
     setup.onSession?.({ sessionId, sessionFile: sessionManager.getSessionFile(), effort: session.thinkingLevel,
-      messages: () => session.messages, subscribe: (listener) => session.subscribe(listener) });
+      messages: () => session.messages, subscribe: (listener) => session.subscribe(listener),
+      toolDefinition: (name) => session.getToolDefinition(name) });
   } catch { /* An observer must not fail the worker. */ }
   const abort = () => { void session.abort(); };
   const runningTools = new Map<string, string>();

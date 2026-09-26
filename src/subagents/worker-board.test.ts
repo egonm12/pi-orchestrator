@@ -239,3 +239,40 @@ test("the process has one board, which hears the rungs the router serves", () =>
   assert.deepEqual((board.worker(feed.id)!.model as { rungs: readonly { model: string }[] }).rungs.map((rung) => rung.model), ["anthropic/claude-haiku-4-5"]);
   feed.ended({ state: "completed" });
 });
+
+test("stop reaches only an unfinished worker's own stop, and says whether it did", () => {
+  const board = new WorkerBoard();
+  const stopped: string[] = [];
+  const running = board.add({ callId: "call", background: false, task: "Running", model: { kind: "routed" } }, { stop: () => stopped.push("running") });
+  const queued = board.add({ callId: "call", background: false, task: "Queued", model: { kind: "routed" } }, { stop: () => stopped.push("queued") });
+  const done = board.add({ callId: "call", background: false, task: "Done", model: { kind: "routed" } }, { stop: () => stopped.push("done") });
+  const unstoppable = board.add({ callId: "call", background: false, task: "No stop", model: { kind: "routed" } });
+  running.started();
+  done.started();
+  done.ended({ state: "completed" });
+
+  assert.equal(board.stop(running.id), true);
+  assert.equal(board.stop(queued.id), true);
+  assert.equal(board.stop(done.id), false, "a finished worker cannot be stopped");
+  assert.equal(board.stop(unstoppable.id), false, "a worker added without a stop");
+  assert.equal(board.stop("no-such-worker"), false);
+  assert.deepEqual(stopped, ["running", "queued"]);
+  assert.equal(board.worker(running.id)!.state, "running", "the board changes state only when the worker ends");
+});
+
+test("a finished worker whose session was not saved keeps its last messages for a transcript; a saved one does not", () => {
+  const board = new WorkerBoard();
+  const messages = [{ role: "user", content: "Task" }, { role: "assistant", content: [{ type: "text", text: "Done" }] }];
+  const unsaved = board.add({ callId: "call", background: false, task: "In memory", model: { kind: "routed" } });
+  unsaved.started();
+  unsaved.session({ ...fakeSession("memory-1").session, sessionFile: undefined, messages: () => messages as never });
+  assert.equal(board.unsavedMessages(unsaved.id), undefined, "a running worker's messages are live");
+  unsaved.ended({ state: "completed" });
+  assert.deepEqual(board.unsavedMessages(unsaved.id), messages);
+
+  const saved = board.add({ callId: "call", background: false, task: "Saved", model: { kind: "routed" } });
+  saved.started();
+  saved.session({ ...fakeSession("saved-1").session, messages: () => messages as never });
+  saved.ended({ state: "completed", sessionFile: "/sessions/saved-1.jsonl" });
+  assert.equal(board.unsavedMessages(saved.id), undefined, "its session file holds its transcript");
+});
