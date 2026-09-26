@@ -3,8 +3,9 @@ import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding
 import { workerSessionDir } from "./worker.ts";
 
 /** Snapshot the active path, not the whole append-only session tree. The
- * assistant entry containing this call is excluded even if it also has text. */
-export function forkSession(ctx: ExtensionContext, toolCallId: string): { sessionManager: SessionManager; forkPoint: string | null } {
+ * assistant entry containing this call is excluded even if it also has text.
+ * `id`, when given, becomes the fork's session id: a background call's delegation id. */
+export function forkSession(ctx: ExtensionContext, toolCallId: string, id?: string): { sessionManager: SessionManager; forkPoint: string | null } {
   const branch = ctx.sessionManager.getBranch();
   let callIndex = -1;
   for (let index = branch.length - 1; index >= 0; index--) {
@@ -20,10 +21,10 @@ export function forkSession(ctx: ExtensionContext, toolCallId: string): { sessio
   const forkPoint = path.at(-1)?.id ?? null;
   const parentSession = ctx.sessionManager.getSessionFile();
   if (parentSession === undefined) {
-    const header = SessionManager.inMemory(ctx.cwd, { parentSession }).getHeader()!;
+    const header = SessionManager.inMemory(ctx.cwd, { parentSession, ...(id === undefined ? {} : { id }) }).getHeader()!;
     return { sessionManager: SessionManager.inMemory(ctx.cwd, { id: header.id }, [header, ...path]), forkPoint };
   }
-  const sessionManager = SessionManager.create(ctx.cwd, workerSessionDir(ctx.sessionManager), { parentSession });
+  const sessionManager = SessionManager.create(ctx.cwd, workerSessionDir(ctx.sessionManager), { parentSession, ...(id === undefined ? {} : { id }) });
   const file = sessionManager.getSessionFile()!;
   writeFileSync(file, `${[sessionManager.getHeader(), ...path].map((entry) => JSON.stringify(entry)).join("\n")}\n`, { flag: "wx" });
   return { sessionManager: SessionManager.open(file), forkPoint };

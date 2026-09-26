@@ -57,6 +57,9 @@ export interface WorkerSetup {
     readonly banListException: boolean;
   };
   readonly signal?: AbortSignal;
+  /** The worker's session id, which is its delegation id, when it is chosen
+   *  before the worker starts, as for a background call. */
+  readonly sessionId?: string;
   /** Extensions the worker loads besides the installed ones. */
   readonly extensionFactories?: readonly InlineExtension[];
   /** An agent definition's instructions, appended to the worker's system prompt. */
@@ -104,9 +107,11 @@ function errorText(error: unknown): string {
 
 /** Run one worker to its end. Never throws: a failure is a `failed` result. */
 export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
+  // A fork's session is copied beforehand, already carrying any background delegation id.
+  const sessionOptions = setup.sessionId === undefined ? undefined : { id: setup.sessionId };
   const sessionManager = setup.fork?.sessionManager ?? (setup.orchestratorSession.getSessionFile() === undefined
-    ? SessionManager.inMemory(setup.cwd)
-    : SessionManager.create(setup.cwd, workerSessionDir(setup.orchestratorSession)));
+    ? SessionManager.inMemory(setup.cwd, sessionOptions)
+    : SessionManager.create(setup.cwd, workerSessionDir(setup.orchestratorSession), sessionOptions));
   const sessionId = sessionManager.getSessionId();
   const saved = (): string | undefined => {
     const file = sessionManager.getSessionFile();

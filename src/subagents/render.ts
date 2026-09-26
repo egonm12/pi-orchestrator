@@ -20,7 +20,7 @@ function textComponent(text: string): Component {
 }
 
 /** The task's first line, its whitespace collapsed, cut at 60 characters. */
-function shortTask(task: string): string {
+export function shortTask(task: string): string {
   const line = (task.trim().split(/\r?\n/, 1)[0] ?? "").replace(/\s+/g, " ");
   return line.length <= SHORT_TASK_LENGTH ? line : `${line.slice(0, SHORT_TASK_LENGTH - 1).trimEnd()}…`;
 }

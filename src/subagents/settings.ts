@@ -12,6 +12,8 @@ type AgentDefinitionModelUse = "route" | "preserve";
 
 export interface SubagentsSettings {
   readonly maxParallel: number;
+  /** At most this many background workers, queued or running, at once (ADR 0008). */
+  readonly maxBackgroundWorkers: number;
   readonly agentDefinitionModel: {
     readonly use: AgentDefinitionModelUse;
     /** Under "preserve", a definition-named model may be on the subagent ban list (ADR 0002 follow-up). */
@@ -71,6 +73,10 @@ export function subagentsSettingsFromSettings(personal: unknown, project?: unkno
   if (typeof maxParallel !== "number" || !Number.isInteger(maxParallel) || maxParallel < 1) {
     throw new Error(`${SUBAGENTS_KEY}.maxParallel must be a positive integer`);
   }
+  const maxBackgroundWorkers = options.maxBackgroundWorkers ?? 8;
+  if (typeof maxBackgroundWorkers !== "number" || !Number.isInteger(maxBackgroundWorkers) || maxBackgroundWorkers < 1) {
+    throw new Error(`${SUBAGENTS_KEY}.maxBackgroundWorkers must be a positive integer`);
+  }
   const agentDefinitionModel = options.agentDefinitionModel;
   if (agentDefinitionModel !== undefined && !isPlainObject(agentDefinitionModel)) {
     throw new Error(`${SUBAGENTS_KEY}.agentDefinitionModel must be an object`);
@@ -81,7 +87,7 @@ export function subagentsSettingsFromSettings(personal: unknown, project?: unkno
   if (typeof allowBanned !== "boolean") throw new Error(`${SUBAGENTS_KEY}.agentDefinitionModel.allowBanned must be a boolean`);
 
   return {
-    settings: { maxParallel: Math.min(maxParallel, 8), agentDefinitionModel: { use, allowBanned } },
+    settings: { maxParallel: Math.min(maxParallel, 8), maxBackgroundWorkers, agentDefinitionModel: { use, allowBanned } },
     allowProjectOverrides,
     ignoredProjectKeys,
   };

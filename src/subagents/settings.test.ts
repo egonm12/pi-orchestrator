@@ -4,7 +4,7 @@ import { subagentsSettingsFromSettings } from "./settings.ts";
 
 test("without personal settings the defaults apply and allowProjectOverrides is off", () => {
   assert.deepEqual(subagentsSettingsFromSettings({}), {
-    settings: { maxParallel: 4, agentDefinitionModel: { use: "route", allowBanned: false } },
+    settings: { maxParallel: 4, maxBackgroundWorkers: 8, agentDefinitionModel: { use: "route", allowBanned: false } },
     allowProjectOverrides: false,
     ignoredProjectKeys: [],
   });
@@ -14,7 +14,7 @@ test("with allowProjectOverrides a project key replaces the personal value and t
   const personal = { orchestrator: { subagents: { allowProjectOverrides: true, maxParallel: 3, agentDefinitionModel: { use: "preserve" } } } };
   const project = { orchestrator: { subagents: { maxParallel: 6, allowProjectOverrides: false } } };
   assert.deepEqual(subagentsSettingsFromSettings(personal, project), {
-    settings: { maxParallel: 6, agentDefinitionModel: { use: "preserve", allowBanned: false } },
+    settings: { maxParallel: 6, maxBackgroundWorkers: 8, agentDefinitionModel: { use: "preserve", allowBanned: false } },
     allowProjectOverrides: true,
     ignoredProjectKeys: ["orchestrator.subagents.allowProjectOverrides"],
   });
@@ -41,4 +41,14 @@ test("allowBanned is read from agentDefinitionModel, and a project's agentDefini
   const project = { orchestrator: { subagents: { agentDefinitionModel: { use: "preserve" } } } };
   assert.deepEqual(subagentsSettingsFromSettings(personal, project).settings.agentDefinitionModel, { use: "preserve", allowBanned: false });
   assert.throws(() => subagentsSettingsFromSettings({ orchestrator: { subagents: { agentDefinitionModel: { allowBanned: "yes" } } } }), /allowBanned must be a boolean/);
+});
+
+test("maxBackgroundWorkers defaults to 8, takes a positive integer, and a project may replace it only with allowProjectOverrides", () => {
+  assert.equal(subagentsSettingsFromSettings({ orchestrator: { subagents: { maxBackgroundWorkers: 12 } } }).settings.maxBackgroundWorkers, 12);
+  const project = { orchestrator: { subagents: { maxBackgroundWorkers: 2 } } };
+  assert.equal(subagentsSettingsFromSettings({}, project).settings.maxBackgroundWorkers, 8);
+  assert.equal(subagentsSettingsFromSettings({ orchestrator: { subagents: { allowProjectOverrides: true } } }, project).settings.maxBackgroundWorkers, 2);
+  for (const value of [0, 1.5, "8"]) {
+    assert.throws(() => subagentsSettingsFromSettings({ orchestrator: { subagents: { maxBackgroundWorkers: value } } }), /maxBackgroundWorkers must be a positive integer/);
+  }
 });
