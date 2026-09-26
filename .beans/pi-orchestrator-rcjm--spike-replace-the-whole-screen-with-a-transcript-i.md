@@ -7,7 +7,7 @@ priority: normal
 tags:
     - ready-for-agent
 created_at: 2026-09-26T09:18:43Z
-updated_at: 2026-09-26T09:37:53Z
+updated_at: 2026-09-26T10:19:55Z
 parent: pi-orchestrator-a338
 ---
 
@@ -62,3 +62,9 @@ Checklist after leaving each time:
 - [ ] A pi message arriving while open: send a message to the orchestrator from another pane/session sharing the same session file, or simply note whether anything from the live pi session bleeds through or corrupts the spike's rendering while it is open.
 
 Both todos below are left unchecked and no `## Answer` section is written: the orchestrator records the answer once these steps are tried live.
+
+### First live try (2026-09-26)
+
+In both tuiModes the user could not leave the overlay: Esc did nothing and ctrl+c did not quit pi. Cause: the spike matched raw legacy bytes (a bare `\x1b` for Esc), but pi turns on the kitty keyboard protocol, so Esc arrives as `\x1b[27u`. The overlay holds focus and pi reads the terminal raw, so ctrl+c reached only the spike, which dropped it. Fixed by matching through the keybindings manager pi passes to the `ctx.ui.custom` factory (`tui.select.cancel` covers Esc and ctrl+c in both encodings), with `q` as a last way out.
+
+For llnk: a full-screen overlay takes every key, so the transcript view must match keys through pi's keybindings manager (or pi-tui's `matchesKey`), never raw bytes, and must always leave on Esc and ctrl+c.

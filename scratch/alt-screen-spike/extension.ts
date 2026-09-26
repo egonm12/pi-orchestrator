@@ -35,12 +35,12 @@
  * every 300 ms, follows the end until scrolled, and supports PageUp/
  * PageDown/Home/End to scroll and Escape to leave.
  *
- * Key matching here is hand-rolled (plain VT/xterm escape sequences), not
- * pi-tui's matchesKey: pi-tui is a nested dependency of
- * @earendil-works/pi-coding-agent (not hoisted to this project's own
- * node_modules, see src/subagents/render.ts's own note on this), and
- * pi-coding-agent's public entry point does not re-export it. Fine for a
- * throwaway spike; a shipped version would want that helper exposed.
+ * Keys are matched through the keybindings manager pi passes to the
+ * ctx.ui.custom factory. The first version compared raw legacy bytes (a bare
+ * `\x1b` for Esc), which never matched once pi had turned on the kitty
+ * keyboard protocol, and because the overlay holds focus and pi reads the
+ * terminal raw, ctrl+c could not get out either: the user was trapped.
+ * Esc, ctrl+c (both `tui.select.cancel`) and `q` now all leave.
  */
 
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
@@ -58,20 +58,12 @@ interface SpikeTui {
   readonly terminal: { readonly rows: number };
 }
 
-function isEscape(data: string): boolean {
-  return data === "\x1b";
-}
-function isPageUp(data: string): boolean {
-  return data === "\x1b[5~";
-}
-function isPageDown(data: string): boolean {
-  return data === "\x1b[6~";
-}
-function isHome(data: string): boolean {
-  return data === "\x1b[H" || data === "\x1b[1~" || data === "\x1bOH";
-}
-function isEnd(data: string): boolean {
-  return data === "\x1b[F" || data === "\x1b[4~" || data === "\x1bOF";
+/** The bit of pi's keybindings manager the component needs. pi turns on the
+ *  kitty keyboard protocol when the terminal supports it, so Esc arrives as
+ *  `\x1b[27u` and ctrl+c as `\x1b[99;5u`, not as their legacy bytes. The
+ *  manager matches both encodings, and honours the user's remapped keys. */
+interface SpikeKeys {
+  matches(data: string, keybinding: "tui.select.cancel" | "tui.select.pageUp" | "tui.select.pageDown" | "tui.editor.cursorLineStart" | "tui.editor.cursorLineEnd"): boolean;
 }
 
 /** A fake, ever-growing transcript. Surfaces its own state (mechanism, tuiMode,
@@ -88,6 +80,7 @@ class TranscriptSpikeComponent {
   constructor(
     private readonly tui: SpikeTui,
     private readonly theme: Theme,
+    private readonly keys: SpikeKeys,
     private readonly mechanism: Mechanism,
     private readonly done: (result: undefined) => void,
   ) {
@@ -110,22 +103,24 @@ class TranscriptSpikeComponent {
   }
 
   handleInput(data: string): void {
-    if (isEscape(data)) {
+    // Cancel is Esc or ctrl+c. `q` is a last way out, since pi reads the
+    // terminal raw and ctrl+c never kills it while the overlay has focus.
+    if (this.keys.matches(data, "tui.select.cancel") || data === "q") {
       this.dispose();
       this.done(undefined);
       return;
     }
     const height = this.viewportHeight();
-    if (isPageUp(data)) {
+    if (this.keys.matches(data, "tui.select.pageUp")) {
       this.scrollOffset = Math.min(this.maxScrollOffset(height), this.scrollOffset + height);
       this.followEnd = this.scrollOffset === 0;
-    } else if (isPageDown(data)) {
+    } else if (this.keys.matches(data, "tui.select.pageDown")) {
       this.scrollOffset = Math.max(0, this.scrollOffset - height);
       this.followEnd = this.scrollOffset === 0;
-    } else if (isHome(data)) {
+    } else if (this.keys.matches(data, "tui.editor.cursorLineStart")) {
       this.scrollOffset = this.maxScrollOffset(height);
       this.followEnd = false;
-    } else if (isEnd(data)) {
+    } else if (this.keys.matches(data, "tui.editor.cursorLineEnd")) {
       this.scrollOffset = 0;
       this.followEnd = true;
     } else {
@@ -154,7 +149,7 @@ class TranscriptSpikeComponent {
       ...visible.map(fit),
     ];
     while (out.length < height + 3) out.push("");
-    out.push(th.fg("dim", fit("PgUp/PgDn scroll · Home/End jump · Esc leave (should restore the orchestrator session)")));
+    out.push(th.fg("dim", fit("PgUp/PgDn scroll · Home/End jump · Esc, ctrl+c or q leave (should restore the orchestrator session)")));
     return out;
   }
 
@@ -176,7 +171,7 @@ function registerSpikeCommand(pi: ExtensionAPI, name: string, description: strin
         return;
       }
       await ctx.ui.custom<undefined>(
-        (tui, theme, _keybindings, done) => new TranscriptSpikeComponent(tui, theme, mechanism, done),
+        (tui, theme, keybindings, done) => new TranscriptSpikeComponent(tui, theme, keybindings, mechanism, done),
         overlay ? { overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", margin: 0 } } : undefined,
       );
       ctx.ui.notify(`Left /${name}`, "info");
@@ -205,8 +200,8 @@ export default function (pi: ExtensionAPI) {
     handler: async (ctx) => {
       if (ctx.mode !== "tui") return;
       await ctx.ui.custom<undefined>(
-        (tui, theme, _keybindings, done) =>
-          new TranscriptSpikeComponent(tui, theme, "full-screen overlay (ctx.ui.custom, overlay: true, 100%x100%)", done),
+        (tui, theme, keybindings, done) =>
+          new TranscriptSpikeComponent(tui, theme, keybindings, "full-screen overlay (ctx.ui.custom, overlay: true, 100%x100%)", done),
         { overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", margin: 0 } },
       );
     },
