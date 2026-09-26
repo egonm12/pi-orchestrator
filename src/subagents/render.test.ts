@@ -95,6 +95,19 @@ test("a preserved-model worker shows its model, marked when the ban-list excepti
   ].join("\n"));
 });
 
+test("a fork's line marks the fork and its pinned session model", () => {
+  const text = subagentsResultText(details(
+    { task: "Inspect", fork: true, status: "queued", model: "anthropic/claude-haiku-4-5" },
+    { task: "Review", fork: true, status: "running", model: "anthropic/claude-haiku-4-5" },
+    { ...DONE, task: "Answer", finalText: "ok", fork: true, model: "anthropic/claude-haiku-4-5", banListException: true },
+  ), false, PLAIN);
+  assert.deepEqual(text.split("\n"), [
+    "worker (fork) · Inspect · queued · anthropic/claude-haiku-4-5",
+    "worker (fork) · Review · running · anthropic/claude-haiku-4-5",
+    "worker (fork) · Answer · done · anthropic/claude-haiku-4-5 (ban-list exception)",
+  ]);
+});
+
 test("states are coloured: done as success, error as error, running as warning, the ban-list exception as warning", () => {
   const text = subagentsResultText(details(
     { ...DONE, task: "A", finalText: "ok" },

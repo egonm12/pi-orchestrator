@@ -1,9 +1,11 @@
 import { dirname, join } from "node:path";
+import { rmSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext, InlineExtension } from "@earendil-works/pi-coding-agent";
 import { banListsFromSettings, personalAgentDir, readSettingsFile, subagentBanListEntry } from "../policy/ban-lists.ts";
 import { THINKING_LEVELS, splitKnownThinkingSuffix, type ThinkingLevel } from "../models/model-info.ts";
 import { agentDefinitionDirs, agentDefinitionListing, loadAgentDefinitions, resolveAgent } from "./agent-definitions.ts";
 import { renderSubagentsCall, renderSubagentsResult } from "./render.ts";
+import { forkSession } from "./fork-session.ts";
 import { loadSubagentsSettings } from "./settings.ts";
 import { runWorker, SUBAGENTS_TOOL, type WorkerResult, type WorkerSetup } from "./worker.ts";
 
@@ -24,8 +26,9 @@ const PARAMETERS = {
   properties: {
     items: { type: "array", minItems: 1, maxItems: 8, items: {
       type: "object", properties: {
-        task: { type: "string", description: "The whole task for the worker, with every fact it needs. The worker sees nothing else." },
+        task: { type: "string", description: "The whole task for an ordinary worker. Forks also see the current branch." },
         agent: { type: "string", description: "Optional: the name of an agent definition the worker follows." },
+        fork: { type: "boolean", description: "Start from the orchestrator's current branch on its session model." },
       }, required: ["task"], additionalProperties: false,
     } },
   },
@@ -49,20 +52,21 @@ export function cutText(text: string, sessionFile: string | undefined): string {
 interface SubagentItem {
   readonly task: string;
   readonly agent?: string;
+  readonly fork?: boolean;
 }
 
-/** The model a worker ran on when its agent definition named one and the
- *  model was preserved, not routed (ADR 0007), and whether the subagent ban
- *  list's exception let it run. Absent for a routed worker. */
-interface PreservedModel {
+/** The model an unrouted worker used, and whether its exception to the
+ *  subagent ban list let it run. Absent for a routed worker. */
+interface WorkerModelDetails {
   readonly model?: string;
   readonly banListException?: boolean;
+  readonly fork?: boolean;
 }
 
 /** An item's result. Only a started worker has a session id: an item whose
  *  agent is unknown fails before a worker starts, and an item still queued at
  *  abort is not started. */
-export type SubagentResult = PreservedModel & (
+export type SubagentResult = WorkerModelDetails & (
   | (SubagentItem & WorkerResult)
   | (SubagentItem & {
     readonly status: "failed";
@@ -87,8 +91,8 @@ export interface SubagentsDetails {
 /** An item while its call runs: queued, running (with the tool its worker is
  *  in, if any), or finished with its result. */
 export type SubagentProgress =
-  | (SubagentItem & { readonly status: "queued" })
-  | (SubagentItem & PreservedModel & { readonly status: "running"; readonly tool?: string })
+  | (SubagentItem & WorkerModelDetails & { readonly status: "queued" })
+  | (SubagentItem & WorkerModelDetails & { readonly status: "running"; readonly tool?: string })
   | SubagentResult;
 
 /** A partial result's `details`, sent through `onUpdate` while the call runs.
@@ -121,9 +125,10 @@ export interface SubagentsDependencies {
 
 const DESCRIPTION = "Hand 1 to 8 tasks to workers. At most orchestrator.subagents.maxParallel run at once. " +
   "Results keep item order; abort stops running workers and leaves queued workers not started. " +
-  "Each worker sees only its task text, so put every fact it needs in it. " +
+  "An ordinary worker sees only its task text, so put every fact it needs in it. " +
   "An item's `agent` is optional: it names an agent definition, whose instructions the worker follows and whose tools list narrows the worker's tools. " +
-  "An unknown agent fails that item without starting its worker.";
+  "An unknown agent fails that item without starting its worker. " +
+  "Set `fork: true` to copy the current branch before this call and run on the session model and effort, without routing.";
 
 export function createSubagentsExtension(overrides: Partial<SubagentsDependencies> = {}) {
   const deps: SubagentsDependencies = { workerExtensions: [], ...overrides };
@@ -148,7 +153,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
       label: "Subagents",
       description,
       parameters: PARAMETERS,
-      async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      async execute(toolCallId, params, signal, onUpdate, ctx) {
         const { items } = params as { items: SubagentItem[] };
         if (!Array.isArray(items) || items.length < 1 || items.length > 8) throw new Error("subagents requires 1 to 8 items per call");
         const agentDir = personalAgentDir();
@@ -163,7 +168,23 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
         const definitions = loadAgentDefinitions(definitionDirs);
         const orchestratorTools = pi.getActiveTools();
         const results: SubagentResult[] = new Array(items.length);
-        const progress: SubagentProgress[] = items.map(({ task, agent }) => ({ task, ...(agent === undefined ? {} : { agent }), status: "queued" }));
+        // Snapshot every fork before the queue runs: a later model switch or
+        // parent turn cannot change a queued fork's pin or branch.
+        const forks = items.map((item) => {
+          if (item.fork !== true || !resolveAgent(item.agent, definitions, orchestratorTools).ok) return undefined;
+          try {
+            if (!ctx.model) throw new Error("the session has no model to fork");
+            const model = `${ctx.model.provider}/${ctx.model.id}`;
+            const { sessionManager, forkPoint } = forkSession(ctx, toolCallId);
+            const banned = subagentBanListEntry(model, { subagentBanList: modelSettings.banned, sessionBanList: [] });
+            return { sessionManager, model, effort: ctx.thinkingLevel ?? "off", parentSession: ctx.sessionManager.getSessionId(), forkPoint,
+              banListException: banned !== undefined } as const;
+          } catch (error) { return { error: error instanceof Error ? error.message : String(error) } as const; }
+        });
+        const progress: SubagentProgress[] = items.map(({ task, agent, fork }, index) => ({ task, ...(agent === undefined ? {} : { agent }),
+          ...(fork === true ? { fork: true } : {}),
+          ...(forks[index]?.model === undefined ? {} : { model: forks[index].model,
+            ...(forks[index].banListException ? { banListException: true } : {}) }), status: "queued" }));
         const sendProgress = () => {
           const done = progress.filter((item) => item.status !== "queued" && item.status !== "running").length;
           const update: SubagentsProgressDetails = { results: [...progress] };
@@ -179,8 +200,14 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
           while (next < items.length) {
             if (signal?.aborted) return;
             const index = next++;
-            const { task, agent } = items[index]!;
-            const item: SubagentItem = { task, ...(agent === undefined ? {} : { agent }) };
+            const { task, agent, fork } = items[index]!;
+            const item: SubagentItem = { task, ...(agent === undefined ? {} : { agent }), ...(fork === true ? { fork: true } : {}) };
+            const preparedFork = forks[index];
+            if (preparedFork?.error !== undefined) {
+              results[index] = { ...item, status: "failed", finalText: "", error: preparedFork.error };
+              showProgress(index, results[index]);
+              continue;
+            }
             const resolution = resolveAgent(agent, definitions, orchestratorTools);
             if (!resolution.ok) {
               results[index] = { ...item, status: "failed", finalText: "", error: resolution.error };
@@ -188,11 +215,11 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               continue;
             }
             const definition = resolution.definition;
-            if (modelSettings.use === "route" && definition && (definition.model || definition.thinking)) {
+            if (!preparedFork && modelSettings.use === "route" && definition && (definition.model || definition.thinking)) {
               warnOnce(ctx, "pi-orchestrator subagents: agent definition model and thinking are ignored under route mode");
             }
             let namedModel: NonNullable<WorkerSetup["namedModel"]> | undefined;
-            if (modelSettings.use === "preserve" && definition?.model) {
+            if (!preparedFork && modelSettings.use === "preserve" && definition?.model) {
               const { baseModel, thinkingSuffix } = splitKnownThinkingSuffix(definition.model);
               // The provider ends at the first slash; a model id may hold more.
               const slash = baseModel.indexOf("/");
@@ -219,23 +246,29 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               namedModel = { model: baseModel, ...(effort === undefined ? {} : { effort: effort as ThinkingLevel }), agent: definition.name, definitionFile: definition.file,
                 ...(banListException ? { banListException: true } : {}) };
             }
-            const preservedModel: PreservedModel = namedModel === undefined ? {}
+            const workerModel: WorkerModelDetails = preparedFork ? { fork: true, model: preparedFork.model,
+              ...(preparedFork.banListException ? { banListException: true } : {}) } : namedModel === undefined ? {}
               : { model: namedModel.model, ...(namedModel.banListException ? { banListException: true } : {}) };
-            showProgress(index, { ...item, ...preservedModel, status: "running" });
+            showProgress(index, { ...item, ...workerModel, status: "running" });
             const worker = await runWorker({
               task, cwd: ctx.cwd, agentDir, orchestratorSession: ctx.sessionManager, signal,
               extensionFactories: deps.workerExtensions, instructions: resolution.instructions, tools: resolution.tools,
               ...(namedModel === undefined ? {} : { namedModel }),
-              onTool: (tool) => showProgress(index, { ...item, ...preservedModel, status: "running", ...(tool === undefined ? {} : { tool }) }),
+              ...(preparedFork === undefined ? {} : { fork: preparedFork }),
+              onTool: (tool) => showProgress(index, { ...item, ...workerModel, status: "running", ...(tool === undefined ? {} : { tool }) }),
             });
-            results[index] = { ...item, ...preservedModel, ...worker, finalText: cutText(worker.finalText, worker.sessionFile) };
+            results[index] = { ...item, ...workerModel, ...worker, finalText: cutText(worker.finalText, worker.sessionFile) };
             showProgress(index, results[index]);
           }
         };
         await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => runQueue()));
         for (let index = 0; index < items.length; index++) {
-          const { task, agent } = items[index]!;
-          results[index] ??= { task, ...(agent === undefined ? {} : { agent }), status: "not-started", finalText: "" };
+          const { task, agent, fork } = items[index]!;
+          if (results[index] === undefined) {
+            const file = forks[index]?.sessionManager?.getSessionFile();
+            if (file !== undefined) rmSync(file, { force: true });
+            results[index] = { task, ...(agent === undefined ? {} : { agent }), ...(fork === true ? { fork: true } : {}), status: "not-started", finalText: "" };
+          }
         }
         const details: SubagentsDetails = { results };
         return { content: [{ type: "text", text: results.map(resultText).join("\n\n") }], details };

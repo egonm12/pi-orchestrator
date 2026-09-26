@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { appendRoutingRecord, buildAgentModelRecord } from "../routing/decision-record.ts";
+import { appendRoutingRecord, buildAgentModelRecord, buildForkRecord } from "../routing/decision-record.ts";
 import { stateDir } from "../router/extension.ts";
 import { markWorkerSession } from "./worker-sessions.ts";
 import type { ThinkingLevel } from "../models/model-info.ts";
@@ -48,6 +48,14 @@ export interface WorkerSetup {
    *  installed extensions. */
   readonly agentDir: string;
   readonly orchestratorSession: Pick<ExtensionContext["sessionManager"], "getSessionDir" | "getSessionId" | "getSessionFile">;
+  readonly fork?: {
+    readonly sessionManager: SessionManager;
+    readonly model: string;
+    readonly effort: ThinkingLevel;
+    readonly parentSession: string;
+    readonly forkPoint: string | null;
+    readonly banListException: boolean;
+  };
   readonly signal?: AbortSignal;
   /** Extensions the worker loads besides the installed ones. */
   readonly extensionFactories?: readonly InlineExtension[];
@@ -92,9 +100,9 @@ function errorText(error: unknown): string {
 
 /** Run one worker to its end. Never throws: a failure is a `failed` result. */
 export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
-  const sessionManager = setup.orchestratorSession.getSessionFile() === undefined
+  const sessionManager = setup.fork?.sessionManager ?? (setup.orchestratorSession.getSessionFile() === undefined
     ? SessionManager.inMemory(setup.cwd)
-    : SessionManager.create(setup.cwd, workerSessionDir(setup.orchestratorSession));
+    : SessionManager.create(setup.cwd, workerSessionDir(setup.orchestratorSession)));
   const sessionId = sessionManager.getSessionId();
   const saved = (): string | undefined => {
     const file = sessionManager.getSessionFile();
@@ -116,25 +124,29 @@ export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
         ...(instructions === undefined ? {} : { appendSystemPromptOverride: (base: string[]) => [...base, instructions] }),
       },
     });
-    const { namedModel } = setup;
+    const { namedModel, fork } = setup;
     // The provider ends at the first slash; a model id may hold more.
-    const slash = namedModel?.model.indexOf("/") ?? -1;
-    const [provider, modelId] = namedModel ? [namedModel.model.slice(0, slash), namedModel.model.slice(slash + 1)] : [AUTO_PROVIDER, AUTO_MODEL_ID];
+    const selectedModel = fork?.model ?? namedModel?.model;
+    const slash = selectedModel?.indexOf("/") ?? -1;
+    const [provider, modelId] = selectedModel ? [selectedModel.slice(0, slash), selectedModel.slice(slash + 1)] : [AUTO_PROVIDER, AUTO_MODEL_ID];
     const model = services.modelRuntime.getModel(provider, modelId);
     if (model === undefined) {
       const loadErrors = services.diagnostics.filter((diagnostic) => diagnostic.type === "error").map((diagnostic) => diagnostic.message);
-      return failed([`${namedModel?.model ?? "orchestrator/auto"} is not in the worker's model runtime${namedModel ? "" : "; is the router extension installed?"}`, ...loadErrors].join(" "));
+      return failed([`${selectedModel ?? "orchestrator/auto"} is not in the worker's model runtime${selectedModel ? "" : "; is the router extension installed?"}`, ...loadErrors].join(" "));
     }
     session = (await createAgentSessionFromServices({
-      services, sessionManager, model, ...(namedModel?.effort === undefined ? {} : { thinkingLevel: namedModel.effort }),
+      services, sessionManager, model, ...((fork?.effort ?? namedModel?.effort) === undefined ? {} : { thinkingLevel: fork?.effort ?? namedModel?.effort }),
       ...(setup.tools === undefined ? {} : { tools: [...setup.tools] }),
     })).session;
-    if (namedModel) {
+    if (fork || namedModel) {
       try {
-        appendRoutingRecord(join(stateDir(), "routing"), buildAgentModelRecord({
-          delegationId: sessionId, agent: namedModel.agent, definitionFile: namedModel.definitionFile,
-          model: namedModel.model, effort: session.thinkingLevel,
-          ...(namedModel.banListException ? { banListException: true } : {}),
+        appendRoutingRecord(join(stateDir(), "routing"), fork ? buildForkRecord({
+          delegationId: sessionId, model: fork.model, effort: fork.effort,
+          parentSession: fork.parentSession, forkPoint: fork.forkPoint, banListException: fork.banListException,
+        }) : buildAgentModelRecord({
+          delegationId: sessionId, agent: namedModel!.agent, definitionFile: namedModel!.definitionFile,
+          model: namedModel!.model, effort: session.thinkingLevel,
+          ...(namedModel!.banListException ? { banListException: true } : {}),
         }));
       } catch (error) {
         session.dispose();

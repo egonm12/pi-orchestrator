@@ -38,10 +38,10 @@ function stateText(item: SubagentProgress, theme: Theme): string {
 
 function workerLine(item: SubagentProgress, theme: Theme): string {
   const separator = theme.fg("muted", " · ");
-  const parts = [theme.fg("accent", item.agent ?? NO_AGENT), theme.fg("dim", shortTask(item.task)), stateText(item, theme)];
-  const model = item.status === "queued" ? undefined : item.model;
+  const parts = [theme.fg("accent", `${item.agent ?? NO_AGENT}${item.fork === true ? " (fork)" : ""}`), theme.fg("dim", shortTask(item.task)), stateText(item, theme)];
+  const model = item.model;
   if (model !== undefined) {
-    const exception = item.status !== "queued" && item.banListException === true ? ` ${theme.fg("warning", "(ban-list exception)")}` : "";
+    const exception = item.banListException === true ? ` ${theme.fg("warning", "(ban-list exception)")}` : "";
     parts.push(`${theme.fg("dim", model)}${exception}`);
   }
   return parts.join(separator);

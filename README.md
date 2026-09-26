@@ -49,7 +49,16 @@ The `subagents` tool starts workers in the orchestrator's own process, by defaul
 ] }
 ```
 
-Each item's `task` is the whole task for that worker, with every fact it needs: a worker sees nothing else. `agent` is optional; see Agent definitions below. At most `orchestrator.subagents.maxParallel` items (default 4) run at once, the rest queue. The orchestrator waits for every item; Ctrl+C aborts running workers and drops queued ones.
+Each item's `task` is the whole task for an ordinary worker, with every fact it needs: an ordinary worker sees nothing else. `agent` is optional; see Agent definitions below. Set `fork: true` to give a forked worker the orchestrator's current branch, ending before the assistant message containing the delegating tool call:
+
+```json
+{ "items": [
+  { "task": "Review this change in context", "fork": true },
+  { "task": "Check the isolated test suite" }
+] }
+```
+
+A fork uses the session model and thinking level at call time, without routing. Later model changes do not move it, even while it is queued. It can use a banned session model as an exception to the subagent ban list; its fork record marks that exception. An `agent` on a fork supplies instructions and narrowed tools, but its `model` and `thinking` are ignored without a warning. Forked workers never receive the `subagents` tool. Forks and ordinary workers may share a call. At most `orchestrator.subagents.maxParallel` items (default 4) run at once, the rest queue. The orchestrator waits for every item; Ctrl+C aborts running workers and drops queued ones.
 
 Each item's result has a status:
 
@@ -60,9 +69,9 @@ Each item's result has a status:
 | `aborted` | The item's worker was running when the call was aborted |
 | `not-started` | The item was still queued when the call was aborted |
 
-A worker's session is saved under the orchestrator's session folder, and its session id is its delegation id. It loads the same installed extensions as the orchestrator, without the `subagents` tool itself: a worker cannot start workers of its own. A worker's final text over 50 KB is cut, with a pointer to its session file, which keeps the whole text.
+A worker's session is saved under the orchestrator's session folder, and its session id is its delegation id. A fork's saved session starts with a copy of the active branch up to the fork point; a fork record names its model, effort, parent session id and fork point. Verdicts attach to fork records by delegation id. It loads the same installed extensions as the orchestrator, without the `subagents` tool itself: a worker cannot start workers of its own. A worker's final text over 50 KB is cut, with a pointer to its session file, which keeps the whole text.
 
-While a call runs, pi shows one line per worker: its agent name (`worker` without one), its short task, and its current tool or state: queued, running, done, error, aborted or not started. A worker on a preserved model also shows that model, marked `(ban-list exception)` when the exception let it run. Expanding the result shows each worker's final text or error.
+While a call runs, pi shows one line per worker: its agent name (`worker` without one), `(fork)` for a fork, its short task, and its current tool or state: queued, running, done, error, aborted or not started. A fork or a worker on a preserved model also shows its model, marked `(ban-list exception)` when an exception let it run. Expanding the result shows each worker's final text or error.
 
 ### Agent definitions
 
