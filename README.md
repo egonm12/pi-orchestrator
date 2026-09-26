@@ -71,6 +71,17 @@ With `"background": true` next to `items`, the call returns at once with its cal
 
 Use `subagents_message({ "id": "<delegation id>", "text": "Check this case", "mode": "steer" })` to message one running background worker. `mode` defaults to `"steer"`, delivered after its current tool call and before the next model request. `"followUp"` is delivered when the worker would otherwise stop. The same tool answers a worker's `report` question: its next message unblocks the waiting question. Call ids, queued or finished workers, foreground workers and unknown ids are refused. Workers cannot use `subagents_message`.
 
+### Reports
+
+Every worker has a `report` tool, `{ "kind": "progress" | "question", "text": string }`, to message the agent that delegated to it on its own, whatever its agent definition's `tools:` list says:
+
+- `progress` is a short note, and the worker goes on at once. It is recorded in the session as a `subagents-report` message without starting a turn, so the orchestrator reads it at its next turn. An idle orchestrator's TUI shows the message at once; while the orchestrator is busy, pi records the message when the current turn ends, so the TUI shows the note at once as a notification.
+- `question` is only for background workers; a foreground worker's `report` has no question kind. The question starts an orchestrator turn when the orchestrator is idle, and is steered in after its current tool call when it is busy. The worker waits for the answer without a time limit: the next `subagents_message` to its delegation id is the answer and the `report` tool's result. `/subagents stop`, stopping its call or ending the session releases the worker, which then aborts.
+
+A question ends a pending `subagents_status` wait on its call, which would otherwise hold the orchestrator's turn until the call ends: the wait fails with a hint to answer with `subagents_message` and wait again. A new wait on a call with an unanswered question is refused with the same hint. The call runs on, and its completion notice goes to a later wait or to the session as usual.
+
+A worker started by another worker reports to that worker, progress only, since a worker's calls are foreground.
+
 ### Status and wait
 
 The `subagents_status` tool, `{ "id"?: string, "wait"?: boolean }`, shows the orchestrator its session's running background calls:
@@ -79,6 +90,7 @@ The `subagents_status` tool, `{ "id"?: string, "wait"?: boolean }`, shows the or
 - With a call id it gives a snapshot of each of the call's items; with a delegation id, a snapshot of that worker alone. A snapshot holds the worker's state, its current tool, the turns it has started, its elapsed time, the last 5 lines of its latest text and its session file.
 - With a call id and `"wait": true` it blocks until the call has finished and returns its results, the same text and details as its completion notice. That notice is then not delivered: a result goes once, to a pending wait, otherwise as the notice. `wait` needs a call id; a delegation id or no id is refused.
 - Ctrl+C during a wait stops only the wait. The workers run on, and the call's completion notice follows.
+- A worker's `report` question ends a pending wait on its call, and a wait on a call with an unanswered question is refused (see Reports above).
 
 A call that has finished is no longer listed; its results are in its completion notice. Workers do not get `subagents_status`, even when their agent definition's `tools:` list names it.
 
@@ -101,7 +113,7 @@ While a call runs, pi shows one line per worker: its agent name (`worker` withou
 
 ### Agent definitions
 
-An item's `agent` name picks a named, owner-written kind of worker: its instructions and the tools it may use. Agent definitions are markdown files with frontmatter (`name`, `description`, `tools`, `model`, `thinking`) and a body of instructions, read from `~/.pi/agent/agents/` and the project's `.pi/agents/`. A project's definition wins by name. `model` (`provider/model`, optionally with `:effort`) and `thinking` apply only when `agentDefinitionModel.use` is `"preserve"` (see below). A `tools:` list only narrows the orchestrator's tool set for that worker; it cannot add a tool the orchestrator itself does not have. Each definition's name and description are listed in the subagents tool's description at session start. `agent` is optional in a call: without it, a worker gets pi's default tools plus extension tools (except `subagents`) and no agent-specific instructions. pi-orchestrator ships no built-in definitions; the owner writes them.
+An item's `agent` name picks a named, owner-written kind of worker: its instructions and the tools it may use. Agent definitions are markdown files with frontmatter (`name`, `description`, `tools`, `model`, `thinking`) and a body of instructions, read from `~/.pi/agent/agents/` and the project's `.pi/agents/`. A project's definition wins by name. `model` (`provider/model`, optionally with `:effort`) and `thinking` apply only when `agentDefinitionModel.use` is `"preserve"` (see below). A `tools:` list only narrows the orchestrator's tool set for that worker; it cannot add a tool the orchestrator itself does not have. Each definition's name and description are listed in the subagents tool's description at session start. `agent` is optional in a call: without it, a worker gets pi's default tools plus extension tools (except `subagents`) and no agent-specific instructions. Every worker also gets the `report` tool (see Reports above). pi-orchestrator ships no built-in definitions; the owner writes them.
 
 ### Nested delegation
 

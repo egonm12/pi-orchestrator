@@ -11,6 +11,7 @@ import { registerSubagentsMessageTool } from "./message.ts";
 import { renderSubagentsCall, renderSubagentsResult } from "./render.ts";
 import { forkSession } from "./fork-session.ts";
 import { prepareResume, saveWorkerOutcome } from "./resume.ts";
+import { workerReports } from "./report.ts";
 import { loadSubagentsSettings } from "./settings.ts";
 import { registerSubagentsStatusTool } from "./status.ts";
 import { runWorker, SUBAGENTS_TOOL, type WorkerResult, type WorkerSetup } from "./worker.ts";
@@ -232,6 +233,8 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
         const backgroundCall = background ? backgroundCalls.start({ callId: toolCallId, progress, delegationIds: delegationIds! }) : undefined;
         const callSignal = backgroundCall ? backgroundCall.callSignal : signal;
         const itemSignals = backgroundCall?.itemSignals;
+        // Only a background call's workers may ask a question (ADR 0008).
+        const reports = workerReports(pi, ctx, backgroundCall === undefined ? undefined : backgroundCalls);
         let next = 0;
         const runQueue = async () => {
           while (next < items.length) {
@@ -250,7 +253,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
                 showProgress(index, { ...item, status: "running" });
                 const worker = await runWorker({ task, resume: prepared, cwd: ctx.cwd, agentDir, orchestratorSession: ctx.sessionManager,
                   signal: itemSignals?.[index] ?? callSignal, extensionFactories: deps.workerExtensions, instructions: prepared.instructions, tools: prepared.tools,
-                  onActivity: backgroundCall?.onActivity[index],
+                  onActivity: backgroundCall?.onActivity[index], reports,
                   onTool: (tool) => showProgress(index, { ...item, status: "running", ...(tool === undefined ? {} : { tool }) }),
                   ...(backgroundCall === undefined ? {} : { onMessageReady: (receive) => backgroundCalls.registerWorker(backgroundCall.delegationIds[index]!, receive) }),
                 });
@@ -319,7 +322,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               ...(namedModel === undefined ? {} : { namedModel }),
               ...(preparedFork === undefined ? {} : { fork: preparedFork }),
               ...(parentDelegationId === undefined ? {} : { parentDelegationId }),
-              onActivity: backgroundCall?.onActivity[index],
+              onActivity: backgroundCall?.onActivity[index], reports,
               onTool: (tool) => showProgress(index, { ...item, ...workerModel, status: "running", ...(tool === undefined ? {} : { tool }) }),
               ...(backgroundCall === undefined ? {} : { onMessageReady: (receive) => backgroundCalls.registerWorker(backgroundCall.delegationIds[index]!, receive) }),
             });
