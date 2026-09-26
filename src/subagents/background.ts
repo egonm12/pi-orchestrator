@@ -22,6 +22,8 @@ export interface BackgroundCallResult {
   readonly details: SubagentsDetails;
 }
 
+export type BackgroundMessageMode = "steer" | "followUp";
+
 export interface BackgroundCall {
   readonly callId: string;
   /** Each item's current state, kept up to date while the call runs. */
@@ -70,6 +72,8 @@ function errorText(error: unknown): string {
 /** One orchestrator session's background calls. */
 export class BackgroundCalls {
   readonly #running = new Map<string, RunningCall>();
+  readonly #receivers = new Map<string, (text: string, mode: BackgroundMessageMode) => Promise<void>>();
+  readonly #questions = new Map<string, (text: string) => void>();
   readonly #deliver: (notice: CompletionNotice, startTurn: boolean) => void;
   #shuttingDown = false;
 
@@ -108,6 +112,10 @@ export class BackgroundCalls {
       (error: unknown): CompletionNotice => ({ text: `Background subagents call ${callId} failed: ${errorText(error)}` }),
     ).then((notice) => {
       this.#running.delete(callId);
+      for (const id of delegationIds) {
+        this.#receivers.delete(id);
+        this.#questions.delete(id);
+      }
       this.#deliver(notice, !this.#shuttingDown);
     }).catch((error: unknown) => {
       process.stderr.write(`pi-orchestrator subagents: the completion notice of background call ${callId} was not delivered: ${errorText(error)}\n`);
@@ -118,6 +126,36 @@ export class BackgroundCalls {
       stopItem: (index) => itemControllers[index]?.abort(),
     });
     return { delegationIds, callSignal: callController.signal, itemSignals, finish };
+  }
+
+  /** A worker's active session accepts messages only while its background item is running. */
+  registerWorker(id: string, receive: (text: string, mode: BackgroundMessageMode) => Promise<void>): () => void {
+    this.#receivers.set(id, receive);
+    return () => { if (this.#receivers.get(id) === receive) this.#receivers.delete(id); };
+  }
+
+  /** A blocking report question uses this to receive the next message directly:
+   *  queuing it in pi would deadlock until the report tool returned. */
+  registerQuestion(id: string, answer: (text: string) => void): () => void {
+    this.#questions.set(id, answer);
+    return () => { if (this.#questions.get(id) === answer) this.#questions.delete(id); };
+  }
+
+  /** Send to one active background worker, not to a call, queued item, or foreground worker. */
+  async message(id: string, text: string, mode: BackgroundMessageMode): Promise<void> {
+    const running = [...this.#running.values()].find(({ delegationIds }) => delegationIds.includes(id));
+    const index = running?.delegationIds.indexOf(id) ?? -1;
+    const receive = this.#receivers.get(id);
+    if (!running || index < 0 || running.call.progress[index]?.status !== "running" || !receive) {
+      throw new Error(`subagents_message: no running background worker has the delegation id ${id}`);
+    }
+    const answer = this.#questions.get(id);
+    if (answer) {
+      this.#questions.delete(id);
+      answer(text);
+    } else {
+      await receive(text, mode);
+    }
   }
 
   /** The `/subagents` command: `list` (the default) or `stop <id | all>`. Returns the text to show. */

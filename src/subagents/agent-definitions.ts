@@ -109,7 +109,7 @@ export function resolveAgent(
     const known = definitions.length === 0 ? "there are none" : `known agents: ${definitions.map((candidate) => candidate.name).join(", ")}`;
     return { ok: false, error: `unknown agent "${agent}"; ${known}` };
   }
-  const tools = definition.tools?.filter((tool) => (mayDelegate || tool !== SUBAGENTS_TOOL) && orchestratorTools.includes(tool));
+  const tools = definition.tools?.filter((tool) => tool !== "subagents_message" && (mayDelegate || tool !== SUBAGENTS_TOOL) && orchestratorTools.includes(tool));
   return {
     ok: true,
     definition,
