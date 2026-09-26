@@ -9,12 +9,23 @@ The role the main session takes. It owns clarification, task decomposition, dele
 An agent the orchestrator hands one bounded piece of investigation, implementation or verification work to. It reports to the orchestrator, never to the user.
 _Avoid_: Execution agent, subagent (that is the tool that starts workers, not the role)
 
+**Forked worker**:
+A worker whose context starts as a copy of the orchestrator's conversation up to the delegating call. The only worker that runs on the orchestrator's own session model and effort, unrouted.
+_Avoid_: Clone, branch, fork (alone)
+
+**Background worker**:
+A worker whose delegating call returned before it finished. The orchestrator can check on it, steer it and answer its questions.
+
+**Report**:
+A message a background worker sends the orchestrator on its own: progress, or a question it waits on.
+_Avoid_: Callback, notification (that is the completion notice)
+
 **Agent definition**:
 A named, owner-written description of a kind of worker: its instructions and the tools it may use. Read from the owner's and the project's agent folders; pi-orchestrator ships none.
 _Avoid_: Role (that is the orchestrator/worker split), persona
 
 **Delegation**:
-One handing of one piece of work from the orchestrator to a worker. Each attempt has a delegation id: the id of the worker's pi session.
+One handing of one piece of work from the orchestrator to a worker. Each attempt has a delegation id: the id of the worker's pi session. Resuming a finished worker continues the same delegation; a retry on the effort ladder is a new one. A delegation made by a worker, not by the orchestrator, has that worker's delegation as its parent delegation.
 _Avoid_: Dispatch, spawn
 
 **Routing policy**:
@@ -68,7 +79,7 @@ Older harness text uses "escalation" more loosely: for ticket 06's low-confidenc
 _Avoid_: Fallback (ticket 06's low-confidence fallback tier is a different rule), downgrade
 
 **Subagent ban list**:
-The owner's list of model names that no worker may run on, matched by name regardless of provider or tier map. The one exception is a model an agent definition names, when the owner has switched that exception on. Does not bind the orchestrator's own session.
+The owner's list of model names that no worker may run on, matched by name regardless of provider or tier map. The two exceptions are a forked worker, which runs on the orchestrator's session model, and a model an agent definition names, when the owner has switched that exception on. Does not bind the orchestrator's own session.
 _Avoid_: Prohibited patterns, Fable/Astra rule, ban list (alone)
 
 **Session ban list**:
@@ -87,5 +98,5 @@ The virtual model `orchestrator/auto` that workers run on. Each request to it go
 _Avoid_: Smart router, proxy model, auto-routing model
 
 **Pin**:
-The rung a worker keeps for all of its requests, chosen at its first request. It holds through compaction and ends with the worker.
+The rung a worker keeps for all of its requests, chosen at its first request. A forked worker's pin is the orchestrator's session rung at the delegating call. It holds through compaction and ends with the worker.
 _Avoid_: Session affinity, sticky model
