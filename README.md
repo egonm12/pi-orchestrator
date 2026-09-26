@@ -20,7 +20,7 @@ Or from a local checkout:
 pi install ~/path/to/pi-orchestrator
 ```
 
-The package ships its own `subagents` tool (see below), so an orchestrator session needs no separate subagent extension to start workers. Other subagent extensions that start workers on `orchestrator/auto` still work and are still routed; use one for background workers, chains, resume or nested delegation, which the built-in tool does not do yet. For background workers, install pi-orchestrator as a package, not just with `pi -e`: their separate process loads installed packages. The package has no runtime dependencies of its own.
+The package ships its own `subagents` tool (see below), so an orchestrator session needs no separate subagent extension to start workers. Other subagent extensions that start workers on `orchestrator/auto` still work and are still routed; use one for background workers or nested delegation, which the built-in tool does not do yet. For background workers, install pi-orchestrator as a package, not just with `pi -e`: their separate process loads installed packages. The package has no runtime dependencies of its own.
 
 ## Set up with `init`
 
@@ -45,11 +45,12 @@ The `subagents` tool starts workers in the orchestrator's own process, by defaul
 ```json
 { "items": [
   { "task": "Fix the typo in README.md" },
-  { "task": "Add a test for the new validation rule", "agent": "reviewer" }
+  { "task": "Add a test for the new validation rule", "agent": "reviewer" },
+  { "resume": "<delegation id>", "task": "Continue the test with the new case" }
 ] }
 ```
 
-Each item's `task` is the whole task for that worker, with every fact it needs: a worker sees nothing else. `agent` is optional; see Agent definitions below. At most `orchestrator.subagents.maxParallel` items (default 4) run at once, the rest queue. The orchestrator waits for every item; Ctrl+C aborts running workers and drops queued ones.
+Each item's `task` is the whole task for that worker, with every fact it needs: a new worker sees nothing else. `agent` is optional; see Agent definitions below. A `resume` item uses a finished worker's delegation id and a new task instead of `agent` or `fork`. It continues that worker's saved session and original pin without a new routing decision. Unknown, running and not-started workers cannot be resumed, nor can workers from another orchestrator session or those without a recoverable pin. The original pin must still pass the hard filters; otherwise the item fails without re-routing. A preserved agent model's ban-list exception is rechecked against current settings. Later verdicts for the same delegation replace earlier ones in the routing report; the record retains all verdicts. At most `orchestrator.subagents.maxParallel` items (default 4) run at once, the rest queue. The orchestrator waits for every item; Ctrl+C aborts running workers and drops queued ones.
 
 Each item's result has a status:
 
@@ -180,7 +181,7 @@ The guard protects against accidental mistakes, not a determined agent. It refus
 
 - A worker started on a real model is not routed. A workflow's workers are routed only if the subagent extension starts them on `orchestrator/auto`.
 - The task allowance is per session ($5 by default), not shared between the orchestrator and background workers.
-- The built-in `subagents` tool runs one call to its end in the orchestrator's own process; it has no background workers, chains, resume or nested delegation yet (workers do not get the `subagents` tool). Use another subagent extension for those.
+- The built-in `subagents` tool runs one call to its end in the orchestrator's own process; it has no background workers or nested delegation yet (workers do not get the `subagents` tool). Use another subagent extension for those.
 
 ## Development
 

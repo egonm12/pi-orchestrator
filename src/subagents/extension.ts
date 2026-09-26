@@ -4,6 +4,7 @@ import { banListsFromSettings, personalAgentDir, readSettingsFile, subagentBanLi
 import { THINKING_LEVELS, splitKnownThinkingSuffix, type ThinkingLevel } from "../models/model-info.ts";
 import { agentDefinitionDirs, agentDefinitionListing, loadAgentDefinitions, resolveAgent } from "./agent-definitions.ts";
 import { renderSubagentsCall, renderSubagentsResult } from "./render.ts";
+import { prepareResume, saveWorkerOutcome } from "./resume.ts";
 import { loadSubagentsSettings } from "./settings.ts";
 import { runWorker, SUBAGENTS_TOOL, type WorkerResult, type WorkerSetup } from "./worker.ts";
 
@@ -26,6 +27,7 @@ const PARAMETERS = {
       type: "object", properties: {
         task: { type: "string", description: "The whole task for the worker, with every fact it needs. The worker sees nothing else." },
         agent: { type: "string", description: "Optional: the name of an agent definition the worker follows." },
+        resume: { type: "string", description: "Continue a finished delegation by id, in its saved session and on its original pin." },
       }, required: ["task"], additionalProperties: false,
     } },
   },
@@ -49,6 +51,7 @@ export function cutText(text: string, sessionFile: string | undefined): string {
 interface SubagentItem {
   readonly task: string;
   readonly agent?: string;
+  readonly resume?: string;
 }
 
 /** The model a worker ran on when its agent definition named one and the
@@ -123,7 +126,8 @@ const DESCRIPTION = "Hand 1 to 8 tasks to workers. At most orchestrator.subagent
   "Results keep item order; abort stops running workers and leaves queued workers not started. " +
   "Each worker sees only its task text, so put every fact it needs in it. " +
   "An item's `agent` is optional: it names an agent definition, whose instructions the worker follows and whose tools list narrows the worker's tools. " +
-  "An unknown agent fails that item without starting its worker.";
+  "An unknown agent fails that item without starting its worker. " +
+  "Use `resume` with `task` (without `agent`) to continue a finished saved worker on its original pin.";
 
 export function createSubagentsExtension(overrides: Partial<SubagentsDependencies> = {}) {
   const deps: SubagentsDependencies = { workerExtensions: [], ...overrides };
@@ -163,7 +167,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
         const definitions = loadAgentDefinitions(definitionDirs);
         const orchestratorTools = pi.getActiveTools();
         const results: SubagentResult[] = new Array(items.length);
-        const progress: SubagentProgress[] = items.map(({ task, agent }) => ({ task, ...(agent === undefined ? {} : { agent }), status: "queued" }));
+        const progress: SubagentProgress[] = items.map(({ task, agent, resume }) => ({ task, ...(agent === undefined ? {} : { agent }), ...(resume === undefined ? {} : { resume }), status: "queued" }));
         const sendProgress = () => {
           const done = progress.filter((item) => item.status !== "queued" && item.status !== "running").length;
           const update: SubagentsProgressDetails = { results: [...progress] };
@@ -179,8 +183,27 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
           while (next < items.length) {
             if (signal?.aborted) return;
             const index = next++;
-            const { task, agent } = items[index]!;
-            const item: SubagentItem = { task, ...(agent === undefined ? {} : { agent }) };
+            const { task, agent, resume } = items[index]!;
+            const item: SubagentItem = { task, ...(agent === undefined ? {} : { agent }), ...(resume === undefined ? {} : { resume }) };
+            if (resume !== undefined) {
+              let releaseResume: (() => void) | undefined;
+              try {
+                if (agent !== undefined || "fork" in items[index]!) throw new Error("resume excludes agent and fork");
+                const prepared = prepareResume(resume, task, { cwd: ctx.cwd, agentDir, orchestratorSession: ctx.sessionManager });
+                releaseResume = prepared.release;
+                showProgress(index, { ...item, status: "running" });
+                const worker = await runWorker({ task, resume: prepared, cwd: ctx.cwd, agentDir, orchestratorSession: ctx.sessionManager,
+                  signal, extensionFactories: deps.workerExtensions, instructions: prepared.instructions, tools: prepared.tools,
+                  onTool: (tool) => showProgress(index, { ...item, status: "running", ...(tool === undefined ? {} : { tool }) }),
+                });
+                saveWorkerOutcome(worker.sessionFile, worker.status);
+                results[index] = { ...item, ...worker, finalText: cutText(worker.finalText, worker.sessionFile) };
+              } catch (error) {
+                results[index] = { ...item, status: "failed", finalText: "", error: error instanceof Error ? error.message : String(error) };
+              } finally { releaseResume?.(); }
+              showProgress(index, results[index]);
+              continue;
+            }
             const resolution = resolveAgent(agent, definitions, orchestratorTools);
             if (!resolution.ok) {
               results[index] = { ...item, status: "failed", finalText: "", error: resolution.error };
@@ -228,14 +251,15 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               ...(namedModel === undefined ? {} : { namedModel }),
               onTool: (tool) => showProgress(index, { ...item, ...preservedModel, status: "running", ...(tool === undefined ? {} : { tool }) }),
             });
+            saveWorkerOutcome(worker.sessionFile, worker.status, { instructions: resolution.instructions, tools: resolution.tools });
             results[index] = { ...item, ...preservedModel, ...worker, finalText: cutText(worker.finalText, worker.sessionFile) };
             showProgress(index, results[index]);
           }
         };
         await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => runQueue()));
         for (let index = 0; index < items.length; index++) {
-          const { task, agent } = items[index]!;
-          results[index] ??= { task, ...(agent === undefined ? {} : { agent }), status: "not-started", finalText: "" };
+          const { task, agent, resume } = items[index]!;
+          results[index] ??= { task, ...(agent === undefined ? {} : { agent }), ...(resume === undefined ? {} : { resume }), status: "not-started", finalText: "" };
         }
         const details: SubagentsDetails = { results };
         return { content: [{ type: "text", text: results.map(resultText).join("\n\n") }], details };

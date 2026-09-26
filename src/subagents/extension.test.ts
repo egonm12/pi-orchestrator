@@ -7,8 +7,10 @@ import { DefaultPackageManager, SessionManager, SettingsManager, type ExtensionA
 import { buildCatalog } from "../catalog/model-catalog.ts";
 import { emptyRefreshState } from "../catalog/refresh-lifecycle.ts";
 import { resetBanLists } from "../policy/ban-lists.ts";
-import { authorizeRecipient, emptyAuthorization, grantOwnerApproval } from "../recipients/authorization.ts";
+import { authorizeRecipient, emptyAuthorization, grantOwnerApproval, saveAuthorization } from "../recipients/authorization.ts";
 import { readRoutingRecords } from "../routing/decision-record.ts";
+import { attachVerdict } from "../routing/verdicts.ts";
+import { buildRoutingReport } from "../routing/routing-report.ts";
 import { autoStream } from "../router/auto-stream.ts";
 import { createRouterExtension } from "../router/extension.ts";
 import personalGuard from "../guard/extension.ts";
@@ -232,6 +234,152 @@ interface SessionLine {
 function sessionLines(file: string): SessionLine[] {
   return readFileSync(file, "utf8").split("\n").filter((line) => line.trim() !== "").map((line) => JSON.parse(line) as SessionLine);
 }
+
+test("a completed worker resumes its saved session with the same delegation and pinned rung", async () => {
+  const h = harness();
+  try {
+    mkdirSync(h.stateDir);
+    saveAuthorization(join(h.stateDir, "authorized-recipients.json"), approvedAnthropic());
+    const provider = fakeAnthropic("Done");
+    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    const first = await callSubagents(tool, main.ctx, "First task");
+    assert.equal(first.worker.status, "completed");
+    if (!first.worker.sessionId || !first.worker.sessionFile) return;
+    const resumed = await tool.execute("call-2", { items: [{ resume: first.worker.sessionId, task: "Second task" }] } as never, undefined, undefined, main.ctx);
+    const worker = (resumed.details as SubagentsDetails).results[0]!;
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.equal(worker.sessionId, first.worker.sessionId);
+    assert.equal(worker.sessionFile, first.worker.sessionFile);
+    assert.deepEqual(provider.requests.map((request) => request.sessionId), [first.worker.sessionId, first.worker.sessionId]);
+    assert.equal(readRoutingRecords(join(h.stateDir, "routing")).filter((record) => record.recordType === "decision").length, 1);
+    assert.equal(sessionLines(first.worker.sessionFile).filter((line) => line.message?.role === "user").length, 2);
+    const recordDir = join(h.stateDir, "routing");
+    const refreshStatePath = join(h.stateDir, "refresh-state.json");
+    attachVerdict({ recordDir, delegationId: first.worker.sessionId, verdict: "request_changes", refreshStatePath });
+    attachVerdict({ recordDir, delegationId: first.worker.sessionId, verdict: "accept", refreshStatePath });
+    assert.equal(buildRoutingReport(recordDir).totals.decisions, 1);
+    assert.deepEqual(buildRoutingReport(recordDir).totals.verdicts, { accept: 1, request_changes: 0, missing: 0 });
+  } finally { h.cleanup(); }
+});
+
+test("a preserved agent model resumes without a second record and keeps its agent instructions", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { agentDefinitionModel: { use: "preserve" } } } });
+  try {
+    mkdirSync(h.stateDir);
+    saveAuthorization(join(h.stateDir, "authorized-recipients.json"), approvedAnthropic());
+    writeAgentDefinition(join(h.agentDir, "agents"), "reviewer.md", { name: "reviewer", description: "Reviews", model: HAIKU, tools: "read" }, "Review carefully.");
+    const provider = fakeAnthropic("Done");
+    const main = orchestrator(h);
+    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+    const first = await callSubagents(tool, main.ctx, "First task", "reviewer");
+    assert.equal(first.worker.status, "completed");
+    const resumed = await tool.execute("resume", { items: [{ resume: first.worker.sessionId, task: "Second task" }] } as never, undefined, undefined, main.ctx);
+    assert.equal((resumed.details as SubagentsDetails).results[0]!.status, "completed");
+    assert.equal(readRoutingRecords(join(h.stateDir, "routing")).filter((record) => record.recordType === "agent-model").length, 1);
+    assert.ok(provider.requests[1]!.systemText.includes("Review carefully."));
+    assert.deepEqual(provider.requests.map((request) => request.tools), [["read"], ["read"]]);
+  } finally { h.cleanup(); }
+});
+
+test("a preserved-model ban-list exception is rechecked on resume without routed allowance preflight", async () => {
+  const settings = { orchestrator: { routing: ROUTING, subagentBanList: ["haiku"], subagents: { agentDefinitionModel: { use: "preserve", allowBanned: true } } } };
+  const h = harness(settings);
+  try {
+    mkdirSync(h.stateDir);
+    saveAuthorization(join(h.stateDir, "authorized-recipients.json"), approvedAnthropic());
+    writeAgentDefinition(join(h.agentDir, "agents"), "reviewer.md", { name: "reviewer", description: "Reviews", model: HAIKU }, "Review carefully.");
+    const provider = fakeAnthropic("Done");
+    const main = orchestrator(h);
+    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+    const first = await callSubagents(tool, main.ctx, "First task", "reviewer");
+    assert.equal(first.worker.status, "completed");
+    const resumed = await tool.execute("resume", { items: [{ resume: first.worker.sessionId, task: "Second task" }] } as never, undefined, undefined, main.ctx);
+    assert.equal((resumed.details as SubagentsDetails).results[0]!.status, "completed");
+    writeFileSync(join(h.agentDir, "settings.json"), JSON.stringify({ orchestrator: { ...settings.orchestrator, subagents: { agentDefinitionModel: { use: "preserve", allowBanned: false } } } }));
+    const denied = await tool.execute("resume", { items: [{ resume: first.worker.sessionId, task: "Third task" }] } as never, undefined, undefined, main.ctx);
+    assert.match((denied.details as SubagentsDetails).results[0]!.error ?? "", /subagent ban list/);
+    assert.equal(provider.requests.length, 2);
+  } finally { h.cleanup(); }
+});
+
+test("a shadow worker resumes on the model that ran, not its hypothetical rung", async () => {
+  const h = harness({ orchestrator: { routing: { ...ROUTING, mode: "shadow" } } });
+  try {
+    mkdirSync(h.stateDir);
+    saveAuthorization(join(h.stateDir, "authorized-recipients.json"), approvedAnthropic());
+    const provider = fakeAnthropic("Done");
+    const main = orchestrator(h);
+    const first = await callSubagents(loadSubagentsTool([routerExtension(), provider.extension]), main.ctx, "First task");
+    const second = await loadSubagentsTool([routerExtension(), provider.extension]).execute("resume", {
+      items: [{ resume: first.worker.sessionId, task: "Second task" }],
+    } as never, undefined, undefined, main.ctx);
+    assert.equal((second.details as SubagentsDetails).results[0]!.status, "completed");
+    assert.deepEqual(provider.requests.map((request) => request.thinkingLevel), ["medium", "medium"]);
+    assert.equal(readRoutingRecords(join(h.stateDir, "routing")).filter((record) => record.recordType === "decision").length, 1);
+  } finally { h.cleanup(); }
+});
+
+test("resume refuses unknown, not-started and other orchestrator session ids without starting a worker", async () => {
+  const h = harness();
+  try {
+    const provider = fakeAnthropic("Done");
+    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    const other = orchestrator(h);
+    const first = await callSubagents(tool, other.ctx, "First task");
+    assert.equal(first.worker.status, "completed");
+    for (const id of ["not-an-id", "00000000-0000-0000-0000-000000000000", first.worker.sessionId]) {
+      const result = await tool.execute("resume", { items: [{ resume: id, task: "Second task" }] } as never, undefined, undefined, main.ctx);
+      const worker = (result.details as SubagentsDetails).results[0]!;
+      assert.equal(worker.status, "failed");
+      assert.match(worker.error ?? "", /unknown delegation id/);
+    }
+    assert.equal(provider.requests.length, 1);
+  } finally { h.cleanup(); }
+});
+
+test("resume refuses a saved worker without a recoverable pin and a pin now blocked by the ban list", async () => {
+  const h = harness();
+  try {
+    mkdirSync(h.stateDir);
+    saveAuthorization(join(h.stateDir, "authorized-recipients.json"), approvedAnthropic());
+    const provider = fakeAnthropic("Done");
+    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    const first = await callSubagents(tool, main.ctx, "First task");
+    assert.equal(first.worker.status, "completed");
+    const settings = { orchestrator: { routing: ROUTING, subagentBanList: ["haiku"] } };
+    writeFileSync(join(h.agentDir, "settings.json"), JSON.stringify(settings));
+    const refused = await tool.execute("resume", { items: [{ resume: first.worker.sessionId, task: "Second task" }] } as never, undefined, undefined, main.ctx);
+    assert.match((refused.details as SubagentsDetails).results[0]!.error ?? "", /pin .*subagent ban list/);
+    writeFileSync(join(h.agentDir, "settings.json"), JSON.stringify({ orchestrator: { routing: ROUTING } }));
+    rmSync(join(h.stateDir, "routing"), { recursive: true });
+    const missing = await tool.execute("resume", { items: [{ resume: first.worker.sessionId, task: "Second task" }] } as never, undefined, undefined, main.ctx);
+    assert.match((missing.details as SubagentsDetails).results[0]!.error ?? "", /no recoverable pin/);
+    assert.equal(provider.requests.length, 1);
+  } finally { h.cleanup(); }
+});
+
+test("a running worker cannot be resumed", async () => {
+  const h = harness();
+  try {
+    let finish!: () => void;
+    let started!: () => void;
+    const ready = new Promise<void>((resolve) => { started = resolve; });
+    const provider = fakeAnthropic("Done", (done) => { finish = done; started(); });
+    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    const pending = callSubagents(tool, main.ctx, "First task");
+    await ready;
+    const id = provider.requests[0]!.sessionId!;
+    const result = await tool.execute("resume", { items: [{ resume: id, task: "Second task" }] } as never, undefined, undefined, main.ctx);
+    assert.match((result.details as SubagentsDetails).results[0]!.error ?? "", /still running/);
+    finish();
+    await pending;
+    assert.equal(provider.requests.length, 1);
+  } finally { h.cleanup(); }
+});
 
 test("a call with one task routes the worker on orchestrator/auto and returns its final text, status and session file", async () => {
   const h = harness();

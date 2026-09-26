@@ -9,6 +9,16 @@ import { recordedRungPassesHardFilters, routeTask, type ActiveRouter } from "./r
 
 type ProviderConfig = NonNullable<Parameters<ExtensionAPI["registerProvider"]>[1]>;
 
+const RESUME_PINS = Symbol.for("pi-orchestrator.subagents.resume-pins");
+type Pin = { model: string; effort: string };
+type ProcessGlobal = typeof globalThis & { [RESUME_PINS]?: Map<string, Pin> };
+function resumePins(): Map<string, Pin> { return (globalThis as ProcessGlobal)[RESUME_PINS] ??= new Map(); }
+/** A checked resume keeps its original pin without making a new routing decision. */
+export function setResumePin(id: string, pin: Pin): () => void {
+  resumePins().set(id, pin);
+  return () => { resumePins().delete(id); };
+}
+
 export interface AutoProviderDependencies {
   readonly router: () => ActiveRouter | undefined;
   readonly registry: () => ExtensionContext["modelRegistry"];
@@ -78,7 +88,7 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
           if (!sessionId) throw new Error("auto model request has no sessionId");
           const registry = deps.registry();
           if (!registry) throw new Error("auto model has no session model registry");
-          let pin = pins.get(sessionId);
+          let pin = resumePins().get(sessionId) ?? pins.get(sessionId);
           wasPinned = pin !== undefined;
           if (!pin) {
             const router = deps.disabled() ? undefined : deps.router();

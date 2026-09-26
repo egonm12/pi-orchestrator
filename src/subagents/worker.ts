@@ -3,6 +3,8 @@ import { join } from "node:path";
 import { appendRoutingRecord, buildAgentModelRecord } from "../routing/decision-record.ts";
 import { stateDir } from "../router/extension.ts";
 import { markWorkerSession } from "./worker-sessions.ts";
+import type { ResumeWorker } from "./resume.ts";
+import { setResumePin } from "../router/auto-provider.ts";
 import type { ThinkingLevel } from "../models/model-info.ts";
 import {
   createAgentSessionFromServices,
@@ -43,6 +45,7 @@ export interface WorkerResult {
 
 export interface WorkerSetup {
   readonly task: string;
+  readonly resume?: ResumeWorker;
   readonly cwd: string;
   /** The orchestrator's agent dir: its auth.json, models.json, settings and
    *  installed extensions. */
@@ -92,9 +95,11 @@ function errorText(error: unknown): string {
 
 /** Run one worker to its end. Never throws: a failure is a `failed` result. */
 export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
-  const sessionManager = setup.orchestratorSession.getSessionFile() === undefined
-    ? SessionManager.inMemory(setup.cwd)
-    : SessionManager.create(setup.cwd, workerSessionDir(setup.orchestratorSession));
+  const sessionManager = setup.resume
+    ? SessionManager.open(setup.resume.file, workerSessionDir(setup.orchestratorSession), setup.cwd)
+    : setup.orchestratorSession.getSessionFile() === undefined
+      ? SessionManager.inMemory(setup.cwd)
+      : SessionManager.create(setup.cwd, workerSessionDir(setup.orchestratorSession));
   const sessionId = sessionManager.getSessionId();
   const saved = (): string | undefined => {
     const file = sessionManager.getSessionFile();
@@ -116,7 +121,7 @@ export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
         ...(instructions === undefined ? {} : { appendSystemPromptOverride: (base: string[]) => [...base, instructions] }),
       },
     });
-    const { namedModel } = setup;
+    const namedModel = setup.resume?.namedModel ?? setup.namedModel;
     // The provider ends at the first slash; a model id may hold more.
     const slash = namedModel?.model.indexOf("/") ?? -1;
     const [provider, modelId] = namedModel ? [namedModel.model.slice(0, slash), namedModel.model.slice(slash + 1)] : [AUTO_PROVIDER, AUTO_MODEL_ID];
@@ -129,7 +134,7 @@ export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
       services, sessionManager, model, ...(namedModel?.effort === undefined ? {} : { thinkingLevel: namedModel.effort }),
       ...(setup.tools === undefined ? {} : { tools: [...setup.tools] }),
     })).session;
-    if (namedModel) {
+    if (namedModel && !setup.resume) {
       try {
         appendRoutingRecord(join(stateDir(), "routing"), buildAgentModelRecord({
           delegationId: sessionId, agent: namedModel.agent, definitionFile: namedModel.definitionFile,
@@ -155,6 +160,7 @@ export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
   });
   // Before binding, so the extensions see the mark at session_start.
   const unmarkWorkerSession = markWorkerSession(sessionId);
+  const unsetResumePin = setup.resume && !setup.resume.namedModel ? setResumePin(sessionId, setup.resume.pin) : undefined;
   try {
     // Binding starts the extensions: the router extension reads its settings
     // at session_start.
@@ -175,6 +181,7 @@ export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
     setup.signal?.removeEventListener("abort", abort);
     unsubscribe();
     session.dispose();
+    unsetResumePin?.();
     unmarkWorkerSession();
   }
 }

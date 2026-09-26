@@ -23,6 +23,11 @@ export function markWorkerSession(sessionId: string): () => void {
   return () => { workerSessionIds().delete(sessionId); };
 }
 
+/** Whether this process is currently running the delegation. */
+export function isRunningWorkerSession(sessionId: string): boolean {
+  return workerSessionIds().has(sessionId);
+}
+
 /** Whether `ctx` belongs to a session the subagents tool started as a worker. */
 export function isWorkerSession(ctx: Partial<Pick<ExtensionContext, "sessionManager">> | undefined): boolean {
   const sessionId = ctx?.sessionManager?.getSessionId();
