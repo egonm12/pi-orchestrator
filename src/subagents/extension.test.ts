@@ -363,7 +363,7 @@ test("a preserved agent model resumes without a second record and keeps its agen
     assert.equal((resumed.details as SubagentsDetails).results[0]!.status, "completed");
     assert.equal(readRoutingRecords(join(h.stateDir, "routing")).filter((record) => record.recordType === "agent-model").length, 1);
     assert.ok(provider.requests[1]!.systemText.includes("Review carefully."));
-    assert.deepEqual(provider.requests.map((request) => request.tools), [["read"], ["read"]]);
+    assert.deepEqual(provider.requests.map((request) => request.tools), [["read", "report"], ["read", "report"]]);
   } finally { h.cleanup(); }
 });
 
@@ -690,7 +690,7 @@ test("a definition's tools: list narrows the orchestrator's tools and cannot add
 
     const { worker } = await callSubagents(subagents.tool(), main.ctx, "Look around.", "scout");
     assert.equal(worker.status, "completed", JSON.stringify(worker));
-    assert.deepEqual([...(provider.requests[0]?.tools ?? [])].sort(), ["probe", "read"]);
+    assert.deepEqual([...(provider.requests[0]?.tools ?? [])].sort(), ["probe", "read", "report"]);
   } finally { h.cleanup(); }
 });
 
@@ -1179,7 +1179,7 @@ test("a fork with an agent applies its instructions and narrowed tools but not t
     assert.equal(provider.requests[0]?.model, HAIKU);
     assert.equal(provider.requests[0]?.thinkingLevel, "high");
     assert.match(provider.requests[0]!.systemText, /Review carefully/);
-    assert.deepEqual(provider.requests[0]?.tools, ["read"]);
+    assert.deepEqual(provider.requests[0]?.tools, ["read", "report"]);
     assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")).map((record) => record.recordType), ["fork"]);
   } finally { h.cleanup(); }
 });
@@ -1319,12 +1319,12 @@ test("a worker gets the subagents tool only when its agent definition lists it, 
 
     const withoutTool = await callSubagents(tool, main.ctx, "Look around.", "scout");
     assert.equal(withoutTool.worker.status, "completed", JSON.stringify(withoutTool.worker));
-    assert.deepEqual(provider.requests.find((request) => request.sessionId === withoutTool.worker.sessionId)?.tools, ["read"]);
+    assert.deepEqual(provider.requests.find((request) => request.sessionId === withoutTool.worker.sessionId)?.tools, ["read", "report"]);
 
     const { worker } = await callSubagents(tool, main.ctx, `Delegate:${JSON.stringify({ items: [{ task: "Find the config file" }] })}`, "lead");
     assert.equal(worker.status, "completed", JSON.stringify(worker));
     const leadRequests = provider.requests.filter((request) => request.sessionId === worker.sessionId);
-    assert.deepEqual([...(leadRequests[0]?.tools ?? [])].sort(), ["read", "subagents"]);
+    assert.deepEqual([...(leadRequests[0]?.tools ?? [])].sort(), ["read", "report", "subagents"]);
     const nested = provider.requests.filter((request) => request.task === "Find the config file");
     assert.equal(nested.length, 1, "the lead's subagents call started one worker");
     assert.notEqual(nested[0]?.sessionId, worker.sessionId);
@@ -1347,7 +1347,7 @@ test("a nested worker cannot delegate further, and cannot start a background cal
     assert.equal(worker.status, "completed", JSON.stringify(worker));
     const nestedLead = provider.requests.filter((request) => request.task === tooDeep);
     assert.ok(nestedLead.length > 0, "the nested lead ran");
-    assert.deepEqual(nestedLead[0]?.tools, ["read"], "the nested lead has no subagents tool although its definition lists it");
+    assert.deepEqual(nestedLead[0]?.tools, ["read", "report"], "the nested lead has no subagents tool although its definition lists it");
     assert.equal(nestedLead.at(-1)?.toolResults[0]?.isError, true, "its subagents call failed");
     assert.deepEqual(provider.requests.filter((request) => request.task === "Too deep"), [], "no worker started two levels down");
 
@@ -1624,7 +1624,7 @@ test("a fork whose agent definition lists subagents has no subagents tool", asyn
     const result = await tool.execute("fork-call", { items: [{ task: "Lead on", agent: "lead", fork: true }] } as never, undefined, undefined, ctx);
     const worker = (result.details as SubagentsDetails).results[0]!;
     assert.equal(worker.status, "completed", JSON.stringify(worker));
-    assert.deepEqual(provider.requests[0]?.tools, ["read"]);
+    assert.deepEqual(provider.requests[0]?.tools, ["read", "report"]);
   } finally { h.cleanup(); }
 });
 
@@ -1894,6 +1894,110 @@ test("a worker whose agent definition lists subagents_status does not get it", a
     const tool = loadSubagentsTool(installedWithSubagents(provider.extension));
     const { worker } = await callSubagents(tool, orchestrator(h).ctx, "Look around.", "lead");
     assert.equal(worker.status, "completed", JSON.stringify(worker));
-    assert.deepEqual([...(provider.requests[0]?.tools ?? [])].sort(), ["read", "subagents"]);
+    assert.deepEqual([...(provider.requests[0]?.tools ?? [])].sort(), ["read", "report", "subagents"]);
+  } finally { h.cleanup(); }
+});
+
+/** A provider whose worker first calls `report` with `kind` and `text`, then
+ *  replies with the report's tool result: "answer: " and its text, or
+ *  "refused: " and its error. */
+function reportingAnthropic(kind: string, text: string) {
+  return scriptedAnthropic((request) => {
+    const [result] = request.toolResults;
+    if (result) return { text: `${result.isError ? "refused" : "answer"}: ${result.text}` };
+    return { toolCall: { name: "report", arguments: { kind, text } } };
+  });
+}
+
+test("a worker's progress report is shown at once and reaches the orchestrator's next turn without starting one", async () => {
+  const h = harness();
+  try {
+    const provider = reportingAnthropic("progress", "Half way there");
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const shown: string[] = [];
+    let idle = false;
+    const ctx = { ...orchestrator(h).ctx, hasUI: true, ui: { notify: (text: string) => { shown.push(text); } }, isIdle: () => idle } as unknown as ExtensionContext;
+    const { worker } = await callSubagents(subagents.tool(), ctx, "Work and report");
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.match(worker.finalText, /^answer: /, "the report tool returned at once");
+    assert.equal(subagents.messages.length, 1);
+    const { message, options } = subagents.messages[0]!;
+    assert.deepEqual(options, { triggerTurn: false }, "the report waits for the orchestrator's next turn");
+    assert.equal(message.customType, "subagents-report");
+    assert.equal(message.display, true);
+    assert.equal(message.content, `Worker ${worker.sessionId} reports progress:\n\nHalf way there`);
+    assert.deepEqual(shown, [`Worker ${worker.sessionId}: Half way there`], "a busy orchestrator's TUI shows the report at once");
+
+    // An idle orchestrator's session shows the report message itself at once.
+    idle = true;
+    await callSubagents(subagents.tool(), ctx, "Work and report");
+    assert.equal(subagents.messages.length, 2);
+    assert.equal(shown.length, 1);
+  } finally { h.cleanup(); }
+});
+
+test("a background worker's question starts an orchestrator turn and blocks the worker until the subagents_message reply", async () => {
+  const h = harness();
+  try {
+    const provider = reportingAnthropic("question", "Which config file?");
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h).ctx;
+    const start = (await subagents.tool().execute("call-1", { items: [{ task: "Ask first" }], background: true } as never,
+      undefined, undefined, ctx)).details as BackgroundStart;
+    const id = start.delegationIds[0]!;
+    // The orchestrator waits on the call before the worker asks.
+    const waitEnded = assert.rejects(subagents.statusTool().execute("status-1", { id: "call-1", wait: true } as never, undefined, undefined, ctx),
+      new RegExp(`Stopped waiting for background call call-1: its worker ${id} asked a question, which follows\\. ` +
+        "Answer it with subagents_message, then wait again"));
+    await waitFor(() => subagents.messages.length === 1, "the question is in");
+    const { message, options } = subagents.messages[0]!;
+    assert.deepEqual(options, { triggerTurn: true, deliverAs: "steer" }, "a turn when idle, after the current tool call when busy");
+    assert.equal(message.customType, "subagents-report");
+    assert.equal(message.content, `Worker ${id} asks, and waits for the answer:\n\nWhich config file?\n\nAnswer with subagents_message and the id ${id}.`);
+    await waitEnded;
+    await assert.rejects(subagents.statusTool().execute("status-2", { id: "call-1", wait: true } as never, undefined, undefined, ctx),
+      new RegExp(`wait refused: worker ${id} of background call call-1 is waiting for an answer to its question`));
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(provider.requests.length, 1, "the worker waits for the answer");
+    assert.equal(subagents.messages.length, 1, "no completion notice while the worker waits");
+    await subagents.tool("subagents_message").execute("message-1", { id, text: "Use config.json" } as never, undefined, undefined, ctx);
+    await waitFor(() => subagents.messages.length === 2, "the completion notice");
+    const [result] = (subagents.messages[1]!.message.details as NoticeDetails).results;
+    assert.equal(result?.status, "completed", JSON.stringify(result));
+    assert.equal(result?.finalText, "answer: The orchestrator answered: Use config.json");
+  } finally { h.cleanup(); }
+});
+
+test("/subagents stop and an aborted call release a worker blocked on its question", async () => {
+  const h = harness();
+  try {
+    const provider = reportingAnthropic("question", "May I delete the cache?");
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h).ctx;
+    const first = (await subagents.tool().execute("call-1", { items: [{ task: "Ask first" }], background: true } as never,
+      undefined, undefined, ctx)).details as BackgroundStart;
+    await waitFor(() => subagents.messages.length === 1, "the first question is in");
+    await subagents.runCommand("subagents", `stop ${first.delegationIds[0]}`, ctx);
+    await waitFor(() => subagents.messages.length === 2, "the stopped call's notice");
+    assert.deepEqual((subagents.messages[1]!.message.details as NoticeDetails).results.map((result) => result.status), ["aborted"]);
+
+    await subagents.tool().execute("call-2", { items: [{ task: "Ask again" }], background: true } as never, undefined, undefined, ctx);
+    await waitFor(() => subagents.messages.length === 3, "the second question is in");
+    await subagents.shutdownSession(ctx);
+    assert.equal(subagents.messages.length, 4, "shutdown ended the call");
+    assert.deepEqual((subagents.messages[3]!.message.details as NoticeDetails).results.map((result) => result.status), ["aborted"]);
+  } finally { h.cleanup(); }
+});
+
+test("a foreground worker's report tool has no question kind", async () => {
+  const h = harness();
+  try {
+    const provider = reportingAnthropic("question", "Which config file?");
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const { worker } = await callSubagents(subagents.tool(), orchestrator(h).ctx, "Ask first");
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.match(worker.finalText, /^refused: .*kind/s, worker.finalText);
+    assert.deepEqual(subagents.messages, [], "the orchestrator got no question");
   } finally { h.cleanup(); }
 });

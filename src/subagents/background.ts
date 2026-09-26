@@ -77,6 +77,14 @@ export interface BackgroundCallHandle {
   readonly onActivity: readonly ((activity: WorkerActivity) => void)[];
 }
 
+/** A pending `subagents_status` wait on a call. */
+interface Waiter {
+  /** Hands the wait the call's notice, which the session then does not get. */
+  readonly deliver: (notice: CompletionNotice) => void;
+  /** Ends the wait early with `reason`; the call runs on. */
+  readonly interrupt: (reason: string) => void;
+}
+
 /** An item's worker activity and when its worker started and ended. */
 interface ItemActivity {
   readonly activity: WorkerActivity;
@@ -94,8 +102,10 @@ interface RunningCall {
   /** `activities[i]`: item i's worker activity, once its worker started. */
   readonly activities: (ItemActivity | undefined)[];
   /** The pending `subagents_status` waits, which get the notice instead of the session. */
-  readonly waiters: Set<(notice: CompletionNotice) => void>;
+  readonly waiters: Set<Waiter>;
 }
+
+const ANSWER_HINT = "Answer it with subagents_message, then wait again; the call runs on.";
 
 const USAGE = "Usage: /subagents [list], or /subagents stop <call id | delegation id | all>";
 
@@ -168,7 +178,7 @@ export class BackgroundCalls {
       const tracked = activities[index];
       activities[index] = { activity, startedAt: tracked?.startedAt ?? now, ...(activity.ended ? { endedAt: tracked?.endedAt ?? now } : {}) };
     });
-    const waiters = new Set<(notice: CompletionNotice) => void>();
+    const waiters = new Set<Waiter>();
     const callController = new AbortController();
     const itemControllers = delegationIds.map(() => new AbortController());
     const itemSignals = itemControllers.map((controller) => AbortSignal.any([callController.signal, controller.signal]));
@@ -184,7 +194,7 @@ export class BackgroundCalls {
         this.#questions.delete(id);
       }
       if (waiters.size === 0) this.#deliver(notice, !this.#shuttingDown);
-      for (const waiter of waiters) waiter(notice);
+      for (const waiter of waiters) waiter.deliver(notice);
     }).catch((error: unknown) => {
       process.stderr.write(`pi-orchestrator subagents: the completion notice of background call ${callId} was not delivered: ${errorText(error)}\n`);
     });
@@ -220,20 +230,28 @@ export class BackgroundCalls {
   wait(id: string, signal?: AbortSignal): Promise<CompletionNotice> {
     const running = this.#running.get(id);
     if (running === undefined) {
-      const inCall = [...this.#running.values()].find((candidate) => candidate.delegationIds.includes(id));
+      const inCall = this.#callWith(id);
       throw new Error(inCall === undefined
         ? `wait needs a background call id, and no running background call has the id ${id}. A finished call's results are in its completion notice.`
         : `wait needs a background call id; ${id} is a worker of background call ${inCall.call.callId}.`);
     }
     const { callId } = running.call;
+    // A wait would hold the orchestrator's turn, so the question could never reach it.
+    const asking = running.delegationIds.find((delegationId) => this.#questions.has(delegationId));
+    if (asking !== undefined) throw new Error(`wait refused: worker ${asking} of background call ${callId} is waiting for an answer to its question. ${ANSWER_HINT}`);
     return new Promise((resolve, reject) => {
-      const stop = () => {
-        running.waiters.delete(waiter);
-        reject(new Error(`Stopped waiting for background call ${callId}; its workers run on, and its completion notice follows.`));
-      };
-      const waiter = (notice: CompletionNotice) => {
+      const interrupt = (reason: string) => {
         signal?.removeEventListener("abort", stop);
-        resolve(notice);
+        running.waiters.delete(waiter);
+        reject(new Error(reason));
+      };
+      const stop = () => interrupt(`Stopped waiting for background call ${callId}; its workers run on, and its completion notice follows.`);
+      const waiter: Waiter = {
+        deliver: (notice) => {
+          signal?.removeEventListener("abort", stop);
+          resolve(notice);
+        },
+        interrupt,
       };
       if (signal?.aborted) return stop();
       running.waiters.add(waiter);
@@ -247,16 +265,36 @@ export class BackgroundCalls {
     return () => { if (this.#receivers.get(id) === receive) this.#receivers.delete(id); };
   }
 
-  /** A blocking report question uses this to receive the next message directly:
-   *  queuing it in pi would deadlock until the report tool returned. */
-  registerQuestion(id: string, answer: (text: string) => void): () => void {
-    this.#questions.set(id, answer);
-    return () => { if (this.#questions.get(id) === answer) this.#questions.delete(id); };
+  /** A running background worker's blocking report question. Resolves with the
+   *  next subagents_message to the worker, which would otherwise be queued in pi
+   *  and deadlock until the report tool returned. Ends the pending waits on the
+   *  worker's call, which would hold the orchestrator's turn. Rejects when
+   *  `signal` fires: an abort or a `/subagents stop`. */
+  question(id: string, signal: AbortSignal | undefined): Promise<string> {
+    const running = this.#callWith(id);
+    if (running === undefined) return Promise.reject(new Error(`no running background worker has the delegation id ${id}`));
+    if (this.#questions.has(id)) return Promise.reject(new Error("ask one question at a time: an earlier question is still waiting for its answer"));
+    return new Promise((resolve, reject) => {
+      const stop = () => {
+        if (this.#questions.get(id) === answer) this.#questions.delete(id);
+        reject(new Error("The question was not answered: the worker was stopped."));
+      };
+      const answer = (text: string) => {
+        signal?.removeEventListener("abort", stop);
+        resolve(text);
+      };
+      if (signal?.aborted) return stop();
+      this.#questions.set(id, answer);
+      signal?.addEventListener("abort", stop, { once: true });
+      for (const waiter of running.waiters) {
+        waiter.interrupt(`Stopped waiting for background call ${running.call.callId}: its worker ${id} asked a question, which follows. ${ANSWER_HINT}`);
+      }
+    });
   }
 
   /** Send to one active background worker, not to a call, queued item, or foreground worker. */
   async message(id: string, text: string, mode: BackgroundMessageMode): Promise<void> {
-    const running = [...this.#running.values()].find(({ delegationIds }) => delegationIds.includes(id));
+    const running = this.#callWith(id);
     const index = running?.delegationIds.indexOf(id) ?? -1;
     const receive = this.#receivers.get(id);
     if (!running || index < 0 || running.call.progress[index]?.status !== "running" || !receive) {
@@ -296,6 +334,11 @@ export class BackgroundCalls {
         `  ${delegationIds[index]} · ${item.agent ?? "worker"} · ${stateText(item)} · ${shortTask(item.task)}`);
       return [`Background call ${call.callId}: ${done}/${call.progress.length} workers done`, ...lines].join("\n");
     }).join("\n\n");
+  }
+
+  /** The running call with the worker `delegationId`, if any. */
+  #callWith(delegationId: string): RunningCall | undefined {
+    return [...this.#running.values()].find(({ delegationIds }) => delegationIds.includes(delegationId));
   }
 
   #stop(id: string): string {

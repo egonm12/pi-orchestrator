@@ -5,6 +5,7 @@ import { stateDir } from "../router/extension.ts";
 import { markWorkerSession } from "./worker-sessions.ts";
 import type { ResumeWorker } from "./resume.ts";
 import type { BackgroundMessageMode } from "./background.ts";
+import { REPORT_TOOL, reportExtension, type WorkerReports } from "./report.ts";
 import { setResumePin } from "../router/auto-provider.ts";
 import type { ThinkingLevel } from "../models/model-info.ts";
 import {
@@ -88,6 +89,9 @@ export interface WorkerSetup {
   readonly onMessageReady?: (receive: (text: string, mode: BackgroundMessageMode) => Promise<void>) => () => void;
   /** Called when the worker starts, as its turns and text move on, and once more when it ends. */
   readonly onActivity?: (activity: WorkerActivity) => void;
+  /** Where the worker's `report` tool sends its reports. The tool is added to
+   *  a `tools` list, since every worker gets it (ADR 0008). */
+  readonly reports?: WorkerReports;
 }
 
 /** What a worker has done so far, for `subagents_status`. */
@@ -173,14 +177,15 @@ async function runWorkerSession(setup: WorkerSetup, activity: ActivitySoFar, rep
     ? { status: "aborted", sessionId, sessionFile: saved(), finalText: "" }
     : { status: "failed", sessionId, sessionFile: saved(), finalText: "", error };
 
-  const { instructions } = setup;
+  const { instructions, reports } = setup;
+  const tools = setup.tools === undefined || reports === undefined ? setup.tools : [...setup.tools, REPORT_TOOL];
   let session: Awaited<ReturnType<typeof createAgentSessionFromServices>>["session"];
   try {
     const services = await createAgentSessionServices({
       cwd: setup.cwd,
       agentDir: setup.agentDir,
       resourceLoaderOptions: {
-        extensionFactories: [...(setup.extensionFactories ?? [])],
+        extensionFactories: [...(setup.extensionFactories ?? []), ...(reports === undefined ? [] : [reportExtension(reports)])],
         ...(setup.tools?.includes(SUBAGENTS_TOOL) ? {} : { extensionsOverride: withoutSubagentsTool }),
         ...(instructions === undefined ? {} : { appendSystemPromptOverride: (base: string[]) => [...base, instructions] }),
       },
@@ -198,7 +203,7 @@ async function runWorkerSession(setup: WorkerSetup, activity: ActivitySoFar, rep
     }
     session = (await createAgentSessionFromServices({
       services, sessionManager, model, ...((fork?.effort ?? namedModel?.effort) === undefined ? {} : { thinkingLevel: fork?.effort ?? namedModel?.effort }),
-      ...(setup.tools === undefined ? {} : { tools: [...setup.tools] }),
+      ...(tools === undefined ? {} : { tools: [...tools] }),
     })).session;
     // A resume writes no new record: the delegation keeps its original one.
     if ((fork || namedModel) && !setup.resume) {
