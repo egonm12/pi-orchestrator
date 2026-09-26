@@ -16,6 +16,7 @@ import { createRouterExtension } from "../router/extension.ts";
 import personalGuard from "../guard/extension.ts";
 import { createSubagentsExtension, MAX_TEXT_BYTES, type SubagentsDetails, type SubagentsProgressDetails } from "./extension.ts";
 import { markWorkerSession } from "./worker-sessions.ts";
+import { workerBoard, type BoardWorker } from "./worker-board.ts";
 
 // The subagents extension as pi loads it. A fake ExtensionAPI records the
 // registered tool; a test calls its `execute` as pi does. The worker is a real
@@ -330,6 +331,7 @@ test("a finished fork resumes on its fork record's model and effort, and a resum
     assert.deepEqual(provider.requests.map((request) => [request.sessionId, request.model, request.thinkingLevel]),
       [[fork.sessionId, HAIKU, "high"], [fork.sessionId, HAIKU, "high"]]);
     assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")).map((record) => record.recordType), ["fork"], "a resume writes no record");
+    assert.deepEqual(workerBoard().byDelegation(fork.sessionId!)?.model, { kind: "fork", model: HAIKU, effort: "high" }, "the worker board shows the resumed fork's fixed model");
   } finally { h.cleanup(); }
 });
 
@@ -1999,5 +2001,127 @@ test("a foreground worker's report tool has no question kind", async () => {
     assert.equal(worker.status, "completed", JSON.stringify(worker));
     assert.match(worker.finalText, /^refused: .*kind/s, worker.finalText);
     assert.deepEqual(subagents.messages, [], "the orchestrator got no question");
+  } finally { h.cleanup(); }
+});
+
+// The worker board (worker-board.ts) as the subagents extension feeds it from
+// real workers. The board is the process's, so each test starts the
+// orchestrator's session first, which gives it an empty board.
+
+/** The board's workers without their changing ids, times and counters. */
+function boardShape(workers: readonly BoardWorker[]) {
+  return workers.map(({ task, agent, background, state, parentDelegationId, model }) => ({
+    task, ...(agent === undefined ? {} : { agent }), background, state,
+    ...(parentDelegationId === undefined ? {} : { parentDelegationId }),
+    model: model.kind === "routed" ? { kind: "routed", rungs: model.rungs.map(({ model: rung, effort, escalation }) => ({ model: rung, effort, ...(escalation ? { escalation } : {}) })) } : model,
+  }));
+}
+
+test("the worker board shows a call's workers and a nested worker under its parent delegation, each with the rung that served it and its end state", async () => {
+  const h = harness();
+  try {
+    writeAgentDefinition(join(h.agentDir, "agents"), "lead.md", { name: "lead", description: "Delegates", tools: "read, subagents" }, "Split the work.");
+    const provider = scriptedAnthropic(delegatingScript);
+    const subagents = loadSubagents(installedWithSubagents(provider.extension));
+    const main = orchestrator(h);
+    await subagents.startSession(main.ctx);
+    const task = `Delegate:${JSON.stringify({ items: [{ task: "Find the config file" }] })}`;
+    const { worker } = await callSubagents(subagents.tool(), main.ctx, task, "lead");
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+
+    const workers = workerBoard().workers();
+    const haiku = { kind: "routed", rungs: [{ model: HAIKU, effort: "low" }] };
+    assert.deepEqual(boardShape(workers), [
+      { task, agent: "lead", background: false, state: "completed", model: haiku },
+      { task: "Find the config file", background: false, state: "completed", parentDelegationId: worker.sessionId, model: haiku },
+    ]);
+    const [lead, nested] = workers;
+    assert.equal(lead!.delegationId, worker.sessionId);
+    assert.equal(lead!.sessionFile, worker.sessionFile);
+    assert.equal(nested!.parentId, lead!.id);
+    assert.equal(lead!.turns, 2, "the delegating turn and the reply");
+    assert.equal(nested!.turns, 1);
+    assert.equal(lead!.text, worker.finalText);
+    assert.ok(lead!.endedAt !== undefined && lead!.startedAt !== undefined && lead!.endedAt >= lead!.startedAt);
+  } finally { h.cleanup(); }
+});
+
+test("the worker board follows items through the queue: queued, routing, running on its rung, then aborted, a queued item included", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { maxParallel: 1 } } });
+  const pending: (() => void)[] = [];
+  try {
+    const provider = fakeAnthropic("done", (finish) => pending.push(finish));
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    await subagents.startSession(main.ctx);
+    const seen: string[] = [];
+    const stop = workerBoard().subscribe((changed) => {
+      if (changed?.task === "Item 1") seen.push(`${changed.state} ${changed.model.kind}`);
+    });
+    const controller = new AbortController();
+    const call = subagents.tool().execute("call-1", { items: [{ task: "Item 1" }, { task: "Item 2" }] } as never, controller.signal, undefined, main.ctx);
+    await waitFor(() => pending.length === 1, "the first worker's request is in");
+    assert.deepEqual(boardShape(workerBoard().workers()), [
+      { task: "Item 1", background: false, state: "running", model: { kind: "routed", rungs: [{ model: HAIKU, effort: "low" }] } },
+      { task: "Item 2", background: false, state: "queued", model: { kind: "routing" } },
+    ]);
+    controller.abort();
+    await call;
+    stop();
+    assert.deepEqual(workerBoard().workers().map((worker) => worker.state), ["aborted", "aborted"]);
+    assert.equal(workerBoard().workers()[1]!.startedAt, undefined, "the queued item never started");
+    assert.deepEqual([...new Set(seen)].slice(0, 3), ["queued routing", "running routing", "running routed"], "routing until the first request");
+  } finally {
+    for (const finish of pending) finish();
+    h.cleanup();
+  }
+});
+
+test("the worker board shows a background worker asking while its question waits, then completed", async () => {
+  const h = harness();
+  try {
+    const provider = reportingAnthropic("question", "Which config file?");
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    await subagents.startSession(main.ctx);
+    const start = (await subagents.tool().execute("call-1", { items: [{ task: "Ask first" }], background: true } as never,
+      undefined, undefined, main.ctx)).details as BackgroundStart;
+    const id = start.delegationIds[0]!;
+    await waitFor(() => subagents.messages.length === 1, "the question is in");
+    const asking = workerBoard().byDelegation(id);
+    assert.equal(asking?.state, "asking");
+    assert.equal(asking?.background, true);
+    assert.equal(asking?.callId, "call-1");
+    await subagents.tool("subagents_message").execute("message-1", { id, text: "Use config.json" } as never, undefined, undefined, main.ctx);
+    await waitFor(() => subagents.messages.length === 2, "the completion notice");
+    assert.equal(workerBoard().byDelegation(id)?.state, "completed");
+  } finally { h.cleanup(); }
+});
+
+test("the worker board marks an escalated rung, and shows a fork's and a preserved agent's fixed model", async () => {
+  const sonnet = "anthropic/claude-sonnet-5";
+  // The catalog has no Sonnet, so the hard filters empty the mechanical tier and the task moves up to standard.
+  const h = harness({ orchestrator: {
+    routing: { ...ROUTING, tiers: { mechanical: [`${sonnet}:low`], standard: [RUNG], elevated: [RUNG], critical: [RUNG] } },
+    subagents: { agentDefinitionModel: { use: "preserve" } },
+  } });
+  try {
+    writeAgentDefinition(join(h.agentDir, "agents"), "scout.md", { name: "scout", description: "Scouts", model: HAIKU, thinking: "high" }, "Find files.");
+    const provider = fakeAnthropic("done", undefined, ["claude-haiku-4-5", "claude-sonnet-5"]);
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const parent = SessionManager.inMemory(h.projectDir);
+    parent.appendMessage({ role: "user", content: "Earlier turn", timestamp: Date.now() });
+    parent.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "subagents", arguments: {} }], timestamp: Date.now() } as never);
+    const ctx = { cwd: h.projectDir, hasUI: false, sessionManager: parent,
+      model: { provider: "anthropic", id: "claude-haiku-4-5" }, thinkingLevel: "medium" } as unknown as ExtensionContext;
+    await subagents.startSession(ctx);
+    const result = await subagents.tool().execute("call-1", { items: [{ task: "Routed" }, { task: "Forked", fork: true }, { task: "Scout", agent: "scout" }] } as never,
+      undefined, undefined, ctx);
+    assert.deepEqual((result.details as SubagentsDetails).results.map((worker) => worker.status), ["completed", "completed", "completed"]);
+    assert.deepEqual(boardShape(workerBoard().workers()).map((worker) => worker.model), [
+      { kind: "routed", rungs: [{ model: HAIKU, effort: "low", escalation: { from: "mechanical", to: "standard" } }] },
+      { kind: "fork", model: HAIKU, effort: "medium" },
+      { kind: "preserved", model: HAIKU, effort: "high" },
+    ]);
   } finally { h.cleanup(); }
 });

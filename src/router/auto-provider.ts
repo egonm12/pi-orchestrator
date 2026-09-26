@@ -7,6 +7,8 @@ import { autoStream } from "./auto-stream.ts";
 import { ROUTER_PREFIX } from "./prefix.ts";
 import { recordedRungPassesHardFilters, routeTask, type ActiveRouter } from "./route-task.ts";
 import { parentDelegationOf } from "../subagents/worker-sessions.ts";
+import { publishServedRung, type RungEscalation } from "./served-rungs.ts";
+import type { RiskTier } from "../routing/classifier.ts";
 
 type ProviderConfig = NonNullable<Parameters<ExtensionAPI["registerProvider"]>[1]>;
 
@@ -27,6 +29,13 @@ export interface AutoProviderDependencies {
   readonly banLists: () => BanLists;
   readonly disabled: () => boolean;
   readonly disable: (error: unknown) => void;
+}
+
+/** A pin and, when its routing decision escalated, the tiers it moved between. */
+type ServedPin = Pin & { readonly escalation?: RungEscalation };
+
+function escalationOf(route: { readonly startedAtTier: RiskTier; readonly tier: RiskTier }): { escalation?: RungEscalation } {
+  return route.startedAtTier === route.tier ? {} : { escalation: { from: route.startedAtTier, to: route.tier } };
 }
 
 function contentText(content: string | readonly { type: string; text?: string }[]): string {
@@ -73,7 +82,7 @@ function sessionPin(banLists: BanLists): { model: string; effort: string } {
 }
 
 export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConfig {
-  const pins = new Map<string, { model: string; effort: string }>();
+  const pins = new Map<string, ServedPin>();
   return {
     name: "Orchestrator auto", baseUrl: "http://localhost/unused", apiKey: "unused", api: "orchestrator-auto" as never,
     models: [{ id: "auto", name: "Orchestrator auto", reasoning: true, input: ["text", "image"],
@@ -89,7 +98,7 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
           if (!sessionId) throw new Error("auto model request has no sessionId");
           const registry = deps.registry();
           if (!registry) throw new Error("auto model has no session model registry");
-          let pin = resumePins().get(sessionId) ?? pins.get(sessionId);
+          let pin: ServedPin | undefined = resumePins().get(sessionId) ?? pins.get(sessionId);
           wasPinned = pin !== undefined;
           if (!pin) {
             const router = deps.disabled() ? undefined : deps.router();
@@ -102,12 +111,12 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
                 if (latest?.mode === "live" && latest.route.outcome === "chosen" &&
                   (latest.ranOn === undefined || latest.ranOn === `${latest.route.rung.model}:${latest.route.rung.effort}`) &&
                   recordedRungPassesHardFilters(router, latest.route.rung, taskText, at)) {
-                  pin = { model: latest.route.rung.model, effort: latest.route.rung.effort };
+                  pin = { model: latest.route.rung.model, effort: latest.route.rung.effort, ...escalationOf(latest.route) };
                 } else {
                   const { classification, route } = await routeTask(router, taskText, agentRole, at);
                   pin = router.mode === "shadow" || !route.ok
                     ? sessionPin(router.banLists)
-                    : { model: route.rung.model, effort: route.rung.effort };
+                    : { model: route.rung.model, effort: route.rung.effort, ...escalationOf(route) };
                   const ranOn = `${pin.model}:${pin.effort}`;
                   const parentDelegationId = parentDelegationOf(sessionId);
                   const common = { delegationId: sessionId, at, taskText, agentRole, classification, tierMap: router.tierMap, route, ranOn,
@@ -129,6 +138,8 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
           const slash = pin.model.indexOf("/");
           const rung = registry.find(pin.model.slice(0, slash), pin.model.slice(slash + 1));
           if (!rung) throw new Error(`pinned rung ${pin.model} is missing from the session model registry`);
+          // The worker board shows the rung, which the relabelled replies below never name.
+          publishServedRung({ delegationId: sessionId, model: pin.model, effort: pin.effort, ...(pin.escalation ? { escalation: pin.escalation } : {}) });
           // The rung sets the effort; a caller's thinking level never reaches it (ADR 0006).
           const { apiKey: _apiKey, headers: _headers, reasoning: _reasoning, ...rest } = options ?? {};
           const inward = { ...context, messages: context.messages.map((message) =>

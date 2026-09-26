@@ -8,6 +8,7 @@ import type { BackgroundMessageMode } from "./background.ts";
 import { REPORT_TOOL, reportExtension, type WorkerReports } from "./report.ts";
 import { setResumePin } from "../router/auto-provider.ts";
 import type { ThinkingLevel } from "../models/model-info.ts";
+import type { WorkerSession } from "./worker-board.ts";
 import {
   createAgentSessionFromServices,
   createAgentSessionServices,
@@ -87,6 +88,9 @@ export interface WorkerSetup {
   readonly onTool?: (tool: string | undefined) => void;
   /** Registers this running background session as a message recipient. */
   readonly onMessageReady?: (receive: (text: string, mode: BackgroundMessageMode) => Promise<void>) => () => void;
+  /** Called once the worker's session exists, before its first request: its
+   *  delegation id, session file, messages and events, for the worker board. */
+  readonly onSession?: (session: WorkerSession) => void;
   /** Called when the worker starts, as its turns and text move on, and once more when it ends. */
   readonly onActivity?: (activity: WorkerActivity) => void;
   /** Where the worker's `report` tool sends its reports. The tool is added to
@@ -225,6 +229,10 @@ async function runWorkerSession(setup: WorkerSetup, activity: ActivitySoFar, rep
     return failed(errorText(error));
   }
 
+  try {
+    setup.onSession?.({ sessionId, sessionFile: sessionManager.getSessionFile(), effort: session.thinkingLevel,
+      messages: () => session.messages, subscribe: (listener) => session.subscribe(listener) });
+  } catch { /* An observer must not fail the worker. */ }
   const abort = () => { void session.abort(); };
   const runningTools = new Map<string, string>();
   const unsubscribe = session.subscribe((event) => {
