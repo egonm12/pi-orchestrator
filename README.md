@@ -67,6 +67,10 @@ With `"background": true` next to `items`, the call returns at once with its cal
 
 `orchestrator.subagents.maxBackgroundWorkers` (default 8) caps the background workers, queued or running, across the session's background calls; a call that would exceed it is refused with the reason, and starts no worker. Ctrl+C leaves background workers running. The `/subagents` command lists each running background call with its workers' delegation ids and states, and `/subagents stop <id>` stops one: a call id stops the whole call (running workers abort, queued ones are not started), a delegation id stops that worker alone, and `all` stops every call. A stopped call still sends its notice. When the orchestrator's session ends, its background workers are aborted, and each call's notice, with status `aborted`, is recorded in the session without starting a turn. A worker's own `subagents` call cannot be background.
 
+### Messages
+
+Use `subagents_message({ "id": "<delegation id>", "text": "Check this case", "mode": "steer" })` to message one running background worker. `mode` defaults to `"steer"`, delivered after its current tool call and before the next model request. `"followUp"` is delivered when the worker would otherwise stop. The same tool answers a worker's `report` question: its next message unblocks the waiting question. Call ids, queued or finished workers, foreground workers and unknown ids are refused. Workers cannot use `subagents_message`.
+
 ### Status and wait
 
 The `subagents_status` tool, `{ "id"?: string, "wait"?: boolean }`, shows the orchestrator its session's running background calls:

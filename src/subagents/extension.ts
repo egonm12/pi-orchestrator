@@ -7,6 +7,7 @@ import { THINKING_LEVELS, splitKnownThinkingSuffix, type ThinkingLevel } from ".
 import { agentDefinitionDirs, agentDefinitionListing, loadAgentDefinitions, resolveAgent } from "./agent-definitions.ts";
 import { callingDelegation } from "./nested-delegation.ts";
 import { BackgroundCalls, type BackgroundCallResult } from "./background.ts";
+import { registerSubagentsMessageTool } from "./message.ts";
 import { renderSubagentsCall, renderSubagentsResult } from "./render.ts";
 import { forkSession } from "./fork-session.ts";
 import { prepareResume, saveWorkerOutcome } from "./resume.ts";
@@ -251,6 +252,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
                   signal: itemSignals?.[index] ?? callSignal, extensionFactories: deps.workerExtensions, instructions: prepared.instructions, tools: prepared.tools,
                   onActivity: backgroundCall?.onActivity[index],
                   onTool: (tool) => showProgress(index, { ...item, status: "running", ...(tool === undefined ? {} : { tool }) }),
+                  ...(backgroundCall === undefined ? {} : { onMessageReady: (receive) => backgroundCalls.registerWorker(backgroundCall.delegationIds[index]!, receive) }),
                 });
                 saveWorkerOutcome(worker.sessionFile, worker.status);
                 results[index] = { ...item, ...worker, finalText: cutText(worker.finalText, worker.sessionFile) };
@@ -319,6 +321,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               ...(parentDelegationId === undefined ? {} : { parentDelegationId }),
               onActivity: backgroundCall?.onActivity[index],
               onTool: (tool) => showProgress(index, { ...item, ...workerModel, status: "running", ...(tool === undefined ? {} : { tool }) }),
+              ...(backgroundCall === undefined ? {} : { onMessageReady: (receive) => backgroundCalls.registerWorker(backgroundCall.delegationIds[index]!, receive) }),
             });
             saveWorkerOutcome(worker.sessionFile, worker.status, { instructions: resolution.instructions, tools: resolution.tools });
             results[index] = { ...item, ...workerModel, ...worker, finalText: cutText(worker.finalText, worker.sessionFile) };
@@ -357,6 +360,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
     // out by its tool. The listing of agent definitions follows at session start,
     // when the project's folder is known.
     registerSubagentsTool(DESCRIPTION);
+    registerSubagentsMessageTool(pi, backgroundCalls);
     pi.registerCommand("subagents", {
       description: "List this session's background subagents calls, or stop one: /subagents stop <call id | delegation id | all>",
       handler: async (args, ctx) => { ctx.ui.notify(backgroundCalls.command(args), "info"); },

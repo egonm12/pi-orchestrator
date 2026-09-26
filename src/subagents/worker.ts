@@ -4,6 +4,7 @@ import { appendRoutingRecord, buildAgentModelRecord, buildForkRecord } from "../
 import { stateDir } from "../router/extension.ts";
 import { markWorkerSession } from "./worker-sessions.ts";
 import type { ResumeWorker } from "./resume.ts";
+import type { BackgroundMessageMode } from "./background.ts";
 import { setResumePin } from "../router/auto-provider.ts";
 import type { ThinkingLevel } from "../models/model-info.ts";
 import {
@@ -83,6 +84,8 @@ export interface WorkerSetup {
   /** Called with a tool's name when the worker starts running it, and with
    *  the name of a tool still running, or `undefined`, when one ends. */
   readonly onTool?: (tool: string | undefined) => void;
+  /** Registers this running background session as a message recipient. */
+  readonly onMessageReady?: (receive: (text: string, mode: BackgroundMessageMode) => Promise<void>) => () => void;
   /** Called when the worker starts, as its turns and text move on, and once more when it ends. */
   readonly onActivity?: (activity: WorkerActivity) => void;
 }
@@ -241,12 +244,17 @@ async function runWorkerSession(setup: WorkerSetup, activity: ActivitySoFar, rep
   // Before binding, so the extensions see the mark at session_start.
   const unmarkWorkerSession = markWorkerSession(sessionId, setup.parentDelegationId);
   const unsetResumePin = setup.resume && !setup.resume.namedModel ? setResumePin(sessionId, setup.resume.pin) : undefined;
+  let unregisterMessage: (() => void) | undefined;
   try {
     // Binding starts the extensions: the router extension reads its settings
     // at session_start.
     await session.bindExtensions({});
     setup.signal?.addEventListener("abort", abort, { once: true });
     if (setup.signal?.aborted) return { status: "aborted", sessionId, sessionFile: saved(), finalText: "" };
+    unregisterMessage = setup.onMessageReady?.((text, mode) => {
+      if (!session.isStreaming) throw new Error("subagents_message: the background worker is no longer running");
+      return session[mode](text);
+    });
     await session.prompt(setup.task);
     const replies = session.messages.filter((message) => (message as Reply).role === "assistant") as Reply[];
     const last = replies.at(-1);
@@ -258,6 +266,7 @@ async function runWorkerSession(setup: WorkerSetup, activity: ActivitySoFar, rep
   } catch (error) {
     return failed(errorText(error));
   } finally {
+    unregisterMessage?.();
     setup.signal?.removeEventListener("abort", abort);
     unsubscribe();
     session.dispose();

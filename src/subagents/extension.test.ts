@@ -164,7 +164,7 @@ function routerExtension(modelIds: readonly string[] = [HAIKU]): InlineExtension
 type Tool = Parameters<ExtensionAPI["registerTool"]>[0];
 
 /** The orchestrator's active tools in these tests: pi's default built-ins, the probe tool and subagents. */
-const ORCHESTRATOR_TOOLS = ["read", "bash", "edit", "write", "probe", "subagents", "subagents_status"];
+const ORCHESTRATOR_TOOLS = ["read", "bash", "edit", "write", "probe", "subagents", "subagents_status", "subagents_message"];
 
 /** A message the extension sent into the orchestrator's session, with its delivery options. */
 interface SentMessage {
@@ -173,8 +173,8 @@ interface SentMessage {
 }
 
 interface LoadedSubagents {
-  /** The subagents tool as last registered. */
-  tool(): Tool;
+  /** A registered tool by name, as pi exposes it to the orchestrator. */
+  tool(name?: string): Tool;
   /** The subagents_status tool. */
   statusTool(): Tool;
   /** Runs the extension's session_start handlers, as pi does when the orchestrator's session starts. */
@@ -206,10 +206,10 @@ function loadSubagents(workerExtensions: readonly InlineExtension[]): LoadedSuba
     for (const handler of handlers.get(event.type) ?? []) await handler(event, ctx);
   };
   return {
-    tool() {
-      const subagentsTools = tools.filter((tool) => tool.name === "subagents");
-      assert.ok(subagentsTools.length > 0, JSON.stringify(tools.map((tool) => tool.name)));
-      return subagentsTools.at(-1)!;
+    tool(name = "subagents") {
+      const found = tools.filter((tool) => tool.name === name).at(-1);
+      assert.ok(found, `tool ${name} is registered`);
+      return found;
     },
     statusTool() {
       const statusTool = tools.find((tool) => tool.name === "subagents_status");
@@ -1239,6 +1239,7 @@ interface ScriptedRequest {
   readonly tools: readonly string[];
   /** The tool results in the request's context, in order. */
   readonly toolResults: readonly { readonly text: string; readonly isError: boolean }[];
+  readonly userMessages: readonly string[];
 }
 
 /** What a scripted provider answers: a final text, or one tool call, which a text may come before. */
@@ -1265,6 +1266,7 @@ function scriptedAnthropic(script: (request: ScriptedRequest) => ScriptedReply) 
       const request: ScriptedRequest = {
         sessionId: options?.sessionId, task: firstUser ? text(firstUser.content) : "", tools: [...tools],
         toolResults: context.messages.flatMap((message) => message.role === "toolResult" ? [{ text: text(message.content), isError: message.isError }] : []),
+        userMessages: context.messages.flatMap((message) => message.role === "user" ? [text(message.content)] : []),
       };
       requests.push(request);
       const reply = script(request);
@@ -1309,7 +1311,7 @@ test("a worker gets the subagents tool only when its agent definition lists it, 
   const h = harness();
   try {
     const agents = join(h.agentDir, "agents");
-    writeAgentDefinition(agents, "lead.md", { name: "lead", description: "Delegates", tools: "read, subagents" }, "Split the work.");
+    writeAgentDefinition(agents, "lead.md", { name: "lead", description: "Delegates", tools: "read, subagents, subagents_message" }, "Split the work.");
     writeAgentDefinition(agents, "scout.md", { name: "scout", description: "Reads only", tools: "read" }, "Read, never write.");
     const provider = scriptedAnthropic(delegatingScript);
     const tool = loadSubagentsTool(installedWithSubagents(provider.extension));
@@ -1440,6 +1442,100 @@ test("a background call returns its call id and delegation ids at once, and one 
         assert.ok(text.includes(`Worker ${result.sessionId} completed.\nSession file: ${result.sessionFile}\n\ndone`), `the foreground result text: ${text}`);
       }
     }
+  } finally {
+    for (const finish of pending) finish();
+    h.cleanup();
+  }
+});
+
+test("subagents_message delivers steer and followUp to a running background worker", async () => {
+  const h = harness();
+  const pending: (() => void)[] = [];
+  try {
+    const provider = fakeAnthropic("done", (finish) => {
+      if (provider.requests.length === 1 || provider.requests.length === 3) pending.push(finish);
+      else finish();
+    });
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h).ctx;
+    for (const [index, mode] of ["steer", "followUp"].entries()) {
+      const start = (await subagents.tool().execute(`call-${index}`, { items: [{ task: `Task ${index}` }], background: true } as never,
+        undefined, undefined, ctx)).details as BackgroundStart;
+      await waitFor(() => pending.length === 1, "the worker's current request");
+      const response = await subagents.tool("subagents_message").execute(`message-${index}`,
+        { id: start.delegationIds[0], text: `${mode} instruction`, ...(index === 0 ? {} : { mode }) } as never, undefined, undefined, ctx);
+      assert.match(toolText(response), new RegExp(mode));
+      pending.shift()!();
+      await waitFor(() => subagents.messages.length === index + 1, "the worker's completion notice");
+      assert.equal(provider.requests[index * 2 + 1]?.sessionId, start.delegationIds[0]);
+      assert.match(provider.requests[index * 2 + 1]!.messages.join(" "), new RegExp(`${mode} instruction`));
+      assert.equal((subagents.messages[index]!.message.details as NoticeDetails).results[0]?.status, "completed");
+    }
+  } finally {
+    for (const finish of pending) finish();
+    h.cleanup();
+  }
+});
+
+test("steer waits for the current tool call and followUp waits until the worker would stop", async () => {
+  const h = harness();
+  let releaseTool!: () => void;
+  let toolStarted!: () => void;
+  const toolRunning = new Promise<void>((resolve) => { toolStarted = resolve; });
+  const toolFinished = new Promise<void>((resolve) => { releaseTool = resolve; });
+  try {
+    const probe: InlineExtension = { name: "blocking-probe", factory: (pi) => pi.registerTool({
+      name: "probe", label: "Probe", description: "Wait for release", parameters: { type: "object", properties: {} } as Tool["parameters"],
+      async execute() { toolStarted(); await toolFinished; return { content: [{ type: "text", text: "tool finished" }], details: undefined }; },
+    }) };
+    const provider = scriptedAnthropic((request) => {
+      if (request.toolResults.length === 0) return { toolCall: { name: "probe", arguments: {} } };
+      return { text: request.userMessages.includes("follow later") ? "follow-up received" : "steer received" };
+    });
+    const subagents = loadSubagents([routerExtension(), provider.extension, probe]);
+    const ctx = orchestrator(h).ctx;
+    const start = (await subagents.tool().execute("call", { items: [{ task: "Use probe" }], background: true } as never,
+      undefined, undefined, ctx)).details as BackgroundStart;
+    await toolRunning;
+    const send = (text: string, mode: string) => subagents.tool("subagents_message").execute(`send-${mode}`,
+      { id: start.delegationIds[0], text, mode } as never, undefined, undefined, ctx);
+    await send("steer now", "steer");
+    await send("follow later", "followUp");
+    assert.equal(provider.requests.length, 1, "neither message interrupts a tool");
+    releaseTool();
+    await waitFor(() => subagents.messages.length === 1, "the worker processes both messages");
+    assert.deepEqual(provider.requests.map((request) => request.userMessages),
+      [["Use probe"], ["Use probe", "steer now"], ["Use probe", "steer now", "follow later"]]);
+    assert.equal((subagents.messages[0]!.message.details as NoticeDetails).results[0]?.finalText, "follow-up received");
+  } finally { releaseTool?.(); h.cleanup(); }
+});
+
+test("subagents_message refuses finished, foreground, and unknown delegation ids", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { maxParallel: 1 } } });
+  const pending: (() => void)[] = [];
+  try {
+    const provider = fakeAnthropic("done", (finish) => pending.push(finish));
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h).ctx;
+    const start = (await subagents.tool().execute("call", { items: [{ task: "Background" }, { task: "Queued" }], background: true } as never,
+      undefined, undefined, ctx)).details as BackgroundStart;
+    await waitFor(() => pending.length === 1, "background worker starts");
+    const message = (id: string) => subagents.tool("subagents_message").execute("message", { id, text: "Look here" } as never, undefined, undefined, ctx);
+    await assert.rejects(message("unknown"), /no running background worker/i);
+    await assert.rejects(message("call"), /no running background worker/i);
+    await assert.rejects(message(start.delegationIds[1]!), /no running background worker/i);
+    pending.shift()!();
+    await waitFor(() => pending.length === 1, "queued background worker starts");
+    await assert.rejects(message(start.delegationIds[0]!), /no running background worker/i);
+    pending.shift()!();
+    await waitFor(() => subagents.messages.length === 1, "background call finishes");
+    await assert.rejects(message(start.delegationIds[0]!), /no running background worker/i);
+    const foreground = subagents.tool().execute("foreground", { items: [{ task: "Foreground" }] } as never, undefined, undefined, ctx);
+    await waitFor(() => pending.length === 1, "foreground worker starts");
+    const foregroundId = provider.requests.at(-1)!.sessionId!;
+    await assert.rejects(message(foregroundId), /no running background worker/i);
+    pending.shift()!();
+    await foreground;
   } finally {
     for (const finish of pending) finish();
     h.cleanup();
