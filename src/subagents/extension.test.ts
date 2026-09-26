@@ -3,7 +3,9 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { after, test } from "node:test";
-import { DefaultPackageManager, SessionManager, SettingsManager, type ExtensionAPI, type ExtensionContext, type InlineExtension } from "@earendil-works/pi-coding-agent";
+import { DefaultPackageManager, initTheme, SessionManager, SettingsManager, type ExtensionAPI, type ExtensionContext, type InlineExtension, type Theme } from "@earendil-works/pi-coding-agent";
+// pi's own keybindings manager, which pi hands a ctx.ui.custom factory; its public entry exports only the type.
+import { KeybindingsManager } from "../../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js";
 import { buildCatalog } from "../catalog/model-catalog.ts";
 import { emptyRefreshState } from "../catalog/refresh-lifecycle.ts";
 import { resetBanLists } from "../policy/ban-lists.ts";
@@ -17,6 +19,7 @@ import personalGuard from "../guard/extension.ts";
 import { createSubagentsExtension, MAX_TEXT_BYTES, type SubagentsDetails, type SubagentsProgressDetails } from "./extension.ts";
 import { markWorkerSession } from "./worker-sessions.ts";
 import { workerBoard, type BoardWorker } from "./worker-board.ts";
+import { openTranscript } from "./transcript-view.ts";
 
 // The subagents extension as pi loads it. A fake ExtensionAPI records the
 // registered tool; a test calls its `execute` as pi does. The worker is a real
@@ -1248,8 +1251,9 @@ interface ScriptedRequest {
 type ScriptedReply = { readonly text: string } | { readonly text?: string; readonly toolCall: { readonly name: string; readonly arguments: Record<string, unknown> } };
 
 /** A fake `anthropic` provider serving claude-haiku-4-5 offline, answering each
- *  request with what `script` returns for it. */
-function scriptedAnthropic(script: (request: ScriptedRequest) => ScriptedReply) {
+ *  request with what `script` returns for it. A request `hold` returns true for
+ *  is answered only when the worker is aborted. */
+function scriptedAnthropic(script: (request: ScriptedRequest) => ScriptedReply, hold?: (request: ScriptedRequest) => boolean) {
   const requests: ScriptedRequest[] = [];
   const config: ProviderConfig = {
     name: "Fake Anthropic", baseUrl: "http://localhost/unused", apiKey: "unused", api: "fake-anthropic" as never,
@@ -1281,8 +1285,12 @@ function scriptedAnthropic(script: (request: ScriptedRequest) => ScriptedReply) 
         stopReason: "toolCall" in reply ? "toolUse" : "stop", timestamp: Date.now(),
       };
       push({ type: "start", partial: { ...message, content: [] } } as never);
-      push({ type: "done", reason: message.stopReason, message } as never);
-      end({ api: model.api, provider: model.provider, model: model.id });
+      const finish = () => {
+        push({ type: "done", reason: message.stopReason, message } as never);
+        end({ api: model.api, provider: model.provider, model: model.id });
+      };
+      if (hold?.(request)) options?.signal?.addEventListener("abort", finish, { once: true });
+      else finish();
       return stream;
     },
   };
@@ -2159,5 +2167,91 @@ test("the orchestrator's session shows its workers in the widget above the edito
     assert.match(component!.render(200)[0]!, /^lead · anthropic\/claude-haiku-4-5:low · completed · /, "a finished worker lingers with its end state");
     await subagents.shutdownSession(ctx);
     assert.equal(component, undefined, "the session's end removes the widget");
+  } finally { h.cleanup(); }
+});
+
+// The transcript view's x (transcript-view.ts) on real workers: the view
+// opens as xytd's ways in will open it, through a fake ctx.ui.custom with pi's
+// own keybindings manager, and the stop reaches the worker through the board.
+
+/** Opens `workerId`'s transcript view on the process's board; `closed` settles when it is left. */
+function openView(workerId: string) {
+  initTheme("dark");
+  const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as unknown as Theme;
+  let component: { render(width: number): string[]; handleInput(data: string): void } | undefined;
+  const ui = {
+    custom: (async (factory: (...args: unknown[]) => unknown) => new Promise<void>((resolve) => {
+      component = factory({ terminal: { rows: 40 }, requestRender() {} }, plainTheme, new KeybindingsManager(), () => resolve()) as typeof component;
+    })) as never,
+  };
+  const closed = openTranscript(ui, workerBoard(), workerId);
+  return {
+    closed,
+    press(...keys: string[]) { for (const key of keys) component!.handleInput(key); },
+    header: () => component!.render(200)[0]!.replace(/\x1b\[[0-9;]*m/g, "").trimEnd(),
+  };
+}
+
+test("x in the transcript view stops one worker of a call after a confirmation, a queued one at once, and the others run on", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { maxParallel: 2 } } });
+  const pending: (() => void)[] = [];
+  try {
+    const provider = fakeAnthropic("done", (finish) => pending.push(finish));
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    await subagents.startSession(main.ctx);
+    const call = subagents.tool().execute("call-1", { items: [{ task: "Keeps going" }, { task: "Gets stopped" }, { task: "Never starts" }] } as never,
+      undefined, undefined, main.ctx);
+    await waitFor(() => pending.length === 2, "both running workers' requests are in");
+    const [keeps, stopped, queued] = workerBoard().workers();
+
+    const view = openView(queued!.id);
+    assert.equal(view.header(), "worker · queued · worker 3 of 3");
+    view.press("x", "y");
+    assert.equal(workerBoard().worker(queued!.id)?.state, "aborted", "a queued worker ends at once");
+    assert.equal(view.header(), "worker · aborted · worker 3 of 3", "the view stays open with its end state");
+
+    view.press("\x1b[D", "x");
+    assert.equal(view.header(), "worker · running · worker 2 of 3");
+    assert.equal(workerBoard().worker(stopped!.id)?.state, "running", "nothing stops before the confirmation");
+    view.press("y");
+    await waitFor(() => workerBoard().worker(stopped!.id)?.state === "aborted", "the stopped worker has ended");
+    assert.equal(view.header(), "worker · aborted · worker 2 of 3");
+    assert.equal(workerBoard().worker(keeps!.id)?.state, "running", "the other worker runs on");
+    assert.equal(pending.length, 2, "the queued worker never started in the freed slot");
+
+    for (const finish of pending) finish();
+    const results = ((await call).details as SubagentsDetails).results;
+    assert.deepEqual(results.map((result) => result.status), ["completed", "aborted", "not-started"]);
+    view.press("\x1b");
+    await view.closed;
+  } finally {
+    for (const finish of pending) finish();
+    h.cleanup();
+  }
+});
+
+test("x in the transcript view stops a nested worker alone: its parent hears it was aborted and completes", async () => {
+  const h = harness();
+  try {
+    writeAgentDefinition(join(h.agentDir, "agents"), "lead.md", { name: "lead", description: "Delegates", tools: "read, subagents" }, "Split the work.");
+    const provider = scriptedAnthropic(delegatingScript, (request) => request.task === "Hold on");
+    const subagents = loadSubagents(installedWithSubagents(provider.extension));
+    const main = orchestrator(h);
+    await subagents.startSession(main.ctx);
+    const lead = callSubagents(subagents.tool(), main.ctx, `Delegate:${JSON.stringify({ items: [{ task: "Hold on" }] })}`, "lead");
+    await waitFor(() => provider.requests.some((request) => request.task === "Hold on"), "the nested worker's request is in");
+    const nested = workerBoard().workers().find((worker) => worker.task === "Hold on")!;
+    assert.ok(nested.parentId !== undefined);
+
+    const view = openView(nested.id);
+    view.press("x", "y");
+    const { worker } = await lead;
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.match(worker.finalText, /^delegated: Worker \S+ aborted\./, worker.finalText);
+    assert.deepEqual(workerBoard().workers().map((entry) => entry.state), ["completed", "aborted"]);
+    assert.equal(view.header(), "worker · aborted · worker 2 of 2");
+    view.press("\x1b");
+    await view.closed;
   } finally { h.cleanup(); }
 });

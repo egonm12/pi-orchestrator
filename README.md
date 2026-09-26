@@ -130,6 +130,31 @@ worker · routing… · queued · Fix the typo
 
 A worker started by another worker is indented under it. At most 6 workers are listed; a `+N more` line counts the rest. A finished worker stays about 10 seconds with its end state, then drops out, and the widget disappears when no worker is left. The widget only shows workers; it never steers them. A worker's own session shows no widget.
 
+### Transcript view
+
+The transcript view shows one worker's transcript on the whole screen: any worker of the orchestrator's session, foreground, background or nested, running or finished. Leaving it returns to the orchestrator's session as it was, editor text and scrollback included, in regular and fullscreen TUI mode. The ways to open it, alt+a on the worker widget and the `/subagents` picker, come in a later version.
+
+The transcript looks like pi's own chat: the worker's replies with their thinking, its tool calls with their results, and the tool-output expand toggle. Two kinds of message are marked, so they stand out from the task and from ordinary tool calls:
+
+- `◆ Report: progress` and `◆ Report: question` mark the worker's `report` calls, with a question's answer below it.
+- `▸ Steer from the orchestrator` and `▸ Follow-up from the orchestrator` mark the messages `subagents_message` sent the worker.
+
+A forked worker's transcript starts with the orchestrator's conversation it was copied from. A tool from another installed extension keeps its own drawing while the worker runs. In a finished worker's transcript, only pi's built-in tools, `subagents` and `report` keep theirs; other tools are drawn plainly.
+
+The header names the worker's agent, its worker state, and which worker of how many it is. The workers it started are listed below the header. While the worker runs, the view follows the end of its transcript until you scroll.
+
+| Key | Action |
+|-----|--------|
+| PgUp, PgDn | Scroll a page; paging back down to the end follows it again |
+| Home, End | Go to the start; go to the end and follow it again |
+| ← → | Show the previous or next worker, in the order they were queued, each nested worker after its parent |
+| ↑ ↓, Enter | Select one of the worker's nested workers, and open it |
+| x | Stop this worker, after a `Stop this worker? y/n` confirmation. A running worker aborts, a queued one never starts; a nested worker's parent runs on |
+| ctrl+o | Expand or collapse tool output |
+| Esc, ctrl+c | Go back to the orchestrator's session |
+
+The view is read-only: answering and steering a worker stay with the orchestrator, through `subagents_message`, and x is the only thing it sends a worker. It never closes on its own. A worker that finishes while shown stays open with its end state, and a worker you stop stays open as aborted. A finished worker's transcript is read from its session file, which the view never changes. When the orchestrator's session is not saved, its workers' sessions are not saved either, and a finished worker shows the messages the session kept in memory.
+
 ### Agent definitions
 
 An item's `agent` name picks a named, owner-written kind of worker: its instructions and the tools it may use. Agent definitions are markdown files with frontmatter (`name`, `description`, `tools`, `model`, `thinking`) and a body of instructions, read from `~/.pi/agent/agents/` and the project's `.pi/agents/`. A project's definition wins by name. `model` (`provider/model`, optionally with `:effort`) and `thinking` apply only when `agentDefinitionModel.use` is `"preserve"` (see below). A `tools:` list only narrows the orchestrator's tool set for that worker; it cannot add a tool the orchestrator itself does not have. Each definition's name and description are listed in the subagents tool's description at session start. `agent` is optional in a call: without it, a worker gets pi's default tools plus extension tools (except `subagents`) and no agent-specific instructions. Every worker also gets the `report` tool (see Reports above). pi-orchestrator ships no built-in definitions; the owner writes them.

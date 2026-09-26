@@ -52,6 +52,11 @@ export function widgetRows(workers: readonly BoardWorker[], now: number): Widget
 /** The label of a worker whose item names no agent definition, as the subagents tool shows it. */
 const NO_AGENT = "worker";
 
+/** A worker's agent name, `worker` without one, and `(fork)` for a fork. */
+export function agentLabel(worker: Pick<BoardWorker, "agent" | "model">): string {
+  return `${worker.agent ?? NO_AGENT}${worker.model.kind === "fork" ? " (fork)" : ""}`;
+}
+
 /** A worker's model and effort: a routed worker's latest rung, marked when its routing escalated. */
 function modelText(model: WorkerModel): string {
   switch (model.kind) {
@@ -66,7 +71,8 @@ function modelText(model: WorkerModel): string {
   }
 }
 
-const STATE_COLOR: Record<WorkerState, ThemeColor> = {
+/** Each worker state's colour, shared with the transcript view. */
+export const STATE_COLOR: Record<WorkerState, ThemeColor> = {
   queued: "muted", running: "warning", asking: "accent", completed: "success", failed: "error", aborted: "warning",
 };
 
@@ -99,8 +105,7 @@ type Part = readonly [ThemeColor, string];
 /** A worker's line, before it is fitted to the render width. */
 function rowParts(row: WidgetRow, now: number): { indent: string; parts: Part[] } {
   const { worker } = row;
-  const agent = `${worker.agent ?? NO_AGENT}${worker.model.kind === "fork" ? " (fork)" : ""}`;
-  const parts: Part[] = [["accent", agent], ["dim", modelText(worker.model)], [STATE_COLOR[worker.state], worker.state]];
+  const parts: Part[] = [["accent", agentLabel(worker)], ["dim", modelText(worker.model)], [STATE_COLOR[worker.state], worker.state]];
   const elapsed = elapsedMs(worker, now);
   if (elapsed !== undefined) parts.push(["dim", formatElapsed(elapsed)], ["dim", `${worker.turns} ${worker.turns === 1 ? "turn" : "turns"}`]);
   parts.push(activity(worker));
