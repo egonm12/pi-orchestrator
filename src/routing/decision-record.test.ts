@@ -351,6 +351,22 @@ test("the shadow record carries the model the orchestrator named by hand and the
   }
 });
 
+test("a nested worker's record names its parent delegation, which must be another delegation (ADR 0008)", async () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    writeDecisionRecord(dir, await liveInput({ delegationId: "attempt-nested-1", parentDelegationId: "attempt-live-1" }));
+    const [nested] = readRoutingRecords(dir);
+    assert.ok(nested?.recordType === "decision");
+    assert.equal(nested.parentDelegationId, "attempt-live-1");
+
+    for (const [parentDelegationId, problem] of [["attempt-nested-2", /'parentDelegationId' must name a different delegation/], [" ", /'parentDelegationId'/]] as const) {
+      assert.throws(() => validateRoutingRecord({ ...nested, delegationId: "attempt-nested-2", parentDelegationId }), problem);
+    }
+  } finally {
+    cleanup();
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Checkbox 9 (story 34): 200 characters of task text, never a credential
 // ---------------------------------------------------------------------------

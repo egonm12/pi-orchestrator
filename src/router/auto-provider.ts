@@ -6,6 +6,7 @@ import { streamReasoning } from "../routing/session-classifier-call.ts";
 import { autoStream } from "./auto-stream.ts";
 import { ROUTER_PREFIX } from "./prefix.ts";
 import { recordedRungPassesHardFilters, routeTask, type ActiveRouter } from "./route-task.ts";
+import { parentDelegationOf } from "../subagents/worker-sessions.ts";
 
 type ProviderConfig = NonNullable<Parameters<ExtensionAPI["registerProvider"]>[1]>;
 
@@ -98,7 +99,9 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
                     ? sessionPin(router.banLists)
                     : { model: route.rung.model, effort: route.rung.effort };
                   const ranOn = `${pin.model}:${pin.effort}`;
-                  const common = { delegationId: sessionId, at, taskText, agentRole, classification, tierMap: router.tierMap, route, ranOn };
+                  const parentDelegationId = parentDelegationOf(sessionId);
+                  const common = { delegationId: sessionId, at, taskText, agentRole, classification, tierMap: router.tierMap, route, ranOn,
+                    ...(parentDelegationId === undefined ? {} : { parentDelegationId }) };
                   appendRoutingRecord(router.recordDir, buildDecisionRecord(router.mode === "shadow"
                     ? { ...common, mode: "shadow", handPickedModel: pin.model }
                     : { ...common, mode: "live" }));

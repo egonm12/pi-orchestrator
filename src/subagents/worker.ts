@@ -54,8 +54,11 @@ export interface WorkerSetup {
   /** An agent definition's instructions, appended to the worker's system prompt. */
   readonly instructions?: string;
   /** The only tools the worker may use; without it, pi's default tools and
-   *  every extension tool. */
+   *  every extension tool except the subagents tool. Only a list naming the
+   *  subagents tool gives it to the worker (ADR 0008). */
   readonly tools?: readonly string[];
+  /** The delegation id of the worker that makes this delegation, if a worker does. */
+  readonly parentDelegationId?: string;
   /** A preserved agent definition names a real model, so the auto router is
    *  bypassed. `banListException` is set when the model is on the subagent ban
    *  list and the owner's exception let it run. */
@@ -74,8 +77,9 @@ export function workerSessionDir(orchestratorSession: WorkerSetup["orchestratorS
   return join(orchestratorSession.getSessionDir(), "subagents", orchestratorSession.getSessionId());
 }
 
-/** Workers do not get the `subagents` tool (ADR 0007): the extension that
- *  registers it is left out of the worker's extensions. */
+/** A worker does not get the `subagents` tool unless its tools list names it
+ *  (ADR 0007, ADR 0008): the extension that registers it is left out of the
+ *  worker's extensions. */
 function withoutSubagentsTool(base: LoadExtensionsResult): LoadExtensionsResult {
   return { ...base, extensions: base.extensions.filter((extension) => !extension.tools.has(SUBAGENTS_TOOL)) };
 }
@@ -112,7 +116,7 @@ export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
       agentDir: setup.agentDir,
       resourceLoaderOptions: {
         extensionFactories: [...(setup.extensionFactories ?? [])],
-        extensionsOverride: withoutSubagentsTool,
+        ...(setup.tools?.includes(SUBAGENTS_TOOL) ? {} : { extensionsOverride: withoutSubagentsTool }),
         ...(instructions === undefined ? {} : { appendSystemPromptOverride: (base: string[]) => [...base, instructions] }),
       },
     });
@@ -154,7 +158,7 @@ export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
     setup.onTool?.([...runningTools.values()].at(-1));
   });
   // Before binding, so the extensions see the mark at session_start.
-  const unmarkWorkerSession = markWorkerSession(sessionId);
+  const unmarkWorkerSession = markWorkerSession(sessionId, setup.parentDelegationId);
   try {
     // Binding starts the extensions: the router extension reads its settings
     // at session_start.

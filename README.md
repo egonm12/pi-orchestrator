@@ -60,13 +60,17 @@ Each item's result has a status:
 | `aborted` | The item's worker was running when the call was aborted |
 | `not-started` | The item was still queued when the call was aborted |
 
-A worker's session is saved under the orchestrator's session folder, and its session id is its delegation id. It loads the same installed extensions as the orchestrator, without the `subagents` tool itself: a worker cannot start workers of its own. A worker's final text over 50 KB is cut, with a pointer to its session file, which keeps the whole text.
+A worker's session is saved under the orchestrator's session folder, and its session id is its delegation id. It loads the same installed extensions as the orchestrator, without the `subagents` tool itself unless its agent definition lists it (see Nested delegation below). A worker's final text over 50 KB is cut, with a pointer to its session file, which keeps the whole text.
 
 While a call runs, pi shows one line per worker: its agent name (`worker` without one), its short task, and its current tool or state: queued, running, done, error, aborted or not started. A worker on a preserved model also shows that model, marked `(ban-list exception)` when the exception let it run. Expanding the result shows each worker's final text or error.
 
 ### Agent definitions
 
 An item's `agent` name picks a named, owner-written kind of worker: its instructions and the tools it may use. Agent definitions are markdown files with frontmatter (`name`, `description`, `tools`, `model`, `thinking`) and a body of instructions, read from `~/.pi/agent/agents/` and the project's `.pi/agents/`. A project's definition wins by name. `model` (`provider/model`, optionally with `:effort`) and `thinking` apply only when `agentDefinitionModel.use` is `"preserve"` (see below). A `tools:` list only narrows the orchestrator's tool set for that worker; it cannot add a tool the orchestrator itself does not have. Each definition's name and description are listed in the subagents tool's description at session start. `agent` is optional in a call: without it, a worker gets pi's default tools plus extension tools (except `subagents`) and no agent-specific instructions. pi-orchestrator ships no built-in definitions; the owner writes them.
+
+### Nested delegation
+
+A worker may start workers of its own only when its agent definition lists `subagents` in `tools:`. That is one level deep: the workers it starts never get the `subagents` tool, even when their own definition lists it. A worker's call is foreground only; asking for a background call fails the call before any worker starts. Its workers always run on the auto model and are routed, even when `agentDefinitionModel.use` is `"preserve"` and their definition names a model. Each of its calls has its own `maxParallel` limit, read from the same settings. The decision record of a worker started by another worker has `parentDelegationId`: the delegation id of the worker that started it.
 
 ### `orchestrator.subagents` settings
 
