@@ -3,10 +3,9 @@
 title: 'Live worker view: widget and transcript'
 status: todo
 type: epic
-tags:
-    - needs-triage
+priority: normal
 created_at: 2026-09-26T09:18:43Z
-updated_at: 2026-09-26T09:18:43Z
+updated_at: 2026-09-26T09:22:17Z
 ---
 
 The user cannot see which workers are active, which model serves them or what they are doing, and cannot read a live worker's transcript. Goal: a view that works like Claude Code's agent list, for every worker of the orchestrator session.
