@@ -11,10 +11,12 @@ import { registerSubagentsMessageTool } from "./message.ts";
 import { renderSubagentsCall, renderSubagentsResult } from "./render.ts";
 import { forkSession } from "./fork-session.ts";
 import { prepareResume, saveWorkerOutcome } from "./resume.ts";
-import { workerReports } from "./report.ts";
+import { workerReports, type WorkerReports } from "./report.ts";
 import { loadSubagentsSettings } from "./settings.ts";
 import { registerSubagentsStatusTool } from "./status.ts";
 import { runWorker, SUBAGENTS_TOOL, type WorkerResult, type WorkerSetup } from "./worker.ts";
+import { workerBoard, type WorkerModelSetup } from "./worker-board.ts";
+import { isWorkerSession } from "./worker-sessions.ts";
 
 // The subagents extension (ADR 0007): a third pi extension, separate from the
 // router and the guard, with a `subagents` tool. Each call starts a worker in
@@ -24,7 +26,8 @@ import { runWorker, SUBAGENTS_TOOL, type WorkerResult, type WorkerSetup } from "
 // tools; one listing `subagents` lets the worker delegate one level deeper
 // (nested-delegation.ts). While the call runs, partial updates show each item
 // queued, running with its worker's current tool, or finished (render.ts
-// draws them).
+// draws them). Every worker is also on the worker board (worker-board.ts),
+// from the moment its item is queued, for the live worker view.
 
 type ToolParameters = Parameters<ExtensionAPI["registerTool"]>[0]["parameters"];
 
@@ -134,6 +137,11 @@ export interface SubagentsBackgroundDetails {
 /** The custom message type of a background call's completion notice. */
 export const COMPLETION_NOTICE = "subagents-completion";
 
+/** A preserved agent definition model as the worker board shows it. */
+function preservedModel(named: NonNullable<WorkerSetup["namedModel"]>): WorkerModelSetup {
+  return { kind: "preserved", model: named.model, ...(named.effort === undefined ? {} : { effort: named.effort }) };
+}
+
 /** The subagent ban list from personal settings; a project may not change it (ADR 0002). */
 function personalSubagentBanList(agentDir: string): readonly string[] {
   return banListsFromSettings(readSettingsFile(join(agentDir, "settings.json")) ?? {}).banLists.subagentBanList;
@@ -224,8 +232,20 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
           // A background call has returned, so its progress has no tool result to update.
           if (!background) onUpdate?.({ content: [{ type: "text", text: `${done}/${items.length} workers done` }], details: update });
         };
+        const board = workerBoard();
+        const feeds = items.map(({ task, agent, resume }, index) => {
+          const fork = forks[index];
+          const delegationId = delegationIds?.[index] ?? resume;
+          return board.add({ callId: toolCallId, background, task, ...(agent === undefined ? {} : { agent }),
+            ...(delegationId === undefined ? {} : { delegationId }), ...(parentDelegationId === undefined ? {} : { parentDelegationId }),
+            model: fork?.model === undefined ? { kind: "routed" } : { kind: "fork", model: fork.model, effort: fork.effort } });
+        });
         const showProgress = (index: number, state: SubagentProgress) => {
           progress[index] = state;
+          if (state.status !== "queued" && state.status !== "running") {
+            feeds[index]!.ended({ state: state.status === "not-started" ? "aborted" : state.status,
+              ...(state.sessionFile === undefined ? {} : { sessionFile: state.sessionFile }), ...(state.error === undefined ? {} : { error: state.error }) });
+          }
           sendProgress();
         };
         sendProgress();
@@ -234,7 +254,13 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
         const callSignal = backgroundCall ? backgroundCall.callSignal : signal;
         const itemSignals = backgroundCall?.itemSignals;
         // Only a background call's workers may ask a question (ADR 0008).
-        const reports = workerReports(pi, ctx, backgroundCall === undefined ? undefined : backgroundCalls);
+        const callReports = workerReports(pi, ctx, backgroundCall === undefined ? undefined : backgroundCalls);
+        const { question } = callReports;
+        // The board shows a background worker as asking while its question waits.
+        const reports: WorkerReports = question === undefined ? callReports : { ...callReports, async question(delegationId, text, questionSignal) {
+          board.asking(delegationId, true);
+          try { return await question(delegationId, text, questionSignal); } finally { board.asking(delegationId, false); }
+        } };
         let next = 0;
         const runQueue = async () => {
           while (next < items.length) {
@@ -251,9 +277,11 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
                 const prepared = prepareResume(resume, task, { cwd: ctx.cwd, agentDir, orchestratorSession: ctx.sessionManager });
                 releaseResume = prepared.release;
                 showProgress(index, { ...item, status: "running" });
+                feeds[index]!.started(prepared.namedModel ? preservedModel(prepared.namedModel)
+                  : prepared.fork ? { kind: "fork", ...prepared.pin } : { kind: "routed", pin: prepared.pin });
                 const worker = await runWorker({ task, resume: prepared, cwd: ctx.cwd, agentDir, orchestratorSession: ctx.sessionManager,
                   signal: itemSignals?.[index] ?? callSignal, extensionFactories: deps.workerExtensions, instructions: prepared.instructions, tools: prepared.tools,
-                  onActivity: backgroundCall?.onActivity[index], reports,
+                  onActivity: backgroundCall?.onActivity[index], reports, onSession: feeds[index]!.session,
                   onTool: (tool) => showProgress(index, { ...item, status: "running", ...(tool === undefined ? {} : { tool }) }),
                   ...(backgroundCall === undefined ? {} : { onMessageReady: (receive) => backgroundCalls.registerWorker(backgroundCall.delegationIds[index]!, receive) }),
                 });
@@ -315,6 +343,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               ...(preparedFork.banListException ? { banListException: true } : {}) } : namedModel === undefined ? {}
               : { model: namedModel.model, ...(namedModel.banListException ? { banListException: true } : {}) };
             showProgress(index, { ...item, ...workerModel, status: "running" });
+            feeds[index]!.started(namedModel === undefined ? undefined : preservedModel(namedModel));
             const worker = await runWorker({
               task, cwd: ctx.cwd, agentDir, orchestratorSession: ctx.sessionManager, signal: itemSignals?.[index] ?? callSignal,
               ...(backgroundCall === undefined ? {} : { sessionId: backgroundCall.delegationIds[index]! }),
@@ -322,7 +351,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               ...(namedModel === undefined ? {} : { namedModel }),
               ...(preparedFork === undefined ? {} : { fork: preparedFork }),
               ...(parentDelegationId === undefined ? {} : { parentDelegationId }),
-              onActivity: backgroundCall?.onActivity[index], reports,
+              onActivity: backgroundCall?.onActivity[index], reports, onSession: feeds[index]!.session,
               onTool: (tool) => showProgress(index, { ...item, ...workerModel, status: "running", ...(tool === undefined ? {} : { tool }) }),
               ...(backgroundCall === undefined ? {} : { onMessageReady: (receive) => backgroundCalls.registerWorker(backgroundCall.delegationIds[index]!, receive) }),
             });
@@ -340,6 +369,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               const file = forks[index]?.sessionManager?.getSessionFile();
               if (file !== undefined) rmSync(file, { force: true });
               results[index] = { task, ...(agent === undefined ? {} : { agent }), ...(fork === true ? { fork: true } : {}), ...(resume === undefined ? {} : { resume }), status: "not-started", finalText: "" };
+              feeds[index]!.ended({ state: "aborted" });
             }
           }
           const details: SubagentsDetails = { results };
@@ -372,6 +402,8 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
     // Ctrl+C leaves background workers running; the session's end stops them.
     pi.on("session_shutdown", () => backgroundCalls.shutdown());
     pi.on("session_start", (_event, ctx) => {
+      // A worker's own copy of this extension shares the orchestrator's board.
+      if (!isWorkerSession(ctx)) workerBoard().startSession(ctx.sessionManager.getSessionId());
       const definitions = loadAgentDefinitions(agentDefinitionDirs(personalAgentDir(), ctx.cwd));
       registerSubagentsTool(`${DESCRIPTION}\n\n${agentDefinitionListing(definitions)}`);
     });

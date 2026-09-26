@@ -21,6 +21,8 @@ export interface ResumeWorker {
   readonly release: () => void;
   readonly pin: { readonly model: string; readonly effort: ThinkingLevel };
   readonly namedModel?: WorkerSetup["namedModel"];
+  /** The delegation is a forked worker's, so its pin is the session model it forked on (ADR 0008). */
+  readonly fork?: boolean;
   readonly instructions?: string;
   readonly tools?: readonly string[];
 }
@@ -56,7 +58,7 @@ function lastStatus(file: string): WorkerStatus | undefined {
 }
 
 /** The record is the authority for the real pin, not the hypothetical shadow rung. */
-function savedPin(id: string): { model: string; effort: ThinkingLevel; namedModel?: WorkerSetup["namedModel"] } | undefined {
+function savedPin(id: string): { model: string; effort: ThinkingLevel; namedModel?: WorkerSetup["namedModel"]; fork?: boolean } | undefined {
   const records = readRoutingRecords(join(stateDir(), "routing"));
   const record = records.filter((entry) => entry.delegationId === id &&
     (entry.recordType === "decision" || entry.recordType === "agent-model" || (entry as { recordType: string }).recordType === "fork")).at(-1);
@@ -75,7 +77,7 @@ function savedPin(id: string): { model: string; effort: ThinkingLevel; namedMode
   }
   // ADR 0008's fork record is introduced on the parallel forked-worker branch.
   const fork = record as unknown as { model?: string; effort?: string };
-  return fork.model && fork.effort ? { model: fork.model, effort: fork.effort as ThinkingLevel } : undefined;
+  return fork.model && fork.effort ? { model: fork.model, effort: fork.effort as ThinkingLevel, fork: true } : undefined;
 }
 
 export function prepareResume(id: string, task: string, setup: Pick<WorkerSetup, "cwd" | "agentDir" | "orchestratorSession">): ResumeWorker {
@@ -120,5 +122,5 @@ export function prepareResume(id: string, task: string, setup: Pick<WorkerSetup,
   return { file, release: () => { resuming().delete(id); }, pin: { model: pin.model, effort: pin.effort },
     ...(typeof outcome.instructions === "string" ? { instructions: outcome.instructions } : {}),
     ...(Array.isArray(outcome.tools) && outcome.tools.every((tool) => typeof tool === "string") ? { tools: outcome.tools as string[] } : {}),
-    ...(pin.namedModel ? { namedModel: { ...pin.namedModel, banListException } } : {}) };
+    ...(pin.namedModel ? { namedModel: { ...pin.namedModel, banListException } } : {}), ...(pin.fork ? { fork: true } : {}) };
 }
