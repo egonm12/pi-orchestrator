@@ -111,6 +111,25 @@ A worker's session is saved under the orchestrator's session folder, and its ses
 
 While a call runs, pi shows one line per worker: its agent name (`worker` without one), `(fork)` for a fork, its short task, and its current tool or state: queued, running, done, error, aborted or not started. A fork or a worker on a preserved model also shows its model, marked `(ban-list exception)` when an exception let it run. Expanding the result shows each worker's final text or error.
 
+### Worker widget
+
+Above the editor, the orchestrator's session lists its active workers: foreground, background and nested, queued ones included. Each worker has one line:
+
+```text
+lead · anthropic/claude-sonnet-4-5:high ↑elevated · running · 1m15s · 2 turns · subagents
+└ tester · routing… · running · 1m15s · 0 turns · Check the tests
+worker (fork) · anthropic/claude-opus-4-5:high · running · 1m15s · 1 turn · The change looks right so far.
+worker · routing… · queued · Fix the typo
+```
+
+- The agent name, `worker` without one, and `(fork)` for a fork.
+- The model and effort. A routed worker shows `routing…` until its first request, then the rung serving its latest request, and `↑<tier>` when its routing decision escalated to that tier. A fork or a worker on a preserved agent model shows its fixed model.
+- The worker state: queued, running, asking, completed, failed or aborted.
+- Once it has started: its elapsed time and the turns it has started.
+- Its current tool, otherwise the last line of its latest text, or for a failed worker why it failed. Before any of those, its short task.
+
+A worker started by another worker is indented under it. At most 6 workers are listed; a `+N more` line counts the rest. A finished worker stays about 10 seconds with its end state, then drops out, and the widget disappears when no worker is left. The widget only shows workers; it never steers them. A worker's own session shows no widget.
+
 ### Agent definitions
 
 An item's `agent` name picks a named, owner-written kind of worker: its instructions and the tools it may use. Agent definitions are markdown files with frontmatter (`name`, `description`, `tools`, `model`, `thinking`) and a body of instructions, read from `~/.pi/agent/agents/` and the project's `.pi/agents/`. A project's definition wins by name. `model` (`provider/model`, optionally with `:effort`) and `thinking` apply only when `agentDefinitionModel.use` is `"preserve"` (see below). A `tools:` list only narrows the orchestrator's tool set for that worker; it cannot add a tool the orchestrator itself does not have. Each definition's name and description are listed in the subagents tool's description at session start. `agent` is optional in a call: without it, a worker gets pi's default tools plus extension tools (except `subagents`) and no agent-specific instructions. Every worker also gets the `report` tool (see Reports above). pi-orchestrator ships no built-in definitions; the owner writes them.

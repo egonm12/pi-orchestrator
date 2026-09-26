@@ -2125,3 +2125,39 @@ test("the worker board marks an escalated rung, and shows a fork's and a preserv
     ]);
   } finally { h.cleanup(); }
 });
+
+test("the orchestrator's session shows its workers in the widget above the editor, a nested worker indented under its parent, until the session ends", async () => {
+  const h = harness();
+  try {
+    writeAgentDefinition(join(h.agentDir, "agents"), "lead.md", { name: "lead", description: "Delegates", tools: "read, subagents" }, "Split the work.");
+    const provider = scriptedAnthropic(delegatingScript);
+    const subagents = loadSubagents(installedWithSubagents(provider.extension));
+    const main = orchestrator(h);
+    const plain = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+    let component: { render(width: number): string[]; dispose?(): void } | undefined;
+    const seen: string[][] = [];
+    const snapshot = () => { if (component) seen.push(component.render(200).map((line) => line.trimEnd())); };
+    const ui = {
+      notify() {},
+      setWidget(_key: string, content: unknown, options?: { placement?: string }) {
+        component?.dispose?.();
+        assert.ok(content === undefined || options?.placement === "aboveEditor");
+        component = (content as ((tui: unknown, theme: unknown) => typeof component) | undefined)?.({ requestRender: snapshot }, plain);
+        snapshot();
+      },
+    };
+    const ctx = { ...main.ctx, hasUI: true, ui } as unknown as ExtensionContext;
+    await subagents.startSession(ctx);
+    assert.equal(component, undefined, "no widget while no worker runs");
+    const task = `Delegate:${JSON.stringify({ items: [{ task: "Find the config file" }] })}`;
+    const { worker } = await callSubagents(subagents.tool(), ctx, task, "lead");
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+
+    const nestedShown = seen.find((lines) => lines.length === 2 && lines[1]!.startsWith("└ worker · anthropic/claude-haiku-4-5:low · running"));
+    assert.ok(nestedShown, JSON.stringify(seen));
+    assert.match(nestedShown[0]!, /^lead · anthropic\/claude-haiku-4-5:low · running · \d+s · 1 turn · subagents$/);
+    assert.match(component!.render(200)[0]!, /^lead · anthropic\/claude-haiku-4-5:low · completed · /, "a finished worker lingers with its end state");
+    await subagents.shutdownSession(ctx);
+    assert.equal(component, undefined, "the session's end removes the widget");
+  } finally { h.cleanup(); }
+});
