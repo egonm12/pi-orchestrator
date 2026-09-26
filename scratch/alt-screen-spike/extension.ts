@@ -134,7 +134,11 @@ class TranscriptSpikeComponent {
     this.tui.requestRender();
   }
 
-  render(_width: number): string[] {
+  render(width: number): string[] {
+    // pi-tui's regular screen throws on a line wider than the terminal; the
+    // overlay path cuts lines itself, the editor-slot path does not. All text
+    // here is single-width, so cutting the plain text before styling is enough.
+    const fit = (text: string) => (text.length > width ? text.slice(0, Math.max(0, width)) : text);
     const height = this.viewportHeight();
     const max = this.maxScrollOffset(height);
     if (this.scrollOffset > max) this.scrollOffset = max;
@@ -144,13 +148,13 @@ class TranscriptSpikeComponent {
     const status = this.followEnd ? "following end" : `scrolled, −${this.scrollOffset} from end`;
 
     const out: string[] = [
-      th.fg("accent", `── alt-screen spike (rcjm) ── ${this.mechanism} ── tuiMode: ${this.tui.mode} ──`),
-      th.fg("dim", `${this.lines.length} lines, ${status}`),
+      th.fg("accent", fit(`── alt-screen spike (rcjm) ── ${this.mechanism} ── tuiMode: ${this.tui.mode} ──`)),
+      th.fg("dim", fit(`${this.lines.length} lines, ${status}`)),
       "",
-      ...visible,
+      ...visible.map(fit),
     ];
     while (out.length < height + 3) out.push("");
-    out.push(th.fg("dim", "PgUp/PgDn scroll · Home/End jump · Esc leave (should restore the orchestrator session)"));
+    out.push(th.fg("dim", fit("PgUp/PgDn scroll · Home/End jump · Esc leave (should restore the orchestrator session)")));
     return out;
   }
 
