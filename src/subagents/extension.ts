@@ -16,6 +16,7 @@ import { loadSubagentsSettings } from "./settings.ts";
 import { registerSubagentsStatusTool } from "./status.ts";
 import { runWorker, SUBAGENTS_TOOL, type WorkerResult, type WorkerSetup } from "./worker.ts";
 import { workerBoard, type WorkerModelSetup } from "./worker-board.ts";
+import { startWorkerWidget } from "./worker-widget.ts";
 import { isWorkerSession } from "./worker-sessions.ts";
 
 // The subagents extension (ADR 0007): a third pi extension, separate from the
@@ -27,7 +28,8 @@ import { isWorkerSession } from "./worker-sessions.ts";
 // (nested-delegation.ts). While the call runs, partial updates show each item
 // queued, running with its worker's current tool, or finished (render.ts
 // draws them). Every worker is also on the worker board (worker-board.ts),
-// from the moment its item is queued, for the live worker view.
+// from the moment its item is queued, for the live worker view; the
+// orchestrator's session shows the active ones above the editor (worker-widget.ts).
 
 type ToolParameters = Parameters<ExtensionAPI["registerTool"]>[0]["parameters"];
 
@@ -399,11 +401,21 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
       handler: async (args, ctx) => { ctx.ui.notify(backgroundCalls.command(args), "info"); },
     });
     registerSubagentsStatusTool(pi, backgroundCalls);
-    // Ctrl+C leaves background workers running; the session's end stops them.
-    pi.on("session_shutdown", () => backgroundCalls.shutdown());
+    let stopWidget: (() => void) | undefined;
+    pi.on("session_shutdown", () => {
+      // First, so the workers stopped below never reach the ending session's UI.
+      stopWidget?.();
+      stopWidget = undefined;
+      // Ctrl+C leaves background workers running; the session's end stops them, and pi waits for that.
+      return backgroundCalls.shutdown();
+    });
     pi.on("session_start", (_event, ctx) => {
-      // A worker's own copy of this extension shares the orchestrator's board.
-      if (!isWorkerSession(ctx)) workerBoard().startSession(ctx.sessionManager.getSessionId());
+      // A worker's own copy of this extension shares the orchestrator's board, and shows no widget.
+      if (!isWorkerSession(ctx)) {
+        workerBoard().startSession(ctx.sessionManager.getSessionId());
+        stopWidget?.();
+        stopWidget = ctx.hasUI ? startWorkerWidget(ctx.ui, workerBoard()) : undefined;
+      }
       const definitions = loadAgentDefinitions(agentDefinitionDirs(personalAgentDir(), ctx.cwd));
       registerSubagentsTool(`${DESCRIPTION}\n\n${agentDefinitionListing(definitions)}`);
     });
