@@ -36,6 +36,7 @@ import {
   DECISION_RECORD_SCHEMA_VERSION,
   isRoutedDecision,
   readRoutingRecordEntries,
+  type ForkRecord,
   type RoutedDecisionRecord,
   type Verdict,
 } from "./decision-record.ts";
@@ -99,7 +100,7 @@ export type AttachVerdictOutcome =
   | {
       readonly status: "attached";
       readonly recordPath: string;
-      readonly decision: RoutedDecisionRecord;
+      readonly decision: RoutedDecisionRecord | ForkRecord;
       /** Absent for `missing` and for a refused decision. */
       readonly observation?: CapabilityObservation;
     }
@@ -127,7 +128,7 @@ function observationFor(decision: RoutedDecisionRecord, verdict: Verdict, observ
 export function attachVerdict(input: AttachVerdictInput): AttachVerdictOutcome {
   const timestamp = (input.at ?? new Date()).toISOString();
   const decisions = readRoutingRecordEntries(input.recordDir).filter(
-    (entry) => isRoutedDecision(entry.record) && entry.record.delegationId === input.delegationId,
+    (entry) => (isRoutedDecision(entry.record) || entry.record.recordType === "fork") && entry.record.delegationId === input.delegationId,
   );
   const latest = decisions.at(-1);
   if (latest === undefined) {
@@ -140,7 +141,7 @@ export function attachVerdict(input: AttachVerdictInput): AttachVerdictOutcome {
     });
     return { status: "orphaned", recordPath };
   }
-  const decision = latest.record as RoutedDecisionRecord;
+  const decision = latest.record as RoutedDecisionRecord | ForkRecord;
   const recordPath = appendRoutingRecord(input.recordDir, {
     recordType: "verdict",
     schemaVersion: DECISION_RECORD_SCHEMA_VERSION,
@@ -149,7 +150,7 @@ export function attachVerdict(input: AttachVerdictInput): AttachVerdictOutcome {
     verdict: input.verdict,
     decisionFile: latest.file,
   });
-  const observation = observationFor(decision, input.verdict, timestamp);
+  const observation = decision.recordType === "fork" ? undefined : observationFor(decision, input.verdict, timestamp);
   if (observation === undefined) return { status: "attached", recordPath, decision };
   const state = existsSync(input.refreshStatePath) ? loadRefreshState(input.refreshStatePath) : emptyRefreshState();
   saveRefreshState(input.refreshStatePath, recordCapabilityObservation(state, observation));

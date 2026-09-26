@@ -9,6 +9,7 @@ import { emptyRefreshState } from "../catalog/refresh-lifecycle.ts";
 import { resetBanLists } from "../policy/ban-lists.ts";
 import { authorizeRecipient, emptyAuthorization, grantOwnerApproval } from "../recipients/authorization.ts";
 import { readRoutingRecords } from "../routing/decision-record.ts";
+import { attachVerdict } from "../routing/verdicts.ts";
 import { autoStream } from "../router/auto-stream.ts";
 import { createRouterExtension } from "../router/extension.ts";
 import personalGuard from "../guard/extension.ts";
@@ -84,6 +85,7 @@ interface ProviderRequest {
   /** The system messages' text and sections, as one string. */
   readonly systemText: string;
   readonly thinkingLevel: string | undefined;
+  readonly messages: readonly string[];
 }
 
 /** A fake `anthropic` provider serving `modelIds` (claude-haiku-4-5 unless
@@ -106,7 +108,8 @@ function fakeAnthropic(reply: string, onRequest?: (finish: () => void) => void, 
         systemText.push(typeof message.content === "string" ? message.content : message.content.map((part) => part.text).join(""));
         systemText.push(...Object.values(message.sections ?? {}).filter((section) => section !== null));
       }
-      requests.push({ sessionId: options?.sessionId, model: `${model.provider}/${model.id}`, tools: [...tools], systemText: systemText.join("\n"), thinkingLevel: options?.reasoning });
+      requests.push({ sessionId: options?.sessionId, model: `${model.provider}/${model.id}`, tools: [...tools], systemText: systemText.join("\n"), thinkingLevel: options?.reasoning,
+        messages: context.messages.filter((message) => message.role !== "system").map((message) => JSON.stringify(message)) });
       const { stream, push, end } = autoStream();
       const message = {
         role: "assistant", content: [{ type: "text", text: reply }], api: model.api, provider: model.provider, model: model.id,
@@ -861,5 +864,139 @@ test("while a call runs, partial updates show each item queued, running with its
     assert.equal(states.at(-1), "completed, failed, completed");
     assert.ok(updates.every((update) => update.results.map((item) => item.task).join() === items.map((item) => item.task).join()), "updates keep item order");
     assert.equal(updates.at(-1)?.results[1]?.agent, "reviewr");
+  } finally { h.cleanup(); }
+});
+
+test("a fork copies the current branch before the delegating call and keeps the call-time rung", async () => {
+  const h = harness();
+  try {
+    const provider = fakeAnthropic("Fork complete.", undefined, ["claude-haiku-4-5", "claude-sonnet-5"]);
+    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+    const parent = SessionManager.create(h.projectDir, join(h.agentDir, "sessions", "--project--"));
+    parent.appendMessage({ role: "user", content: "Current branch only", timestamp: Date.now() });
+    const branchPoint = parent.appendMessage({ role: "assistant", content: [{ type: "text", text: "Keep this reply" }], stopReason: "stop", timestamp: Date.now() } as never);
+    parent.appendMessage({ role: "user", content: "Abandoned branch", timestamp: Date.now() });
+    parent.branch(branchPoint);
+    parent.appendMessage({ role: "user", content: "Latest branch", timestamp: Date.now() });
+    parent.appendMessage({ role: "assistant", content: [{ type: "text", text: "Delegating call" }, { type: "toolCall", id: "fork-call", name: "subagents", arguments: {} }], stopReason: "toolUse", timestamp: Date.now() } as never);
+    const ctx = { cwd: h.projectDir, hasUI: false, sessionManager: parent,
+      model: { provider: "anthropic", id: "claude-haiku-4-5" }, thinkingLevel: "high" } as unknown as ExtensionContext;
+    const result = await tool.execute("fork-call", { items: [{ task: "Finish", fork: true }] } as never, undefined, undefined, ctx);
+    const worker = (result.details as SubagentsDetails).results[0]!;
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.equal(worker.model, HAIKU);
+    assert.ok(worker.sessionFile);
+    assert.equal(provider.requests.length, 1, "the fork does not route");
+    assert.equal(provider.requests[0]?.model, HAIKU);
+    assert.equal(provider.requests[0]?.thinkingLevel, "high");
+    assert.equal(provider.requests[0]?.tools.includes("subagents"), false, "forks cannot delegate");
+    assert.match(provider.requests[0]!.messages.join(" "), /Latest branch/);
+    assert.doesNotMatch(provider.requests[0]!.messages.join(" "), /Abandoned branch|Delegating call/);
+    assert.equal(sessionLines(worker.sessionFile).some((entry) => entry.id === branchPoint), true);
+    const records = readRoutingRecords(join(h.stateDir, "routing"));
+    assert.equal(records.length, 1);
+    assert.equal(records[0]?.recordType, "fork");
+    assert.equal(records[0]?.delegationId, worker.sessionId);
+    assert.deepEqual(records[0], {
+      recordType: "fork", schemaVersion: "decision-record/3", delegationId: worker.sessionId,
+      timestamp: (records[0] as { timestamp: string }).timestamp,
+      model: HAIKU, effort: "high", parentSession: parent.getSessionId(),
+      forkPoint: parent.getBranch().at(-2)?.id, banListException: false,
+    });
+    const verdict = attachVerdict({ recordDir: join(h.stateDir, "routing"), delegationId: worker.sessionId, verdict: "accept",
+      refreshStatePath: join(h.stateDir, "refresh-state.json") });
+    assert.equal(verdict.status, "attached");
+    assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")).map((record) => record.recordType), ["fork", "verdict"]);
+  } finally { h.cleanup(); }
+});
+
+test("a fork on a subagent-banned session model remains unrouted and records its exemption", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagentBanList: ["haiku"] } });
+  try {
+    const provider = fakeAnthropic("Allowed fork.");
+    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+    const parent = SessionManager.create(h.projectDir, join(h.agentDir, "sessions", "--project--"));
+    parent.appendMessage({ role: "user", content: "Review", timestamp: Date.now() });
+    parent.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "fork-call", name: "subagents", arguments: {} }], timestamp: Date.now() } as never);
+    const ctx = { cwd: h.projectDir, hasUI: false, sessionManager: parent,
+      model: { provider: "anthropic", id: "claude-haiku-4-5" }, thinkingLevel: "medium" } as unknown as ExtensionContext;
+    const result = await tool.execute("fork-call", { items: [{ task: "Review", fork: true }] } as never, undefined, undefined, ctx);
+    const worker = (result.details as SubagentsDetails).results[0]!;
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.equal(worker.banListException, true);
+    assert.equal(provider.requests[0]?.model, HAIKU);
+    assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")).map((record) => record.recordType), ["fork"]);
+    const record = readRoutingRecords(join(h.stateDir, "routing"))[0]!;
+    assert.equal(record.recordType === "fork" && record.banListException, true);
+  } finally { h.cleanup(); }
+});
+
+test("a fork with an agent applies its instructions and narrowed tools but not the definition's model", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { agentDefinitionModel: { use: "preserve" } } } });
+  try {
+    writeAgentDefinition(join(h.agentDir, "agents"), "reviewer.md",
+      { name: "reviewer", description: "Reviews", tools: "read", model: "anthropic/claude-sonnet-5", thinking: "low" }, "Review carefully.");
+    const provider = fakeAnthropic("Reviewed.", undefined, ["claude-haiku-4-5", "claude-sonnet-5"]);
+    const tool = loadSubagentsTool([routerExtension(), provider.extension, PROBE_TOOL_EXTENSION]);
+    const parent = SessionManager.create(h.projectDir, join(h.agentDir, "sessions", "--project--"));
+    parent.appendMessage({ role: "user", content: "Review", timestamp: Date.now() });
+    parent.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "fork-call", name: "subagents", arguments: {} }], timestamp: Date.now() } as never);
+    const ctx = { cwd: h.projectDir, hasUI: false, sessionManager: parent,
+      model: { provider: "anthropic", id: "claude-haiku-4-5" }, thinkingLevel: "high" } as unknown as ExtensionContext;
+    const result = await tool.execute("fork-call", { items: [{ task: "Review", agent: "reviewer", fork: true }] } as never, undefined, undefined, ctx);
+    const worker = (result.details as SubagentsDetails).results[0]!;
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.equal(provider.requests[0]?.model, HAIKU);
+    assert.equal(provider.requests[0]?.thinkingLevel, "high");
+    assert.match(provider.requests[0]!.systemText, /Review carefully/);
+    assert.deepEqual(provider.requests[0]?.tools, ["read"]);
+    assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")).map((record) => record.recordType), ["fork"]);
+  } finally { h.cleanup(); }
+});
+
+test("queued forks keep their call-time rung when the session switches model; ordinary items still route", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { maxParallel: 1 } } });
+  try {
+    let finishFirst: (() => void) | undefined;
+    const provider = fakeAnthropic("Done.", (finish) => { if (finishFirst === undefined) finishFirst = finish; else finish(); },
+      ["claude-haiku-4-5", "claude-sonnet-5"]);
+    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+    const parent = SessionManager.create(h.projectDir, join(h.agentDir, "sessions", "--project--"));
+    parent.appendMessage({ role: "user", content: "Delegate", timestamp: Date.now() });
+    parent.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "fork-call", name: "subagents", arguments: {} }], timestamp: Date.now() } as never);
+    const ctx = { cwd: h.projectDir, hasUI: false, sessionManager: parent,
+      model: { provider: "anthropic", id: "claude-haiku-4-5" }, thinkingLevel: "high" } as unknown as ExtensionContext;
+    const pending = tool.execute("fork-call", { items: [{ task: "First", fork: true }, { task: "Second", fork: true }, { task: "Ordinary" }] } as never,
+      undefined, undefined, ctx);
+    for (let attempt = 0; attempt < 100 && finishFirst === undefined; attempt++) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.ok(finishFirst, "first fork reached the provider");
+    (ctx as { model: unknown }).model = { provider: "anthropic", id: "claude-sonnet-5" };
+    (ctx as { thinkingLevel: string }).thinkingLevel = "low";
+    finishFirst();
+    const result = await pending;
+    const workers = (result.details as SubagentsDetails).results;
+    assert.deepEqual(workers.map((worker) => worker.status), ["completed", "completed", "completed"]);
+    assert.deepEqual(workers.map((worker) => worker.model), [HAIKU, HAIKU, undefined]);
+    assert.equal(provider.requests[1]?.model, HAIKU);
+    assert.equal(provider.requests[1]?.thinkingLevel, "high");
+    assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")).map((record) => record.recordType), ["fork", "fork", "decision"]);
+  } finally { h.cleanup(); }
+});
+
+test("a fork from an unsaved parent keeps the branch in memory", async () => {
+  const h = harness();
+  try {
+    const provider = fakeAnthropic("Done.");
+    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+    const parent = SessionManager.inMemory(h.projectDir);
+    parent.appendMessage({ role: "user", content: "Earlier turn", timestamp: Date.now() });
+    parent.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "fork-call", name: "subagents", arguments: {} }], timestamp: Date.now() } as never);
+    const ctx = { cwd: h.projectDir, hasUI: false, sessionManager: parent,
+      model: { provider: "anthropic", id: "claude-haiku-4-5" }, thinkingLevel: "off" } as unknown as ExtensionContext;
+    const result = await tool.execute("fork-call", { items: [{ task: "Finish", fork: true }] } as never, undefined, undefined, ctx);
+    const worker = (result.details as SubagentsDetails).results[0]!;
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.equal(worker.sessionFile, undefined);
+    assert.match(provider.requests[0]!.messages.join(" "), /Earlier turn/);
   } finally { h.cleanup(); }
 });
