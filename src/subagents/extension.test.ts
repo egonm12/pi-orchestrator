@@ -13,6 +13,7 @@ import { autoStream } from "../router/auto-stream.ts";
 import { createRouterExtension } from "../router/extension.ts";
 import personalGuard from "../guard/extension.ts";
 import { createSubagentsExtension, MAX_TEXT_BYTES, type SubagentsDetails, type SubagentsProgressDetails } from "./extension.ts";
+import { markWorkerSession } from "./worker-sessions.ts";
 
 // The subagents extension as pi loads it. A fake ExtensionAPI records the
 // registered tool; a test calls its `execute` as pi does. The worker is a real
@@ -161,30 +162,59 @@ type Tool = Parameters<ExtensionAPI["registerTool"]>[0];
 /** The orchestrator's active tools in these tests: pi's default built-ins, the probe tool and subagents. */
 const ORCHESTRATOR_TOOLS = ["read", "bash", "edit", "write", "probe", "subagents"];
 
+/** A message the extension sent into the orchestrator's session, with its delivery options. */
+interface SentMessage {
+  readonly message: { readonly customType: string; readonly content: string | readonly { readonly type: string; readonly text?: string }[]; readonly display: boolean; readonly details?: unknown };
+  readonly options: { readonly triggerTurn?: boolean; readonly deliverAs?: "steer" | "followUp" | "nextTurn" } | undefined;
+}
+
 interface LoadedSubagents {
   /** The subagents tool as last registered. */
   tool(): Tool;
   /** Runs the extension's session_start handlers, as pi does when the orchestrator's session starts. */
   startSession(ctx: ExtensionContext): Promise<void>;
+  /** Runs the extension's session_shutdown handlers, as pi does when the orchestrator's session ends. */
+  shutdownSession(ctx: ExtensionContext): Promise<void>;
+  /** Runs a registered command as the owner types it, and returns what it showed. */
+  runCommand(name: string, args: string, ctx: ExtensionContext): Promise<string[]>;
+  /** Every message the extension sent into the orchestrator's session. */
+  readonly messages: readonly SentMessage[];
 }
+
+type Command = Parameters<ExtensionAPI["registerCommand"]>[1];
 
 /** The subagents extension as pi loads it in the orchestrator's session. */
 function loadSubagents(workerExtensions: readonly InlineExtension[]): LoadedSubagents {
   const tools: Tool[] = [];
-  const sessionStart: ((event: unknown, ctx: ExtensionContext) => unknown)[] = [];
+  const handlers = new Map<string, ((event: unknown, ctx: ExtensionContext) => unknown)[]>();
+  const commands = new Map<string, Command>();
+  const messages: SentMessage[] = [];
   createSubagentsExtension({ workerExtensions })({
     registerTool(tool: Tool) { tools.push(tool); },
-    on(event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) { if (event === "session_start") sessionStart.push(handler); },
+    registerCommand(name: string, command: Command) { commands.set(name, command); },
+    on(event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) { handlers.set(event, [...handlers.get(event) ?? [], handler]); },
+    sendMessage(message: SentMessage["message"], options: SentMessage["options"]) { messages.push({ message, options }); },
     getActiveTools: () => [...ORCHESTRATOR_TOOLS],
   } as unknown as ExtensionAPI);
+  const emit = async (event: { type: string; reason: string }, ctx: ExtensionContext) => {
+    for (const handler of handlers.get(event.type) ?? []) await handler(event, ctx);
+  };
   return {
     tool() {
       assert.ok(tools.length > 0 && tools.every((tool) => tool.name === "subagents"), JSON.stringify(tools.map((tool) => tool.name)));
       return tools.at(-1)!;
     },
-    async startSession(ctx) {
-      for (const handler of sessionStart) await handler({ type: "session_start", reason: "startup" }, ctx);
+    startSession: (ctx) => emit({ type: "session_start", reason: "startup" }, ctx),
+    shutdownSession: (ctx) => emit({ type: "session_shutdown", reason: "quit" }, ctx),
+    async runCommand(name, args, ctx) {
+      const command = commands.get(name);
+      assert.ok(command, `command /${name} is registered`);
+      const shown: string[] = [];
+      const ui = { notify: (text: string) => { shown.push(text); } };
+      await command.handler(args, { ...ctx, hasUI: true, ui } as never);
+      return shown;
     },
+    messages,
   };
 }
 
@@ -861,5 +891,202 @@ test("while a call runs, partial updates show each item queued, running with its
     assert.equal(states.at(-1), "completed, failed, completed");
     assert.ok(updates.every((update) => update.results.map((item) => item.task).join() === items.map((item) => item.task).join()), "updates keep item order");
     assert.equal(updates.at(-1)?.results[1]?.agent, "reviewr");
+  } finally { h.cleanup(); }
+});
+
+/** Waits, a millisecond at a time, until `condition` holds. */
+async function waitFor(condition: () => boolean, what: string): Promise<void> {
+  for (let attempt = 0; !condition() && attempt < 2000; attempt++) await new Promise((resolve) => setTimeout(resolve, 1));
+  assert.ok(condition(), `timed out waiting until ${what}`);
+}
+
+function toolText(result: { content: readonly { type: string; text?: string }[] }): string {
+  return result.content.map((part) => part.type === "text" ? part.text ?? "" : "").join("");
+}
+
+/** The background call's return value: its call id and its items' delegation ids. */
+interface BackgroundStart {
+  readonly callId: string;
+  readonly delegationIds: readonly string[];
+}
+
+/** A completion notice's details: the call id and the same results a foreground call returns. */
+type NoticeDetails = SubagentsDetails & { readonly callId: string };
+
+test("a background call returns its call id and delegation ids at once, and one completion notice follows when all its items finish", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { maxParallel: 1 } } });
+  const pending: (() => void)[] = [];
+  try {
+    const provider = fakeAnthropic("done", (finish) => pending.push(finish));
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h).ctx;
+    const items = [{ task: "Item 1" }, { task: "Item 2" }];
+    const first = await subagents.tool().execute("call-1", { items, background: true } as never, undefined, undefined, ctx);
+    const second = await subagents.tool().execute("call-2", { items, background: true } as never, undefined, undefined, ctx);
+    const starts = [first, second].map((result) => result.details as BackgroundStart);
+    assert.deepEqual(starts.map((start) => start.callId), ["call-1", "call-2"]);
+    const ids = starts.flatMap((start) => start.delegationIds);
+    assert.equal(new Set(ids).size, 4, JSON.stringify(ids));
+    for (const [index, result] of [first, second].entries()) {
+      const text = toolText(result);
+      assert.ok(text.includes(`call-${index + 1}`) && starts[index]!.delegationIds.every((id) => text.includes(id)), text);
+    }
+    assert.equal(subagents.messages.length, 0, "no notice before the items finish");
+
+    // Each call keeps its own maxParallel of 1: one worker per call runs.
+    await waitFor(() => pending.length === 2, "each call starts one worker");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(pending.length, 2, "no call runs a second worker at once");
+    while (subagents.messages.length < 2) {
+      await waitFor(() => pending.length > 0 || subagents.messages.length === 2, "a worker is waiting or both notices are in");
+      pending.shift()?.();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(subagents.messages.length, 2, "one notice per call");
+
+    for (const [index, { message, options }] of subagents.messages.entries()) {
+      assert.deepEqual(options, { triggerTurn: true, deliverAs: "followUp" }, "a follow-up that starts a turn when idle");
+      assert.equal(message.display, true);
+      const details = message.details as NoticeDetails;
+      const callId = details.callId;
+      const start = starts.find((candidate) => candidate.callId === callId);
+      assert.ok(start, `notice ${index} names a started call: ${callId}`);
+      assert.deepEqual(details.results.map((result) => result.status), ["completed", "completed"]);
+      assert.deepEqual(details.results.map((result) => result.sessionId), start.delegationIds, "the delegation ids given at the start are the workers' session ids");
+      const text = message.content;
+      assert.ok(typeof text === "string", "the notice's content is its text");
+      assert.ok(text.includes(callId), text);
+      for (const result of details.results) {
+        assert.ok(text.includes(`Worker ${result.sessionId} completed.\nSession file: ${result.sessionFile}\n\ndone`), `the foreground result text: ${text}`);
+      }
+    }
+  } finally {
+    for (const finish of pending) finish();
+    h.cleanup();
+  }
+});
+
+test("maxBackgroundWorkers refuses a background call that would exceed it, with the reason, and frees room as calls finish", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { maxBackgroundWorkers: 3 } } });
+  const pending: (() => void)[] = [];
+  try {
+    const provider = fakeAnthropic("done", (finish) => pending.push(finish));
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h).ctx;
+    const call = (id: string, count: number) => subagents.tool().execute(id,
+      { items: Array.from({ length: count }, (_, index) => ({ task: `Item ${index + 1}` })), background: true } as never, undefined, undefined, ctx);
+    await call("call-1", 2);
+    await assert.rejects(call("call-2", 2),
+      /refused the background call: its 2 workers and the 2 background workers already queued or running would exceed orchestrator\.subagents\.maxBackgroundWorkers \(3\)/);
+    await call("call-3", 1);
+
+    await waitFor(() => pending.length === 3, "the three accepted workers run");
+    for (const finish of pending.splice(0)) finish();
+    await waitFor(() => subagents.messages.length === 2, "both accepted calls sent their notices");
+    assert.deepEqual(subagents.messages.map(({ message }) => (message.details as NoticeDetails).callId).sort(), ["call-1", "call-3"]);
+    await call("call-4", 3);
+    await waitFor(() => pending.length === 3, "a finished call's workers no longer count");
+    assert.equal(provider.requests.length, 6, "the refused call started no worker");
+    for (const finish of pending.splice(0)) finish();
+    await waitFor(() => subagents.messages.length === 3, "the last call sent its notice");
+  } finally {
+    for (const finish of pending) finish();
+    h.cleanup();
+  }
+});
+
+test("Ctrl+C does not stop background workers, and session shutdown aborts them and records the notice without starting a turn", async () => {
+  const h = harness();
+  const pending: (() => void)[] = [];
+  try {
+    const provider = fakeAnthropic("done", (finish) => pending.push(finish));
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h).ctx;
+    const ctrlC = new AbortController();
+    await subagents.tool().execute("call-1", { items: [{ task: "Keep going" }], background: true } as never, ctrlC.signal, undefined, ctx);
+    await waitFor(() => pending.length === 1, "the worker runs");
+    ctrlC.abort();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(subagents.messages.length, 0, "the worker is still running after Ctrl+C");
+    pending.shift()!();
+    await waitFor(() => subagents.messages.length === 1, "the notice is in");
+    assert.deepEqual((subagents.messages[0]!.message.details as NoticeDetails).results.map((result) => result.status), ["completed"]);
+
+    await subagents.tool().execute("call-2", { items: [{ task: "Run long" }, { task: "Wait in line" }], background: true } as never, undefined, undefined, ctx);
+    await waitFor(() => pending.length === 2, "both workers run");
+    await subagents.shutdownSession(ctx);
+    assert.equal(subagents.messages.length, 2, "shutdown waits until the call has ended");
+    const { message, options } = subagents.messages[1]!;
+    assert.deepEqual(options, { triggerTurn: false }, "the notice is recorded without starting a turn");
+    const details = message.details as NoticeDetails;
+    assert.equal(details.callId, "call-2");
+    assert.deepEqual(details.results.map((result) => result.status), ["aborted", "aborted"]);
+    assert.deepEqual(await subagents.runCommand("subagents", "", ctx), ["No background subagents calls are running."]);
+  } finally {
+    for (const finish of pending) finish();
+    h.cleanup();
+  }
+});
+
+test("/subagents lists background calls with each worker's state, and stops one worker or a whole call", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { maxParallel: 1 } } });
+  const pending: (() => void)[] = [];
+  try {
+    const provider = fakeAnthropic("done", (finish) => pending.push(finish));
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h).ctx;
+    const background = async (callId: string, tasks: readonly string[]) => (await subagents.tool().execute(callId,
+      { items: tasks.map((task) => ({ task })), background: true } as never, undefined, undefined, ctx)).details as BackgroundStart;
+    const first = await background("call-1", ["Fix the parser", "Update the docs"]);
+    const second = await background("call-2", ["Review the diff", "Run the benchmarks"]);
+    await waitFor(() => pending.length === 2, "each call runs its first worker");
+
+    const [listing] = await subagents.runCommand("subagents", "list", ctx);
+    assert.equal(listing, [
+      "Background call call-1: 0/2 workers done",
+      `  ${first.delegationIds[0]} · worker · running · Fix the parser`,
+      `  ${first.delegationIds[1]} · worker · queued · Update the docs`,
+      "",
+      "Background call call-2: 0/2 workers done",
+      `  ${second.delegationIds[0]} · worker · running · Review the diff`,
+      `  ${second.delegationIds[1]} · worker · queued · Run the benchmarks`,
+    ].join("\n"));
+
+    // Stopping one worker aborts it; the call's next item then runs.
+    assert.deepEqual(await subagents.runCommand("subagents", `stop ${first.delegationIds[0]}`, ctx), [`Stopping worker ${first.delegationIds[0]}.`]);
+    await waitFor(() => provider.requests.length === 3, "call-1's second item starts");
+    // Stopping a call aborts its running worker and leaves its queued item not started.
+    assert.deepEqual(await subagents.runCommand("subagents", "stop call-2", ctx), ["Stopping background call call-2."]);
+    await waitFor(() => subagents.messages.length === 1, "call-2's notice is in");
+    const stopped = subagents.messages[0]!.message.details as NoticeDetails;
+    assert.equal(stopped.callId, "call-2");
+    assert.deepEqual(stopped.results.map((result) => result.status), ["aborted", "not-started"]);
+
+    assert.deepEqual(await subagents.runCommand("subagents", "stop no-such-id", ctx), ["No running background call or worker has the id no-such-id."]);
+    assert.match((await subagents.runCommand("subagents", "halt", ctx))[0] ?? "", /^Usage: \/subagents/);
+
+    pending.at(-1)!();
+    await waitFor(() => subagents.messages.length === 2, "call-1's notice is in");
+    const finished = subagents.messages[1]!.message.details as NoticeDetails;
+    assert.deepEqual(finished.results.map((result) => result.status), ["aborted", "completed"]);
+    assert.equal(provider.requests.length, 3, "call-2's queued item never started");
+  } finally {
+    for (const finish of pending) finish();
+    h.cleanup();
+  }
+});
+
+test("a worker's own subagents call cannot be background", async () => {
+  const h = harness();
+  try {
+    const provider = fakeAnthropic("done");
+    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h).ctx;
+    const unmark = markWorkerSession(ctx.sessionManager.getSessionId());
+    try {
+      await assert.rejects(tool.execute("call-1", { items: [{ task: "Nested" }], background: true } as never, undefined, undefined, ctx),
+        /a worker's subagents call cannot be background/);
+    } finally { unmark(); }
+    assert.equal(provider.requests.length, 0);
   } finally { h.cleanup(); }
 });

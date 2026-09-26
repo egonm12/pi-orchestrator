@@ -3,9 +3,11 @@ import type { ExtensionAPI, ExtensionContext, InlineExtension } from "@earendil-
 import { banListsFromSettings, personalAgentDir, readSettingsFile, subagentBanListEntry } from "../policy/ban-lists.ts";
 import { THINKING_LEVELS, splitKnownThinkingSuffix, type ThinkingLevel } from "../models/model-info.ts";
 import { agentDefinitionDirs, agentDefinitionListing, loadAgentDefinitions, resolveAgent } from "./agent-definitions.ts";
+import { BackgroundCalls, type BackgroundCallResult } from "./background.ts";
 import { renderSubagentsCall, renderSubagentsResult } from "./render.ts";
 import { loadSubagentsSettings } from "./settings.ts";
 import { runWorker, SUBAGENTS_TOOL, type WorkerResult, type WorkerSetup } from "./worker.ts";
+import { isWorkerSession } from "./worker-sessions.ts";
 
 // The subagents extension (ADR 0007): a third pi extension, separate from the
 // router and the guard, with a `subagents` tool. Each call starts a worker in
@@ -28,6 +30,7 @@ const PARAMETERS = {
         agent: { type: "string", description: "Optional: the name of an agent definition the worker follows." },
       }, required: ["task"], additionalProperties: false,
     } },
+    background: { type: "boolean", description: "Optional: return at once with the call id and delegation ids; one completion notice with the results follows when every item has finished." },
   },
   required: ["items"],
   additionalProperties: false,
@@ -109,6 +112,15 @@ function resultText(result: SubagentResult): string {
   ].join("\n");
 }
 
+/** The background call's result `details`: its call id and each item's delegation id, in item order. */
+export interface SubagentsBackgroundDetails {
+  readonly callId: string;
+  readonly delegationIds: readonly string[];
+}
+
+/** The custom message type of a background call's completion notice. */
+export const COMPLETION_NOTICE = "subagents-completion";
+
 /** The subagent ban list from personal settings; a project may not change it (ADR 0002). */
 function personalSubagentBanList(agentDir: string): readonly string[] {
   return banListsFromSettings(readSettingsFile(join(agentDir, "settings.json")) ?? {}).banLists.subagentBanList;
@@ -123,7 +135,9 @@ const DESCRIPTION = "Hand 1 to 8 tasks to workers. At most orchestrator.subagent
   "Results keep item order; abort stops running workers and leaves queued workers not started. " +
   "Each worker sees only its task text, so put every fact it needs in it. " +
   "An item's `agent` is optional: it names an agent definition, whose instructions the worker follows and whose tools list narrows the worker's tools. " +
-  "An unknown agent fails that item without starting its worker.";
+  "An unknown agent fails that item without starting its worker. " +
+  "With `background: true` the call returns at once with its call id and delegation ids, and one completion notice with the results follows when every item has finished; " +
+  "at most orchestrator.subagents.maxBackgroundWorkers background workers may be queued or running at once.";
 
 export function createSubagentsExtension(overrides: Partial<SubagentsDependencies> = {}) {
   const deps: SubagentsDependencies = { workerExtensions: [], ...overrides };
@@ -143,17 +157,23 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
       logged.add(line);
       process.stderr.write(`pi-orchestrator subagents: ${line}\n`);
     };
+    const backgroundCalls = new BackgroundCalls(({ text, details }, startTurn) => pi.sendMessage(
+      { customType: COMPLETION_NOTICE, content: text, display: true, details },
+      startTurn ? { triggerTurn: true, deliverAs: "followUp" } : { triggerTurn: false },
+    ));
     const registerSubagentsTool = (description: string) => pi.registerTool({
       name: SUBAGENTS_TOOL,
       label: "Subagents",
       description,
       parameters: PARAMETERS,
-      async execute(_toolCallId, params, signal, onUpdate, ctx) {
-        const { items } = params as { items: SubagentItem[] };
+      async execute(toolCallId, params, signal, onUpdate, ctx) {
+        const { items, background = false } = params as { items: SubagentItem[]; background?: boolean };
         if (!Array.isArray(items) || items.length < 1 || items.length > 8) throw new Error("subagents requires 1 to 8 items per call");
+        if (background && isWorkerSession(ctx)) throw new Error("a worker's subagents call cannot be background");
         const agentDir = personalAgentDir();
         const { settings, allowProjectOverrides, ignoredProjectKeys } = loadSubagentsSettings(agentDir, ctx.cwd);
         for (const key of ignoredProjectKeys) logOnce(`ignored project settings key ${key}`);
+        if (background) backgroundCalls.assertRoom(items.length, settings.maxBackgroundWorkers);
         const limit = settings.maxParallel;
         const modelSettings = { ...settings.agentDefinitionModel, banned: personalSubagentBanList(agentDir) };
         if (modelSettings.use === "route" && modelSettings.allowBanned) {
@@ -167,18 +187,24 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
         const sendProgress = () => {
           const done = progress.filter((item) => item.status !== "queued" && item.status !== "running").length;
           const update: SubagentsProgressDetails = { results: [...progress] };
-          onUpdate?.({ content: [{ type: "text", text: `${done}/${items.length} workers done` }], details: update });
+          // A background call has returned, so its progress has no tool result to update.
+          if (!background) onUpdate?.({ content: [{ type: "text", text: `${done}/${items.length} workers done` }], details: update });
         };
         const showProgress = (index: number, state: SubagentProgress) => {
           progress[index] = state;
           sendProgress();
         };
         sendProgress();
+        // A background call's workers stop on its own signals, not on the tool's.
+        const backgroundCall = background ? backgroundCalls.start({ callId: toolCallId, progress }) : undefined;
+        const callSignal = backgroundCall ? backgroundCall.callSignal : signal;
+        const itemSignals = backgroundCall?.itemSignals;
         let next = 0;
         const runQueue = async () => {
           while (next < items.length) {
-            if (signal?.aborted) return;
+            if (callSignal?.aborted) return;
             const index = next++;
+            if (itemSignals?.[index]?.aborted) continue;
             const { task, agent } = items[index]!;
             const item: SubagentItem = { task, ...(agent === undefined ? {} : { agent }) };
             const resolution = resolveAgent(agent, definitions, orchestratorTools);
@@ -223,7 +249,8 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               : { model: namedModel.model, ...(namedModel.banListException ? { banListException: true } : {}) };
             showProgress(index, { ...item, ...preservedModel, status: "running" });
             const worker = await runWorker({
-              task, cwd: ctx.cwd, agentDir, orchestratorSession: ctx.sessionManager, signal,
+              task, cwd: ctx.cwd, agentDir, orchestratorSession: ctx.sessionManager, signal: itemSignals?.[index] ?? callSignal,
+              ...(backgroundCall === undefined ? {} : { sessionId: backgroundCall.delegationIds[index]! }),
               extensionFactories: deps.workerExtensions, instructions: resolution.instructions, tools: resolution.tools,
               ...(namedModel === undefined ? {} : { namedModel }),
               onTool: (tool) => showProgress(index, { ...item, ...preservedModel, status: "running", ...(tool === undefined ? {} : { tool }) }),
@@ -232,13 +259,26 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
             showProgress(index, results[index]);
           }
         };
-        await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => runQueue()));
-        for (let index = 0; index < items.length; index++) {
-          const { task, agent } = items[index]!;
-          results[index] ??= { task, ...(agent === undefined ? {} : { agent }), status: "not-started", finalText: "" };
+        const lanes = Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => runQueue()));
+        const finishCall = async (): Promise<BackgroundCallResult> => {
+          await lanes;
+          for (let index = 0; index < items.length; index++) {
+            const { task, agent } = items[index]!;
+            results[index] ??= { task, ...(agent === undefined ? {} : { agent }), status: "not-started", finalText: "" };
+          }
+          const details: SubagentsDetails = { results };
+          return { text: results.map(resultText).join("\n\n"), details };
+        };
+        if (backgroundCall) {
+          backgroundCall.finish(finishCall());
+          const { delegationIds } = backgroundCall;
+          const details: SubagentsBackgroundDetails = { callId: toolCallId, delegationIds };
+          const text = [`Background subagents call ${toolCallId} started. Delegation ids, in item order:`, ...delegationIds,
+            "A completion notice with the results follows when every item has finished."].join("\n");
+          return { content: [{ type: "text", text }], details };
         }
-        const details: SubagentsDetails = { results };
-        return { content: [{ type: "text", text: results.map(resultText).join("\n\n") }], details };
+        const { text, details } = await finishCall();
+        return { content: [{ type: "text", text }], details };
       },
       renderCall: (args, theme) => renderSubagentsCall(args, theme),
       renderResult: (result, options, theme) => renderSubagentsResult(result, options, theme),
@@ -247,6 +287,12 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
     // out by its tool. The listing of agent definitions follows at session start,
     // when the project's folder is known.
     registerSubagentsTool(DESCRIPTION);
+    pi.registerCommand("subagents", {
+      description: "List this session's background subagents calls, or stop one: /subagents stop <call id | delegation id | all>",
+      handler: async (args, ctx) => { ctx.ui.notify(backgroundCalls.command(args), "info"); },
+    });
+    // Ctrl+C leaves background workers running; the session's end stops them.
+    pi.on("session_shutdown", () => backgroundCalls.shutdown());
     pi.on("session_start", (_event, ctx) => {
       const definitions = loadAgentDefinitions(agentDefinitionDirs(personalAgentDir(), ctx.cwd));
       registerSubagentsTool(`${DESCRIPTION}\n\n${agentDefinitionListing(definitions)}`);

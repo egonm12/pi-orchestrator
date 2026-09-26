@@ -20,7 +20,7 @@ Or from a local checkout:
 pi install ~/path/to/pi-orchestrator
 ```
 
-The package ships its own `subagents` tool (see below), so an orchestrator session needs no separate subagent extension to start workers. Other subagent extensions that start workers on `orchestrator/auto` still work and are still routed; use one for background workers, chains, resume or nested delegation, which the built-in tool does not do yet. For background workers, install pi-orchestrator as a package, not just with `pi -e`: their separate process loads installed packages. The package has no runtime dependencies of its own.
+The package ships its own `subagents` tool (see below), so an orchestrator session needs no separate subagent extension to start workers. Other subagent extensions that start workers on `orchestrator/auto` still work and are still routed; use one for chains, resume or nested delegation, which the built-in tool does not do yet. For another extension's background workers, install pi-orchestrator as a package, not just with `pi -e`: their separate process loads installed packages. The package has no runtime dependencies of its own.
 
 ## Set up with `init`
 
@@ -51,6 +51,12 @@ The `subagents` tool starts workers in the orchestrator's own process, by defaul
 
 Each item's `task` is the whole task for that worker, with every fact it needs: a worker sees nothing else. `agent` is optional; see Agent definitions below. At most `orchestrator.subagents.maxParallel` items (default 4) run at once, the rest queue. The orchestrator waits for every item; Ctrl+C aborts running workers and drops queued ones.
 
+### Background calls
+
+With `"background": true` next to `items`, the call returns at once with its call id and one delegation id per item, in item order. The items run on while the orchestrator does other work, each call with its own `maxParallel`. When every item has finished, one completion notice arrives with the same result text as a foreground call, headed by the call id. It is delivered as a follow-up message: it starts a turn when the orchestrator is idle, and otherwise waits for the current turn to end.
+
+`orchestrator.subagents.maxBackgroundWorkers` (default 8) caps the background workers, queued or running, across the session's background calls; a call that would exceed it is refused with the reason, and starts no worker. Ctrl+C leaves background workers running. The `/subagents` command lists each running background call with its workers' delegation ids and states, and `/subagents stop <id>` stops one: a call id stops the whole call (running workers abort, queued ones are not started), a delegation id stops that worker alone, and `all` stops every call. A stopped call still sends its notice. When the orchestrator's session ends, its background workers are aborted, and each call's notice, with status `aborted`, is recorded in the session without starting a turn. A worker's own `subagents` call cannot be background.
+
 Each item's result has a status:
 
 | Status | Meaning |
@@ -75,6 +81,7 @@ An item's `agent` name picks a named, owner-written kind of worker: its instruct
   "orchestrator": {
     "subagents": {
       "maxParallel": 4,
+      "maxBackgroundWorkers": 8,
       "agentDefinitionModel": { "use": "route", "allowBanned": false },
       "allowProjectOverrides": false
     }
@@ -85,6 +92,7 @@ An item's `agent` name picks a named, owner-written kind of worker: its instruct
 | Key | Meaning |
 |-----|---------|
 | `subagents.maxParallel` | At most this many of one call's items run at once; the rest queue. Default 4 |
+| `subagents.maxBackgroundWorkers` | At most this many background workers, queued or running, across the session's background calls; a background call that would exceed it is refused. Default 8 |
 | `subagents.agentDefinitionModel.use` | `"route"` (the default) ignores an agent definition's `model` and `thinking`, with one warning, and routes the worker as usual. `"preserve"` runs a worker whose definition names a model on that model and thinking, unrouted, and writes an agent-model record (delegation id, agent name, definition file, model, effort). A definition without a model is routed either way |
 | `subagents.agentDefinitionModel.allowBanned` | Default `false`. With `"preserve"`, a worker whose agent definition names a model on the subagent ban list runs on it; with `false`, that item fails before a worker starts. For a definition from the project's `.pi/agents/` this also needs `allowProjectOverrides` in personal settings. With that flag on, a project's `agentDefinitionModel` replaces the personal one, `allowBanned` included. When the exception lets a worker run, its agent-model record gets `banListException: true`, its item result gets `banListException: true`, and its line is marked `(ban-list exception)`. The guard and the router extension do not stop such a worker. Under `"route"`, a `true` value has no effect and warns once per session. Every other path still refuses a banned model: the tier map drops its rungs, and the guard refuses a tool call that names it |
 | `subagents.allowProjectOverrides` | Personal settings only, default `false`. Lets a project's `.pi/settings.json` set every `orchestrator.subagents` key except this one. A project key replaces the personal value whole: a project's `agentDefinitionModel` replaces the personal object, it is not merged into it. Without the flag every project `orchestrator.subagents` key is ignored; with it, a project value for the flag itself is ignored. Each ignored key is logged once to stderr, as `pi-orchestrator subagents: ignored project settings key <key>`, the way the guard logs ignored ban-list keys |
@@ -180,7 +188,7 @@ The guard protects against accidental mistakes, not a determined agent. It refus
 
 - A worker started on a real model is not routed. A workflow's workers are routed only if the subagent extension starts them on `orchestrator/auto`.
 - The task allowance is per session ($5 by default), not shared between the orchestrator and background workers.
-- The built-in `subagents` tool runs one call to its end in the orchestrator's own process; it has no background workers, chains, resume or nested delegation yet (workers do not get the `subagents` tool). Use another subagent extension for those.
+- The built-in `subagents` tool runs its workers in the orchestrator's own process; it has no chains, resume or nested delegation yet (workers do not get the `subagents` tool). Use another subagent extension for those. Its background workers end with the orchestrator's session.
 
 ## Development
 
