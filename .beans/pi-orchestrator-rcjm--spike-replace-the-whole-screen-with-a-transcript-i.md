@@ -1,21 +1,21 @@
 ---
 # pi-orchestrator-rcjm
 title: 'Spike: replace the whole screen with a transcript in regular tuiMode'
-status: in-progress
+status: completed
 type: task
 priority: normal
 tags:
     - ready-for-agent
 created_at: 2026-09-26T09:18:43Z
-updated_at: 2026-09-26T10:19:55Z
+updated_at: 2026-09-26T10:22:39Z
 parent: pi-orchestrator-a338
 ---
 
 Prototype, throwaway. Answer: can an extension show a component on the alternate screen from regular tuiMode (via ctx.ui.custom or pi-tui's TuiAltScreen) and return to the orchestrator session exactly as it was, with no broken scrollback, cursor or editor state? Also try it in fullscreen tuiMode.
 
 ## Todo
-- [ ] Prototype in a scratch extension, tried in a live pi session in both tuiModes
-- [ ] Record the answer and the chosen mechanism (or the fallback) in an ## Answer section
+- [x] Prototype in a scratch extension, tried in a live pi session in both tuiModes
+- [x] Record the answer and the chosen mechanism (or the fallback) in an ## Answer section
 
 ## Spike notes
 
@@ -53,18 +53,43 @@ Both show a fake transcript that grows one line every 300 ms, follows the end un
    ```
    (or toggle "TUI mode" to fullscreen from `/settings` in a regular-mode session already running the spike).
 
-Checklist after leaving each time:
-- [ ] Scrollback intact: earlier turns (and, in fullscreen tuiMode, the transcript scroll position) are exactly as they were, nothing missing or duplicated.
-- [ ] Cursor position correct and visible where the editor left it.
-- [ ] Editor text and cursor preserved: type some text into the editor *before* opening the spike, confirm it, and the cursor position within it, are unchanged after Escape.
-- [ ] No leftover lines: no stray fragments of the fake transcript remain on screen after leaving.
-- [ ] Resize while open: resize the terminal window while the spike is showing; it should redraw at the new size without artifacts (only the overlay mechanism is expected to fill exactly the new size).
-- [ ] A pi message arriving while open: send a message to the orchestrator from another pane/session sharing the same session file, or simply note whether anything from the live pi session bleeds through or corrupts the spike's rendering while it is open.
+Checklist after leaving each time (a guide for the live try, not bean todos; the result is in the Answer):
+- Scrollback intact: earlier turns (and, in fullscreen tuiMode, the transcript scroll position) are exactly as they were, nothing missing or duplicated.
+- Cursor position correct and visible where the editor left it.
+- Editor text and cursor preserved: type some text into the editor *before* opening the spike, confirm it, and the cursor position within it, are unchanged after Escape.
+- No leftover lines: no stray fragments of the fake transcript remain on screen after leaving.
+- Resize while open: resize the terminal window while the spike is showing; it should redraw at the new size without artifacts (only the overlay mechanism is expected to fill exactly the new size).
+- A pi message arriving while open: send a message to the orchestrator from another pane/session sharing the same session file, or simply note whether anything from the live pi session bleeds through or corrupts the spike's rendering while it is open.
 
-Both todos below are left unchecked and no `## Answer` section is written: the orchestrator records the answer once these steps are tried live.
+The worker left both todos unchecked and wrote no Answer; the orchestrator recorded it after the live try.
 
 ### First live try (2026-09-26)
 
 In both tuiModes the user could not leave the overlay: Esc did nothing and ctrl+c did not quit pi. Cause: the spike matched raw legacy bytes (a bare `\x1b` for Esc), but pi turns on the kitty keyboard protocol, so Esc arrives as `\x1b[27u`. The overlay holds focus and pi reads the terminal raw, so ctrl+c reached only the spike, which dropped it. Fixed by matching through the keybindings manager pi passes to the `ctx.ui.custom` factory (`tui.select.cancel` covers Esc and ctrl+c in both encodings), with `q` as a last way out.
 
 For llnk: a full-screen overlay takes every key, so the transcript view must match keys through pi's keybindings manager (or pi-tui's `matchesKey`), never raw bytes, and must always leave on Esc and ctrl+c.
+
+### Second live try (2026-09-26)
+
+After the key fix the user tried `/spike-transcript-overlay` in regular and fullscreen tuiMode and reported that both work fine: the overlay opens over the whole screen, and leaving it restores the orchestrator session.
+
+## Answer
+
+Yes. An extension can replace the whole screen from regular tuiMode and return to the session as it was, and the same mechanism works in fullscreen tuiMode. No fallback is needed.
+
+Chosen mechanism: `ctx.ui.custom(factory, { overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", margin: 0 } })`. pi-tui composites the component over the whole viewport through its overlay stack, the same code in both tuiModes. It never writes to the terminal's scrollback and never touches the editor, so closing it (calling `done`) leaves the session as it was. It is not the terminal's real alternate screen in regular tuiMode, but it covers the whole screen, which is what the epic asks for.
+
+What llnk must do with it:
+
+- Match keys through the keybindings manager pi passes to the factory (or pi-tui's `matchesKey`), never raw bytes. The overlay takes every key and pi reads the terminal raw, so a view that misses Esc and ctrl+c traps the user. Always leave on `tui.select.cancel` (Esc and ctrl+c).
+- Size the view from `tui.terminal.rows` on every render, so a resize redraws at the new size, and cut every line to the render width.
+- Re-render live with `tui.requestRender()`, and clear timers and subscriptions when the view closes.
+- `@earendil-works/pi-tui` resolves for extensions at runtime through pi's extension loader, though not for this repo's typecheck; the keybindings manager from the factory avoids needing it.
+
+The prototype stays in the branch history only, as commit 444c536 (`git show 444c536:scratch/alt-screen-spike/extension.ts`); it is removed before the merge, so no scratch code reaches main.
+
+## Summary of Changes
+
+- A throwaway scratch extension, `scratch/alt-screen-spike/extension.ts`, offered the full-screen overlay and the editor-slot swap side by side, with a fake transcript that grows, follows the end and scrolls.
+- The first live try found that the spike trapped the user, since it matched raw legacy key bytes under the kitty keyboard protocol. It was fixed to match keys through pi's keybindings manager, and to cut lines to the terminal width.
+- The second live try confirmed the full-screen overlay in both tuiModes. The Answer above records the mechanism for llnk. The scratch extension is removed before the merge.
