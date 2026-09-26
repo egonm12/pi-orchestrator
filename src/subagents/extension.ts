@@ -11,6 +11,7 @@ import { renderSubagentsCall, renderSubagentsResult } from "./render.ts";
 import { forkSession } from "./fork-session.ts";
 import { prepareResume, saveWorkerOutcome } from "./resume.ts";
 import { loadSubagentsSettings } from "./settings.ts";
+import { registerSubagentsStatusTool } from "./status.ts";
 import { runWorker, SUBAGENTS_TOOL, type WorkerResult, type WorkerSetup } from "./worker.ts";
 
 // The subagents extension (ADR 0007): a third pi extension, separate from the
@@ -248,6 +249,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
                 showProgress(index, { ...item, status: "running" });
                 const worker = await runWorker({ task, resume: prepared, cwd: ctx.cwd, agentDir, orchestratorSession: ctx.sessionManager,
                   signal: itemSignals?.[index] ?? callSignal, extensionFactories: deps.workerExtensions, instructions: prepared.instructions, tools: prepared.tools,
+                  onActivity: backgroundCall?.onActivity[index],
                   onTool: (tool) => showProgress(index, { ...item, status: "running", ...(tool === undefined ? {} : { tool }) }),
                 });
                 saveWorkerOutcome(worker.sessionFile, worker.status);
@@ -315,6 +317,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               ...(namedModel === undefined ? {} : { namedModel }),
               ...(preparedFork === undefined ? {} : { fork: preparedFork }),
               ...(parentDelegationId === undefined ? {} : { parentDelegationId }),
+              onActivity: backgroundCall?.onActivity[index],
               onTool: (tool) => showProgress(index, { ...item, ...workerModel, status: "running", ...(tool === undefined ? {} : { tool }) }),
             });
             saveWorkerOutcome(worker.sessionFile, worker.status, { instructions: resolution.instructions, tools: resolution.tools });
@@ -358,6 +361,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
       description: "List this session's background subagents calls, or stop one: /subagents stop <call id | delegation id | all>",
       handler: async (args, ctx) => { ctx.ui.notify(backgroundCalls.command(args), "info"); },
     });
+    registerSubagentsStatusTool(pi, backgroundCalls);
     // Ctrl+C leaves background workers running; the session's end stops them.
     pi.on("session_shutdown", () => backgroundCalls.shutdown());
     pi.on("session_start", (_event, ctx) => {

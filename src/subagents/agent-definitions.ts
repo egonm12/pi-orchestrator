@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import { SUBAGENTS_STATUS_TOOL } from "./status.ts";
 import { SUBAGENTS_TOOL } from "./worker.ts";
 
 // Agent definitions (ADR 0007, CONTEXT.md): owner-written markdown files with
@@ -99,7 +100,8 @@ export type AgentResolution =
 /** Resolve a task item's `agent` against the definitions. No agent gives the
  *  worker no instructions and the default tools. A definition's `tools:` list
  *  keeps only tools in `orchestratorTools`, and the subagents tool only when
- *  `mayDelegate` (ADR 0008: the orchestrator's workers, not theirs). */
+ *  `mayDelegate` (ADR 0008: the orchestrator's workers, not theirs). It never
+ *  keeps `subagents_status`, which is the orchestrator's alone. */
 export function resolveAgent(
   agent: string | undefined, definitions: readonly AgentDefinition[], orchestratorTools: readonly string[], mayDelegate = false,
 ): AgentResolution {
@@ -109,7 +111,8 @@ export function resolveAgent(
     const known = definitions.length === 0 ? "there are none" : `known agents: ${definitions.map((candidate) => candidate.name).join(", ")}`;
     return { ok: false, error: `unknown agent "${agent}"; ${known}` };
   }
-  const tools = definition.tools?.filter((tool) => (mayDelegate || tool !== SUBAGENTS_TOOL) && orchestratorTools.includes(tool));
+  const tools = definition.tools?.filter((tool) => (mayDelegate || tool !== SUBAGENTS_TOOL) && tool !== SUBAGENTS_STATUS_TOOL &&
+    orchestratorTools.includes(tool));
   return {
     ok: true,
     definition,

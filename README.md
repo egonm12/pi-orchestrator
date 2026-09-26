@@ -67,6 +67,17 @@ With `"background": true` next to `items`, the call returns at once with its cal
 
 `orchestrator.subagents.maxBackgroundWorkers` (default 8) caps the background workers, queued or running, across the session's background calls; a call that would exceed it is refused with the reason, and starts no worker. Ctrl+C leaves background workers running. The `/subagents` command lists each running background call with its workers' delegation ids and states, and `/subagents stop <id>` stops one: a call id stops the whole call (running workers abort, queued ones are not started), a delegation id stops that worker alone, and `all` stops every call. A stopped call still sends its notice. When the orchestrator's session ends, its background workers are aborted, and each call's notice, with status `aborted`, is recorded in the session without starting a turn. A worker's own `subagents` call cannot be background.
 
+### Status and wait
+
+The `subagents_status` tool, `{ "id"?: string, "wait"?: boolean }`, shows the orchestrator its session's running background calls:
+
+- Without `id` it lists them, as `/subagents list` does: each call's id and done count, and each worker's delegation id, agent, state and short task.
+- With a call id it gives a snapshot of each of the call's items; with a delegation id, a snapshot of that worker alone. A snapshot holds the worker's state, its current tool, the turns it has started, its elapsed time, the last 5 lines of its latest text and its session file.
+- With a call id and `"wait": true` it blocks until the call has finished and returns its results, the same text and details as its completion notice. That notice is then not delivered: a result goes once, to a pending wait, otherwise as the notice. `wait` needs a call id; a delegation id or no id is refused.
+- Ctrl+C during a wait stops only the wait. The workers run on, and the call's completion notice follows.
+
+A call that has finished is no longer listed; its results are in its completion notice. Workers do not get `subagents_status`, even when their agent definition's `tools:` list names it.
+
 ### Resume
 
 A `resume` item uses a finished worker's delegation id and a new task instead of `agent` or `fork`. It continues that worker's saved session and original pin without a new routing decision. Unknown, running and not-started workers cannot be resumed, nor can workers from another orchestrator session or those without a recoverable pin. The original pin must still pass the hard filters; otherwise the item fails without re-routing. A preserved agent model's ban-list exception is rechecked against current settings. Later verdicts for the same delegation replace earlier ones in the routing report; the record retains all verdicts. A resume item may be background: its delegation id stays the one it resumes.

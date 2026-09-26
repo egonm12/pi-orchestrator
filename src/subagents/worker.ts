@@ -83,6 +83,19 @@ export interface WorkerSetup {
   /** Called with a tool's name when the worker starts running it, and with
    *  the name of a tool still running, or `undefined`, when one ends. */
   readonly onTool?: (tool: string | undefined) => void;
+  /** Called when the worker starts, as its turns and text move on, and once more when it ends. */
+  readonly onActivity?: (activity: WorkerActivity) => void;
+}
+
+/** What a worker has done so far, for `subagents_status`. */
+export interface WorkerActivity {
+  /** Where its session is saved; `undefined` for a session that is not saved. */
+  readonly sessionFile: string | undefined;
+  /** The turns it has started. */
+  readonly turns: number;
+  /** Its latest assistant message's text; empty until it writes any. */
+  readonly text: string;
+  readonly ended: boolean;
 }
 
 /** Where a worker's session is saved: below the orchestrator's session
@@ -108,8 +121,36 @@ function errorText(error: unknown): string {
   return (error instanceof Error ? error.message : String(error)).split(/\r?\n/, 1)[0] ?? "";
 }
 
+interface AssistantText {
+  readonly role?: string;
+  readonly content?: string | readonly { readonly type: string; readonly text?: string }[];
+}
+
+/** An assistant message's text; empty for any other message. */
+function assistantText(message: AssistantText): string {
+  if (message.role !== "assistant" || message.content === undefined) return "";
+  if (typeof message.content === "string") return message.content;
+  return message.content.map((part) => part.type === "text" ? part.text ?? "" : "").join("");
+}
+
+/** A running worker's activity so far, which `runWorkerSession` moves on. */
+interface ActivitySoFar {
+  sessionFile: string | undefined;
+  turns: number;
+  text: string;
+}
+
 /** Run one worker to its end. Never throws: a failure is a `failed` result. */
 export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
+  const activity: ActivitySoFar = { sessionFile: undefined, turns: 0, text: "" };
+  const report = (ended: boolean) => setup.onActivity?.({ ...activity, ended });
+  try {
+    return await runWorkerSession(setup, activity, () => report(false));
+  } finally { report(true); }
+}
+
+/** `runWorker`'s body: it moves `activity` on and calls `report` at each step. */
+async function runWorkerSession(setup: WorkerSetup, activity: ActivitySoFar, report: () => void): Promise<WorkerResult> {
   // A fork's session is copied beforehand, already carrying any background delegation id;
   // a resumed worker reopens its saved session.
   const sessionOptions = setup.sessionId === undefined ? undefined : { id: setup.sessionId };
@@ -119,6 +160,8 @@ export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
       ? SessionManager.inMemory(setup.cwd, sessionOptions)
       : SessionManager.create(setup.cwd, workerSessionDir(setup.orchestratorSession), sessionOptions));
   const sessionId = sessionManager.getSessionId();
+  activity.sessionFile = sessionManager.getSessionFile();
+  report();
   const saved = (): string | undefined => {
     const file = sessionManager.getSessionFile();
     return file !== undefined && existsSync(file) ? file : undefined;
@@ -177,6 +220,19 @@ export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
   const abort = () => { void session.abort(); };
   const runningTools = new Map<string, string>();
   const unsubscribe = session.subscribe((event) => {
+    if (event.type === "turn_start") {
+      activity.turns++;
+      report();
+      return;
+    }
+    if (event.type === "message_update" || event.type === "message_end") {
+      const text = assistantText(event.message as AssistantText);
+      if (text !== "" && text !== activity.text) {
+        activity.text = text;
+        report();
+      }
+      return;
+    }
     if (event.type === "tool_execution_start") runningTools.set(event.toolCallId, event.toolName);
     else if (event.type === "tool_execution_end") runningTools.delete(event.toolCallId);
     else return;
