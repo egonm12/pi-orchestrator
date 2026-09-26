@@ -18,6 +18,6 @@ Tool `subagents_message({ id, text, mode: "steer" | "followUp" })`, default stee
 - [x] Test: refused for finished, foreground and unknown delegations
 - [x] README
 
-## Summary of changes
+## Summary of Changes
 
 Added `subagents_message` for running background workers, using pi's steer and follow-up queues and a direct reply seam for a blocking report question. Covered delivery timing, refusal cases and worker tool isolation in the subagents integration tests, and documented usage in README.md.
