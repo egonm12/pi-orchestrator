@@ -3,6 +3,8 @@ import { join } from "node:path";
 import { appendRoutingRecord, buildAgentModelRecord, buildForkRecord } from "../routing/decision-record.ts";
 import { stateDir } from "../router/extension.ts";
 import { markWorkerSession } from "./worker-sessions.ts";
+import type { ResumeWorker } from "./resume.ts";
+import { setResumePin } from "../router/auto-provider.ts";
 import type { ThinkingLevel } from "../models/model-info.ts";
 import {
   createAgentSessionFromServices,
@@ -43,6 +45,7 @@ export interface WorkerResult {
 
 export interface WorkerSetup {
   readonly task: string;
+  readonly resume?: ResumeWorker;
   readonly cwd: string;
   /** The orchestrator's agent dir: its auth.json, models.json, settings and
    *  installed extensions. */
@@ -107,11 +110,14 @@ function errorText(error: unknown): string {
 
 /** Run one worker to its end. Never throws: a failure is a `failed` result. */
 export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
-  // A fork's session is copied beforehand, already carrying any background delegation id.
+  // A fork's session is copied beforehand, already carrying any background delegation id;
+  // a resumed worker reopens its saved session.
   const sessionOptions = setup.sessionId === undefined ? undefined : { id: setup.sessionId };
-  const sessionManager = setup.fork?.sessionManager ?? (setup.orchestratorSession.getSessionFile() === undefined
-    ? SessionManager.inMemory(setup.cwd, sessionOptions)
-    : SessionManager.create(setup.cwd, workerSessionDir(setup.orchestratorSession), sessionOptions));
+  const sessionManager = setup.resume
+    ? SessionManager.open(setup.resume.file, workerSessionDir(setup.orchestratorSession), setup.cwd)
+    : setup.fork?.sessionManager ?? (setup.orchestratorSession.getSessionFile() === undefined
+      ? SessionManager.inMemory(setup.cwd, sessionOptions)
+      : SessionManager.create(setup.cwd, workerSessionDir(setup.orchestratorSession), sessionOptions));
   const sessionId = sessionManager.getSessionId();
   const saved = (): string | undefined => {
     const file = sessionManager.getSessionFile();
@@ -133,7 +139,8 @@ export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
         ...(instructions === undefined ? {} : { appendSystemPromptOverride: (base: string[]) => [...base, instructions] }),
       },
     });
-    const { namedModel, fork } = setup;
+    const { fork } = setup;
+    const namedModel = setup.resume?.namedModel ?? setup.namedModel;
     // The provider ends at the first slash; a model id may hold more.
     const selectedModel = fork?.model ?? namedModel?.model;
     const slash = selectedModel?.indexOf("/") ?? -1;
@@ -147,7 +154,8 @@ export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
       services, sessionManager, model, ...((fork?.effort ?? namedModel?.effort) === undefined ? {} : { thinkingLevel: fork?.effort ?? namedModel?.effort }),
       ...(setup.tools === undefined ? {} : { tools: [...setup.tools] }),
     })).session;
-    if (fork || namedModel) {
+    // A resume writes no new record: the delegation keeps its original one.
+    if ((fork || namedModel) && !setup.resume) {
       try {
         appendRoutingRecord(join(stateDir(), "routing"), fork ? buildForkRecord({
           delegationId: sessionId, model: fork.model, effort: fork.effort,
@@ -176,6 +184,7 @@ export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
   });
   // Before binding, so the extensions see the mark at session_start.
   const unmarkWorkerSession = markWorkerSession(sessionId, setup.parentDelegationId);
+  const unsetResumePin = setup.resume && !setup.resume.namedModel ? setResumePin(sessionId, setup.resume.pin) : undefined;
   try {
     // Binding starts the extensions: the router extension reads its settings
     // at session_start.
@@ -196,6 +205,7 @@ export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
     setup.signal?.removeEventListener("abort", abort);
     unsubscribe();
     session.dispose();
+    unsetResumePin?.();
     unmarkWorkerSession();
   }
 }

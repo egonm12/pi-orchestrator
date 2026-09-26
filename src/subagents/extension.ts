@@ -9,6 +9,7 @@ import { callingDelegation } from "./nested-delegation.ts";
 import { BackgroundCalls, type BackgroundCallResult } from "./background.ts";
 import { renderSubagentsCall, renderSubagentsResult } from "./render.ts";
 import { forkSession } from "./fork-session.ts";
+import { prepareResume, saveWorkerOutcome } from "./resume.ts";
 import { loadSubagentsSettings } from "./settings.ts";
 import { runWorker, SUBAGENTS_TOOL, type WorkerResult, type WorkerSetup } from "./worker.ts";
 
@@ -34,6 +35,7 @@ const PARAMETERS = {
         task: { type: "string", description: "The whole task for an ordinary worker. Forks also see the current branch." },
         agent: { type: "string", description: "Optional: the name of an agent definition the worker follows." },
         fork: { type: "boolean", description: "Start from the orchestrator's current branch on its session model." },
+        resume: { type: "string", description: "Continue a finished delegation by id, in its saved session and on its original pin." },
       }, required: ["task"], additionalProperties: false,
     } },
     background: { type: "boolean", description: "Optional: return at once with the call id and delegation ids; one completion notice with the results follows when every item has finished." },
@@ -59,6 +61,7 @@ interface SubagentItem {
   readonly task: string;
   readonly agent?: string;
   readonly fork?: boolean;
+  readonly resume?: string;
 }
 
 /** The model an unrouted worker used, and whether its exception to the
@@ -145,7 +148,8 @@ const DESCRIPTION = "Hand 1 to 8 tasks to workers. At most orchestrator.subagent
   "An unknown agent fails that item without starting its worker. " +
   "Set `fork: true` to copy the current branch before this call and run on the session model and effort, without routing. " +
   "With `background: true` the call returns at once with its call id and delegation ids, and one completion notice with the results follows when every item has finished; " +
-  "at most orchestrator.subagents.maxBackgroundWorkers background workers may be queued or running at once.";
+  "at most orchestrator.subagents.maxBackgroundWorkers background workers may be queued or running at once. " +
+  "Use `resume` with `task` (without `agent`) to continue a finished saved worker on its original pin.";
 
 export function createSubagentsExtension(overrides: Partial<SubagentsDependencies> = {}) {
   const deps: SubagentsDependencies = { workerExtensions: [], ...overrides };
@@ -194,9 +198,10 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
         // Snapshot every fork before the queue runs: a later model switch or
         // parent turn cannot change a queued fork's pin or branch.
         // A background call's delegation ids are chosen now, so a fork's copied session can carry its id.
-        const delegationIds = background ? items.map(() => randomUUID()) : undefined;
+        // A resume item's delegation id is the one it resumes.
+        const delegationIds = background ? items.map((item) => item.resume ?? randomUUID()) : undefined;
         const forks = items.map((item, index) => {
-          if (item.fork !== true || !resolveAgent(item.agent, definitions, orchestratorTools).ok) return undefined;
+          if (item.fork !== true || item.resume !== undefined || !resolveAgent(item.agent, definitions, orchestratorTools).ok) return undefined;
           try {
             if (!ctx.model) throw new Error("the session has no model to fork");
             const model = `${ctx.model.provider}/${ctx.model.id}`;
@@ -206,8 +211,8 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               banListException: banned !== undefined } as const;
           } catch (error) { return { error: error instanceof Error ? error.message : String(error) } as const; }
         });
-        const progress: SubagentProgress[] = items.map(({ task, agent, fork }, index) => ({ task, ...(agent === undefined ? {} : { agent }),
-          ...(fork === true ? { fork: true } : {}),
+        const progress: SubagentProgress[] = items.map(({ task, agent, fork, resume }, index) => ({ task, ...(agent === undefined ? {} : { agent }),
+          ...(fork === true ? { fork: true } : {}), ...(resume === undefined ? {} : { resume }),
           ...(forks[index]?.model === undefined ? {} : { model: forks[index].model,
             ...(forks[index].banListException ? { banListException: true } : {}) }), status: "queued" }));
         const sendProgress = () => {
@@ -231,8 +236,28 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
             if (callSignal?.aborted) return;
             const index = next++;
             if (itemSignals?.[index]?.aborted) continue;
-            const { task, agent, fork } = items[index]!;
-            const item: SubagentItem = { task, ...(agent === undefined ? {} : { agent }), ...(fork === true ? { fork: true } : {}) };
+            const { task, agent, fork, resume } = items[index]!;
+            const item: SubagentItem = { task, ...(agent === undefined ? {} : { agent }), ...(fork === true ? { fork: true } : {}),
+              ...(resume === undefined ? {} : { resume }) };
+            if (resume !== undefined) {
+              let releaseResume: (() => void) | undefined;
+              try {
+                if (agent !== undefined || fork !== undefined) throw new Error("resume excludes agent and fork");
+                const prepared = prepareResume(resume, task, { cwd: ctx.cwd, agentDir, orchestratorSession: ctx.sessionManager });
+                releaseResume = prepared.release;
+                showProgress(index, { ...item, status: "running" });
+                const worker = await runWorker({ task, resume: prepared, cwd: ctx.cwd, agentDir, orchestratorSession: ctx.sessionManager,
+                  signal: itemSignals?.[index] ?? callSignal, extensionFactories: deps.workerExtensions, instructions: prepared.instructions, tools: prepared.tools,
+                  onTool: (tool) => showProgress(index, { ...item, status: "running", ...(tool === undefined ? {} : { tool }) }),
+                });
+                saveWorkerOutcome(worker.sessionFile, worker.status);
+                results[index] = { ...item, ...worker, finalText: cutText(worker.finalText, worker.sessionFile) };
+              } catch (error) {
+                results[index] = { ...item, status: "failed", finalText: "", error: error instanceof Error ? error.message : String(error) };
+              } finally { releaseResume?.(); }
+              showProgress(index, results[index]);
+              continue;
+            }
             const preparedFork = forks[index];
             if (preparedFork?.error !== undefined) {
               results[index] = { ...item, status: "failed", finalText: "", error: preparedFork.error };
@@ -292,6 +317,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               ...(parentDelegationId === undefined ? {} : { parentDelegationId }),
               onTool: (tool) => showProgress(index, { ...item, ...workerModel, status: "running", ...(tool === undefined ? {} : { tool }) }),
             });
+            saveWorkerOutcome(worker.sessionFile, worker.status, { instructions: resolution.instructions, tools: resolution.tools });
             results[index] = { ...item, ...workerModel, ...worker, finalText: cutText(worker.finalText, worker.sessionFile) };
             showProgress(index, results[index]);
           }
@@ -300,11 +326,11 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
         const finishCall = async (): Promise<BackgroundCallResult> => {
           await lanes;
           for (let index = 0; index < items.length; index++) {
-            const { task, agent, fork } = items[index]!;
+            const { task, agent, fork, resume } = items[index]!;
             if (results[index] === undefined) {
               const file = forks[index]?.sessionManager?.getSessionFile();
               if (file !== undefined) rmSync(file, { force: true });
-              results[index] = { task, ...(agent === undefined ? {} : { agent }), ...(fork === true ? { fork: true } : {}), status: "not-started", finalText: "" };
+              results[index] = { task, ...(agent === undefined ? {} : { agent }), ...(fork === true ? { fork: true } : {}), ...(resume === undefined ? {} : { resume }), status: "not-started", finalText: "" };
             }
           }
           const details: SubagentsDetails = { results };
