@@ -14,6 +14,7 @@ import { autoStream } from "../router/auto-stream.ts";
 import { createRouterExtension } from "../router/extension.ts";
 import personalGuard from "../guard/extension.ts";
 import { createSubagentsExtension, MAX_TEXT_BYTES, type SubagentsDetails, type SubagentsProgressDetails } from "./extension.ts";
+import { markWorkerSession } from "./worker-sessions.ts";
 
 // The subagents extension as pi loads it. A fake ExtensionAPI records the
 // registered tool; a test calls its `execute` as pi does. The worker is a real
@@ -450,9 +451,9 @@ test("agent definitions come from the owner's and the project's agent folders, t
 test("a definition's tools: list narrows the orchestrator's tools and cannot add one", async () => {
   const h = harness();
   try {
-    // grep is a pi built-in the orchestrator does not have on; subagents is never a worker's.
+    // grep is a pi built-in the orchestrator does not have on.
     writeAgentDefinition(join(h.projectDir, ".pi", "agents"), "scout.md",
-      { name: "scout", description: "Reads only", tools: "read, probe, grep, subagents" }, "Read, never write.");
+      { name: "scout", description: "Reads only", tools: "read, probe, grep" }, "Read, never write.");
     const provider = fakeAnthropic("done");
     const subagents = loadSubagents([routerExtension(), provider.extension, PROBE_TOOL_EXTENSION]);
     const main = orchestrator(h);
@@ -998,5 +999,206 @@ test("a fork from an unsaved parent keeps the branch in memory", async () => {
     assert.equal(worker.status, "completed", JSON.stringify(worker));
     assert.equal(worker.sessionFile, undefined);
     assert.match(provider.requests[0]!.messages.join(" "), /Earlier turn/);
+  } finally { h.cleanup(); }
+});
+
+/** One request a scripted provider got: whose it was, what it offered and what it had seen. */
+interface ScriptedRequest {
+  readonly sessionId: string | undefined;
+  /** The first user message: the worker's task. */
+  readonly task: string;
+  readonly tools: readonly string[];
+  /** The tool results in the request's context, in order. */
+  readonly toolResults: readonly { readonly text: string; readonly isError: boolean }[];
+}
+
+/** What a scripted provider answers: a final text, or one tool call. */
+type ScriptedReply = { readonly text: string } | { readonly toolCall: { readonly name: string; readonly arguments: Record<string, unknown> } };
+
+/** A fake `anthropic` provider serving claude-haiku-4-5 offline, answering each
+ *  request with what `script` returns for it. */
+function scriptedAnthropic(script: (request: ScriptedRequest) => ScriptedReply) {
+  const requests: ScriptedRequest[] = [];
+  const config: ProviderConfig = {
+    name: "Fake Anthropic", baseUrl: "http://localhost/unused", apiKey: "unused", api: "fake-anthropic" as never,
+    models: [{ id: "claude-haiku-4-5", name: "Claude Haiku 4.5", reasoning: true, input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200_000, maxTokens: 64_000 }],
+    streamSimple(model, context, options) {
+      const tools = new Set<string>();
+      for (const message of context.messages) {
+        if (message.role !== "system") continue;
+        for (const tool of message.toolsRemoved ?? []) tools.delete(tool.name);
+        for (const tool of message.toolsAdded ?? []) tools.add(tool.name);
+      }
+      const text = (content: string | readonly { type: string; text?: string }[]) =>
+        typeof content === "string" ? content : content.map((part) => part.type === "text" ? part.text ?? "" : "").join("");
+      const firstUser = context.messages.find((message) => message.role === "user");
+      const request: ScriptedRequest = {
+        sessionId: options?.sessionId, task: firstUser ? text(firstUser.content) : "", tools: [...tools],
+        toolResults: context.messages.flatMap((message) => message.role === "toolResult" ? [{ text: text(message.content), isError: message.isError }] : []),
+      };
+      requests.push(request);
+      const reply = script(request);
+      const { stream, push, end } = autoStream();
+      const message = {
+        role: "assistant", api: model.api, provider: model.provider, model: model.id,
+        content: "text" in reply ? [{ type: "text", text: reply.text }]
+          : [{ type: "toolCall", id: `call-${requests.length}`, name: reply.toolCall.name, arguments: reply.toolCall.arguments }],
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+        stopReason: "text" in reply ? "stop" : "toolUse", timestamp: Date.now(),
+      };
+      push({ type: "start", partial: { ...message, content: [] } } as never);
+      push({ type: "done", reason: message.stopReason, message } as never);
+      end({ api: model.api, provider: model.provider, model: model.id });
+      return stream;
+    },
+  };
+  const extension: InlineExtension = { name: "fake-anthropic", factory: (pi) => pi.registerProvider("anthropic", config) };
+  return { extension, requests };
+}
+
+/** A worker whose task starts with "Delegate:" calls subagents once with the
+ *  rest of its task as one item (`{ "task": ..., "agent": ... }` as JSON), and
+ *  reports the tool result it got; any other worker says "leaf done". */
+function delegatingScript(request: ScriptedRequest): ScriptedReply {
+  if (!request.task.startsWith("Delegate:")) return { text: "leaf done" };
+  const [result] = request.toolResults;
+  if (result) return { text: `${result.isError ? "refused" : "delegated"}: ${result.text}` };
+  return { toolCall: { name: "subagents", arguments: JSON.parse(request.task.slice("Delegate:".length)) as Record<string, unknown> } };
+}
+
+/** The extensions a worker loads when the subagents extension is installed:
+ *  the router, `provider` and the subagents extension, whose own workers load
+ *  the same set again. */
+function installedWithSubagents(provider: InlineExtension, depth = 3): InlineExtension[] {
+  const base = [routerExtension(), provider];
+  if (depth === 0) return base;
+  return [...base, { name: "subagents", factory: createSubagentsExtension({ workerExtensions: installedWithSubagents(provider, depth - 1) }) }];
+}
+
+test("a worker gets the subagents tool only when its agent definition lists it, and can then delegate", async () => {
+  const h = harness();
+  try {
+    const agents = join(h.agentDir, "agents");
+    writeAgentDefinition(agents, "lead.md", { name: "lead", description: "Delegates", tools: "read, subagents" }, "Split the work.");
+    writeAgentDefinition(agents, "scout.md", { name: "scout", description: "Reads only", tools: "read" }, "Read, never write.");
+    const provider = scriptedAnthropic(delegatingScript);
+    const tool = loadSubagentsTool(installedWithSubagents(provider.extension));
+    const main = orchestrator(h);
+
+    const withoutTool = await callSubagents(tool, main.ctx, "Look around.", "scout");
+    assert.equal(withoutTool.worker.status, "completed", JSON.stringify(withoutTool.worker));
+    assert.deepEqual(provider.requests.find((request) => request.sessionId === withoutTool.worker.sessionId)?.tools, ["read"]);
+
+    const { worker } = await callSubagents(tool, main.ctx, `Delegate:${JSON.stringify({ items: [{ task: "Find the config file" }] })}`, "lead");
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    const leadRequests = provider.requests.filter((request) => request.sessionId === worker.sessionId);
+    assert.deepEqual([...(leadRequests[0]?.tools ?? [])].sort(), ["read", "subagents"]);
+    const nested = provider.requests.filter((request) => request.task === "Find the config file");
+    assert.equal(nested.length, 1, "the lead's subagents call started one worker");
+    assert.notEqual(nested[0]?.sessionId, worker.sessionId);
+    assert.match(worker.finalText, /^delegated: Worker \S+ completed\./, worker.finalText);
+    assert.match(worker.finalText, /leaf done/);
+  } finally { h.cleanup(); }
+});
+
+test("a nested worker cannot delegate further, and cannot start a background call", async () => {
+  const h = harness();
+  try {
+    writeAgentDefinition(join(h.agentDir, "agents"), "lead.md", { name: "lead", description: "Delegates", tools: "read, subagents" }, "Split the work.");
+    const provider = scriptedAnthropic(delegatingScript);
+    const tool = loadSubagentsTool(installedWithSubagents(provider.extension));
+    const main = orchestrator(h);
+
+    // The lead hands a nested lead a task that would delegate once more.
+    const tooDeep = `Delegate:${JSON.stringify({ items: [{ task: "Too deep" }] })}`;
+    const { worker } = await callSubagents(tool, main.ctx, `Delegate:${JSON.stringify({ items: [{ task: tooDeep, agent: "lead" }] })}`, "lead");
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    const nestedLead = provider.requests.filter((request) => request.task === tooDeep);
+    assert.ok(nestedLead.length > 0, "the nested lead ran");
+    assert.deepEqual(nestedLead[0]?.tools, ["read"], "the nested lead has no subagents tool although its definition lists it");
+    assert.equal(nestedLead.at(-1)?.toolResults[0]?.isError, true, "its subagents call failed");
+    assert.deepEqual(provider.requests.filter((request) => request.task === "Too deep"), [], "no worker started two levels down");
+
+    const background = await callSubagents(tool, main.ctx, `Delegate:${JSON.stringify({ items: [{ task: "Run in the background" }], background: true })}`, "lead");
+    assert.equal(background.worker.status, "completed", JSON.stringify(background.worker));
+    assert.match(background.worker.finalText, /^refused: .*background/s, background.worker.finalText);
+    assert.deepEqual(provider.requests.filter((request) => request.task === "Run in the background"), [], "the background call started no worker");
+  } finally { h.cleanup(); }
+});
+
+test("a worker's subagents call that asks for background is refused before any worker starts", async () => {
+  const h = harness();
+  const main = orchestrator(h);
+  // The call comes from a worker's session, as the lead's did above; pi's schema check is passed by, as a background-capable schema would.
+  const unmark = markWorkerSession(main.sessionId);
+  try {
+    const provider = fakeAnthropic("done");
+    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+    await assert.rejects(tool.execute("call-1", { items: [{ task: "Run in the background" }], background: true } as never, undefined, undefined, main.ctx),
+      /a worker's subagents calls run in the foreground only/);
+    assert.deepEqual(provider.requests, []);
+    assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")), []);
+  } finally {
+    unmark();
+    h.cleanup();
+  }
+});
+
+test("a worker's subagents call with a fork item is refused before any worker starts", async () => {
+  const h = harness();
+  const main = orchestrator(h);
+  const unmark = markWorkerSession(main.sessionId);
+  try {
+    const provider = fakeAnthropic("done");
+    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+    await assert.rejects(tool.execute("call-1", { items: [{ task: "Plain" }, { task: "Continue me", fork: true }] } as never, undefined, undefined, main.ctx),
+      /a worker's subagents calls cannot fork/);
+    assert.deepEqual(provider.requests, []);
+    assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")), []);
+  } finally {
+    unmark();
+    h.cleanup();
+  }
+});
+
+test("a fork whose agent definition lists subagents has no subagents tool", async () => {
+  const h = harness();
+  try {
+    writeAgentDefinition(join(h.agentDir, "agents"), "lead.md", { name: "lead", description: "Delegates", tools: "read, subagents" }, "Split the work.");
+    const provider = fakeAnthropic("Forked lead done.");
+    const tool = loadSubagentsTool(installedWithSubagents(provider.extension));
+    const parent = SessionManager.create(h.projectDir, join(h.agentDir, "sessions", "--project--"));
+    parent.appendMessage({ role: "user", content: "Lead", timestamp: Date.now() });
+    parent.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "fork-call", name: "subagents", arguments: {} }], timestamp: Date.now() } as never);
+    const ctx = { cwd: h.projectDir, hasUI: false, sessionManager: parent,
+      model: { provider: "anthropic", id: "claude-haiku-4-5" }, thinkingLevel: "high" } as unknown as ExtensionContext;
+    const result = await tool.execute("fork-call", { items: [{ task: "Lead on", agent: "lead", fork: true }] } as never, undefined, undefined, ctx);
+    const worker = (result.details as SubagentsDetails).results[0]!;
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.deepEqual(provider.requests[0]?.tools, ["read"]);
+  } finally { h.cleanup(); }
+});
+
+test("a nested worker is routed, even when its definition names a model under preserve, and its decision record names the parent delegation", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { agentDefinitionModel: { use: "preserve" } } } });
+  try {
+    const agents = join(h.agentDir, "agents");
+    writeAgentDefinition(agents, "lead.md", { name: "lead", description: "Delegates", tools: "read, subagents" }, "Split the work.");
+    writeAgentDefinition(agents, "scout.md", { name: "scout", description: "Scouts", model: HAIKU, thinking: "high" }, "Find files.");
+    const provider = scriptedAnthropic(delegatingScript);
+    const tool = loadSubagentsTool(installedWithSubagents(provider.extension));
+    const { worker } = await callSubagents(tool, orchestrator(h).ctx, `Delegate:${JSON.stringify({ items: [{ task: "Find the config file", agent: "scout" }] })}`, "lead");
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    const nestedId = provider.requests.find((request) => request.task === "Find the config file")?.sessionId;
+    assert.ok(nestedId && nestedId !== worker.sessionId, "the lead's call started a worker");
+
+    const records = readRoutingRecords(join(h.stateDir, "routing"));
+    assert.deepEqual(records.map((record) => [record.recordType, record.delegationId]), [["decision", worker.sessionId], ["decision", nestedId]],
+      "both workers were routed, the nested scout on orchestrator/auto rather than its preserved model");
+    const [lead, nested] = records;
+    assert.ok(lead?.recordType === "decision" && nested?.recordType === "decision");
+    assert.equal(lead.parentDelegationId, undefined, "the orchestrator's worker has no parent delegation");
+    assert.equal(nested.parentDelegationId, worker.sessionId);
   } finally { h.cleanup(); }
 });

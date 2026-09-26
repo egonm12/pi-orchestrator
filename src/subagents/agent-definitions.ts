@@ -98,9 +98,10 @@ export type AgentResolution =
 
 /** Resolve a task item's `agent` against the definitions. No agent gives the
  *  worker no instructions and the default tools. A definition's `tools:` list
- *  keeps only tools in `orchestratorTools`, and never the subagents tool. */
+ *  keeps only tools in `orchestratorTools`, and the subagents tool only when
+ *  `mayDelegate` (ADR 0008: the orchestrator's workers, not theirs). */
 export function resolveAgent(
-  agent: string | undefined, definitions: readonly AgentDefinition[], orchestratorTools: readonly string[],
+  agent: string | undefined, definitions: readonly AgentDefinition[], orchestratorTools: readonly string[], mayDelegate = false,
 ): AgentResolution {
   if (agent === undefined) return { ok: true };
   const definition = definitions.find((candidate) => candidate.name === agent);
@@ -108,7 +109,7 @@ export function resolveAgent(
     const known = definitions.length === 0 ? "there are none" : `known agents: ${definitions.map((candidate) => candidate.name).join(", ")}`;
     return { ok: false, error: `unknown agent "${agent}"; ${known}` };
   }
-  const tools = definition.tools?.filter((tool) => tool !== SUBAGENTS_TOOL && orchestratorTools.includes(tool));
+  const tools = definition.tools?.filter((tool) => (mayDelegate || tool !== SUBAGENTS_TOOL) && orchestratorTools.includes(tool));
   return {
     ok: true,
     definition,

@@ -4,6 +4,7 @@ import type { ExtensionAPI, ExtensionContext, InlineExtension } from "@earendil-
 import { banListsFromSettings, personalAgentDir, readSettingsFile, subagentBanListEntry } from "../policy/ban-lists.ts";
 import { THINKING_LEVELS, splitKnownThinkingSuffix, type ThinkingLevel } from "../models/model-info.ts";
 import { agentDefinitionDirs, agentDefinitionListing, loadAgentDefinitions, resolveAgent } from "./agent-definitions.ts";
+import { callingDelegation } from "./nested-delegation.ts";
 import { renderSubagentsCall, renderSubagentsResult } from "./render.ts";
 import { forkSession } from "./fork-session.ts";
 import { loadSubagentsSettings } from "./settings.ts";
@@ -14,8 +15,10 @@ import { runWorker, SUBAGENTS_TOOL, type WorkerResult, type WorkerSetup } from "
 // this pi process, normally on the auto model `orchestrator/auto`, and the
 // router extension routes it. A call queues up to eight tasks. A task may name an
 // agent definition, which gives the worker its instructions and narrows its
-// tools. While the call runs, partial updates show each item queued, running
-// with its worker's current tool, or finished (render.ts draws them).
+// tools; one listing `subagents` lets the worker delegate one level deeper
+// (nested-delegation.ts). While the call runs, partial updates show each item
+// queued, running with its worker's current tool, or finished (render.ts
+// draws them).
 
 type ToolParameters = Parameters<ExtensionAPI["registerTool"]>[0]["parameters"];
 
@@ -156,6 +159,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
       async execute(toolCallId, params, signal, onUpdate, ctx) {
         const { items } = params as { items: SubagentItem[] };
         if (!Array.isArray(items) || items.length < 1 || items.length > 8) throw new Error("subagents requires 1 to 8 items per call");
+        const parentDelegationId = callingDelegation(ctx, params as { background?: unknown; items?: unknown });
         const agentDir = personalAgentDir();
         const { settings, allowProjectOverrides, ignoredProjectKeys } = loadSubagentsSettings(agentDir, ctx.cwd);
         for (const key of ignoredProjectKeys) logOnce(`ignored project settings key ${key}`);
@@ -208,7 +212,8 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               showProgress(index, results[index]);
               continue;
             }
-            const resolution = resolveAgent(agent, definitions, orchestratorTools);
+            // Forked workers never delegate (ADR 0008), whatever their definition lists.
+            const resolution = resolveAgent(agent, definitions, orchestratorTools, parentDelegationId === undefined && !preparedFork);
             if (!resolution.ok) {
               results[index] = { ...item, status: "failed", finalText: "", error: resolution.error };
               showProgress(index, results[index]);
@@ -219,7 +224,8 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               warnOnce(ctx, "pi-orchestrator subagents: agent definition model and thinking are ignored under route mode");
             }
             let namedModel: NonNullable<WorkerSetup["namedModel"]> | undefined;
-            if (!preparedFork && modelSettings.use === "preserve" && definition?.model) {
+            // A worker's own workers are always routed (ADR 0008).
+            if (!preparedFork && modelSettings.use === "preserve" && definition?.model && parentDelegationId === undefined) {
               const { baseModel, thinkingSuffix } = splitKnownThinkingSuffix(definition.model);
               // The provider ends at the first slash; a model id may hold more.
               const slash = baseModel.indexOf("/");
@@ -255,6 +261,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               extensionFactories: deps.workerExtensions, instructions: resolution.instructions, tools: resolution.tools,
               ...(namedModel === undefined ? {} : { namedModel }),
               ...(preparedFork === undefined ? {} : { fork: preparedFork }),
+              ...(parentDelegationId === undefined ? {} : { parentDelegationId }),
               onTool: (tool) => showProgress(index, { ...item, ...workerModel, status: "running", ...(tool === undefined ? {} : { tool }) }),
             });
             results[index] = { ...item, ...workerModel, ...worker, finalText: cutText(worker.finalText, worker.sessionFile) };

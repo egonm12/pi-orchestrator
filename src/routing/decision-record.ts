@@ -9,9 +9,9 @@
 // The writer copies each field it records by name from the values it is
 // given: ticket 23's classification, ticket 22's resolved tier map, ticket
 // 24's router decision, and the delegation facts (delegation id, mode, task text,
-// agent role, the model the worker ran on, and the hand-picked model in
-// shadow mode). Nothing else an input object carries (a parsed settings file,
-// a token) can reach the file.
+// agent role, the model the worker ran on, the hand-picked model in shadow
+// mode, and the parent delegation of a worker's own worker). Nothing else an
+// input object carries (a parsed settings file, a token) can reach the file.
 //
 // Free text (task text, the classifier's `why` and reasons, hop details,
 // route messages, removal and drop reasons, skipped-rung details) passes one
@@ -239,6 +239,9 @@ export interface DecisionRecord extends RecordCommon {
   readonly ranOn?: string;
   /** Shadow mode only: the model the orchestrator named by hand. */
   readonly handPickedModel?: string;
+  /** The delegation id of the worker that made this delegation (ADR 0008);
+   *  absent when the orchestrator made it. */
+  readonly parentDelegationId?: string;
 }
 
 export interface VerdictRecord extends RecordCommon {
@@ -509,8 +512,12 @@ export function validateRoutingRecord(value: unknown): RoutingRecord {
     const mode = oneOf(value, "mode", "", ROUTING_MODES);
     const required = [...COMMON_KEYS, "mode", "taskTextPrefix", "agentRole", "classification", "tierMap", "route",
       ...(value.schemaVersion === DECISION_RECORD_SCHEMA_VERSION ? ["ranOn"] : [])];
-    checkKeys(value, "", mode === "shadow" ? [...required, "handPickedModel"] : required);
+    checkKeys(value, "", mode === "shadow" ? [...required, "handPickedModel"] : required, ["parentDelegationId"]);
     checkCommon(value);
+    if (value.parentDelegationId !== undefined) {
+      stringAt(value, "parentDelegationId", "", { nonBlank: true });
+      if (value.parentDelegationId === value.delegationId) throw new RoutingRecordError("parentDelegationId", "must name a different delegation");
+    }
     stringAt(value, "taskTextPrefix", "");
     stringAt(value, "agentRole", "", { nonBlank: true });
     if (mode === "shadow") stringAt(value, "handPickedModel", "", { nonBlank: true });
@@ -587,6 +594,7 @@ interface DecisionRecordInputCommon {
   readonly tierMap: ResolvedTierMap;
   readonly route: TierRouteDecision;
   readonly ranOn: string;
+  readonly parentDelegationId?: string;
 }
 
 export type DecisionRecordInput =
@@ -733,6 +741,7 @@ export function buildDecisionRecord(input: DecisionRecordInput): DecisionRecord 
     route: recordedRoute(input.route),
     ranOn: input.ranOn,
     ...(input.handPickedModel === undefined ? {} : { handPickedModel: input.handPickedModel }),
+    ...(input.parentDelegationId === undefined ? {} : { parentDelegationId: input.parentDelegationId }),
   };
   return checkedRecord(record);
 }
