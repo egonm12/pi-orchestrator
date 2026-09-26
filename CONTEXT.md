@@ -20,6 +20,10 @@ A worker whose delegating call returned before it finished. The orchestrator can
 A message a background worker sends the orchestrator on its own: progress, or a question it waits on.
 _Avoid_: Callback, notification (that is the completion notice)
 
+**Worker state**:
+Where a worker is in its life: *queued* (held back until a parallel slot frees), *running*, *asking* (waiting on the answer to a question it reported), then one end state: *completed*, *failed* or *aborted*. Only a background worker can be *asking*.
+_Avoid_: Status (that is the tool that reports worker states), waiting
+
 **Agent definition**:
 A named, owner-written description of a kind of worker: its instructions and the tools it may use. Read from the owner's and the project's agent folders; pi-orchestrator ships none.
 _Avoid_: Role (that is the orchestrator/worker split), persona
