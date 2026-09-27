@@ -1,5 +1,5 @@
 import { join, resolve } from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { toModelInfo, splitKnownThinkingSuffix, type ModelInfo } from "../models/model-info.ts";
 import { autoProviderConfig } from "./auto-provider.ts";
 import { autoModelLimits, withAutoModelLimits } from "./auto-model-limits.ts";
@@ -18,8 +18,9 @@ import {
 import { tierMapFromSettings } from "../routing/tier-map.ts";
 import { runInit } from "../init/command.ts";
 import { INIT_COMMAND, setupNotice, setupStatus } from "../init/setup.ts";
+import { commandDescription, dispatchSubcommand, type Subcommand } from "../init/subcommands.ts";
 import { stateFolderEvidence, type EvidenceSetup, type RoutingEvidenceSource } from "./evidence.ts";
-import { isWorkerSession } from "../subagents/worker-sessions.ts";
+import { isOrchestratorSession } from "../subagents/orchestrator-session.ts";
 
 export type { RoutingEvidence, RoutingEvidenceSource, EvidenceSetup } from "./evidence.ts";
 
@@ -170,21 +171,25 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
     };
     const probe = process.env.PI_ORCHESTRATOR_ROUTER_PROBE === "1";
 
-    // `/pi-orchestrator init` sets up a fresh install. Its failures are
-    // reported by the command and never disable routing.
-    if (typeof pi.registerCommand === "function") pi.registerCommand(INIT_COMMAND, {
-      description: "Set up pi-orchestrator: starter tier map, ban list and approved recipients (init)",
-      handler: async (args, ctx) => {
-        try { await runInit(args, ctx, { stateDir: stateDir() }); }
+    // `/pi-orchestrator <subcommand>`. `init` sets up a fresh install. Its
+    // failures are reported by the command and never disable routing.
+    const subcommands: Subcommand<ExtensionCommandContext>[] = [{
+      name: "init",
+      summary: "set up a starter tier map, ban list and approved recipients",
+      run: async (rest, ctx) => {
+        try { await runInit(`init ${rest}`, ctx, { stateDir: stateDir() }); }
         catch (error) { ctx.ui.notify(`pi-orchestrator init failed: ${String(error).split(/\r?\n/, 1)[0]}`, "error"); }
       },
+    }];
+    if (typeof pi.registerCommand === "function") pi.registerCommand(INIT_COMMAND, {
+      description: commandDescription(subcommands),
+      handler: async (args, ctx) => { await dispatchSubcommand(args, ctx, subcommands); },
     });
 
     // The orchestrator's session model, for workers to fall back to. A
-    // subagents worker in this process is not the orchestrator's session.
+    // worker's or a child process's session model is not remembered.
     const rememberSessionModel = (model: { provider: string; id: string } | undefined, effort: string, ctx: ExtensionContext) => {
-      if (process.env.PI_SUBAGENT_CHILD === "1" || process.env.PI_SUBAGENTS_HERDR_BRIDGE === "1") return;
-      if (isWorkerSession(ctx)) return;
+      if (!isOrchestratorSession(ctx)) return;
       if (model?.provider === "orchestrator" && model.id === "auto") return;
       if (model) process.env.PI_ORCHESTRATOR_SESSION_MODEL = `${model.provider}/${model.id}:${effort}`;
       else delete process.env.PI_ORCHESTRATOR_SESSION_MODEL;
@@ -196,7 +201,7 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
       if (disabled) return;
       try {
         // One line on a fresh install, in the owner's session only.
-        if (!noticeShown && process.env.PI_SUBAGENT_CHILD !== "1" && !isWorkerSession(ctx)) {
+        if (!noticeShown && isOrchestratorSession(ctx)) {
           noticeShown = true;
           const personal = readSettingsFile(join(personalAgentDir(), "settings.json")) ?? {};
           const notice = setupNotice(setupStatus(personal, stateDir()), stateDir());

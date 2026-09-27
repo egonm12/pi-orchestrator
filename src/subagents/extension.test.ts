@@ -18,6 +18,7 @@ import { createRouterExtension } from "../router/extension.ts";
 import personalGuard from "../guard/extension.ts";
 import { createSubagentsExtension, MAX_TEXT_BYTES, type SubagentsDetails, type SubagentsProgressDetails } from "./extension.ts";
 import { markWorkerSession } from "./worker-sessions.ts";
+import { isOrchestratorSession } from "./orchestrator-session.ts";
 import { workerBoard, type BoardWorker } from "./worker-board.ts";
 import { openTranscript } from "./transcript-view.ts";
 
@@ -1165,6 +1166,33 @@ test("a fork copies the current branch before the delegating call and keeps the 
       refreshStatePath: join(h.stateDir, "refresh-state.json") });
     assert.equal(verdict.status, "attached");
     assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")).map((record) => record.recordType), ["fork", "verdict"]);
+  } finally { h.cleanup(); }
+});
+
+test("neither a worker nor a forked worker is the orchestrator's session, as the extensions it loads see it", async () => {
+  const h = harness();
+  try {
+    const seen: { sessionId: string; orchestrator: boolean }[] = [];
+    const probe: InlineExtension = {
+      name: "orchestrator-session-probe",
+      factory: (pi) => { pi.on("session_start", (_event, ctx) => { seen.push({ sessionId: ctx.sessionManager.getSessionId(), orchestrator: isOrchestratorSession(ctx) }); }); },
+    };
+    const provider = fakeAnthropic("Done.");
+    const tool = loadSubagentsTool([probe, routerExtension(), provider.extension]);
+    const parent = SessionManager.create(h.projectDir, join(h.agentDir, "sessions", "--project--"));
+    parent.appendMessage({ role: "user", content: "Delegate", timestamp: Date.now() });
+    parent.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "fork-call", name: "subagents", arguments: {} }], stopReason: "toolUse", timestamp: Date.now() } as never);
+    const ctx = { cwd: h.projectDir, hasUI: false, sessionManager: parent,
+      model: { provider: "anthropic", id: "claude-haiku-4-5" }, thinkingLevel: "low" } as unknown as ExtensionContext;
+    assert.equal(isOrchestratorSession(ctx), true);
+
+    const { worker } = await callSubagents(tool, ctx, "Fix the typo in README.md");
+    const forked = await tool.execute("fork-call", { items: [{ task: "Finish", fork: true }] } as never, undefined, undefined, ctx);
+    const fork = (forked.details as SubagentsDetails).results[0]!;
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.equal(fork.status, "completed", JSON.stringify(fork));
+    assert.deepEqual(seen, [{ sessionId: worker.sessionId, orchestrator: false }, { sessionId: fork.sessionId, orchestrator: false }]);
+    assert.equal(isOrchestratorSession(ctx), true, "the orchestrator's session still is once its workers ended");
   } finally { h.cleanup(); }
 });
 

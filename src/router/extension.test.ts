@@ -247,6 +247,67 @@ test("the router extension's fresh-install notice names what is missing", async 
   } finally { h.cleanup(); }
 });
 
+for (const marker of ["PI_SUBAGENT_CHILD", "PI_SUBAGENTS_HERDR_BRIDGE"]) {
+  test(`the fresh-install notice is not shown in a child process (${marker}=1)`, async () => {
+    const h = harness(undefined);
+    process.env[marker] = "1";
+    try {
+      const notices: string[] = [];
+      const handlers = piHandlers();
+      createRouterExtension()({
+        registerProvider() {},
+        on(event: string, handler: Handler) { handlers.on(event, handler); },
+      } as unknown as ExtensionAPI);
+      await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, {
+        cwd: h.projectDir, hasUI: true, model: SESSION_MODEL, thinkingLevel: "medium",
+        ui: { notify: (message: string) => { notices.push(message); } },
+      } as ExtensionContext);
+      assert.deepEqual(notices, []);
+    } finally { delete process.env[marker]; h.cleanup(); }
+  });
+}
+
+type Command = Parameters<ExtensionAPI["registerCommand"]>[1];
+
+/** The `/pi-orchestrator` command the router extension registers. */
+function orchestratorCommand(): Command {
+  const commands = new Map<string, Command>();
+  createRouterExtension()({
+    registerProvider() {},
+    registerCommand(name: string, command: Command) { commands.set(name, command); },
+    on() {},
+  } as unknown as ExtensionAPI);
+  const command = commands.get("pi-orchestrator");
+  assert.ok(command, JSON.stringify([...commands.keys()]));
+  return command;
+}
+
+/** Runs `/pi-orchestrator <args>` and returns what it printed to stderr. */
+async function runWithoutUI(command: Command, args: string): Promise<string> {
+  let written = "";
+  const write = process.stderr.write;
+  process.stderr.write = ((chunk: string) => { written += chunk; return true; }) as typeof process.stderr.write;
+  try { await command.handler(args, { hasUI: false } as never); } finally { process.stderr.write = write; }
+  return written;
+}
+
+test("/pi-orchestrator dispatches init and prints the usage for an unknown subcommand", async () => {
+  const h = harness(undefined);
+  try {
+    const command = orchestratorCommand();
+    assert.match(command.description ?? "", /^pi-orchestrator: init \(/);
+    const notices: { message: string; type?: string }[] = [];
+    await command.handler("frobnicate", { hasUI: true, ui: { notify: (message: string, type?: string) => { notices.push({ message, type }); } } } as never);
+    assert.equal(notices.length, 1);
+    assert.equal(notices[0]!.type, "warning");
+    assert.match(notices[0]!.message, /^pi-orchestrator: unknown subcommand 'frobnicate'\.\nusage: \/pi-orchestrator <subcommand>\n {2}init: /);
+    assert.equal(await runWithoutUI(command, "init"), "pi-orchestrator: /pi-orchestrator init asks for approvals and needs an interactive session; nothing was written.\n");
+    assert.equal(await runWithoutUI(command, "init extra"), "usage: /pi-orchestrator init\n", "init keeps refusing extra arguments");
+    assert.equal(readFileSync(join(h.agentDir, "settings.json"), "utf8"), JSON.stringify({ orchestrator: {} }), "personal settings are unchanged");
+    assert.equal(existsSync(h.stateDir), false, "nothing was written");
+  } finally { h.cleanup(); }
+});
+
 test("the router extension registers no tool_call handler", async () => {
   const h = harness(LIVE);
   try {

@@ -24,7 +24,7 @@ The package ships its own `subagents` tool (see below), so an orchestrator sessi
 
 ## Set up with `init`
 
-A fresh install ships no tier map, no ban list and no approved recipients, so routing is not enabled yet. At session start the notice names what is missing:
+A fresh install ships no tier map, no ban list and no approved recipients, so routing is not enabled yet. At the start of the orchestrator's own session (not a worker's, and not in a pi-subagents child process) the notice names what is missing:
 
 ```text
 pi-orchestrator: not set up: no tier map (...), no approved recipients (...). Run /pi-orchestrator init.
@@ -37,6 +37,8 @@ Run `/pi-orchestrator init` in an interactive session. It:
 3. Asks you to approve each provider the map would send task text to. Only the providers you say yes to are approved. A declined provider's rungs are skipped.
 
 Review the written map in `~/.pi/agent/settings.json`, then start a new session. Workers started through the built-in `subagents` tool always run on `orchestrator/auto` already; nothing else needs setting up for them.
+
+`/pi-orchestrator` takes a subcommand as its first word; `init` is the only one so far. Without a subcommand, or with one it does not know, it prints the usage with every subcommand.
 
 ## Subagents tool
 

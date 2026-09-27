@@ -3,9 +3,10 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 // Which pi sessions in this process are the subagents tool's workers. A
 // worker runs in the orchestrator's process and loads the same extensions, so
 // a process-wide marker such as an environment variable would mark the
-// orchestrator too. The router and the guard look up their own session's id
-// here to leave the orchestrator's session behaviour out of a worker: the
-// remembered session model, the session ban list and the fresh-install notice.
+// orchestrator too. The orchestrator-session check (orchestrator-session.ts)
+// looks up a session's id here to leave the orchestrator's session behaviour
+// out of a worker: the remembered session model, the session ban list and the
+// fresh-install notice.
 // A worker started by another worker (ADR 0008) is kept with its parent
 // delegation, which the router extension writes into its decision record.
 //
