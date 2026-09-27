@@ -1,11 +1,11 @@
 ---
 # pi-orchestrator-a338
 title: 'Live worker view: widget and transcript'
-status: todo
+status: completed
 type: epic
 priority: normal
 created_at: 2026-09-26T09:18:43Z
-updated_at: 2026-09-26T09:22:17Z
+updated_at: 2026-09-27T13:58:58Z
 ---
 
 The user cannot see which workers are active, which model serves them or what they are doing, and cannot read a live worker's transcript. Goal: a view that works like Claude Code's agent list, for every worker of the orchestrator session.
@@ -25,3 +25,38 @@ The user cannot see which workers are active, which model serves them or what th
 
 ## Open facts
 - Confirm the display can read the router's chosen rung per worker request in-process (worker board bean).
+
+## Summary of Changes
+
+All six child beans are built and merged into main, in three waves:
+
+- Wave 1: rcjm (spike) and 2jba (worker board). The spike's answer: a full-screen `ctx.ui.custom` overlay restores the session cleanly in both regular and fullscreen tuiMode, as the owner confirmed live, so the fallback was not needed. The first live try trapped the user, because the prototype matched raw key bytes under the kitty keyboard protocol. From then on every view matches keys through pi's keybindings manager and always leaves on Esc and ctrl+c. The worker board confirmed the open fact: the router's chosen rung is readable in-process, through a new served-rungs hook in the auto provider.
+- Wave 2: oy50 (worker widget above the editor) and llnk (transcript view). oy50 started as soon as 2jba was merged, while the spike waited for the live try.
+- Wave 3: xytd (alt+a, the `/subagents` picker and direct jumps) and vo0z (transcript header and orchestrator bar). Both first workers' model requests timed out on long sessions; fresh workers finished the uncommitted work.
+
+Integration work done while merging:
+
+- c1sw: the fork rung test expected routing records in write order, which only held on 2026-09-26, because the test router's clock is fixed while fork records carry the real date. It now compares the record types sorted.
+- Merging vo0z: both branches appended tests to the end of extension.test.ts; both are kept. The merged suite, run under a long TMPDIR, showed that the transcript view kept only the first row of an over-wide notice or end-state line. The view now wraps those lines.
+- xytd deliberately changed `/subagents`: without arguments it opens the picker of every worker, and any argument but `stop ...` is a direct jump, so `/subagents list` is now refused. The README was updated to match.
+
+How the recorded decisions landed:
+
+- Every worker of the session, nested ones under their parent delegation: board, widget, picker and view (2jba, oy50, xytd, llnk).
+- The widget's line, cap, 10 s linger and disappearing: oy50.
+- A routed worker's model, "routing…" and the escalation marker: 2jba, shown in the widget and the header.
+- The whole-screen view and restoring the session: rcjm and llnk.
+- The ways in (alt+a, the picker, direct jumps, `/subagents stop` unchanged): xytd.
+- Keys inside the view, following the end, nested workers, x with a confirmation: llnk.
+- Read-only, never pulling the user out, and the top bar: llnk and vo0z.
+- The header fields: vo0z.
+- Reusing pi's message rendering with marked reports and steers: llnk. What an extension cannot reach is deferred to i81j.
+
+Each piece has its own tests. On main, `npm run typecheck` passes and `npm test` shows 653 tests: 636 passing, 0 failing and 17 skipped.
+
+Follow-ups left open under this epic:
+
+- i81j: the transcript view's rendering gaps (needs triage).
+- 5utr: subagents_status reads the worker board.
+- 5798: remove the unreachable listing branch from `BackgroundCalls.command`.
+- sgym: which workers the widget's 6-line cap keeps (needs the owner's decision).
