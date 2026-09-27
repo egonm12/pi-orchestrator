@@ -2154,7 +2154,7 @@ test("the worker board marks an escalated rung, and shows a fork's and a preserv
   } finally { h.cleanup(); }
 });
 
-test("the orchestrator's session shows its workers in the widget above the editor, a nested worker indented under its parent, until the session ends", async () => {
+test("the orchestrator's session shows its workers in the widget below the editor, a nested worker indented under its parent, until the session ends", async () => {
   const h = harness();
   try {
     writeAgentDefinition(join(h.agentDir, "agents"), "lead.md", { name: "lead", description: "Delegates", tools: "read, subagents" }, "Split the work.");
@@ -2169,10 +2169,11 @@ test("the orchestrator's session shows its workers in the widget above the edito
       notify() {},
       setWidget(_key: string, content: unknown, options?: { placement?: string }) {
         component?.dispose?.();
-        assert.ok(content === undefined || options?.placement === "aboveEditor");
+        assert.ok(content === undefined || options?.placement === "belowEditor");
         component = (content as ((tui: unknown, theme: unknown) => typeof component) | undefined)?.({ requestRender: snapshot }, plain);
         snapshot();
       },
+      onTerminalInput: () => () => {},
     };
     const ctx = { ...main.ctx, hasUI: true, ui } as unknown as ExtensionContext;
     await subagents.startSession(ctx);
@@ -2380,7 +2381,7 @@ test("/subagents <list number> and /subagents <delegation id> open that worker's
   }
 });
 
-test("alt+a focuses the worker widget for the orchestrator's session; Enter opens the focused worker's transcript, and a worker session's own alt+a does nothing", async () => {
+test("alt+a or Down at the editor's end focuses the worker widget for the orchestrator's session; Enter opens the focused worker's transcript and leaving it comes back to the list; a worker session's own alt+a does nothing", async () => {
   const h = harness();
   const pending: (() => void)[] = [];
   try {
@@ -2390,11 +2391,19 @@ test("alt+a focuses the worker widget for the orchestrator's session; Enter open
     const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as unknown as Theme;
     let widget: { render(width: number): string[] } | undefined;
     const custom = fakeCustomUI();
+    const inputs: ((data: string) => { consume?: boolean } | undefined)[] = [];
+    // pi's editor, focused, its cursor on its only line.
+    const editor = { keybindings: new KeybindingsManager(), getLines: () => [""], getCursor: () => ({ line: 0, col: 0 }), historyIndex: -1, autocompleteState: null };
     const ui = {
       ...custom.ui,
       notify() {},
-      setWidget(_key: string, content: unknown) {
-        widget = (content as ((tui: unknown, theme: unknown) => typeof widget) | undefined)?.({ requestRender() {} }, plainTheme);
+      setWidget(_key: string, content: unknown, options?: { placement?: string }) {
+        assert.ok(content === undefined || options?.placement === "belowEditor");
+        widget = (content as ((tui: unknown, theme: unknown) => typeof widget) | undefined)?.({ requestRender() {}, getFocusedComponent: () => editor }, plainTheme);
+      },
+      onTerminalInput(handler: (data: string) => { consume?: boolean } | undefined) {
+        inputs.push(handler);
+        return () => { inputs.splice(inputs.indexOf(handler), 1); };
       },
     };
     const ctx = { ...main.ctx, hasUI: true, ui } as unknown as ExtensionContext;
@@ -2412,17 +2421,30 @@ test("alt+a focuses the worker widget for the orchestrator's session; Enter open
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.equal(custom.opens, 2, "Enter opened the chosen worker's transcript next");
     custom.press("\x1b");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(custom.opens, 3, "leaving the transcript comes back to the list");
+    assert.ok(custom.open);
+    custom.press("\x1b");
     await focusing;
+
+    assert.equal(inputs.length, 1, "one listener sees each key before the editor");
+    assert.equal(inputs[0]!("x"), undefined, "any other key goes to the editor");
+    assert.deepEqual(inputs[0]!("\x1b[B"), { consume: true }, "Down at the editor's end is the widget's");
+    assert.equal(custom.opens, 4, "and focuses it");
+    custom.press("\x1b");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(custom.open, false);
 
     // A worker's own copy of this extension shows no widget (session_start
     // guards it), so its alt+a is a no-op even though the shortcut is registered.
     const unmark = markWorkerSession(ctx.sessionManager.getSessionId());
     try {
       await subagents.runShortcut("alt+a", ctx);
-      assert.equal(custom.opens, 2, "no widget to focus in a worker's own session");
+      assert.equal(custom.opens, 4, "no widget to focus in a worker's own session");
     } finally { unmark(); }
 
     await subagents.shutdownSession(ctx);
+    assert.equal(inputs.length, 0, "the session's end stops the Down entry");
   } finally {
     for (const finish of pending) finish();
     h.cleanup();

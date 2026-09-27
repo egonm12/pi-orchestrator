@@ -113,7 +113,7 @@ While a call runs, pi shows one line per worker: its agent name (`worker` withou
 
 ### Worker widget
 
-Above the editor, the orchestrator's session lists its active workers: foreground, background and nested, queued ones included. Each worker has one line:
+Below the editor, the orchestrator's session lists its active workers: foreground, background and nested, queued ones included. Each worker has one line:
 
 ```text
 lead · anthropic/claude-sonnet-4-5:high ↑elevated · running · 1m15s · 2 turns · subagents
@@ -130,7 +130,7 @@ worker · routing… · queued · Fix the typo
 
 A worker started by another worker is indented under it. At most 6 workers are listed; a `+N more` line counts the rest. A finished worker stays about 10 seconds with its end state, then drops out, and the widget disappears when no worker is left. The widget only shows workers; it never steers them. A worker's own session shows no widget.
 
-Alt+a focuses the widget: arrow keys pick a worker and Enter opens its transcript view; Esc or Ctrl+C leaves the widget unfocused, the editor's text untouched. Alt+a does nothing when no worker is shown. A worker's own session does not bind alt+a.
+Down enters the widget when it would do nothing in the editor: the cursor is at the end of the editor's last line, you are not browsing the prompt history, no autocomplete list is open, and at least one worker is shown. On the last line, a first Down moves the cursor to the line's end as usual. Alt+a enters it too. In the widget, ↑ ↓ pick a worker and Enter opens its transcript view; leaving the transcript view comes back to the widget with that worker selected. ↑ on the first row, Esc or Ctrl+C go back to the editor with its text untouched, and any other key goes back to the editor and into it. When the selected worker drops out, the selection moves to the row in its place; when the widget empties, the editor gets the keyboard back. Down and alt+a do nothing when no worker is shown. A worker's own session does not bind either.
 
 ### Transcript view
 

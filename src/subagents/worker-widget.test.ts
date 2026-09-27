@@ -132,8 +132,16 @@ function fakeUI() {
   let component: ReturnType<WidgetFactory> | undefined;
   let renders = 0;
   const placements: (string | undefined)[] = [];
-  const tui = { requestRender: () => { renders++; } };
   let overlay: FocusOverlay | undefined;
+  /** pi's editor as the widget reads it: its lines, cursor and history
+   *  browsing, pi's keybindings, and the keys that reach it. */
+  const editor = {
+    keybindings: new KeybindingsManager(), lines: ["draft text"], cursor: { line: 0, col: 10 }, historyIndex: -1,
+    autocompleteState: null as unknown, received: [] as string[],
+    getLines() { return this.lines; }, getCursor() { return this.cursor; },
+    handleInput(data: string) { this.received.push(data); },
+  };
+  const tui = { requestRender: () => { renders++; }, getFocusedComponent: () => overlay ?? editor };
   const customOptions: unknown[] = [];
   const ui: WorkerWidgetUI & WorkerWidgetFocusUI = {
     setWidget(key: string, content: unknown, options?: { placement?: string }) {
@@ -162,7 +170,7 @@ function fakeUI() {
     clearInterval: (handle: unknown) => { timers.delete(handle as () => void); },
   };
   return {
-    ui, timer, placements, customOptions,
+    ui, timer, placements, customOptions, editor,
     /** Whether the focus overlay holds the keyboard. */
     get focused() { return overlay !== undefined; },
     /** Keys as the terminal sends them, to whatever holds the keyboard. */
@@ -187,7 +195,7 @@ test("a finished worker stays about 10 s with its end state, then drops out, and
   const first = board.add({ callId: "call", background: false, task: "First", model: { kind: "routed" } });
   const second = board.add({ callId: "call", background: false, task: "Second", model: { kind: "fork", model: "anthropic/claude-opus-4-5", effort: "high" } });
   assert.deepEqual(screen.shown(), ["worker · routing… · queued · First", "worker (fork) · anthropic/claude-opus-4-5:high · queued · Second"]);
-  assert.equal(screen.placements.at(-1), "aboveEditor");
+  assert.equal(screen.placements.at(-1), "belowEditor");
   first.started();
   second.started();
   time.advance(3_000);
@@ -271,14 +279,10 @@ test("the focused widget marks the selected worker, arrows move over its rows bu
     "  +1 more",
     HINT,
   ]);
-  screen.press(KEY.up);
-  assert.equal(screen.shown()![0], "› worker · routing… · queued · Item 1", "up stops at the first row");
   screen.press(KEY.down, KEY.down);
   assert.equal(screen.shown()![2], "› worker · routing… · queued · Item 3");
   screen.press(...Array.from({ length: 9 }, () => KEY.down));
   assert.equal(screen.shown()![5], "› worker · routing… · queued · Item 6", "down stops at the last row, not on \"+N more\"");
-  screen.press("q", "x");
-  assert.ok(screen.focused, "other keys do nothing");
   screen.press(KEY.enter);
   assert.deepEqual(await chosen, { workerId: ids[5] });
   assert.equal(screen.focused, false, "Enter gives the keyboard back");
@@ -291,6 +295,63 @@ test("the focused widget marks the selected worker, arrows move over its rows bu
     assert.equal(screen.focused, false);
     assert.equal(screen.shown()!.length, 7, "the widget is as it was");
   }
+});
+
+test("Down enters the widget only when it would do nothing in the editor: the cursor on its last line, no history browsing, a worker shown", () => {
+  const time = clock();
+  const board = new WorkerBoard({ now: time.now });
+  const screen = fakeUI();
+  const widget = startWorkerWidget(screen.ui, board, { now: time.now, ...screen.timer });
+  assert.equal(widget.downEnters(KEY.down), false, "no worker is shown");
+  board.add({ callId: "call", background: false, task: "First", model: { kind: "routed" } });
+
+  assert.equal(widget.downEnters(KEY.down), true, "at the end of the editor's only line");
+  assert.equal(widget.downEnters("\x1b[1;1B"), true, "Down as the kitty keyboard protocol sends it");
+  assert.equal(widget.downEnters("\x1b[1;1:3B"), false, "not its release: the press already went to the editor");
+  assert.equal(widget.downEnters("\x1b[1;1:2B"), false, "nor a repeat");
+  screen.editor.cursor = { line: 0, col: 3 };
+  assert.equal(widget.downEnters(KEY.down), false, "Down moves the cursor to the end of the last line first");
+  assert.equal(widget.downEnters(KEY.up), false, "only Down");
+  assert.equal(widget.downEnters("j"), false);
+  screen.editor.lines = ["first line", "second line"];
+  assert.equal(widget.downEnters(KEY.down), false, "Down moves the cursor to the next line");
+  screen.editor.cursor = { line: 1, col: 11 };
+  assert.equal(widget.downEnters(KEY.down), true, "at the end of the last line");
+  screen.editor.historyIndex = 2;
+  assert.equal(widget.downEnters(KEY.down), false, "Down browses the history back");
+  screen.editor.historyIndex = -1;
+  screen.editor.autocompleteState = { kind: "regular" };
+  assert.equal(widget.downEnters(KEY.down), false, "Down moves in the autocomplete list");
+  screen.editor.autocompleteState = null;
+
+  void widget.focus(screen.ui);
+  assert.equal(widget.downEnters(KEY.down), false, "the focused widget takes Down itself");
+  screen.press(KEY.escape);
+});
+
+test("in the focused widget ↑ on the first row or Esc returns to the editor untouched; any other key returns and goes into it; a chosen worker can be selected again", async () => {
+  const time = clock();
+  const board = new WorkerBoard({ now: time.now });
+  for (let item = 1; item <= 3; item++) board.add({ callId: "call", background: true, task: `Item ${item}`, delegationId: `bg-${item}`, model: { kind: "routed" } });
+  const ids = board.workers().map((worker) => worker.id);
+  const screen = fakeUI();
+  const widget = startWorkerWidget(screen.ui, board, { now: time.now, ...screen.timer });
+
+  let focus = widget.focus(screen.ui);
+  screen.press(KEY.down, KEY.up, KEY.up);
+  assert.deepEqual(await focus, { reason: "left" }, "↑ on the first row leaves");
+  assert.deepEqual(screen.editor.received, [], "and the editor gets nothing");
+
+  focus = widget.focus(screen.ui);
+  screen.press("q");
+  assert.deepEqual(await focus, { reason: "left" });
+  assert.equal(screen.focused, false);
+  assert.deepEqual(screen.editor.received, ["q"], "the key goes into the editor");
+
+  focus = widget.focus(screen.ui, { select: ids[2] });
+  assert.equal(screen.shown()![2], "› worker · routing… · queued · Item 3", "back from a transcript, that worker is selected");
+  screen.press(KEY.up, KEY.enter);
+  assert.deepEqual(await focus, { workerId: ids[1] });
 });
 
 test("focus on a hidden widget is refused; a selected worker that drops out passes the mark to the row in its place, and an emptied widget gives the keyboard back", async () => {

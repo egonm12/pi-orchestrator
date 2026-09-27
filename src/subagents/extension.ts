@@ -31,7 +31,7 @@ import { isWorkerSession } from "./worker-sessions.ts";
 // queued, running with its worker's current tool, or finished (render.ts
 // draws them). Every worker is also on the worker board (worker-board.ts),
 // from the moment its item is queued, for the live worker view; the
-// orchestrator's session shows the active ones above the editor (worker-widget.ts).
+// orchestrator's session shows the active ones below the editor (worker-widget.ts).
 
 type ToolParameters = Parameters<ExtensionAPI["registerTool"]>[0]["parameters"];
 
@@ -426,8 +426,23 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
     registerSubagentsMessageTool(pi, backgroundCalls);
     // The worker widget started at session_start, orchestrator sessions only
     // (a worker's own copy of this extension shares the board but shows no
-    // widget); alt+a's focus and every /subagents opener reach it here.
+    // widget); Down's and alt+a's focus and every /subagents opener reach it here.
     let widget: WorkerWidget | undefined;
+    /** Stops the Down arrow's way into the widget. */
+    let stopDownEntry: (() => void) | undefined;
+    /** Focuses the widget, and after each transcript opened from it comes
+     *  back to the list with that worker selected, until the user leaves the list. */
+    const browseWidget = async (ctx: Pick<ExtensionContext, "ui">): Promise<void> => {
+      // This session's widget only: a new session's widget has its own ctx.
+      const browsed = widget;
+      let select: string | undefined;
+      while (browsed !== undefined && widget === browsed) {
+        const result = await browsed.focus(ctx.ui, { select });
+        if (result.workerId === undefined) return;
+        await openWorker(ctx, result.workerId);
+        select = result.workerId;
+      }
+    };
     pi.registerCommand("subagents", {
       description: "Open a worker's transcript by delegation id or list number, list every worker of this session, or stop one: /subagents stop <call id | delegation id | all>",
       getArgumentCompletions: (prefix) => {
@@ -465,17 +480,18 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
       },
     });
     pi.registerShortcut("alt+a", {
-      description: "Focus the worker widget: arrows select a worker, Enter opens its transcript, Esc leaves.",
+      description: "Focus the worker widget (Down at the editor's end does too): arrows select a worker, Enter opens its transcript, Esc leaves.",
       handler: async (ctx) => {
         // Not bound by pi itself; guarded to the orchestrator's session, where the widget runs.
         if (isWorkerSession(ctx) || widget === undefined) return;
-        const result = await widget.focus(ctx.ui);
-        if (result.workerId !== undefined) await openWorker(ctx, result.workerId);
+        await browseWidget(ctx);
       },
     });
     registerSubagentsStatusTool(pi, backgroundCalls);
     pi.on("session_shutdown", () => {
       // First, so the workers stopped below never reach the ending session's UI.
+      stopDownEntry?.();
+      stopDownEntry = undefined;
       widget?.stop();
       widget = undefined;
       // Ctrl+C leaves background workers running; the session's end stops them, and pi waits for that.
@@ -485,8 +501,16 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
       // A worker's own copy of this extension shares the orchestrator's board, and shows no widget.
       if (!isWorkerSession(ctx)) {
         workerBoard().startSession(ctx.sessionManager.getSessionId());
+        stopDownEntry?.();
         widget?.stop();
         widget = ctx.hasUI ? startWorkerWidget(ctx.ui, workerBoard()) : undefined;
+        // Down at the editor's end enters the widget below it (faal); the key never reaches the editor then.
+        stopDownEntry = widget === undefined ? undefined : ctx.ui.onTerminalInput((data) => {
+          if (widget?.downEnters(data) !== true) return undefined;
+          // A failure to open a worker must not escape the key handler; the editor has the keyboard again.
+          browseWidget(ctx).catch(() => {});
+          return { consume: true };
+        });
       }
       const definitions = loadAgentDefinitions(agentDefinitionDirs(personalAgentDir(), ctx.cwd));
       registerSubagentsTool(`${DESCRIPTION}\n\n${agentDefinitionListing(definitions)}`);

@@ -2,15 +2,15 @@ import { truncateToVisualLines, type ExtensionUIContext, type Theme, type ThemeC
 import { shortTask } from "./render.ts";
 import { elapsedMs, type BoardWorker, type Activity, type WorkerBoardView, type WorkerModel, type WorkerState } from "./worker-board.ts";
 
-// The worker widget above the editor (epic a338): one line per active worker
+// The worker widget below the editor (epic a338, faal): one line per active worker
 // of the orchestrator session, read from the worker board. Which workers show
 // is a pure function of the board's workers and the time, so alt+a's focus
 // (arrows, Enter) works on the same rows. The widget only observes: it never
 // steers a worker.
 //
-// Focus (xytd): a widget above the editor cannot take the keyboard through
-// pi's extension API, and the editor sends a key to an extension only as a
-// shortcut. So alt+a opens a capturing overlay through ctx.ui.custom that
+// Focus (xytd, faal): a widget cannot take the keyboard through pi's
+// extension API, and the editor sends a key to an extension only as a
+// shortcut. So Down at the editor's end, or alt+a, opens a capturing overlay through ctx.ui.custom that
 // draws nothing and only takes the keys, while the widget marks the selected
 // row. The overlay gets pi's keybindings manager, so every key is matched as
 // pi binds it (rcjm: never raw bytes, and always leave on tui.select.cancel),
@@ -179,12 +179,17 @@ export type WidgetFocusResult =
   | { readonly workerId: string; readonly reason?: never }
   | { readonly workerId?: never; readonly reason: "empty" | "left" };
 
-/** The shown widget, and alt+a's focus on it. */
+/** The shown widget, and the focus on it. */
 export interface WorkerWidget {
   /** Takes the keyboard until the user chooses a worker with Enter or leaves
-   *  with Esc (or ctrl+c), marking the selected row; the keyboard then goes
-   *  back to the editor. */
-  focus(ui: WorkerWidgetFocusUI): Promise<WidgetFocusResult>;
+   *  with Esc (or ctrl+c) or ↑ on the first row, marking the selected row;
+   *  the keyboard then goes back to the editor. Any other key leaves too and
+   *  goes into the editor. `select` starts on that worker while it is shown. */
+  focus(ui: WorkerWidgetFocusUI, options?: { readonly select?: string }): Promise<WidgetFocusResult>;
+  /** Whether `data`, a key before the editor gets it, is Down that would do
+   *  nothing in the editor while the widget shows a worker: then the caller
+   *  consumes it and focuses the widget. */
+  downEnters(data: string): boolean;
   /** Stops following the board and removes the widget. */
   stop(): void;
 }
@@ -220,6 +225,48 @@ export function moveSelection(selection: RowSelection, rows: readonly WidgetRow[
   selection.selected = rows[selection.index]?.worker.id;
 }
 
+/** pi's editor, the focused component, as the Down entry reads it. Only
+ *  getLines and getCursor are pi-tui's public Editor API, and keybindings is
+ *  pi's CustomEditor's own manager, so Down is matched as the editor binds
+ *  it. historyIndex (-1 when not browsing), autocompleteState and
+ *  isOnLastVisualLine are pi-tui internals, read only when present. */
+interface FocusedEditor {
+  readonly keybindings?: SelectionKeys;
+  getLines?(): readonly string[];
+  getCursor?(): { readonly line: number; readonly col: number };
+  isOnLastVisualLine?(): boolean;
+  readonly historyIndex?: number;
+  readonly autocompleteState?: unknown;
+  readonly jumpMode?: unknown;
+  handleInput?(data: string): void;
+}
+
+/** A key's release or repeat under the kitty keyboard protocol, which pi
+ *  turns on: listeners see them before pi-tui drops them, and the key's press already came. */
+const RELEASE_OR_REPEAT = /^\x1b\[[\d;:]*:[23][~A-Za-z]$/;
+
+/** The part of pi's TUI the widget reads: the focused component, not in pi-tui's TUI interface but on its every TUI. */
+interface FocusTui {
+  getFocusedComponent?(): unknown;
+}
+
+/** Whether Down would do nothing in `component`: it is pi's editor, `data`
+ *  is its Down, its cursor is at the end of its last line, and it is neither
+ *  browsing its history, showing an autocomplete list nor waiting on a jump
+ *  target, where Down does something. Down on the last line moves the cursor
+ *  to its end first. */
+export function downDoesNothing(component: unknown, data: string): boolean {
+  const editor = component as FocusedEditor | null | undefined;
+  if (typeof editor?.getLines !== "function" || typeof editor.getCursor !== "function" || editor.keybindings === undefined) return false;
+  if (RELEASE_OR_REPEAT.test(data) || !editor.keybindings.matches(data, "tui.editor.cursorDown")) return false;
+  if ((editor.historyIndex ?? -1) > -1 || (editor.autocompleteState ?? null) !== null || (editor.jumpMode ?? null) !== null) return false;
+  const lines = editor.getLines();
+  const cursor = editor.getCursor();
+  if (cursor.line < lines.length - 1 || cursor.col < (lines.at(-1) ?? "").length) return false;
+  // A long last line wraps: Down moves between its visual lines first.
+  return typeof editor.isOnLastVisualLine !== "function" || editor.isOnLastVisualLine();
+}
+
 /** An active focus. */
 interface Focus extends RowSelection {
   readonly end: (result: WidgetFocusResult) => void;
@@ -239,7 +286,7 @@ export interface WorkerWidgetOptions {
   readonly clearInterval?: (handle: unknown) => void;
 }
 
-/** Shows the board's active workers above the editor until it is stopped.
+/** Shows the board's active workers below the editor until it is stopped.
  *  The widget is there while any worker is active or lingering, and gone
  *  otherwise; a timer runs only while it is there. */
 export function startWorkerWidget(ui: WorkerWidgetUI, board: WorkerBoardView, options: WorkerWidgetOptions = {}): WorkerWidget {
@@ -251,6 +298,8 @@ export function startWorkerWidget(ui: WorkerWidgetUI, board: WorkerBoardView, op
   let requestRender: (() => void) | undefined;
   let stopped = false;
   let focus: Focus | undefined;
+  /** pi's TUI, from the shown widget's factory. */
+  let widgetTui: FocusTui | undefined;
 
   const hide = () => {
     // An emptied widget has nothing to select: the keyboard goes back to the editor.
@@ -267,6 +316,7 @@ export function startWorkerWidget(ui: WorkerWidgetUI, board: WorkerBoardView, op
     if (requestRender !== undefined) return requestRender();
     // The component renders the board afresh each time, so a change only needs a render request.
     ui.setWidget(WORKER_WIDGET, (tui, theme) => {
+      widgetTui = tui as unknown as FocusTui;
       const component = {
         render: (width: number) => {
           const rows = widgetRows(board.workers(), now());
@@ -279,7 +329,7 @@ export function startWorkerWidget(ui: WorkerWidgetUI, board: WorkerBoardView, op
       const rerender = () => tui.requestRender();
       requestRender = rerender;
       return component;
-    }, { placement: "aboveEditor" });
+    }, { placement: "belowEditor" });
     timer ??= setTimer(refresh, TICK_MS);
   };
 
@@ -289,27 +339,35 @@ export function startWorkerWidget(ui: WorkerWidgetUI, board: WorkerBoardView, op
   const unsubscribe = board.subscribe((worker) => worker !== undefined && requestRender !== undefined ? requestRender() : refresh());
   refresh();
 
-  const onKey = (active: Focus, keys: SelectionKeys, data: string) => {
+  const onKey = (active: Focus, keys: SelectionKeys, tui: FocusTui, data: string) => {
     if (keys.matches(data, "tui.select.cancel")) return active.end({ reason: "left" });
     const rows = widgetRows(board.workers(), now()).rows;
-    selectedRow(active, rows);
+    const index = selectedRow(active, rows);
     if (keys.matches(data, "tui.select.confirm")) {
       if (active.selected !== undefined) active.end({ workerId: active.selected });
       return;
     }
     const step = keys.matches(data, "tui.select.up") ? -1 : keys.matches(data, "tui.select.down") ? 1 : 0;
-    if (step === 0) return;
+    // ↑ above the first row goes back up into the editor.
+    if (step === -1 && index === 0) return active.end({ reason: "left" });
+    if (step === 0) {
+      // A key the list does not take is the editor's: closing gives the editor
+      // the focus back at once, and the key goes on to it.
+      active.end({ reason: "left" });
+      (tui.getFocusedComponent?.() as FocusedEditor | null | undefined)?.handleInput?.(data);
+      return;
+    }
     moveSelection(active, rows, step);
     requestRender?.();
   };
 
   return {
-    focus(focusUI) {
+    focus(focusUI, focusOptions = {}) {
       if (stopped || focus !== undefined || widgetRows(board.workers(), now()).rows.length === 0) {
         return Promise.resolve({ reason: focus === undefined ? "empty" : "left" });
       }
-      return focusUI.custom<WidgetFocusResult>((_tui, _theme, keys, done) => {
-        const active: Focus = { selected: undefined, index: 0, end: (result) => {
+      return focusUI.custom<WidgetFocusResult>((tui, _theme, keys, done) => {
+        const active: Focus = { selected: focusOptions.select, index: 0, end: (result) => {
           if (focus !== active) return;
           focus = undefined;
           requestRender?.();
@@ -320,11 +378,15 @@ export function startWorkerWidget(ui: WorkerWidgetUI, board: WorkerBoardView, op
         return {
           render: () => [],
           invalidate() {},
-          handleInput: (data: string) => { if (focus === active) onKey(active, keys, data); },
+          handleInput: (data: string) => { if (focus === active) onKey(active, keys, tui as unknown as FocusTui, data); },
           // pi closes the overlay on its own only when it drops the whole UI, as on a reload.
           dispose: () => active.end({ reason: "left" }),
         };
       }, { overlay: true, overlayOptions: FOCUS_OVERLAY });
+    },
+    downEnters(data) {
+      if (stopped || focus !== undefined || requestRender === undefined || widgetRows(board.workers(), now()).rows.length === 0) return false;
+      return downDoesNothing(widgetTui?.getFocusedComponent?.(), data);
     },
     stop() {
       stopped = true;
