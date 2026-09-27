@@ -107,7 +107,7 @@ export function prepareResume(id: string, task: string, setup: Pick<WorkerSetup,
     refreshState: existsSync(join(folder, "refresh-state.json")) ? loadRefreshState(join(folder, "refresh-state.json")) : emptyRefreshState(),
     authorization: loadAuthorizationOrEmpty(join(folder, "authorized-recipients.json")),
   };
-  const failure = failedHardFilter({ model: pin.model }, {
+  const failure = failedHardFilter({ model: pin.model, effort: pin.effort }, {
     catalog: evidence.catalog, authorization: evidence.authorization, providerUsage: deriveProviderUsage(evidence, new Date()),
     estimatedPromptTokens: Buffer.byteLength(task, "utf8"),
     allowance: banListException ? NO_BUDGET_CONSTRAINT : allowanceConstraint(

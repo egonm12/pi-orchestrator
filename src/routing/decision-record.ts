@@ -8,10 +8,11 @@
 //
 // The writer copies each field it records by name from the values it is
 // given: ticket 23's classification, ticket 22's resolved tier map, ticket
-// 24's router decision, and the delegation facts (delegation id, mode, task text,
-// agent role, the model the worker ran on, the hand-picked model in shadow
-// mode, and the parent delegation of a worker's own worker). Nothing else an
-// input object carries (a parsed settings file, a token) can reach the file.
+// 24's router decision, the worker's routing constraints, and the delegation
+// facts (delegation id, mode, task text, agent role, the model the worker ran
+// on, the hand-picked model in shadow mode, and the parent delegation of a
+// worker's own worker). Nothing else an input object carries (a parsed
+// settings file, a token) can reach the file.
 //
 // Free text (task text, the classifier's `why` and reasons, hop details,
 // route messages, removal and drop reasons, skipped-rung details) passes one
@@ -35,7 +36,7 @@ import type { HopOutcome, TierClassification } from "./tier-classifier.ts";
 import type { ResolvedTierMap, TierMapDrop, TierRung } from "./tier-map.ts";
 import type { LadderSkippedRung } from "./effort-ladder.ts";
 import { LADDER_SKIP_REASONS } from "./skip-reasons.ts";
-import type { RemovedRung, TierRouteDecision } from "./tier-router.ts";
+import type { RemovedRung, RoutingConstraints, TierRouteDecision } from "./tier-router.ts";
 
 export const DECISION_RECORD_SCHEMA_VERSION = "decision-record/3";
 /** Only for reading old records, including the explicit records no longer written. */
@@ -219,6 +220,15 @@ export interface RecordedRouteRefusal extends RecordedRouteCommon {
 
 export type RecordedRoute = RecordedRouteChoice | RecordedRouteRefusal;
 
+/** The routing constraints a decision was made under. */
+export interface RecordedConstraints {
+  readonly minimumTier?: RiskTier;
+  /** `provider/model:effort`. */
+  readonly excludedRung?: string;
+  /** The forced rung and the tier it stands for; never with another constraint. */
+  readonly forcedRung?: { readonly tier: RiskTier; readonly rung: string };
+}
+
 interface RecordCommon {
   readonly schemaVersion: string;
   /** Ticket 18's delegation id: the key verdicts attach by. */
@@ -242,6 +252,8 @@ export interface DecisionRecord extends RecordCommon {
   /** The delegation id of the worker that made this delegation (ADR 0008);
    *  absent when the orchestrator made it. */
   readonly parentDelegationId?: string;
+  /** The worker's routing constraints; absent when it had none. */
+  readonly constraints?: RecordedConstraints;
 }
 
 export interface VerdictRecord extends RecordCommon {
@@ -479,6 +491,22 @@ function checkRoute(record: Json): void {
   });
 }
 
+function checkConstraints(record: Json): void {
+  const path = "constraints";
+  const value = objectAt(record, path, "");
+  checkKeys(value, path, [], ["minimumTier", "excludedRung", "forcedRung"]);
+  if (Object.keys(value).length === 0) throw new RoutingRecordError(path, "must name at least one constraint");
+  if (value.minimumTier !== undefined) oneOf(value, "minimumTier", path, RISK_TIERS);
+  if (value.excludedRung !== undefined) stringAt(value, "excludedRung", path, { nonBlank: true });
+  if (value.forcedRung !== undefined) {
+    if (Object.keys(value).length > 1) throw new RoutingRecordError(`${path}.forcedRung`, "must be the only constraint");
+    const forced = objectAt(value, "forcedRung", path);
+    checkKeys(forced, `${path}.forcedRung`, ["tier", "rung"]);
+    oneOf(forced, "tier", `${path}.forcedRung`, RISK_TIERS);
+    stringAt(forced, "rung", `${path}.forcedRung`, { nonBlank: true });
+  }
+}
+
 const DAY_FILE = /^\d{4}-\d{2}-\d{2}\.jsonl$/;
 const COMMON_KEYS = ["recordType", "schemaVersion", "delegationId", "timestamp"] as const;
 
@@ -512,7 +540,7 @@ export function validateRoutingRecord(value: unknown): RoutingRecord {
     const mode = oneOf(value, "mode", "", ROUTING_MODES);
     const required = [...COMMON_KEYS, "mode", "taskTextPrefix", "agentRole", "classification", "tierMap", "route",
       ...(value.schemaVersion === DECISION_RECORD_SCHEMA_VERSION ? ["ranOn"] : [])];
-    checkKeys(value, "", mode === "shadow" ? [...required, "handPickedModel"] : required, ["parentDelegationId"]);
+    checkKeys(value, "", mode === "shadow" ? [...required, "handPickedModel"] : required, ["parentDelegationId", "constraints"]);
     checkCommon(value);
     if (value.parentDelegationId !== undefined) {
       stringAt(value, "parentDelegationId", "", { nonBlank: true });
@@ -525,6 +553,7 @@ export function validateRoutingRecord(value: unknown): RoutingRecord {
     checkClassification(value);
     checkTierMap(value);
     checkRoute(value);
+    if (value.constraints !== undefined) checkConstraints(value);
   } else if (recordType === "effort-ladder") {
     checkKeys(value, "", [...COMMON_KEYS, "cause", "previousDecisionId", "step", "mode", "taskTextPrefix", "agentRole", "kindOfWork", "tierMap", "route", "skipped"]);
     checkCommon(value);
@@ -595,6 +624,8 @@ interface DecisionRecordInputCommon {
   readonly route: TierRouteDecision;
   readonly ranOn: string;
   readonly parentDelegationId?: string;
+  /** The worker's routing constraints; none leaves the record without the field. */
+  readonly constraints?: RoutingConstraints;
 }
 
 export type DecisionRecordInput =
@@ -670,6 +701,26 @@ function recordedRoute(route: TierRouteDecision): RecordedRoute {
   return { outcome: "refused", ...common, code: route.code, message: route.message };
 }
 
+/** `undefined` when no constraint is set, so an unconstrained record has no
+ *  `constraints` field. */
+function recordedConstraints(constraints: RoutingConstraints | undefined): RecordedConstraints | undefined {
+  const recorded: RecordedConstraints = {
+    ...(constraints?.minimumTier === undefined ? {} : { minimumTier: constraints.minimumTier }),
+    ...(constraints?.excludedRung === undefined ? {} : { excludedRung: `${constraints.excludedRung.model}:${constraints.excludedRung.effort}` }),
+    ...(constraints?.forcedRung === undefined ? {} : { forcedRung: { tier: constraints.forcedRung.tier, rung: constraints.forcedRung.rung.rung } }),
+  };
+  return Object.keys(recorded).length === 0 ? undefined : recorded;
+}
+
+/** Whether `record` was made under exactly `constraints`; a record without
+ *  constraints matches a worker without any. */
+export function madeUnderConstraints(record: DecisionRecord, constraints: RoutingConstraints | undefined): boolean {
+  const recorded = record.constraints;
+  const wanted = recordedConstraints(constraints);
+  return recorded?.minimumTier === wanted?.minimumTier && recorded?.excludedRung === wanted?.excludedRung &&
+    recorded?.forcedRung?.tier === wanted?.forcedRung?.tier && recorded?.forcedRung?.rung === wanted?.forcedRung?.rung;
+}
+
 export function buildEffortLadderRecord(input: {
   readonly delegationId: string;
   readonly at: Date;
@@ -728,6 +779,7 @@ export function buildAgentModelRecord(input: {
 }
 
 export function buildDecisionRecord(input: DecisionRecordInput): DecisionRecord {
+  const constraints = recordedConstraints(input.constraints);
   const record: DecisionRecord = {
     recordType: "decision",
     schemaVersion: DECISION_RECORD_SCHEMA_VERSION,
@@ -742,6 +794,7 @@ export function buildDecisionRecord(input: DecisionRecordInput): DecisionRecord 
     ranOn: input.ranOn,
     ...(input.handPickedModel === undefined ? {} : { handPickedModel: input.handPickedModel }),
     ...(input.parentDelegationId === undefined ? {} : { parentDelegationId: input.parentDelegationId }),
+    ...(constraints === undefined ? {} : { constraints }),
   };
   return checkedRecord(record);
 }

@@ -7,7 +7,7 @@ priority: normal
 tags:
     - ready-for-agent
 created_at: 2026-09-27T22:07:20Z
-updated_at: 2026-09-27T22:07:20Z
+updated_at: 2026-09-27T22:52:02Z
 parent: pi-orchestrator-3p1z
 blocked_by:
     - pi-orchestrator-kokv
@@ -35,3 +35,8 @@ ADR 0010. When subagents_verdict records request_changes, its reply names the ne
 
 - pi-orchestrator-kokv
 - pi-orchestrator-uezs
+
+
+## Notes from uezs
+- setRoutingConstraints(id, { forcedRung: { rung, tier } }) pins a forced rung or refuses it (code no_authorized_candidate) when it fails a hard filter. Nothing calls it yet; WorkerSetup needs a field.
+- A forced rung writes a normal decision record carrying constraints, not an effort-ladder record. This ticket must write the effort-ladder record (buildEffortLadderRecord) linked to the failed attempt and reconcile the two.

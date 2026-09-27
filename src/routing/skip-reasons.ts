@@ -5,8 +5,9 @@
 // ladder records without loading the router: the report CLI runs under Node's
 // permission model with a fixed list of readable module sources.
 
-/** The hard filters, in the order a rung is checked against them. A rung is
- *  removed by the first one it fails. */
+/** The hard filters, in the order a rung is checked against them, then the
+ *  rung a worker's routing constraints exclude. A rung is removed by the
+ *  first one it fails. */
 export const REMOVAL_REASONS = [
   "subagent ban list",
   "allowed-model list",
@@ -15,6 +16,7 @@ export const REMOVAL_REASONS = [
   "context window",
   "allowance preflight",
   "unapproved recipient",
+  "excluded rung",
 ] as const;
 
 export type RemovalReason = (typeof REMOVAL_REASONS)[number];

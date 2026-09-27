@@ -8,8 +8,9 @@
 // verdicts by kind, and the shadow agreement rate, then the totals and the
 // orphaned verdict count.
 //
-//   - A decision's row is the tier and rung it chose, or `<classified tier>,
-//     refused` when the router refused.
+//   - A decision's row is the tier and rung it chose, or `<tier routing
+//     started at>, refused` when the router refused: the classified tier,
+//     unless a routing constraint raised it or forced a rung.
 //   - Verdicts count once per delegation id, the newest winning, as ticket 08's
 //     ledger does. A decision with no verdict yet counts in no verdict column.
 //   - Shadow agreement: of the shadow decisions in the row, the share whose

@@ -205,6 +205,15 @@ test("a rung whose provider is not an approved recipient is removed with the rea
   assertOnlyLunaRemoved(decision, "unapproved recipient", /'openai-codex' is not an approved data recipient/);
 });
 
+test("the rung a worker's routing constraints exclude is removed with the reason 'excluded rung', and its model at another effort is kept", () => {
+  const excluded = routeTier(input("standard", { excludedRung: { model: LUNA, effort: "medium" } }));
+  assertOnlyLunaRemoved(excluded, "excluded rung", /routing constraints exclude openai-codex\/gpt-6-luna:medium/);
+
+  const otherEffort = routeTier(input("standard", { excludedRung: { model: LUNA, effort: "high" } }));
+  assert.equal(otherEffort.ok && otherEffort.rung.rung, `${LUNA}:medium`);
+  assert.deepEqual(otherEffort.ok && otherEffort.removed, []);
+});
+
 test("the context window boundary is exact: a prompt needing exactly the window is kept, one token more is removed", () => {
   const tiers = { ...TIERS, standard: [`${HAIKU}:medium`, `${SONNET}:medium`] };
   // 190,476 + ceil(9,523.8) = 200,000 tokens needed: exactly haiku's window.

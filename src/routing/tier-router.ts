@@ -23,6 +23,10 @@ import type { ResolvedTierMap, TierRung } from "./tier-map.ts";
 //   stage 2  the first survivor. No score, no cost, no preference beyond the
 //            owner's order.
 //
+// A worker's routing constraints narrow this: a minimum tier raises the tier
+// stage 1 starts at, an excluded rung fails stage 1 in every tier, and a
+// forced rung (`routeForcedRung`) goes through stage 1 alone, with no stage 2.
+//
 // All evidence is a plain input, so the router reads no file, no clock and no
 // network. The router extension calls `routeTier` (../router/route-task.ts);
 // ticket 19's `computeAgentCandidates` consumes the same decision.
@@ -51,10 +55,45 @@ export interface RouterEvidence {
   readonly banLists?: BanLists;
   /** Defaults to ticket 04's `HARNESS_MODEL_SCOPE`. */
   readonly modelScope?: ModelScopeCheckRule;
+  /** A rung this worker's routing constraints exclude. Only that model at
+   *  that effort is removed, in every tier. */
+  readonly excludedRung?: ConstraintRung;
 }
 
+/** One model at one effort, as a routing constraint names it. A recorded
+ *  rung fits, so a worker's rung can be taken from its decision record. */
+export interface ConstraintRung {
+  readonly model: string;
+  readonly effort: string;
+}
+
+/** The rung a worker must run on and the tier it stands for, as the effort
+ *  ladder's choice names them. The rung need not be listed: the ladder may
+ *  raise a listed model to its next effort. */
+export type ForcedRung = Pick<TierRouteChoice, "rung" | "tier">;
+
+/** Per-worker routing constraints, set for one worker before its first
+ *  request. They narrow the choice and never bypass the hard filters. A
+ *  forced rung replaces the tier choice, so it stands alone. */
+export type RoutingConstraints =
+  | {
+      /** Route at this tier or higher: a lower classified tier is raised to it. */
+      readonly minimumTier?: RiskTier;
+      /** A rung the worker must not run on. Removed in every tier, so escalation
+       *  cannot choose it either. */
+      readonly excludedRung?: ConstraintRung;
+      readonly forcedRung?: undefined;
+    }
+  | {
+      /** Pinned if it passes the hard filters, else a refusal. */
+      readonly forcedRung: ForcedRung;
+      readonly minimumTier?: undefined;
+      readonly excludedRung?: undefined;
+    };
+
 export interface TierRouteInput {
-  /** The classifier's tier (ticket 23). The router does not classify. */
+  /** The tier routing starts at: the classifier's tier (ticket 23), or a
+   *  minimum tier above it. The router does not classify. */
   readonly tier: RiskTier;
   readonly tierMap: ResolvedTierMap;
   readonly evidence: RouterEvidence;
@@ -78,7 +117,8 @@ export interface TierRouteChoice {
   readonly model: string;
   /** Every survivor of `tier`, in map order; `rung` is the first. */
   readonly survivors: readonly TierRung[];
-  /** The classified tier. */
+  /** The tier routing started at: the classified tier, or a minimum tier
+   *  above it. */
   readonly startedAtTier: RiskTier;
   /** The tier the rung came from: `startedAtTier` or a higher one. */
   readonly tier: RiskTier;
@@ -89,7 +129,8 @@ export interface TierRouteChoice {
 }
 
 /**
- * Every tier from the classified one up to critical emptied. The shape is
+ * Every tier from the one routing started at up to critical emptied, or a
+ * forced rung failed a hard filter. The shape is
  * ticket 07's delegation refusal (`AuthorizedDelegationOutcome` with `ok: false`)
  * plus the router's own fields. It carries no model and no rung, so nothing
  * can be written into the call from it.
@@ -124,7 +165,15 @@ interface Removal {
   readonly detail: string;
 }
 
-export function failedHardFilter(rung: Pick<TierRung, "model">, evidence: RouterEvidence): Removal | undefined {
+/** The model is matched without case, as the installed registry is; the
+ *  effort exactly. */
+function isExcluded(rung: ConstraintRung, excluded: ConstraintRung | undefined): boolean {
+  return excluded !== undefined && rung.model.toLowerCase() === excluded.model.toLowerCase() && rung.effort === excluded.effort;
+}
+
+/** The hard filters see the whole rung, so one effort of a model can be
+ *  excluded while its other efforts stay. */
+export function failedHardFilter(rung: ConstraintRung, evidence: RouterEvidence): Removal | undefined {
   const { model } = rung;
   if (isProhibitedModel(model, evidence.banLists)) {
     return { reason: "subagent ban list", detail: subagentBanListReason(model, evidence.banLists) };
@@ -165,6 +214,9 @@ export function failedHardFilter(rung: Pick<TierRung, "model">, evidence: Router
 
   const recipient = checkRecipient(provider, evidence.authorization);
   if (!recipient.ok) return { reason: "unapproved recipient", detail: recipient.message };
+  if (isExcluded(rung, evidence.excludedRung)) {
+    return { reason: "excluded rung", detail: `the worker's routing constraints exclude ${rung.model}:${rung.effort}` };
+  }
   return undefined;
 }
 
@@ -181,6 +233,34 @@ export function refusedAlternatives(removed: readonly RemovedRung[]): readonly R
   return Object.freeze(
     removed.map((entry) => Object.freeze({ model: entry.rung, why: `${entry.tier}: ${entry.reason}: ${entry.detail}` })),
   );
+}
+
+/** A forced rung through the hard filters: chosen when it passes them, else
+ *  a refusal naming the filter it failed. No other rung is tried. */
+export function routeForcedRung(forced: ForcedRung, evidence: RouterEvidence): TierRouteDecision {
+  checkEstimatedPromptTokens("tier router", evidence.estimatedPromptTokens);
+  const { rung, tier } = forced;
+  const tiersTried = Object.freeze([tier]);
+  const failed = failedHardFilter(rung, evidence);
+  if (failed === undefined) {
+    return Object.freeze({
+      ok: true, refused: false, rung, model: rung.model, survivors: Object.freeze([rung]), startedAtTier: tier, tier, tiersTried,
+      removed: Object.freeze([]), allowanceApplied: evidence.allowance.describe,
+    });
+  }
+  const removed = Object.freeze([Object.freeze({ tier, rung: rung.rung, model: rung.model, ...failed })]);
+  return Object.freeze({
+    ok: false,
+    refused: true,
+    code: "no_authorized_candidate",
+    message: `pi-orchestration-harness: the forced rung ${rung.rung} (${tier}) fails ${failed.reason}: ${failed.detail}. No other rung was tried.`,
+    startedAtTier: tier,
+    tiersTried,
+    removed,
+    consideredAndRefused: refusedAlternatives(removed),
+    approvedRecipients: approvedRecipients(evidence.authorization),
+    allowanceApplied: evidence.allowance.describe,
+  });
 }
 
 function refusalMessage(startedAtTier: RiskTier, tiersTried: readonly RiskTier[], removed: readonly RemovedRung[]): string {

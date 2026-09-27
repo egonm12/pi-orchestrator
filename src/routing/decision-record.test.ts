@@ -367,6 +367,35 @@ test("a nested worker's record names its parent delegation, which must be anothe
   }
 });
 
+test("a constrained worker's record names its routing constraints, and a malformed constraints field fails validation, naming the field", async () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    writeDecisionRecord(dir, await liveInput({ constraints: { minimumTier: "elevated", excludedRung: { model: SONNET, effort: "high" } } }));
+    const [record] = readRoutingRecords(dir);
+    assert.ok(record?.recordType === "decision");
+    assert.deepEqual(record.constraints, { minimumTier: "elevated", excludedRung: `${SONNET}:high` });
+
+    const cases: readonly (readonly [unknown, string, RegExp])[] = [
+      [{}, "constraints", /must name at least one constraint/],
+      [{ minimumTier: "urgent" }, "constraints.minimumTier", /must be one of/],
+      [{ excludedRung: "" }, "constraints.excludedRung", /non-blank/],
+      [{ surprise: 1 }, "constraints.surprise", /is not a known field/],
+      [{ forcedRung: { tier: "standard", rung: `${SONNET}:high` }, minimumTier: "elevated" }, "constraints.forcedRung", /must be the only constraint/],
+      [{ forcedRung: { tier: "standard" } }, "constraints.forcedRung.rung", /is missing/],
+    ];
+    for (const [constraints, field, problem] of cases) {
+      assert.throws(() => validateRoutingRecord({ ...record, constraints }), (error: unknown) => {
+        assert.ok(error instanceof RoutingRecordError, String(error));
+        assert.equal(error.field, field, error.message);
+        assert.match(error.problem, problem);
+        return true;
+      });
+    }
+  } finally {
+    cleanup();
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Checkbox 9 (story 34): 200 characters of task text, never a credential
 // ---------------------------------------------------------------------------

@@ -287,7 +287,15 @@ A project's `.pi/settings.json` may replace individual tiers under `orchestrator
 
 A worker started on the auto model is identified by its pi session id (its delegation id). The router extension classifies its first request from the task text, agent role and named file paths. The task text is the first user message, the delegated prompt; context that other extensions append to the request is not part of it. Keyword signals (credentials, security, destructive operations) set a minimum tier. The first rung that passes the hard filters (subagent ban list, allowed-model list, installed model, approved recipient, usage limits, context window and task allowance) is chosen. If no rung survives, routing escalates through higher tiers, then refuses.
 
-The worker keeps that rung as its pin across later requests and compaction. In live mode, a resumed worker can restore its pin from the decision record if the rung still passes the hard filters. The auto model declares the largest context window in the tier map; an overflow on the pinned rung lets pi compact and retry on that rung. A compaction summary has a new session id and is classified separately. The classifier runs in the worker's process through its session model registry, without an extra `pi` process.
+pi-orchestrator can set routing constraints for one worker, by its session id, before its first request:
+
+- A minimum tier raises a lower classified tier to it; escalation goes on from there as usual.
+- An excluded rung is removed in every tier, with the reason `excluded rung`, so escalation cannot choose it either. The same model at another effort stays.
+- A forced rung, with the tier it stands for, replaces the tier choice. It is pinned if it passes the hard filters. Otherwise routing refuses with the filter it failed, and the worker runs on the orchestrator's session model like any refused worker.
+
+The classifier still runs, so the decision record keeps the tier and why, and its `constraints` field names the constraint. Constraints never lift a hard filter.
+
+The worker keeps the chosen rung as its pin across later requests and compaction. In live mode, a resumed worker can restore its pin from the decision record if the rung still passes the hard filters and the record was made under the same routing constraints. The auto model declares the largest context window in the tier map; an overflow on the pinned rung lets pi compact and retry on that rung. A compaction summary has a new session id and is classified separately. The classifier runs in the worker's process through its session model registry, without an extra `pi` process.
 
 In live mode the worker runs on the chosen rung. In shadow mode the router extension records the shadow decision, but the worker runs on the orchestrator's session model. A routing refusal, disabled routing or an internal routing failure also runs the worker on that model. The router extension sets `PI_ORCHESTRATOR_SESSION_MODEL` from the orchestrator's session model, including for a background worker at delegation time. If that variable is missing or names a model on the subagent ban list, the auto model request fails with a reason instead. A worker started on a real model is not routed; the guard still enforces the subagent ban list.
 

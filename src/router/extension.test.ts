@@ -21,6 +21,7 @@ import { SettingsManager, type ExtensionAPI } from "@earendil-works/pi-coding-ag
 import type { TestContext as ExtensionContext } from "../fixtures/extension-context.ts";
 import type { SessionModelRegistry } from "../routing/model-stream.ts";
 import { createRouterExtension, type RouterDependencies, type RoutingEvidence } from "./extension.ts";
+import { setRoutingConstraints } from "./auto-provider.ts";
 import { useOwnerBanLists } from "../fixtures/owner-ban-lists.ts";
 
 type ProviderConfigInput = NonNullable<Parameters<ExtensionAPI["registerProvider"]>[1]>;
@@ -1317,4 +1318,167 @@ test("under PI_ORCHESTRATOR_ROUTER_PROBE=1 the in-session classifier prints its 
     delete process.env.PI_ORCHESTRATOR_ROUTER_PROBE;
     h.cleanup();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Per-worker routing constraints: set for one worker before its first request
+// ---------------------------------------------------------------------------
+
+test("a minimum tier routes the worker at that tier, above its classified tier, and the record names it", async () => {
+  const h = harness(LIVE);
+  const clear = setRoutingConstraints("min-tier-worker", { minimumTier: "elevated" });
+  try {
+    const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
+    const stream = await loadAutoProvider(h, registry);
+    assert.equal((await autoEvents(stream, FIX_README, "min-tier-worker")).at(-1)?.type, "done");
+    assert.deepEqual(registry.calls.map((call) => [call.model.id, call.options?.reasoning]), [["claude-opus-5", "high"]]);
+    const [record] = h.records();
+    assert.ok(record?.recordType === "decision" && record.route.outcome === "chosen");
+    assert.equal(record.classification.tier, "mechanical");
+    assert.equal(record.route.startedAtTier, "elevated");
+    assert.equal(record.route.tier, "elevated");
+    assert.deepEqual(record.route.tiersTried, ["elevated"]);
+    assert.deepEqual(record.constraints, { minimumTier: "elevated" });
+  } finally { clear(); h.cleanup(); }
+});
+
+test("a classified tier above the minimum tier is kept", async () => {
+  const h = harness(LIVE);
+  const clear = setRoutingConstraints("above-min-worker", { minimumTier: "standard" });
+  try {
+    const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
+    const stream = await loadAutoProvider(h, registry, { classifierCall: () => answering("critical").call });
+    assert.equal((await autoEvents(stream, FIX_README, "above-min-worker")).at(-1)?.type, "done");
+    assert.deepEqual(registry.calls.map((call) => [call.model.id, call.options?.reasoning]), [["claude-opus-5", "xhigh"]]);
+    const [record] = h.records();
+    assert.ok(record?.recordType === "decision" && record.route.outcome === "chosen");
+    assert.deepEqual([record.classification.tier, record.route.startedAtTier, record.route.tier], ["critical", "critical", "critical"]);
+    assert.deepEqual(record.constraints, { minimumTier: "standard" });
+  } finally { clear(); h.cleanup(); }
+});
+
+test("a minimum tier whose rungs the hard filters remove escalates as usual, never below the minimum", async () => {
+  const tiers = { ...TEST_TIERS, elevated: ["openai-codex/gpt-6-sol:high"] };
+  const h = harness({ ...LIVE, tiers });
+  const clear = setRoutingConstraints("min-tier-escalated", { minimumTier: "elevated" });
+  try {
+    const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
+    const stream = await loadAutoProvider(h, registry, { evidence: () => () => evidenceOf({ authorization: approved("anthropic") }) });
+    assert.equal((await autoEvents(stream, FIX_README, "min-tier-escalated")).at(-1)?.type, "done");
+    assert.deepEqual(registry.calls.map((call) => [call.model.id, call.options?.reasoning]), [["claude-opus-5", "xhigh"]]);
+    const [record] = h.records();
+    assert.ok(record?.recordType === "decision" && record.route.outcome === "chosen");
+    assert.equal(record.route.startedAtTier, "elevated");
+    assert.equal(record.route.tier, "critical");
+    assert.deepEqual(record.route.tiersTried, ["elevated", "critical"]);
+    assert.deepEqual(record.route.removed.map((removed) => [removed.tier, removed.rung, removed.reason]), [
+      ["elevated", "openai-codex/gpt-6-sol:high", "unapproved recipient"],
+      ["critical", "openai-codex/gpt-6-sol:xhigh", "unapproved recipient"],
+    ]);
+  } finally { clear(); h.cleanup(); }
+});
+
+test("an excluded rung is never chosen, in its own tier or after escalation, while its model at another effort still is", async () => {
+  const tiers = { ...TEST_TIERS, elevated: ["anthropic/claude-opus-5:high"], critical: ["anthropic/claude-opus-5:high", "anthropic/claude-opus-5:xhigh"] };
+  const h = harness({ ...LIVE, tiers });
+  const clear = setRoutingConstraints("excluding-worker", { excludedRung: { model: "anthropic/claude-opus-5", effort: "high" } });
+  try {
+    const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
+    const stream = await loadAutoProvider(h, registry, { classifierCall: () => answering("elevated").call });
+    assert.equal((await autoEvents(stream, FIX_README, "excluding-worker")).at(-1)?.type, "done");
+    assert.deepEqual(registry.calls.map((call) => [call.model.id, call.options?.reasoning]), [["claude-opus-5", "xhigh"]]);
+    const [record] = h.records();
+    assert.ok(record?.recordType === "decision" && record.route.outcome === "chosen");
+    assert.equal(record.route.rung.rung, "anthropic/claude-opus-5:xhigh");
+    assert.deepEqual(record.route.tiersTried, ["elevated", "critical"]);
+    assert.deepEqual(record.route.removed.map((removed) => [removed.tier, removed.rung, removed.reason]), [
+      ["elevated", "anthropic/claude-opus-5:high", "excluded rung"],
+      ["critical", "anthropic/claude-opus-5:high", "excluded rung"],
+    ]);
+    assert.deepEqual(record.constraints, { excludedRung: "anthropic/claude-opus-5:high" });
+  } finally { clear(); h.cleanup(); }
+});
+
+/** An effort the ladder generated: sonnet is listed at medium only. */
+const FORCED_SONNET_HIGH = { tier: "standard", rung: { rung: "anthropic/claude-sonnet-5:high", model: "anthropic/claude-sonnet-5", effort: "high", origin: "personal" } } as const;
+
+test("a forced rung that passes the hard filters is pinned without a tier choice, and the record names it", async () => {
+  const h = harness(LIVE);
+  const clear = setRoutingConstraints("forced-worker", { forcedRung: FORCED_SONNET_HIGH });
+  try {
+    const registry = fakeSessionRegistry([{ events: answerEvents("first") }, { events: answerEvents("second") }]);
+    const stream = await loadAutoProvider(h, registry);
+    for (let request = 0; request < 2; request++) assert.equal((await autoEvents(stream, FIX_README, "forced-worker")).at(-1)?.type, "done");
+    assert.deepEqual(registry.calls.map((call) => [call.model.id, call.options?.reasoning]), [["claude-sonnet-5", "high"], ["claude-sonnet-5", "high"]]);
+    const records = h.records();
+    assert.equal(records.length, 1);
+    const [record] = records;
+    assert.ok(record?.recordType === "decision" && record.route.outcome === "chosen");
+    assert.equal(record.classification.tier, "mechanical");
+    assert.deepEqual([record.route.startedAtTier, record.route.tier, record.route.tiersTried], ["standard", "standard", ["standard"]]);
+    assert.equal(record.route.rung.rung, "anthropic/claude-sonnet-5:high");
+    assert.deepEqual(record.route.survivors.map((rung) => rung.rung), ["anthropic/claude-sonnet-5:high"]);
+    assert.deepEqual(record.route.removed, []);
+    assert.equal(record.ranOn, "anthropic/claude-sonnet-5:high");
+    assert.deepEqual(record.constraints, { forcedRung: { tier: "standard", rung: "anthropic/claude-sonnet-5:high" } });
+  } finally { clear(); h.cleanup(); }
+});
+
+test("a forced rung that fails a hard filter is a refusal with the reason: no other rung is tried and the worker runs on the session model", async () => {
+  const h = harness(LIVE);
+  const forced = { tier: "elevated", rung: { rung: "openai-codex/gpt-6-sol:high", model: "openai-codex/gpt-6-sol", effort: "high", origin: "personal" } } as const;
+  const clear = setRoutingConstraints("refused-forced-worker", { forcedRung: forced });
+  try {
+    const registry = fakeSessionRegistry([{ events: answerEvents("fallback") }]);
+    const stream = await loadAutoProvider(h, registry, { evidence: () => () => evidenceOf({ authorization: approved("anthropic") }) });
+    process.env.PI_ORCHESTRATOR_SESSION_MODEL = "anthropic/claude-sonnet-5:medium";
+    assert.equal((await autoEvents(stream, FIX_README, "refused-forced-worker")).at(-1)?.type, "done");
+    assert.deepEqual(registry.calls.map((call) => [call.model.id, call.options?.reasoning]), [["claude-sonnet-5", "medium"]]);
+    const [record] = h.records();
+    assert.ok(record?.recordType === "decision" && record.route.outcome === "refused");
+    assert.match(record.route.message, /forced rung openai-codex\/gpt-6-sol:high \(elevated\) fails unapproved recipient: .*No other rung was tried/);
+    assert.deepEqual(record.route.tiersTried, ["elevated"]);
+    assert.deepEqual(record.route.removed.map((removed) => [removed.tier, removed.rung, removed.reason]), [["elevated", "openai-codex/gpt-6-sol:high", "unapproved recipient"]]);
+    assert.equal(record.ranOn, "anthropic/claude-sonnet-5:medium");
+    assert.deepEqual(record.constraints, { forcedRung: { tier: "elevated", rung: "openai-codex/gpt-6-sol:high" } });
+  } finally { clear(); h.cleanup(); }
+});
+
+test("routing constraints bind only their worker's session id, and removing them restores the usual routing", async () => {
+  const h = harness(LIVE);
+  const clear = setRoutingConstraints("constrained-worker", { minimumTier: "critical" });
+  try {
+    const registry = fakeSessionRegistry([{ events: answerEvents("other") }, { events: answerEvents("cleared") }]);
+    const stream = await loadAutoProvider(h, registry);
+    await autoEvents(stream, FIX_README, "other-worker");
+    clear();
+    await autoEvents(stream, FIX_README, "constrained-worker");
+    assert.deepEqual(registry.calls.map((call) => [call.model.id, call.options?.reasoning]), [["claude-haiku-4-5", "low"], ["claude-haiku-4-5", "low"]]);
+    const records = h.records();
+    assert.deepEqual(records.map((record) => record.delegationId), ["other-worker", "constrained-worker"]);
+    for (const record of records) assert.equal("constraints" in record, false, "an unconstrained decision record has no constraints field");
+  } finally { clear(); h.cleanup(); }
+});
+
+test("a recorded decision pins a constrained worker again only when it was made under the same constraints", async () => {
+  const h = harness(LIVE);
+  let clear = () => {};
+  try {
+    // Recorded without constraints, on a mechanical rung that still passes the hard filters.
+    await autoEvents(await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("first") }])), FIX_README, "restored-worker");
+    clear = setRoutingConstraints("restored-worker", { minimumTier: "elevated" });
+    const classifier = answering("mechanical");
+    const rerouted = fakeSessionRegistry([{ events: answerEvents("rerouted") }]);
+    await autoEvents(await loadAutoProvider(h, rerouted, { classifierCall: () => classifier.call }), FIX_README, "restored-worker");
+    assert.equal(classifier.prompts.length, 1, "classified again");
+    assert.deepEqual(rerouted.calls.map((call) => [call.model.id, call.options?.reasoning]), [["claude-opus-5", "high"]]);
+
+    // Recorded under these constraints: restored without classifying.
+    const again = answering("critical");
+    const restored = fakeSessionRegistry([{ events: answerEvents("restored") }]);
+    await autoEvents(await loadAutoProvider(h, restored, { classifierCall: () => again.call }), FIX_README, "restored-worker");
+    assert.equal(again.prompts.length, 0, "not classified");
+    assert.deepEqual(restored.calls.map((call) => [call.model.id, call.options?.reasoning]), [["claude-opus-5", "high"]]);
+    assert.equal(h.records().length, 2);
+  } finally { clear(); h.cleanup(); }
 });

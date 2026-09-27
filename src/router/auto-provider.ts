@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { appendRoutingRecord, buildDecisionRecord, readRoutingRecords, RoutingRecordError, type DecisionRecord } from "../routing/decision-record.ts";
+import { appendRoutingRecord, buildDecisionRecord, madeUnderConstraints, readRoutingRecords, RoutingRecordError, type DecisionRecord } from "../routing/decision-record.ts";
 import { splitKnownThinkingSuffix } from "../models/model-info.ts";
 import { subagentBanListEntry, type BanLists } from "../policy/ban-lists.ts";
 import { streamReasoning } from "../routing/session-classifier-call.ts";
@@ -9,17 +9,29 @@ import { recordedRungPassesHardFilters, routeTask, type ActiveRouter } from "./r
 import { parentDelegationOf } from "../subagents/worker-sessions.ts";
 import { publishServedRung, type RungEscalation } from "./served-rungs.ts";
 import type { RiskTier } from "../routing/classifier.ts";
+import type { RoutingConstraints } from "../routing/tier-router.ts";
 
 type ProviderConfig = NonNullable<Parameters<ExtensionAPI["registerProvider"]>[1]>;
 
 const RESUME_PINS = Symbol.for("pi-orchestrator.subagents.resume-pins");
+const ROUTING_CONSTRAINTS = Symbol.for("pi-orchestrator.router.routing-constraints");
 type Pin = { model: string; effort: string };
-type ProcessGlobal = typeof globalThis & { [RESUME_PINS]?: Map<string, Pin> };
+type ProcessGlobal = typeof globalThis & { [RESUME_PINS]?: Map<string, Pin>; [ROUTING_CONSTRAINTS]?: Map<string, RoutingConstraints> };
 function resumePins(): Map<string, Pin> { return (globalThis as ProcessGlobal)[RESUME_PINS] ??= new Map(); }
 /** A checked resume keeps its original pin without making a new routing decision. */
 export function setResumePin(id: string, pin: Pin): () => void {
   resumePins().set(id, pin);
   return () => { resumePins().delete(id); };
+}
+
+// Like resume pins, constraints are set by the orchestrator's extension copy
+// and read by the worker's, so they are kept on the process's global object.
+function routingConstraints(): Map<string, RoutingConstraints> { return (globalThis as ProcessGlobal)[ROUTING_CONSTRAINTS] ??= new Map(); }
+/** Routing constraints for the worker with session id `id`, read at its
+ *  first request. Returns the function that removes them. */
+export function setRoutingConstraints(id: string, constraints: RoutingConstraints): () => void {
+  routingConstraints().set(id, constraints);
+  return () => { routingConstraints().delete(id); };
 }
 
 export interface AutoProviderDependencies {
@@ -107,20 +119,23 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
               try {
                 const at = deps.now();
                 const { taskText, agentRole } = firstTaskAndRole(context);
+                const constraints = routingConstraints().get(sessionId);
                 const latest = router.mode === "live" ? latestDecision(router.recordDir, sessionId) : undefined;
+                // A decision made under other constraints could restore a rung these exclude.
                 if (latest?.mode === "live" && latest.route.outcome === "chosen" &&
                   (latest.ranOn === undefined || latest.ranOn === `${latest.route.rung.model}:${latest.route.rung.effort}`) &&
-                  recordedRungPassesHardFilters(router, latest.route.rung, taskText, at)) {
+                  madeUnderConstraints(latest, constraints) &&
+                  recordedRungPassesHardFilters(router, latest.route.rung, taskText, at, constraints)) {
                   pin = { model: latest.route.rung.model, effort: latest.route.rung.effort, ...escalationOf(latest.route) };
                 } else {
-                  const { classification, route } = await routeTask(router, taskText, agentRole, at);
+                  const { classification, route } = await routeTask(router, taskText, agentRole, at, constraints);
                   pin = router.mode === "shadow" || !route.ok
                     ? sessionPin(router.banLists)
                     : { model: route.rung.model, effort: route.rung.effort, ...escalationOf(route) };
                   const ranOn = `${pin.model}:${pin.effort}`;
                   const parentDelegationId = parentDelegationOf(sessionId);
                   const common = { delegationId: sessionId, at, taskText, agentRole, classification, tierMap: router.tierMap, route, ranOn,
-                    ...(parentDelegationId === undefined ? {} : { parentDelegationId }) };
+                    ...(parentDelegationId === undefined ? {} : { parentDelegationId }), ...(constraints === undefined ? {} : { constraints }) };
                   appendRoutingRecord(router.recordDir, buildDecisionRecord(router.mode === "shadow"
                     ? { ...common, mode: "shadow", handPickedModel: pin.model }
                     : { ...common, mode: "live" }));
