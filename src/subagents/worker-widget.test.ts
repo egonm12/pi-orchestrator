@@ -28,14 +28,15 @@ function fakeSession(sessionId: string) {
   return { session, emit: (event: object) => { for (const listener of listeners) listener(event as AgentSessionEvent); } };
 }
 
-const reply = (text: string) => ({ type: "message_update", message: { role: "assistant", content: [{ type: "text", text }] } });
+const reply = (text: string) => ({ type: "message_update", message: { role: "assistant", content: [{ type: "text", text }] },
+  assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: text } });
 
 /** The widget's lines for `board` at the clock's time. */
 function lines(board: WorkerBoard, now: number, width = WIDE): string[] {
   return widgetLines(widgetRows(board.workers(), now), now, PLAIN, width);
 }
 
-test("each worker's line shows its agent, model and effort, worker state, elapsed time, turns and current tool or latest text, nested workers indented under their parent", () => {
+test("each worker's line shows its agent, model and effort, worker state, elapsed time, turns and activity, nested workers indented under their parent", () => {
   const time = clock();
   const board = new WorkerBoard({ now: time.now });
   const lead = board.add({ callId: "call-1", background: false, task: "Lead the refactor", agent: "lead", model: { kind: "routed" } });
@@ -43,6 +44,7 @@ test("each worker's line shows its agent, model and effort, worker state, elapse
   const preserved = board.add({ callId: "call-2", background: true, task: "Scout the config", agent: "scout", delegationId: "bg-1",
     model: { kind: "preserved", model: "openai/gpt-5", effort: "low" } });
   const queued = board.add({ callId: "call-2", background: true, task: "Fix the typo\nin README.md", delegationId: "bg-2", model: { kind: "routed" } });
+  const fails = board.add({ callId: "call-3", background: false, task: "Try the build", model: { kind: "fork", model: "anthropic/claude-opus-4-5", effort: "high" } });
 
   lead.started();
   const leadSession = fakeSession("lead-1");
@@ -62,17 +64,23 @@ test("each worker's line shows its agent, model and effort, worker state, elapse
   preserved.started();
   preserved.session(fakeSession("bg-1").session);
   board.asking("bg-1", true);
+  fails.started();
+  const failsSession = fakeSession("fails-1");
+  fails.session(failsSession.session);
+  failsSession.emit({ type: "turn_start" });
   time.advance(75_000);
+  fails.ended({ state: "failed", error: "The model call failed\nwith a 529" });
 
   assert.deepEqual(lines(board, time.now()), [
     "lead · anthropic/claude-sonnet-4-5:high ↑elevated · running · 1m15s · 2 turns · subagents",
     "└ tester · routing… · running · 1m15s · 0 turns · Check the tests",
-    "worker (fork) · anthropic/claude-opus-4-5:high · running · 1m15s · 1 turn · The change looks right so far.",
+    "worker (fork) · anthropic/claude-opus-4-5:high · running · 1m15s · 1 turn · writing…",
     "scout · openai/gpt-5:low · asking · 1m15s · 0 turns · Scout the config",
     "worker · routing… · queued · Fix the typo",
+    "worker (fork) · anthropic/claude-opus-4-5:high · failed · 1m15s · 1 turn · The model call failed",
   ]);
   const rows = widgetRows(board.workers(), time.now()).rows;
-  assert.deepEqual(rows.map((row) => [row.worker.id, row.depth]), [[lead.id, 0], [nested.id, 1], [fork.id, 0], [preserved.id, 0], [queued.id, 0]],
+  assert.deepEqual(rows.map((row) => [row.worker.id, row.depth]), [[lead.id, 0], [nested.id, 1], [fork.id, 0], [preserved.id, 0], [queued.id, 0], [fails.id, 0]],
     "each row knows its worker, so a later selection can open it");
 });
 

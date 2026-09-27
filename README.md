@@ -118,7 +118,7 @@ Above the editor, the orchestrator's session lists its active workers: foregroun
 ```text
 lead · anthropic/claude-sonnet-4-5:high ↑elevated · running · 1m15s · 2 turns · subagents
 └ tester · routing… · running · 1m15s · 0 turns · Check the tests
-worker (fork) · anthropic/claude-opus-4-5:high · running · 1m15s · 1 turn · The change looks right so far.
+worker (fork) · anthropic/claude-opus-4-5:high · running · 1m15s · 1 turn · writing…
 worker · routing… · queued · Fix the typo
 ```
 
@@ -126,7 +126,7 @@ worker · routing… · queued · Fix the typo
 - The model and effort. A routed worker shows `routing…` until its first request, then the rung serving its latest request, and `↑<tier>` when its routing decision escalated to that tier. A fork or a worker on a preserved agent model shows its fixed model.
 - The worker state: queued, running, asking, completed, failed or aborted.
 - Once it has started: its elapsed time and the turns it has started.
-- Its current tool, otherwise the last line of its latest text, or for a failed worker why it failed. Before any of those, its short task.
+- Its activity: `thinking…`, `writing…`, the name of the tool it runs (no arguments), or for a failed worker why it failed. Before its first event, its short task. An activity stays at least 1.5 seconds before a newer one replaces it, so a line never changes with each streamed piece of text; a failure shows at once. The transcript view's header shows the same activity.
 
 A worker started by another worker is indented under it. At most 6 workers are listed; a `+N more` line counts the rest. A finished worker stays about 10 seconds with its end state, then drops out, and the widget disappears when no worker is left. The widget only shows workers; it never steers them. A worker's own session shows no widget.
 

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { publishServedRung } from "../router/served-rungs.ts";
-import { elapsedMs, WorkerBoard, workerBoard, type BoardWorker, type WorkerSession } from "./worker-board.ts";
+import { ACTIVITY_HOLD_MS, elapsedMs, WorkerBoard, workerBoard, type BoardWorker, type WorkerSession } from "./worker-board.ts";
 
 // The worker board's own seam: the feed the subagents extension writes into
 // and the read side later views use. The subagents extension's tests show real
@@ -140,7 +140,7 @@ const usage = (input: number, output: number, cost: number) => ({ input, output,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: cost } });
 const assistant = (text: string, extra: object = {}) => ({ role: "assistant", content: [{ type: "text", text }], ...extra });
 
-test("turns, tokens, cost and the current tool or latest text follow the worker's session events, and views get a change signal", () => {
+test("turns, tokens and cost follow the worker's session events, and views get a change signal", () => {
   const board = new WorkerBoard();
   const changes: (string | undefined)[] = [];
   const unsubscribe = board.subscribe((worker) => { changes.push(worker?.state); });
@@ -149,33 +149,22 @@ test("turns, tokens, cost and the current tool or latest text follow the worker'
   const { session, emit, listeners } = fakeSession("busy-1");
   feed.session(session);
   const worker = () => board.worker(feed.id)!;
-  assert.deepEqual({ turns: worker().turns, tokens: worker().tokens, cost: worker().cost, text: worker().text, tool: worker().tool },
-    { turns: 0, tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0, text: "", tool: undefined });
+  assert.deepEqual({ turns: worker().turns, tokens: worker().tokens, cost: worker().cost, activity: worker().activity },
+    { turns: 0, tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0, activity: undefined });
 
   emit({ type: "turn_start" });
-  emit({ type: "message_update", message: assistant("Looking") });
-  emit({ type: "message_update", message: assistant("Looking at the config") });
-  assert.equal(worker().text, "Looking at the config");
   emit({ type: "message_end", message: assistant("Looking at the config", { usage: usage(100, 20, 0.01) }) });
   emit({ type: "message_end", message: { role: "user", content: "not the worker's reply" } });
-  emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "read" });
-  emit({ type: "tool_execution_start", toolCallId: "t2", toolName: "bash" });
-  assert.equal(worker().tool, "bash", "the latest tool still running");
-  emit({ type: "tool_execution_end", toolCallId: "t2", toolName: "bash" });
-  assert.equal(worker().tool, "read");
-  emit({ type: "tool_execution_end", toolCallId: "t1", toolName: "read" });
-  assert.equal(worker().tool, undefined);
   emit({ type: "turn_start" });
   emit({ type: "message_end", message: assistant("Done", { usage: usage(200, 30, 0.02) }) });
 
   assert.equal(worker().turns, 2);
   assert.deepEqual(worker().tokens, { input: 300, output: 50, cacheRead: 20, cacheWrite: 10, total: 380 });
   assert.ok(Math.abs(worker().cost - 0.03) < 1e-12, String(worker().cost));
-  assert.equal(worker().text, "Done");
 
   const signalled = changes.length;
-  assert.ok(signalled >= 10, `every change is signalled, got ${signalled}`);
-  emit({ type: "message_update", message: assistant("Done") });
+  assert.ok(signalled >= 5, `every change is signalled, got ${signalled}`);
+  emit({ type: "message_end", message: { role: "user", content: "again not the worker's reply" } });
   assert.equal(changes.length, signalled, "an event that changes nothing is not signalled");
 
   feed.ended({ state: "completed" });
@@ -184,6 +173,106 @@ test("turns, tokens, cost and the current tool or latest text follow the worker'
   unsubscribe();
   board.add({ callId: "call", background: false, task: "After", model: { kind: "routed" } });
   assert.equal(changes.at(-1), "completed", "an unsubscribed view gets no more signals");
+});
+
+/** A streamed piece of the worker's reply, as pi's message_update carries it. */
+const streamed = (type: string, text = "") => ({ type: "message_update", message: assistant(text), assistantMessageEvent: { type, contentIndex: 0, delta: text } });
+
+test("the activity is the worker's phase from its events: thinking, writing, or the tool it runs, never its streamed text", () => {
+  const time = clock();
+  const board = new WorkerBoard({ now: time.now });
+  const feed = board.add({ callId: "call", background: false, task: "Busy", model: { kind: "routed" } });
+  feed.started();
+  const { session, emit } = fakeSession("busy-1");
+  feed.session(session);
+  const activity = () => board.worker(feed.id)!.activity;
+  const step = (event: object) => { emit(event); time.advance(ACTIVITY_HOLD_MS); };
+  assert.equal(activity(), undefined, "nothing yet before its first event");
+
+  step({ type: "turn_start" });
+  assert.deepEqual(activity(), { kind: "thinking" }, "waiting on its model is thinking");
+  step(streamed("thinking_delta", "Hmm"));
+  assert.deepEqual(activity(), { kind: "thinking" });
+  step(streamed("text_delta", "Looking"));
+  assert.deepEqual(activity(), { kind: "writing" });
+  step(streamed("toolcall_start"));
+  assert.deepEqual(activity(), { kind: "writing" }, "writing a tool call is writing");
+  step({ type: "tool_execution_start", toolCallId: "t1", toolName: "read", args: { path: "notes.md" } });
+  assert.deepEqual(activity(), { kind: "tool", tool: "read" }, "the tool's name, no arguments");
+  step({ type: "tool_execution_start", toolCallId: "t2", toolName: "bash", args: { command: "ls" } });
+  assert.deepEqual(activity(), { kind: "tool", tool: "bash" }, "the latest tool still running");
+  step({ type: "tool_execution_end", toolCallId: "t2", toolName: "bash" });
+  assert.deepEqual(activity(), { kind: "tool", tool: "read" });
+  step({ type: "tool_execution_end", toolCallId: "t1", toolName: "read" });
+  assert.deepEqual(activity(), { kind: "thinking" }, "with its tools done it waits on its model again");
+
+  const changes: unknown[] = [];
+  board.subscribe((worker) => { changes.push(worker?.activity); });
+  emit(streamed("text_delta", "Done"));
+  time.advance(ACTIVITY_HOLD_MS);
+  emit(streamed("text_delta", " with"));
+  emit(streamed("text_delta", " the work"));
+  assert.deepEqual(changes, [{ kind: "writing" }], "streamed text within one phase is no change");
+
+  feed.ended({ state: "completed" });
+  assert.equal(activity(), undefined, "a finished worker has no activity");
+});
+
+test("an activity stays shown for at least 1.5 s, then the newest pending one replaces it; a failure shows at once", () => {
+  assert.equal(ACTIVITY_HOLD_MS, 1_500);
+  const time = clock();
+  const board = new WorkerBoard({ now: time.now });
+  const feed = board.add({ callId: "call", background: false, task: "Busy", model: { kind: "routed" } });
+  feed.started();
+  const { session, emit } = fakeSession("busy-1");
+  feed.session(session);
+  const activity = () => board.worker(feed.id)!.activity;
+
+  emit({ type: "turn_start" });
+  assert.deepEqual(activity(), { kind: "thinking" }, "the first activity shows at once");
+  time.advance(500);
+  emit(streamed("text_delta", "Hi"));
+  emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "read" });
+  assert.deepEqual(activity(), { kind: "thinking" }, "held");
+  time.advance(999);
+  assert.deepEqual(activity(), { kind: "thinking" }, "held until 1.5 s have passed");
+  time.advance(1);
+  assert.deepEqual(activity(), { kind: "tool", tool: "read" }, "the newest pending one, skipping writing");
+
+  time.advance(200);
+  emit({ type: "tool_execution_end", toolCallId: "t1", toolName: "read" });
+  emit({ type: "tool_execution_start", toolCallId: "t2", toolName: "read" });
+  time.advance(ACTIVITY_HOLD_MS);
+  assert.deepEqual(activity(), { kind: "tool", tool: "read" }, "a pending activity equal to the shown one is dropped");
+
+  const views = board.workers().map((worker) => worker.activity);
+  assert.deepEqual(views, [{ kind: "tool", tool: "read" }], "every read of the board shows the same activity");
+
+  emit({ type: "tool_execution_end", toolCallId: "t2", toolName: "read" });
+  feed.ended({ state: "failed", error: "the model call failed" });
+  assert.deepEqual(activity(), { kind: "failed", error: "the model call failed" }, "a failure bypasses the hold");
+});
+
+test("a pending activity nobody read in time shows from when its hold passed, so the next phase is not held behind it", () => {
+  const time = clock();
+  const board = new WorkerBoard({ now: time.now });
+  const feed = board.add({ callId: "call", background: false, task: "Busy", model: { kind: "routed" } });
+  feed.started();
+  const { session, emit } = fakeSession("busy-1");
+  feed.session(session);
+
+  emit({ type: "turn_start" });
+  time.advance(100);
+  emit(streamed("text_delta", "Hi"));
+  time.advance(2_900);
+  emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash" });
+  assert.deepEqual(board.worker(feed.id)!.activity, { kind: "tool", tool: "bash" },
+    "writing showed from 1.5 s on, so by 3 s its hold has passed too");
+
+  const failing = board.add({ callId: "call", background: false, task: "Fails", model: { kind: "routed" } });
+  failing.started();
+  failing.ended({ state: "failed" });
+  assert.deepEqual(board.worker(failing.id)!.activity, { kind: "failed", error: "failed" }, "a failure without a reason still shows as one");
 });
 
 test("a running worker's live session reaches views: its messages and its events as they come", () => {

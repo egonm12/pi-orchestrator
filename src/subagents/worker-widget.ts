@@ -1,6 +1,6 @@
 import { truncateToVisualLines, type ExtensionUIContext, type Theme, type ThemeColor } from "@earendil-works/pi-coding-agent";
 import { shortTask } from "./render.ts";
-import { elapsedMs, type BoardWorker, type WorkerBoardView, type WorkerModel, type WorkerState } from "./worker-board.ts";
+import { elapsedMs, type BoardWorker, type Activity, type WorkerBoardView, type WorkerModel, type WorkerState } from "./worker-board.ts";
 
 // The worker widget above the editor (epic a338): one line per active worker
 // of the orchestrator session, read from the worker board. Which workers show
@@ -105,13 +105,15 @@ export function oneLine(text: string, which: "first" | "last"): string {
   return (which === "first" ? lines[0] : lines.at(-1)) ?? "";
 }
 
-/** What the worker is doing: its current tool, its latest text, why it failed,
- *  or, before any of those, its short task. */
-function activity(worker: BoardWorker): [ThemeColor, string] {
-  if (worker.tool !== undefined) return ["accent", worker.tool];
-  if (worker.state === "failed" && worker.error !== undefined) return ["error", oneLine(worker.error, "first")];
-  const text = oneLine(worker.text, "last");
-  return text === "" ? ["dim", shortTask(worker.task)] : ["muted", text];
+/** An activity as a line shows it (CONTEXT.md, Activity): the same in the
+ *  worker widget and the transcript view. */
+export function activityPart(activity: Activity): Part {
+  switch (activity.kind) {
+    case "thinking": return ["muted", "thinking…"];
+    case "writing": return ["muted", "writing…"];
+    case "tool": return ["accent", activity.tool];
+    case "failed": return ["error", oneLine(activity.error, "first")];
+  }
 }
 
 /** A piece of a line and its colour. */
@@ -123,7 +125,7 @@ function rowParts(row: WidgetRow, now: number): { indent: string; parts: Part[] 
   const parts: Part[] = [["accent", agentLabel(worker)], ["dim", modelText(worker.model)], [STATE_COLOR[worker.state], worker.state]];
   const elapsed = elapsedMs(worker, now);
   if (elapsed !== undefined) parts.push(["dim", formatElapsed(elapsed)], ["dim", `${worker.turns} ${worker.turns === 1 ? "turn" : "turns"}`]);
-  parts.push(activity(worker));
+  parts.push(worker.activity === undefined ? ["dim", shortTask(worker.task)] : activityPart(worker.activity));
   return { indent: row.depth === 0 ? "" : `${"  ".repeat(row.depth - 1)}└ `, parts };
 }
 

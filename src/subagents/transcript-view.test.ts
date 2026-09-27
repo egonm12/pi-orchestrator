@@ -369,7 +369,7 @@ test("a finished worker's transcript is read from its session file without chang
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("the header's first line shows the worker's agent, worker state, elapsed time, turns, tokens and cost, and which worker of how many it is", async () => {
+test("the header's first line shows the worker's agent, worker state, elapsed time, turns, tokens, cost, activity, and which worker of how many it is", async () => {
   const time = clock();
   const board = new WorkerBoard({ now: time.now });
   const { fake } = running(board, "Check the tests", "worker-1", { agent: "tester" });
@@ -381,7 +381,10 @@ test("the header's first line shows the worker's agent, worker state, elapsed ti
   const view = fakeUI(20);
   void openTranscript(view.ui, board, board.workers()[0]!.id, { now: time.now });
 
-  assert.equal(header(view)[0], "tester · running · 1m15s · 2 turns · 12.3k tok · $0.042 · worker 1 of 2");
+  assert.equal(header(view)[0], "tester · running · 1m15s · 2 turns · 12.3k tok · $0.042 · thinking… · worker 1 of 2");
+  fake.emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash", args: { command: "npm test" } });
+  assert.equal(header(view)[0], "tester · running · 1m15s · 2 turns · 12.3k tok · $0.042 · bash · worker 1 of 2",
+    "the tool's name, as the worker widget shows it");
   view.press(KEY.right);
   assert.equal(header(view)[0], "worker · queued · worker 2 of 2", "a queued worker has no elapsed time, turns, tokens or cost yet");
 });

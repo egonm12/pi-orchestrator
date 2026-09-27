@@ -2069,7 +2069,7 @@ test("the worker board shows a call's workers and a nested worker under its pare
     assert.equal(nested!.parentId, lead!.id);
     assert.equal(lead!.turns, 2, "the delegating turn and the reply");
     assert.equal(nested!.turns, 1);
-    assert.equal(lead!.text, worker.finalText);
+    assert.equal(lead!.activity, undefined, "a finished worker is doing nothing");
     assert.ok(lead!.endedAt !== undefined && lead!.startedAt !== undefined && lead!.endedAt >= lead!.startedAt);
   } finally { h.cleanup(); }
 });
@@ -2183,7 +2183,8 @@ test("the orchestrator's session shows its workers in the widget above the edito
 
     const nestedShown = seen.find((lines) => lines.length === 2 && lines[1]!.startsWith("└ worker · anthropic/claude-haiku-4-5:low · running"));
     assert.ok(nestedShown, JSON.stringify(seen));
-    assert.match(nestedShown[0]!, /^lead · anthropic\/claude-haiku-4-5:low · running · \d+s · 1 turn · subagents$/);
+    // Its tool call follows its turn's start within the 1.5 s hold, so the lead still shows thinking.
+    assert.match(nestedShown[0]!, /^lead · anthropic\/claude-haiku-4-5:low · running · \d+s · 1 turn · thinking…$/);
     assert.match(component!.render(200)[0]!, /^lead · anthropic\/claude-haiku-4-5:low · completed · /, "a finished worker lingers with its end state");
     await subagents.shutdownSession(ctx);
     assert.equal(component, undefined, "the session's end removes the widget");
@@ -2327,7 +2328,8 @@ test("/subagents with no arguments opens the picker of every worker when there i
     const opening = subagents.runCommandWithUI("subagents", "", { ...ctx, hasUI: true, ui: screen.ui } as unknown as ExtensionContext);
     assert.equal(screen.opens, 1, "the picker opened, not the old background-only text notice");
     assert.ok(screen.lines().some((line) => line.includes("Workers of this session")), screen.lines().join("\n"));
-    assert.ok(screen.lines().some((line) => line.includes("Unique widget marker one")), "every worker of the session, not only background calls");
+    // A running worker's line ends in its activity, not its task (CONTEXT.md, Activity).
+    assert.ok(screen.lines().some((line) => / · running · \d+s · 1 turn · thinking…$/.test(line.trimEnd())), "every worker of the session, not only background calls");
     screen.press("\x1b");
     await opening;
     assert.equal(screen.opens, 1, "Esc left without opening a transcript next");
@@ -2336,7 +2338,7 @@ test("/subagents with no arguments opens the picker of every worker when there i
     const noUI = { notify: (text: string) => { shown.push(text); } };
     await subagents.runCommandWithUI("subagents", "", { ...ctx, hasUI: false, ui: noUI } as unknown as ExtensionContext);
     assert.equal(shown.length, 1);
-    assert.match(shown[0]!, /Unique widget marker one/, "the same full listing as text, where there is no UI to pick in");
+    assert.match(shown[0]!, /^\d+\. worker · .* · running · \d+s · 1 turn · thinking…$/m, "the same full listing as text, where there is no UI to pick in");
   } finally {
     for (const finish of pending) finish();
     h.cleanup();

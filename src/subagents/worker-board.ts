@@ -5,7 +5,8 @@ import { watchServedRungs, type RungEscalation, type ServedRung } from "../route
 // The worker board: one in-process record of every worker of the
 // orchestrator session, foreground, background and nested, for the live
 // worker view (epic a338). The subagents extension feeds it; it reads each
-// worker's own session events for turns, tokens, cost and activity, and the
+// worker's own session events for turns, tokens, cost and activity (by
+// phase, held ACTIVITY_HOLD_MS; CONTEXT.md, Activity), and the
 // router's served rungs (src/router/served-rungs.ts) for a routed worker's
 // model. It also keeps whether the orchestrator itself is running or idle,
 // for the transcript view's bar. Views read it and get a change signal. It
@@ -16,6 +17,20 @@ import { watchServedRungs, type RungEscalation, type ServedRung } from "../route
 /** CONTEXT.md, Worker state. Only a background worker can be asking. */
 export type WorkerState = "queued" | "running" | "asking" | "completed" | "failed" | "aborted";
 export type WorkerEndState = Extract<WorkerState, "completed" | "failed" | "aborted">;
+
+/** CONTEXT.md, Activity: what a worker is doing right now, by phase. */
+export type Activity =
+  /** Waiting on its model, or its model thinks. */
+  | { readonly kind: "thinking" }
+  /** Its model writes a reply or a tool call. */
+  | { readonly kind: "writing" }
+  /** The tool it runs, the latest when several run. */
+  | { readonly kind: "tool"; readonly tool: string }
+  | { readonly kind: "failed"; readonly error: string };
+
+/** How long an activity stays shown at least before a newer one replaces it:
+ *  a phase that changes every few hundred milliseconds would flicker. */
+export const ACTIVITY_HOLD_MS = 1_500;
 
 /** A worker's model as the subagents extension knows it when the worker is queued or starts. */
 export type WorkerModelSetup =
@@ -102,10 +117,9 @@ export interface BoardWorker extends Omit<NewWorker, "model"> {
   readonly tokens: WorkerTokens;
   /** Its replies' reported cost in USD: a consumption signal on a subscription route, not a bill. */
   readonly cost: number;
-  /** The tool it is running, if any; the latest one when several run. */
-  readonly tool?: string;
-  /** Its latest reply's text; empty until it writes any. */
-  readonly text: string;
+  /** What it is doing, by phase; `undefined` before its first session
+   *  event and once it ended, unless it failed. The same for every view. */
+  readonly activity?: Activity;
 }
 
 export interface WorkerTokens {
@@ -186,7 +200,10 @@ interface Entry {
   cost: number;
   /** Tool call id to tool name, in start order. */
   readonly tools: Map<string, string>;
-  text: string;
+  /** The activity shown, and since when. */
+  activity: { value: Activity; since: number } | undefined;
+  /** The newest activity waiting for the shown one's hold to pass, and since when. */
+  pending: { value: Activity; since: number } | undefined;
   session: WorkerSession | undefined;
   unsubscribe: (() => void) | undefined;
   readonly stop: (() => void) | undefined;
@@ -205,51 +222,103 @@ interface Usage {
 
 interface AssistantMessage {
   readonly role?: string;
-  readonly content?: string | readonly { readonly type: string; readonly text?: string }[];
   readonly usage?: Usage;
 }
 
-/** An assistant message's text; `undefined` for any other message. */
-function assistantText(message: AssistantMessage): string | undefined {
-  if (message.role !== "assistant" || message.content === undefined) return undefined;
-  if (typeof message.content === "string") return message.content;
-  return message.content.map((part) => part.type === "text" ? part.text ?? "" : "").join("");
+/** The phase a message_update's streamed piece belongs to; `undefined` for a piece of no phase. */
+function streamedPhase(event: Extract<AgentSessionEvent, { type: "message_update" }>): Activity | undefined {
+  if ((event.message as AssistantMessage).role !== "assistant") return undefined;
+  switch (event.assistantMessageEvent?.type) {
+    case "thinking_start":
+    case "thinking_delta":
+    case "thinking_end": return THINKING;
+    case "text_start":
+    case "text_delta":
+    case "text_end":
+    case "toolcall_start":
+    case "toolcall_delta":
+    case "toolcall_end": return WRITING;
+    default: return undefined;
+  }
 }
 
-/** Moves `entry` on by one of its session's events; whether anything changed. */
-function applyEvent(entry: Entry, event: AgentSessionEvent): boolean {
+const THINKING: Activity = Object.freeze({ kind: "thinking" });
+const WRITING: Activity = Object.freeze({ kind: "writing" });
+
+/** The activity as one line of text, for comparing two. */
+function activityKey(activity: Activity | undefined): string | undefined {
+  switch (activity?.kind) {
+    case undefined: return undefined;
+    case "thinking":
+    case "writing": return activity.kind;
+    case "tool": return `tool:${activity.tool}`;
+    case "failed": return `failed:${activity.error}`;
+  }
+}
+
+/** The shown activity at `now`: a pending one replaces it once its hold has
+ *  passed. It shows from when it could first have, not from when this runs,
+ *  so a late settle holds it no longer than its due. */
+function settleActivity(entry: Entry, now: number): void {
+  const { activity, pending } = entry;
+  if (pending === undefined || activity === undefined || now - activity.since < ACTIVITY_HOLD_MS) return;
+  entry.activity = { value: pending.value, since: Math.max(activity.since + ACTIVITY_HOLD_MS, pending.since) };
+  entry.pending = undefined;
+}
+
+/** The worker's phase moved to `activity` at `now`; whether the shown activity changed. */
+function enterPhase(entry: Entry, activity: Activity, now: number): boolean {
+  settleActivity(entry, now);
+  const shown = entry.activity;
+  if (activityKey(shown?.value) === activityKey(activity)) {
+    entry.pending = undefined;
+    return false;
+  }
+  if (shown === undefined || now - shown.since >= ACTIVITY_HOLD_MS) {
+    entry.activity = { value: activity, since: now };
+    entry.pending = undefined;
+    return true;
+  }
+  entry.pending = { value: activity, since: now };
+  return false;
+}
+
+/** The tool phase of the latest tool still running, or thinking when none runs. */
+function toolPhase(entry: Entry): Activity {
+  const tool = [...entry.tools.values()].at(-1);
+  return tool === undefined ? THINKING : Object.freeze({ kind: "tool", tool });
+}
+
+/** Moves `entry` on by one of its session's events at `now`; whether anything changed. */
+function applyEvent(entry: Entry, event: AgentSessionEvent, now: number): boolean {
   switch (event.type) {
     case "turn_start":
       entry.turns++;
+      enterPhase(entry, THINKING, now);
       return true;
-    case "message_update":
+    case "message_update": {
+      const phase = streamedPhase(event);
+      return phase !== undefined && enterPhase(entry, phase, now);
+    }
     case "message_end": {
       const message = event.message as AssistantMessage;
-      const text = assistantText(message);
-      if (text === undefined) return false;
-      let changed = false;
-      if (text !== "" && text !== entry.text) {
-        entry.text = text;
-        changed = true;
-      }
-      const usage = event.type === "message_end" ? message.usage : undefined;
-      if (usage !== undefined) {
-        const { tokens } = entry;
-        tokens.input += usage.input ?? 0;
-        tokens.output += usage.output ?? 0;
-        tokens.cacheRead += usage.cacheRead ?? 0;
-        tokens.cacheWrite += usage.cacheWrite ?? 0;
-        tokens.total += usage.totalTokens ?? (usage.input ?? 0) + (usage.output ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
-        entry.cost += usage.cost?.total ?? 0;
-        changed = true;
-      }
-      return changed;
+      const usage = message.role === "assistant" ? message.usage : undefined;
+      if (usage === undefined) return false;
+      const { tokens } = entry;
+      tokens.input += usage.input ?? 0;
+      tokens.output += usage.output ?? 0;
+      tokens.cacheRead += usage.cacheRead ?? 0;
+      tokens.cacheWrite += usage.cacheWrite ?? 0;
+      tokens.total += usage.totalTokens ?? (usage.input ?? 0) + (usage.output ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
+      entry.cost += usage.cost?.total ?? 0;
+      return true;
     }
     case "tool_execution_start":
       entry.tools.set(event.toolCallId, event.toolName);
-      return true;
+      return enterPhase(entry, toolPhase(entry), now);
     case "tool_execution_end":
-      return entry.tools.delete(event.toolCallId);
+      if (!entry.tools.delete(event.toolCallId)) return false;
+      return enterPhase(entry, toolPhase(entry), now);
     default:
       return false;
   }
@@ -280,7 +349,7 @@ export class WorkerBoard {
     const entry: Entry = { id: randomUUID(), setup: rest, model, parentId: parent?.id, state: "queued", delegationId: setup.delegationId,
       sessionFile: undefined, queuedAt: this.#now(), startedAt: undefined, endedAt: undefined, error: undefined,
       rungs: pinned(model, this.#now()),
-      turns: 0, tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0, tools: new Map(), text: "",
+      turns: 0, tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0, tools: new Map(), activity: undefined, pending: undefined,
       session: undefined, unsubscribe: undefined, stop: control?.stop, unsaved: undefined };
     this.#entries.push(entry);
     this.#changed(entry);
@@ -303,7 +372,7 @@ export class WorkerBoard {
         entry.session = session;
         // A preserved definition without a thinking level runs on pi's default, which only the session knows.
         if (entry.model.kind === "preserved" && entry.model.effort === undefined) entry.model = { ...entry.model, effort: session.effort };
-        entry.unsubscribe = session.subscribe((event) => { if (applyEvent(entry, event)) this.#changed(entry); });
+        entry.unsubscribe = session.subscribe((event) => { if (applyEvent(entry, event, this.#now())) this.#changed(entry); });
         this.#changed(entry);
       },
       ended: (end) => {
@@ -317,6 +386,10 @@ export class WorkerBoard {
         entry.tools.clear();
         entry.state = end.state;
         entry.endedAt = this.#now();
+        // A failure shows at once; a worker that ended otherwise is doing nothing.
+        entry.activity = end.state === "failed"
+          ? { value: Object.freeze({ kind: "failed", error: end.error ?? "failed" }), since: entry.endedAt } : undefined;
+        entry.pending = undefined;
         entry.sessionFile = end.sessionFile ?? entry.sessionFile;
         entry.error = end.error;
         this.#changed(entry);
@@ -398,7 +471,7 @@ export class WorkerBoard {
     }
     const ordered: BoardWorker[] = [];
     const visit = (entry: Entry) => {
-      ordered.push(snapshot(entry));
+      ordered.push(this.#snapshot(entry));
       for (const child of children.get(entry.id) ?? []) visit(child);
     };
     for (const entry of this.#entries) if (entry.parentId === undefined) visit(entry);
@@ -408,13 +481,13 @@ export class WorkerBoard {
   /** One entry by its board id. */
   worker(id: string): BoardWorker | undefined {
     const entry = this.#entries.find((candidate) => candidate.id === id);
-    return entry === undefined ? undefined : snapshot(entry);
+    return entry === undefined ? undefined : this.#snapshot(entry);
   }
 
   /** The latest entry of a delegation. */
   byDelegation(delegationId: string): BoardWorker | undefined {
     const entry = this.#entryOf(delegationId);
-    return entry === undefined ? undefined : snapshot(entry);
+    return entry === undefined ? undefined : this.#snapshot(entry);
   }
 
   /** The router served a request on `rung` (src/router/served-rungs.ts). A
@@ -431,7 +504,14 @@ export class WorkerBoard {
 
   #changed(entry: Entry): void {
     // A worker of an earlier session may still end after a new session cleared the board.
-    if (this.#listeners.size > 0 && this.#entries.includes(entry)) this.#signal(snapshot(entry));
+    if (this.#listeners.size > 0 && this.#entries.includes(entry)) this.#signal(this.#snapshot(entry));
+  }
+
+  /** `entry` as views read it. A pending activity whose hold has passed shows
+   *  here: views redraw every second, so the board needs no timer of its own. */
+  #snapshot(entry: Entry): BoardWorker {
+    settleActivity(entry, this.#now());
+    return snapshot(entry);
   }
 
   #signal(worker: BoardWorker | undefined): void {
@@ -466,8 +546,8 @@ function snapshot(entry: Entry): BoardWorker {
     ...(entry.startedAt === undefined ? {} : { startedAt: entry.startedAt }),
     ...(entry.endedAt === undefined ? {} : { endedAt: entry.endedAt }),
     ...(entry.error === undefined ? {} : { error: entry.error }),
-    turns: entry.turns, tokens: Object.freeze({ ...entry.tokens }), cost: entry.cost, text: entry.text,
-    ...(entry.tools.size === 0 ? {} : { tool: [...entry.tools.values()].at(-1)! }),
+    turns: entry.turns, tokens: Object.freeze({ ...entry.tokens }), cost: entry.cost,
+    ...(entry.activity === undefined ? {} : { activity: entry.activity.value }),
     ...(entry.delegationId === undefined ? {} : { delegationId: entry.delegationId }),
     ...(entry.parentId === undefined ? {} : { parentId: entry.parentId }),
     ...(entry.sessionFile === undefined ? {} : { sessionFile: entry.sessionFile }),

@@ -1,6 +1,6 @@
 import type { TranscriptFrame } from "./transcript-view.ts";
 import { elapsedMs, type BoardWorker, type RungServing } from "./worker-board.ts";
-import { agentLabel, fitted, formatElapsed, oneLine, STATE_COLOR, type Part } from "./worker-widget.ts";
+import { activityPart, agentLabel, fitted, formatElapsed, oneLine, STATE_COLOR, type Part } from "./worker-widget.ts";
 
 // The transcript view's top (epic a338, vo0z): the orchestrator bar, which
 // keeps the user who reads one worker's transcript aware of the rest, and the
@@ -24,7 +24,7 @@ export function formatCost(usd: number): string {
 }
 
 /** Agent, worker state, and once it has started its elapsed time, turns,
- *  tokens and cost; then which worker of how many it is. */
+ *  tokens and cost; its activity; then which worker of how many it is. */
 function statsLine(frame: TranscriptFrame): string {
   const { worker } = frame;
   const parts: Part[] = [["accent", agentLabel(worker)], [STATE_COLOR[worker.state], worker.state]];
@@ -33,6 +33,7 @@ function statsLine(frame: TranscriptFrame): string {
     parts.push(["dim", formatElapsed(elapsed)], ["dim", `${worker.turns} ${worker.turns === 1 ? "turn" : "turns"}`],
       ["dim", `${formatTokens(worker.tokens.total)} tok`], ["dim", formatCost(worker.cost)]);
   }
+  if (worker.activity !== undefined) parts.push(activityPart(worker.activity));
   parts.push(["dim", frame.position === 0 ? "no longer on the board" : `worker ${frame.position} of ${frame.count}`]);
   return fitted("", parts, frame.theme, frame.width);
 }
