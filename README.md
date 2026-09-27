@@ -141,7 +141,26 @@ The transcript looks like pi's own chat: the worker's replies with their thinkin
 
 A forked worker's transcript starts with the orchestrator's conversation it was copied from. A tool from another installed extension keeps its own drawing while the worker runs. In a finished worker's transcript, only pi's built-in tools, `subagents` and `report` keep theirs; other tools are drawn plainly.
 
-The header names the worker's agent, its worker state, and which worker of how many it is. The workers it started are listed below the header. While the worker runs, the view follows the end of its transcript until you scroll.
+The view opens with a bar and a header:
+
+```text
+orchestrator idle · 1 worker asking: worker 3 (reviewer)
+tester · running · 1m15s · 2 turns · 12.3k tok · $0.042 · worker 2 of 3
+anthropic/claude-haiku-4-5:low since 12:00:05 (escalated from mechanical to standard)
+delegation 0199f0c2-5e0a-7c1b-9d3e-3f2a9c1e44b0 · parent delegation 0199f0b1-7c2d-7e3f-8a4b-5c6d7e8f9a0b (lead)
+Check the tests
+```
+
+The bar shows whether the orchestrator is running or idle, and which workers are asking it a question, by their place among the workers. It updates live, but it only tells: it never closes the view or takes a key, and the question is answered in the orchestrator's session.
+
+The header shows:
+
+- The worker's agent and worker state; once it has started, its elapsed time, turns, tokens (input, output and cache together) and cost; then which worker of how many it is.
+- Its model and effort. A routed worker shows `routing…` before its first request, then its rung history: each rung with the time it started serving, and the escalation that led to it. A forked worker and a worker on its agent definition's model show that fixed model.
+- Its delegation id and, for a nested worker, its parent delegation and that worker's agent. A queued foreground worker gets its delegation id when it starts.
+- The first line of its task.
+
+Every line is cut to the terminal's width. On a narrow terminal the rung history drops its oldest rungs first, keeping the rung that serves the latest request, and the delegation ids shrink to their first eight characters. The workers it started are listed below the header. While the worker runs, the view follows the end of its transcript until you scroll.
 
 | Key | Action |
 |-----|--------|

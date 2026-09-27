@@ -10,6 +10,7 @@ import { initTheme, SessionManager, type AgentSessionEvent, type Theme } from "@
 import { KeybindingsManager } from "../../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js";
 import { WorkerBoard, type WorkerFeed, type WorkerSession } from "./worker-board.ts";
 import { openTranscript, TRANSCRIPT_OVERLAY, type TranscriptUI } from "./transcript-view.ts";
+import { formatCost, formatTokens } from "./transcript-header.ts";
 
 // The transcript view as xytd's ways in will open it: openTranscript on a real
 // worker board, through a fake ctx.ui.custom that mounts the overlay the way
@@ -60,7 +61,7 @@ const toolResult = (toolCallId: string, toolName: string, text: string): Message
 });
 
 /** A worker that has started, with a live session. */
-function running(board: WorkerBoard, task: string, sessionId: string, extra: { agent?: string; parentDelegationId?: string } = {}, messages: Message[] = [user(task)]) {
+function running(board: WorkerBoard, task: string, sessionId: string, extra: { agent?: string; parentDelegationId?: string; background?: boolean } = {}, messages: Message[] = [user(task)]) {
   const feed = board.add({ callId: "call-1", background: false, task, ...extra, model: { kind: "routed" } });
   feed.started();
   const fake = fakeSession(sessionId, messages);
@@ -97,6 +98,37 @@ function fakeUI(rows = 20) {
 /** Lets the view's promise settle. */
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
+/** A clock a test moves on, from a local time of day, so `since` times read the same in any time zone. */
+function clock(start = new Date(2026, 8, 26, 12, 0, 0).getTime()) {
+  let now = start;
+  return { now: () => now, advance: (ms: number) => { now += ms; } };
+}
+
+/** The header's lines: after the orchestrator bar, up to the nested workers or the rule. */
+function header(view: ReturnType<typeof fakeUI>, width = WIDTH): string[] {
+  const text = view.text(width);
+  const start = text[0]!.startsWith("orchestrator ") ? 1 : 0;
+  const end = text.findIndex((line, index) => index > start && (line.startsWith("─") || /^[› ] └ /.test(line)));
+  return text.slice(start, end);
+}
+
+/** Which worker the view shows: its agent, worker state and place, from the header's first line. */
+function shownWorker(view: ReturnType<typeof fakeUI>): string {
+  const parts = header(view)[0]!.split(" · ");
+  return [parts[0], parts[1], parts.at(-1)].join(" · ");
+}
+
+/** The shown worker's nested workers' lines, under the header. */
+function nestedLines(view: ReturnType<typeof fakeUI>): string[] {
+  return view.text().filter((line) => /^[› ] └ /.test(line));
+}
+
+/** A worker's reply with its usage, as pi reports it at message_end. */
+const usage = (input: number, output: number, cacheRead: number, cacheWrite: number, cost: number) => ({
+  role: "assistant", content: [{ type: "text", text: "Working" }], timestamp: 0,
+  usage: { input, output, cacheRead, cacheWrite, totalTokens: input + output + cacheRead + cacheWrite, cost: { total: cost } },
+});
+
 test("the view covers the whole screen, fits every line to it, and Esc or ctrl+c restores the orchestrator's session", async () => {
   const board = new WorkerBoard();
   const { fake } = running(board, "Fix the typo", "worker-1", { agent: "fixer" }, [user("Fix the typo"), reply(`A long line ${"x".repeat(300)}`)]);
@@ -108,7 +140,7 @@ test("the view covers the whole screen, fits every line to it, and Esc or ctrl+c
   const lines = view.lines(60);
   assert.equal(lines.length, 12, "exactly the terminal's height");
   assert.ok(lines.every((line) => plain(line).length <= 60), JSON.stringify(lines.map(plain)));
-  assert.equal(view.text(60)[0], "fixer · running · worker 1 of 1", "a one-line header");
+  assert.equal(shownWorker(view), "fixer · running · worker 1 of 1");
   assert.ok(view.text().some((line) => line.includes("Fix the typo")));
   view.tui.terminal.rows = 30;
   assert.equal(view.lines().length, 30, "a resize redraws at the new size");
@@ -122,7 +154,8 @@ test("the view covers the whole screen, fits every line to it, and Esc or ctrl+c
   const renders = view.tui.renders;
   fake.emit({ type: "turn_start" });
   board.add({ callId: "call-2", background: false, task: "Later", model: { kind: "routed" } });
-  assert.equal(view.tui.renders, renders, "nor does the board redraw it");
+  board.setOrchestratorState("running");
+  assert.equal(view.tui.renders, renders, "nor does the board redraw it, the orchestrator bar included");
 
   for (const key of [KEY.escape, KEY.ctrlC, "\x1b[99;5u"]) {
     const again = fakeUI();
@@ -232,30 +265,30 @@ test("left and right switch to the previous or next worker in the board's order,
   const view = fakeUI(20);
   void openTranscript(view.ui, board, board.workers()[0]!.id);
 
-  assert.equal(view.text()[0], "lead · running · worker 1 of 4");
-  assert.match(view.text()[1]!, /^› └ worker · routing… · running · \d+s · 0 turns · Nested work$/, "its nested workers, the first selected");
-  assert.match(view.text()[2]!, /^  └ worker · routing… · running · \d+s · 0 turns · Second nested$/);
+  assert.equal(shownWorker(view), "lead · running · worker 1 of 4");
+  assert.match(nestedLines(view)[0]!, /^› └ worker · routing… · running · \d+s · 0 turns · Nested work$/, "its nested workers, the first selected");
+  assert.match(nestedLines(view)[1]!, /^  └ worker · routing… · running · \d+s · 0 turns · Second nested$/);
   assert.ok(view.text().at(-1)!.includes("↑↓ Enter nested worker"));
 
   view.press(KEY.right);
-  assert.equal(view.text()[0], "worker · running · worker 2 of 4", "the nested worker comes right after its parent");
+  assert.equal(shownWorker(view), "worker · running · worker 2 of 4", "the nested worker comes right after its parent");
   assert.equal(lead.fake.listeners.size, 1, "only the board follows the lead now, not the view");
   assert.ok(view.text().some((line) => line.includes("Nested reply")));
   view.press(KEY.right, KEY.right);
-  assert.equal(view.text()[0], "other · running · worker 4 of 4");
+  assert.equal(shownWorker(view), "other · running · worker 4 of 4");
   view.press(KEY.right);
-  assert.equal(view.text()[0], "other · running · worker 4 of 4", "the last worker stays");
+  assert.equal(shownWorker(view), "other · running · worker 4 of 4", "the last worker stays");
   view.press(KEY.left, KEY.left, KEY.left, KEY.left);
-  assert.equal(view.text()[0], "lead · running · worker 1 of 4", "the first worker stays");
+  assert.equal(shownWorker(view), "lead · running · worker 1 of 4", "the first worker stays");
 
   view.press(KEY.down, KEY.down, KEY.up, KEY.enter);
-  assert.equal(view.text()[0], "worker · running · worker 2 of 4");
+  assert.equal(shownWorker(view), "worker · running · worker 2 of 4");
   assert.ok(view.text().some((line) => line.includes("Nested reply")), "Enter opened the selected nested worker");
   assert.equal(nested.fake.listeners.size, 2, "the board and the view follow it");
   view.press(KEY.left, KEY.down, KEY.enter);
-  assert.equal(view.text()[0], "worker · running · worker 3 of 4", "the second nested worker");
+  assert.equal(shownWorker(view), "worker · running · worker 3 of 4", "the second nested worker");
   view.press(KEY.enter);
-  assert.equal(view.text()[0], "worker · running · worker 3 of 4", "Enter without nested workers does nothing");
+  assert.equal(shownWorker(view), "worker · running · worker 3 of 4", "Enter without nested workers does nothing");
 });
 
 test("x stops the shown worker after a confirmation, and the view stays open with its aborted end state", async () => {
@@ -279,7 +312,7 @@ test("x stops the shown worker after a confirmation, and the view stays open wit
 
   view.press("x", "y");
   assert.deepEqual(stops, ["bg-1"]);
-  assert.equal(view.text()[0], "worker · aborted · worker 1 of 1");
+  assert.equal(shownWorker(view), "worker · aborted · worker 1 of 1");
   assert.ok(view.text().includes("The worker was aborted."));
   assert.equal(view.text().at(-1), "Stopping this worker.");
   assert.equal(view.closed, false, "the view stays open");
@@ -307,7 +340,7 @@ test("a finished worker's transcript is read from its session file without chang
     const view = fakeUI(20);
     void openTranscript(view.ui, board, board.workers()[0]!.id);
     const text = view.text();
-    assert.equal(text[0], "worker · completed · worker 1 of 1");
+    assert.equal(shownWorker(view), "worker · completed · worker 1 of 1");
     assert.ok(text.some((line) => line.includes("Summarise the log")), JSON.stringify(text));
     assert.ok(text.some((line) => line.includes("The log is quiet.")));
     assert.ok(text.includes("The worker completed."), "its end state");
@@ -331,6 +364,68 @@ test("a finished worker's transcript is read from its session file without chang
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("the header's first line shows the worker's agent, worker state, elapsed time, turns, tokens and cost, and which worker of how many it is", async () => {
+  const time = clock();
+  const board = new WorkerBoard({ now: time.now });
+  const { fake } = running(board, "Check the tests", "worker-1", { agent: "tester" });
+  board.add({ callId: "call-1", background: false, task: "Waits its turn", model: { kind: "routed" } });
+  fake.emit({ type: "turn_start" });
+  fake.emit({ type: "message_end", message: usage(8_000, 1_200, 3_000, 134, 0.0421) });
+  fake.emit({ type: "turn_start" });
+  time.advance(75_000);
+  const view = fakeUI(20);
+  void openTranscript(view.ui, board, board.workers()[0]!.id, { now: time.now });
+
+  assert.equal(header(view)[0], "tester · running · 1m15s · 2 turns · 12.3k tok · $0.042 · worker 1 of 2");
+  view.press(KEY.right);
+  assert.equal(header(view)[0], "worker · queued · worker 2 of 2", "a queued worker has no elapsed time, turns, tokens or cost yet");
+});
+
+test("the header shows a routed worker's rung history, live, each rung since when and its escalation; a fork's and a preserved model's fixed model", async () => {
+  const time = clock();
+  const board = new WorkerBoard({ now: time.now });
+  running(board, "Routed work", "routed-1");
+  board.add({ callId: "call-1", background: false, task: "Forked work", model: { kind: "fork", model: "anthropic/claude-opus-4-5", effort: "high" } });
+  board.add({ callId: "call-1", background: false, task: "Preserved work", agent: "scout", model: { kind: "preserved", model: "anthropic/claude-sonnet-4-5", effort: "medium" } });
+  const view = fakeUI(20);
+  void openTranscript(view.ui, board, board.workers()[0]!.id, { now: time.now });
+  assert.equal(header(view)[1], "routing…", "before its first request");
+
+  time.advance(5_000);
+  const renders = view.tui.renders;
+  board.served({ delegationId: "routed-1", model: "anthropic/claude-haiku-4-5", effort: "low", escalation: { from: "mechanical", to: "standard" } });
+  assert.ok(view.tui.renders > renders, "a served rung redraws the view");
+  assert.equal(header(view)[1], "anthropic/claude-haiku-4-5:low since 12:00:05 (escalated from mechanical to standard)");
+  time.advance(60_000);
+  board.served({ delegationId: "routed-1", model: "anthropic/claude-sonnet-4-5", effort: "high" });
+  assert.equal(header(view, 200)[1],
+    "anthropic/claude-haiku-4-5:low since 12:00:05 (escalated from mechanical to standard), then anthropic/claude-sonnet-4-5:high since 12:01:05");
+  assert.equal(header(view)[1], "… then anthropic/claude-sonnet-4-5:high since 12:01:05", "a narrow terminal keeps the rung serving the latest request");
+
+  view.press(KEY.right);
+  assert.equal(header(view)[1], "anthropic/claude-opus-4-5:high (the session model, not routed)");
+  view.press(KEY.right);
+  assert.equal(header(view)[1], "anthropic/claude-sonnet-4-5:medium (the agent definition's model, not routed)");
+});
+
+test("the header shows the delegation id, a nested worker's parent delegation with its agent, short ids on a narrow terminal, and the task's first line", async () => {
+  const LEAD = "0199f0b1-7c2d-7e3f-8a4b-5c6d7e8f9a0b", TESTER = "0199f0c2-5e0a-7c1b-9d3e-3f2a9c1e44b0";
+  const board = new WorkerBoard();
+  running(board, "Lead the work", LEAD, { agent: "lead" });
+  running(board, "\n  Check   the tests\nThen report back", TESTER, { agent: "tester", parentDelegationId: LEAD });
+  board.add({ callId: "call-2", background: false, task: "Waits its turn", model: { kind: "routed" } });
+  const view = fakeUI(20);
+  void openTranscript(view.ui, board, board.workers()[1]!.id);
+
+  assert.deepEqual(header(view, 120).slice(2), [`delegation ${TESTER} · parent delegation ${LEAD} (lead)`, "Check the tests"]);
+  assert.deepEqual(header(view, 60).slice(2), ["delegation 0199f0c2… · parent delegation 0199f0b1… (lead)", "Check the tests"],
+    "short delegation ids on a narrow terminal");
+  view.press(KEY.left);
+  assert.equal(header(view)[2], `delegation ${LEAD}`, "a worker of the orchestrator has no parent delegation");
+  view.press(KEY.right, KEY.right);
+  assert.equal(header(view)[2], "no delegation id yet", "a queued foreground worker");
+});
+
 test("a worker that finishes while shown stays open with its whole transcript and end state; a queued one opens once it starts", async () => {
   const board = new WorkerBoard();
   const { feed, fake } = running(board, "Quick job", "worker-1");
@@ -341,7 +436,7 @@ test("a worker that finishes while shown stays open with its whole transcript an
   feed.ended({ state: "completed", sessionFile: "/nowhere/worker-1.jsonl" });
   await settle();
   assert.equal(view.closed, false, "the view never closes on its own");
-  assert.equal(view.text()[0], "worker · completed · worker 1 of 2");
+  assert.equal(shownWorker(view), "worker · completed · worker 1 of 2");
   assert.ok(view.text().some((line) => line.includes("Finished the job")), "the live transcript is kept, not reread");
   assert.ok(view.text().includes("The worker completed."));
 
@@ -354,4 +449,68 @@ test("a worker that finishes while shown stays open with its whole transcript an
   assert.equal(later.listeners.size, 2);
   view.press(KEY.escape);
   await shown;
+});
+
+test("the orchestrator bar shows whether the orchestrator runs and which workers ask, live, and never closes the view or takes its keys", async () => {
+  const board = new WorkerBoard();
+  running(board, "Lead the work", "lead-1", { agent: "lead" });
+  running(board, "Review it", "reviewer-1", { agent: "reviewer", background: true });
+  running(board, "Check it", "checker-1", { background: true });
+  const view = fakeUI(20);
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+  assert.equal(view.text()[0], "orchestrator idle");
+
+  let renders = view.tui.renders;
+  board.setOrchestratorState("running");
+  assert.ok(view.tui.renders > renders, "a change of the orchestrator's state redraws the view");
+  assert.equal(view.text()[0], "orchestrator running");
+  renders = view.tui.renders;
+  board.asking("reviewer-1", true);
+  assert.ok(view.tui.renders > renders, "a worker asking redraws the view");
+  assert.equal(view.text()[0], "orchestrator running · 1 worker asking: worker 2 (reviewer)");
+  board.asking("checker-1", true);
+  board.setOrchestratorState("idle");
+  assert.equal(view.text()[0], "orchestrator idle · 2 workers asking: worker 2 (reviewer), worker 3");
+  assert.equal(view.text(40)[0], "orchestrator idle · 2 workers asking: w…", "a narrow terminal cuts the bar");
+  board.asking("reviewer-1", false);
+  assert.equal(view.text()[0], "orchestrator idle · 1 worker asking: worker 3");
+
+  await settle();
+  assert.equal(view.closed, false, "nothing in the bar closes the view");
+  assert.equal(shownWorker(view), "lead · running · worker 1 of 3", "it still shows the worker it showed");
+  view.press(KEY.right);
+  assert.equal(shownWorker(view), "reviewer · running · worker 2 of 3", "the keys still move the view");
+  view.press(KEY.escape);
+  await shown;
+});
+
+test("the view redraws every second while open, so the elapsed time ticks, and its timer stops when it closes", async () => {
+  const time = clock();
+  const board = new WorkerBoard({ now: time.now });
+  running(board, "Take a while", "worker-1");
+  const ticks: (() => void)[] = [];
+  const cleared: unknown[] = [];
+  const view = fakeUI(20);
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id, {
+    now: time.now,
+    setInterval: (tick, ms) => { assert.equal(ms, 1_000); ticks.push(tick); return "timer"; },
+    clearInterval: (handle) => { cleared.push(handle); },
+  });
+  assert.equal(header(view)[0], "worker · running · 0s · 0 turns · 0 tok · $0.000 · worker 1 of 1");
+  assert.equal(ticks.length, 1, "one timer while the view is open");
+
+  time.advance(3_000);
+  const renders = view.tui.renders;
+  ticks[0]!();
+  assert.equal(view.tui.renders, renders + 1, "each tick redraws the view");
+  assert.equal(header(view)[0], "worker · running · 3s · 0 turns · 0 tok · $0.000 · worker 1 of 1");
+  view.press(KEY.escape);
+  await shown;
+  assert.deepEqual(cleared, ["timer"], "leaving the view stops its timer");
+});
+
+test("the header's token counts and cost read short, and a count never rounds up past its unit", () => {
+  assert.deepEqual([999, 1_000, 12_345, 99_949, 99_950, 999_499, 999_500, 1_234_567].map(formatTokens),
+    ["999", "1.0k", "12.3k", "99.9k", "100k", "999k", "1.0M", "1.2M"]);
+  assert.deepEqual([0, 0.0421, 1.5].map(formatCost), ["$0.000", "$0.042", "$1.500"]);
 });

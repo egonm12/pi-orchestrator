@@ -185,6 +185,8 @@ interface LoadedSubagents {
   startSession(ctx: ExtensionContext): Promise<void>;
   /** Runs the extension's session_shutdown handlers, as pi does when the orchestrator's session ends. */
   shutdownSession(ctx: ExtensionContext): Promise<void>;
+  /** Runs the extension's handlers of an agent event, as pi does for the agent of the session `ctx` is. */
+  agentEvent(type: "agent_start" | "agent_settled", ctx: ExtensionContext): Promise<void>;
   /** Runs a registered command as the owner types it, and returns what it showed. */
   runCommand(name: string, args: string, ctx: ExtensionContext): Promise<string[]>;
   /** Every message the extension sent into the orchestrator's session. */
@@ -206,7 +208,7 @@ function loadSubagents(workerExtensions: readonly InlineExtension[]): LoadedSuba
     sendMessage(message: SentMessage["message"], options: SentMessage["options"]) { messages.push({ message, options }); },
     getActiveTools: () => [...ORCHESTRATOR_TOOLS],
   } as unknown as ExtensionAPI);
-  const emit = async (event: { type: string; reason: string }, ctx: ExtensionContext) => {
+  const emit = async (event: { type: string; reason?: string }, ctx: ExtensionContext) => {
     for (const handler of handlers.get(event.type) ?? []) await handler(event, ctx);
   };
   return {
@@ -222,6 +224,7 @@ function loadSubagents(workerExtensions: readonly InlineExtension[]): LoadedSuba
     },
     startSession: (ctx) => emit({ type: "session_start", reason: "startup" }, ctx),
     shutdownSession: (ctx) => emit({ type: "session_shutdown", reason: "quit" }, ctx),
+    agentEvent: (type, ctx) => emit({ type }, ctx),
     async runCommand(name, args, ctx) {
       const command = commands.get(name);
       assert.ok(command, `command /${name} is registered`);
@@ -2188,7 +2191,11 @@ function openView(workerId: string) {
   return {
     closed,
     press(...keys: string[]) { for (const key of keys) component!.handleInput(key); },
-    header: () => component!.render(200)[0]!.replace(/\x1b\[[0-9;]*m/g, "").trimEnd(),
+    /** The header's agent, worker state and place, under the orchestrator bar; its elapsed time and the rest tick with the clock. */
+    header: () => {
+      const parts = component!.render(200)[1]!.replace(/\x1b\[[0-9;]*m/g, "").trimEnd().split(" · ");
+      return [parts[0], parts[1], parts.at(-1)].join(" · ");
+    },
   };
 }
 
@@ -2253,5 +2260,30 @@ test("x in the transcript view stops a nested worker alone: its parent hears it 
     assert.equal(view.header(), "worker · aborted · worker 2 of 2");
     view.press("\x1b");
     await view.closed;
+  } finally { h.cleanup(); }
+});
+
+test("the board's orchestrator state follows the orchestrator's own agent runs, never a worker's", async () => {
+  const h = harness();
+  try {
+    // A lead lists the subagents tool, so its worker loads the subagents extension, whose handlers hear the worker's own agent run.
+    writeAgentDefinition(join(h.agentDir, "agents"), "lead.md", { name: "lead", description: "Delegates", tools: "read, subagents" }, "Split the work.");
+    const provider = scriptedAnthropic(delegatingScript);
+    const subagents = loadSubagents(installedWithSubagents(provider.extension, 1));
+    const main = orchestrator(h);
+    await subagents.startSession(main.ctx);
+    const seen: string[] = [];
+    const unsubscribe = workerBoard().subscribe(() => { seen.push(workerBoard().orchestratorState()); });
+    try {
+      const { worker } = await callSubagents(subagents.tool(), main.ctx, "Look around", "lead");
+      assert.equal(worker.status, "completed", JSON.stringify(worker));
+      assert.ok(seen.length > 0, "the worker changed the board");
+      assert.deepEqual([...new Set(seen)], ["idle"], "a worker's run is not the orchestrator's");
+
+      await subagents.agentEvent("agent_start", main.ctx);
+      assert.equal(workerBoard().orchestratorState(), "running");
+      await subagents.agentEvent("agent_settled", main.ctx);
+      assert.equal(workerBoard().orchestratorState(), "idle");
+    } finally { unsubscribe(); }
   } finally { h.cleanup(); }
 });

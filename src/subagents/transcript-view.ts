@@ -1,7 +1,8 @@
 import { truncateToVisualLines, type AgentSessionEvent, type ExtensionUIContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { readWorkerTranscript, Transcript, type TranscriptContext } from "./transcript.ts";
-import { hasEnded, type BoardWorker, type WorkerBoard, type WorkerBoardView } from "./worker-board.ts";
-import { agentLabel, MAX_WIDGET_ROWS, STATE_COLOR, widgetLines } from "./worker-widget.ts";
+import { orchestratorBar, transcriptHeader } from "./transcript-header.ts";
+import { hasEnded, type BoardWorker, type OrchestratorState, type WorkerBoard, type WorkerBoardView } from "./worker-board.ts";
+import { MAX_WIDGET_ROWS, STATE_COLOR, widgetLines } from "./worker-widget.ts";
 
 // The transcript view (epic a338): one worker's transcript on the whole
 // screen, read from the worker board. It is a full-screen overlay through
@@ -21,8 +22,9 @@ import { agentLabel, MAX_WIDGET_ROWS, STATE_COLOR, widgetLines } from "./worker-
 //
 // The view is drawn in slots, top to bottom: a bar, the header, the worker's
 // nested workers, the transcript and a footer. The header and the bar are
-// options (TranscriptSlot), so a fuller header and an orchestrator bar can
-// replace them without touching the rest.
+// options (TranscriptSlot), drawn by transcript-header.ts by default. The bar
+// only tells: an asking worker or an idle orchestrator never closes the view,
+// moves it or takes a key, so the user leaves when they choose to.
 
 /** The overlay covers the whole terminal. */
 export const TRANSCRIPT_OVERLAY = { width: "100%", maxHeight: "100%", anchor: "top-left", margin: 0 } as const;
@@ -45,9 +47,12 @@ export type TranscriptBoard = WorkerBoardView & Pick<WorkerBoard, "stop">;
 /** What a slot draws from. */
 export interface TranscriptFrame {
   readonly worker: BoardWorker;
+  /** The board's workers, in its order: a nested worker's parent, the workers asking. */
+  readonly workers: readonly BoardWorker[];
   /** The worker's place among the board's workers, from 1; 0 once it is no longer on the board. */
   readonly position: number;
   readonly count: number;
+  readonly orchestrator: OrchestratorState;
   /** Epoch milliseconds. */
   readonly now: number;
   readonly theme: Theme;
@@ -60,9 +65,9 @@ export type TranscriptSlot = (frame: TranscriptFrame) => readonly string[];
 export interface TranscriptViewOptions {
   /** The workers' working directory, for the built-in tools' paths. Default: the process's. */
   readonly cwd?: string;
-  /** The header. Default: transcriptHeader. */
+  /** The header. Default: transcriptHeader (transcript-header.ts). */
   readonly header?: TranscriptSlot;
-  /** A bar above the header. Default: none. */
+  /** A bar above the header. Default: orchestratorBar (transcript-header.ts). */
   readonly bar?: TranscriptSlot;
   /** Whether tool output starts expanded. */
   readonly expanded?: boolean;
@@ -70,19 +75,17 @@ export interface TranscriptViewOptions {
   readonly now?: () => number;
   /** Reads a finished worker's messages from its session file. Default: readWorkerTranscript. */
   readonly readSession?: (file: string) => readonly unknown[];
+  /** The redraw timer, for the elapsed time. Default: an unref'd setInterval, so an open view never keeps pi's process alive. */
+  readonly setInterval?: (tick: () => void, ms: number) => unknown;
+  readonly clearInterval?: (handle: unknown) => void;
 }
+
+/** How often an open view redraws, for the elapsed time. */
+const TICK_MS = 1_000;
 
 const SEPARATOR = " · ";
 /** pi marks user messages for terminal prompt navigation; an overlay is no prompt. */
 const PROMPT_MARKS = /\x1b\]133;[A-D]\x07/g;
-
-/** The default header: agent, worker state and which worker of how many. */
-export function transcriptHeader(frame: TranscriptFrame): string[] {
-  const { worker, theme } = frame;
-  const where = frame.position === 0 ? "no longer on the board" : `worker ${frame.position} of ${frame.count}`;
-  return [[theme.fg("accent", theme.bold(agentLabel(worker))), theme.fg(STATE_COLOR[worker.state], worker.state), theme.fg("dim", where)]
-    .join(theme.fg("muted", SEPARATOR))];
-}
 
 /** `line` cut to `width` columns. Components wrap to the width already;
  *  slots and marks may not, and pi-tui refuses a line wider than the terminal. */
@@ -116,6 +119,7 @@ export class TranscriptView {
   readonly #options: TranscriptViewOptions;
   readonly #now: () => number;
   readonly #unsubscribeBoard: () => void;
+  readonly #stopTimer: () => void;
   #worker!: BoardWorker;
   #transcript: Transcript | undefined;
   #source: Source = { kind: "none" };
@@ -147,6 +151,10 @@ export class TranscriptView {
     if (worker === undefined) throw new Error(`No worker on the board has the id ${workerId}`);
     this.#show(worker);
     this.#unsubscribeBoard = board.subscribe(() => this.#boardChanged());
+    // The board signals changes, not time passing: without it a running worker's elapsed time would stand still.
+    const timer = (options.setInterval ?? ((tick, ms) => setInterval(tick, ms).unref()))(() => this.#tui.requestRender(), TICK_MS);
+    const clearTimer = options.clearInterval ?? ((handle) => clearInterval(handle as ReturnType<typeof setInterval>));
+    this.#stopTimer = () => clearTimer(timer);
   }
 
   handleInput(data: string): void {
@@ -183,9 +191,10 @@ export class TranscriptView {
     const rows = Math.max(1, this.#tui.terminal.rows);
     const workers = this.#board.workers();
     const index = workers.findIndex((worker) => worker.id === this.#worker.id);
-    const frame: TranscriptFrame = { worker: this.#worker, position: index + 1, count: workers.length, now: this.#now(), theme: this.#theme, width };
+    const frame: TranscriptFrame = { worker: this.#worker, workers, position: index + 1, count: workers.length,
+      orchestrator: this.#board.orchestratorState(), now: this.#now(), theme: this.#theme, width };
     const theme = this.#theme;
-    const top = [...this.#options.bar?.(frame) ?? [], ...(this.#options.header ?? transcriptHeader)(frame), ...this.#nestedLines(frame),
+    const top = [...(this.#options.bar ?? orchestratorBar)(frame), ...(this.#options.header ?? transcriptHeader)(frame), ...this.#nestedLines(frame),
       theme.fg("dim", "─".repeat(width))];
     const body = this.#body(width);
     const height = Math.max(1, rows - top.length - 1);
@@ -203,6 +212,7 @@ export class TranscriptView {
   dispose(): void {
     if (this.#disposed) return;
     this.#disposed = true;
+    this.#stopTimer();
     this.#unsubscribeBoard();
     this.#detach();
   }

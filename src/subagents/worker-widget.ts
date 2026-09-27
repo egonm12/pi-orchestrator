@@ -77,7 +77,7 @@ export const STATE_COLOR: Record<WorkerState, ThemeColor> = {
 };
 
 /** `12s`, `3m04s` or `1h02m`. */
-function formatElapsed(ms: number): string {
+export function formatElapsed(ms: number): string {
   const seconds = Math.floor(ms / 1_000);
   if (seconds < 60) return `${seconds}s`;
   const minutes = Math.floor(seconds / 60);
@@ -86,7 +86,7 @@ function formatElapsed(ms: number): string {
 }
 
 /** The first or last non-empty line of `text`, its whitespace collapsed. */
-function oneLine(text: string, which: "first" | "last"): string {
+export function oneLine(text: string, which: "first" | "last"): string {
   const lines = text.split(/\r?\n/).map((line) => line.replace(/\s+/g, " ").trim()).filter((line) => line !== "");
   return (which === "first" ? lines[0] : lines.at(-1)) ?? "";
 }
@@ -100,7 +100,8 @@ function activity(worker: BoardWorker): [ThemeColor, string] {
   return text === "" ? ["dim", shortTask(worker.task)] : ["muted", text];
 }
 
-type Part = readonly [ThemeColor, string];
+/** A piece of a line and its colour. */
+export type Part = readonly [ThemeColor, string];
 
 /** A worker's line, before it is fitted to the render width. */
 function rowParts(row: WidgetRow, now: number): { indent: string; parts: Part[] } {
@@ -115,7 +116,7 @@ function rowParts(row: WidgetRow, now: number): { indent: string; parts: Part[] 
 const SEPARATOR = " · ";
 
 /** `parts` joined and styled, cut with an ellipsis to `width` columns. */
-function fitted(indent: string, parts: readonly Part[], theme: Theme, width: number): string {
+export function fitted(indent: string, parts: readonly Part[], theme: Theme, width: number): string {
   let room = width - indent.length;
   let line = indent;
   for (const [index, [color, text]] of parts.entries()) {

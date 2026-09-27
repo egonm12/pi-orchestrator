@@ -438,6 +438,12 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
       const definitions = loadAgentDefinitions(agentDefinitionDirs(personalAgentDir(), ctx.cwd));
       registerSubagentsTool(`${DESCRIPTION}\n\n${agentDefinitionListing(definitions)}`);
     });
+    // The transcript view's bar shows whether the orchestrator is running. A
+    // worker's own copy of this extension hears its worker's runs, which are
+    // not the orchestrator's. agent_settled, not agent_end: a retry, a
+    // compaction or a queued continuation keeps the orchestrator running.
+    pi.on("agent_start", (_event, ctx) => { if (!isWorkerSession(ctx)) workerBoard().setOrchestratorState("running"); });
+    pi.on("agent_settled", (_event, ctx) => { if (!isWorkerSession(ctx)) workerBoard().setOrchestratorState("idle"); });
   };
 }
 
