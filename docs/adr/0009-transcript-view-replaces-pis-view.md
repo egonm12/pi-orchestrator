@@ -19,3 +19,7 @@ Spike rcjm and ticket llnk made the transcript view a full-screen overlay (`ctx.
 - A change above the visible screen reprints everything, as pi's chat does.
 - While the view is open, the orchestrator's output reaches only the swapped-out tree. It shows once the user leaves.
 - The scroll keys and "following" are gone.
+
+## Implementation note (n0fj)
+
+The spike opened the view through `ctx.ui.custom` without `overlay`. pi takes the overlay choice before the factory runs, and only the TUI handed to the factory tells the tuiMode. So the view always opens as an overlay, with options read after the factory. In fullscreen tuiMode it is the full-screen overlay. In regular tuiMode it swaps pi's root as the spike did, and the overlay is a stub that draws nothing and passes the keys on, as the worker widget's alt+a focus does. On leaving, pi's tree goes back before pi closes the overlay, and closing gives the editor its focus back.

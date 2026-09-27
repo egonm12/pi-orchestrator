@@ -1,6 +1,6 @@
 import { truncateToVisualLines, type AgentSessionEvent, type ExtensionUIContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { readWorkerTranscript, Transcript, type TranscriptContext } from "./transcript.ts";
-import { orchestratorBar, transcriptHeader } from "./transcript-header.ts";
+import { liveStats, orchestratorBar, transcriptHeader, transcriptTop } from "./transcript-header.ts";
 import { hasEnded, type BoardWorker, type OrchestratorState, type WorkerBoard, type WorkerBoardView } from "./worker-board.ts";
 import { MAX_WIDGET_ROWS, STATE_COLOR, widgetLines } from "./worker-widget.ts";
 
@@ -30,10 +30,16 @@ import { MAX_WIDGET_ROWS, STATE_COLOR, widgetLines } from "./worker-widget.ts";
 /** The overlay covers the whole terminal. */
 export const TRANSCRIPT_OVERLAY = { width: "100%", maxHeight: "100%", anchor: "top-left", margin: 0 } as const;
 
-/** What the view needs of pi's TUI: the terminal's height, read on every
- *  render so a resize redraws at the new size, and a redraw request. */
+/** In regular tuiMode the overlay pi mounts only takes the keys: the view
+ *  itself is in pi's root, in place of pi's view (ADR 0009). */
+export const KEYS_OVERLAY = { width: 1, maxHeight: 1, anchor: "bottom-left", margin: 0 } as const;
+
+/** What the view needs of pi's TUI: its tuiMode, the terminal's height, read
+ *  on every render so a resize redraws at the new size, and a redraw request,
+ *  forced to reprint the whole terminal. A TUI that names no tuiMode gets the overlay. */
 export interface TranscriptViewTui {
-  requestRender(): void;
+  readonly mode?: "regular" | "fullscreen";
+  requestRender(force?: boolean): void;
   readonly terminal: { readonly rows: number };
 }
 
@@ -85,7 +91,7 @@ export interface TranscriptParts {
 export interface TranscriptViewOptions {
   /** The workers' working directory, for the built-in tools' paths. Default: the process's. */
   readonly cwd?: string;
-  /** The header. Default: transcriptHeader (transcript-header.ts). */
+  /** The overlay's header. Default: transcriptHeader (transcript-header.ts). */
   readonly header?: TranscriptSlot;
   /** A bar above the header. Default: orchestratorBar (transcript-header.ts). */
   readonly bar?: TranscriptSlot;
@@ -157,6 +163,10 @@ export class TranscriptView {
   /** A one-off line in the footer, until the next key. */
   #flash: string | undefined;
   #disposed = false;
+  /** Regular tuiMode: the view is in pi's root and the terminal scrolls it. */
+  readonly #regular: boolean;
+  /** The next redraw reprints the whole terminal, as after a switch of worker in regular tuiMode. */
+  #reprint = false;
 
   constructor(tui: TranscriptViewTui, theme: Theme, keys: TranscriptKeys, board: TranscriptBoard, workerId: string, close: () => void, options: TranscriptViewOptions = {}) {
     this.#tui = tui;
@@ -167,9 +177,12 @@ export class TranscriptView {
     this.#options = options;
     this.#now = options.now ?? Date.now;
     this.#expanded = options.expanded ?? false;
+    this.#regular = tui.mode === "regular";
     const worker = board.worker(workerId);
     if (worker === undefined) throw new Error(`No worker on the board has the id ${workerId}`);
     this.#show(worker);
+    // Opening reprints through the root swap already.
+    this.#reprint = false;
     this.#unsubscribeBoard = board.subscribe(() => this.#boardChanged());
     // The board signals changes, not time passing: without it a running worker's elapsed time would stand still.
     const timer = (options.setInterval ?? ((tick, ms) => setInterval(tick, ms).unref()))(() => this.#tui.requestRender(), TICK_MS);
@@ -190,35 +203,60 @@ export class TranscriptView {
     this.#flash = undefined;
     const keys = this.#keys;
     if (keys.matches(data, "tui.select.cancel")) return this.#leave();
-    if (keys.matches(data, "tui.select.pageUp")) this.#scrollTo(this.#currentTop() - this.#bodyHeight);
+    if (keys.matches(data, "tui.editor.cursorLeft")) this.#step(-1);
+    else if (keys.matches(data, "tui.editor.cursorRight")) this.#step(1);
+    else if (keys.matches(data, "app.tools.expand")) this.#transcript?.setExpanded(this.#expanded = !this.#expanded);
+    else if (printable(data)?.toLowerCase() === "x") this.#askStop();
+    // In regular tuiMode the terminal scrolls the view: the scroll keys are the overlay's alone.
+    else if (this.#regular) return;
+    else if (keys.matches(data, "tui.select.pageUp")) this.#scrollTo(this.#currentTop() - this.#bodyHeight);
     else if (keys.matches(data, "tui.select.pageDown")) this.#scrollTo(this.#currentTop() + this.#bodyHeight);
     else if (keys.matches(data, "tui.editor.cursorLineStart")) this.#scrollTo(0, true);
     else if (keys.matches(data, "tui.editor.cursorLineEnd")) this.#following = true;
-    else if (keys.matches(data, "tui.editor.cursorLeft")) this.#step(-1);
-    else if (keys.matches(data, "tui.editor.cursorRight")) this.#step(1);
     else if (keys.matches(data, "tui.select.up")) this.#selected = Math.max(0, this.#selected - 1);
     else if (keys.matches(data, "tui.select.down")) this.#selected = Math.min(Math.max(0, this.#nested().length - 1), this.#selected + 1);
     else if (keys.matches(data, "tui.select.confirm")) this.#openNested();
-    else if (keys.matches(data, "app.tools.expand")) this.#transcript?.setExpanded(this.#expanded = !this.#expanded);
-    else if (printable(data)?.toLowerCase() === "x") {
-      if (hasEnded(this.#worker)) this.#flash = "This worker has already finished.";
-      else this.#confirming = true;
-    } else return;
-    this.#tui.requestRender();
+    else return;
+    this.#redraw();
+  }
+
+  #askStop(): void {
+    if (hasEnded(this.#worker)) this.#flash = "This worker has already finished.";
+    else this.#confirming = true;
+  }
+
+  /** Asks for a redraw, reprinting the terminal when a switch of worker needs it. */
+  #redraw(): void {
+    const reprint = this.#reprint;
+    this.#reprint = false;
+    this.#tui.requestRender(reprint);
   }
 
   render(width: number): string[] {
-    return this.#overlayLayout(this.#parts(width), width);
+    const parts = this.#parts(width);
+    return this.#regular ? this.#regularLayout(parts, width) : this.#overlayLayout(parts, width);
   }
 
-  /** The view's parts at `width`. */
+  /** The view's parts at `width`. In regular tuiMode the top is printed once
+   *  and scrolls away, so everything live goes to the end. */
   #parts(width: number): TranscriptParts {
     const workers = this.#board.workers();
     const index = workers.findIndex((worker) => worker.id === this.#worker.id);
     const frame: TranscriptFrame = { worker: this.#worker, workers, position: index + 1, count: workers.length,
       orchestrator: this.#board.orchestratorState(), now: this.#now(), theme: this.#theme, width };
-    const head = [...(this.#options.bar ?? orchestratorBar)(frame), ...(this.#options.header ?? transcriptHeader)(frame), ...this.#nestedLines(frame)];
+    const bar = (this.#options.bar ?? orchestratorBar)(frame);
+    if (this.#regular) {
+      return { head: transcriptTop(frame), body: this.#body(width), live: () => [...liveStats(frame), ...bar, this.#footer(undefined)] };
+    }
+    const head = [...bar, ...(this.#options.header ?? transcriptHeader)(frame), ...this.#nestedLines(frame)];
     return { head, body: this.#body(width), live: (window) => [this.#footer(window)] };
+  }
+
+  /** Regular tuiMode's arrangement: the top, the whole transcript and the
+   *  live lines, as one tall component the terminal scrolls. */
+  #regularLayout(parts: TranscriptParts, width: number): string[] {
+    const rule = this.#theme.fg("dim", "─".repeat(width));
+    return [...parts.head, rule, ...parts.body, rule, ...parts.live()].map((line) => fit(line, width));
   }
 
   /** The overlay's arrangement: the head pinned at the top above a rule, the
@@ -273,6 +311,8 @@ export class TranscriptView {
     this.#top = 0;
     this.#selected = 0;
     this.#confirming = false;
+    // A new transcript in pi's root differs from its first line on: reprint, landing at the bottom.
+    this.#reprint = this.#regular;
     this.#attach();
   }
 
@@ -398,9 +438,11 @@ export class TranscriptView {
     const theme = this.#theme;
     if (this.#confirming) return theme.fg("warning", "Stop this worker? y/n");
     if (this.#flash !== undefined) return theme.fg("muted", this.#flash);
+    const stop = hasEnded(this.#worker) ? [] : ["x stop"];
+    if (this.#regular) return theme.fg("dim", ["←→ worker", ...stop, "ctrl+o tool output", "Esc back"].join(SEPARATOR));
     const where = window === undefined || window.following ? "following" : `line ${window.top + 1} of ${window.length}, End follows`;
     const hints = [where, "←→ worker", "PgUp PgDn Home End scroll", ...this.#nested().length > 0 ? ["↑↓ Enter nested worker"] : [],
-      ...hasEnded(this.#worker) ? [] : ["x stop"], "ctrl+o tool output", "Esc back"];
+      ...stop, "ctrl+o tool output", "Esc back"];
     return theme.fg("dim", hints.join(SEPARATOR));
   }
 }
@@ -408,13 +450,59 @@ export class TranscriptView {
 /** The part of pi's UI openTranscript uses. */
 export type TranscriptUI = Pick<ExtensionUIContext, "custom"> & Partial<Pick<ExtensionUIContext, "getToolsExpanded">>;
 
-/** Shows the worker `workerId` of `board` on the whole screen until the user
- *  leaves with Esc (or ctrl+c), then resolves; the orchestrator's session is
- *  as it was. Tool output starts expanded as the orchestrator's is. Throws
- *  when no worker on the board has the id. */
+/** The part of pi-tui's TUI the root swap uses: its root's children. */
+interface RootTui {
+  readonly children: readonly unknown[];
+  clear(): void;
+  addChild(component: never): void;
+  requestRender(force?: boolean): void;
+}
+
+/** Puts `view` in place of everything in pi's root and reprints; the
+ *  returned function puts pi's tree back, once (spike jjem, ADR 0009). */
+function swapRoot(root: RootTui, view: unknown): () => void {
+  const saved = [...root.children];
+  root.clear();
+  root.addChild(view as never);
+  root.requestRender(true);
+  let restored = false;
+  return () => {
+    if (restored) return;
+    restored = true;
+    root.clear();
+    for (const child of saved) root.addChild(child as never);
+    root.requestRender(true);
+  };
+}
+
+/** Shows the worker `workerId` of `board` until the user leaves with Esc (or
+ *  ctrl+c), then resolves; the orchestrator's session is as it was. Tool
+ *  output starts expanded as the orchestrator's is. Throws when no worker on
+ *  the board has the id.
+ *
+ *  Only the TUI pi hands the factory tells the tuiMode, and pi takes the
+ *  overlay choice before it, so the view always opens as an overlay; its
+ *  options are read after the factory. In fullscreen tuiMode the view is the
+ *  full-screen overlay. In regular tuiMode it swaps pi's root for itself, and
+ *  the overlay is a stub that draws nothing and passes it the keys, as the
+ *  worker widget's focus does. On leaving it puts pi's tree back before pi
+ *  closes the overlay, which gives the editor its focus back. */
 export async function openTranscript(ui: TranscriptUI, board: TranscriptBoard, workerId: string, options: TranscriptViewOptions = {}): Promise<void> {
   if (board.worker(workerId) === undefined) throw new Error(`No worker on the board has the id ${workerId}`);
   const expanded = options.expanded ?? ui.getToolsExpanded?.() ?? false;
-  await ui.custom<void>((tui, theme, keybindings, done) => new TranscriptView(tui, theme, keybindings, board, workerId, () => done(), { ...options, expanded }),
-    { overlay: true, overlayOptions: TRANSCRIPT_OVERLAY });
+  let regular = false;
+  await ui.custom<void>((tui, theme, keybindings, done) => {
+    if (tui.mode !== "regular") return new TranscriptView(tui, theme, keybindings, board, workerId, () => done(), { ...options, expanded });
+    regular = true;
+    let restore = () => {};
+    const view = new TranscriptView(tui, theme, keybindings, board, workerId, () => { restore(); done(); }, { ...options, expanded });
+    restore = swapRoot(tui as unknown as RootTui, view);
+    return {
+      render: () => [],
+      invalidate() {},
+      handleInput: (data: string) => view.handleInput(data),
+      // pi closes the overlay on its own only when it drops the whole UI, as on a reload.
+      dispose: () => { view.dispose(); restore(); },
+    };
+  }, { overlay: true, overlayOptions: () => regular ? KEYS_OVERLAY : TRANSCRIPT_OVERLAY });
 }

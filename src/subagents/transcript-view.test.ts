@@ -71,8 +71,8 @@ function running(board: WorkerBoard, task: string, sessionId: string, extra: { a
 
 /** ctx.ui.custom as pi mounts a full-screen overlay: the factory gets a TUI,
  *  a theme, pi's keybindings manager and done, which resolves the call. */
-function fakeUI(rows = 20) {
-  const tui = { terminal: { rows }, renders: 0, requestRender() { this.renders++; } };
+function fakeUI(rows = 20, mode?: "fullscreen") {
+  const tui = { mode, terminal: { rows }, renders: 0, requestRender() { this.renders++; } };
   let component: { render(width: number): string[]; handleInput(data: string): void; dispose(): void } | undefined;
   let options: unknown;
   let closed = false;
@@ -134,7 +134,9 @@ test("the view covers the whole screen, fits every line to it, and Esc or ctrl+c
   const { fake } = running(board, "Fix the typo", "worker-1", { agent: "fixer" }, [user("Fix the typo"), reply(`A long line ${"x".repeat(300)}`)]);
   const view = fakeUI(12);
   const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
-  assert.deepEqual(view.options, { overlay: true, overlayOptions: TRANSCRIPT_OVERLAY });
+  const options = view.options as { overlay: boolean; overlayOptions: () => unknown };
+  assert.equal(options.overlay, true);
+  assert.deepEqual(options.overlayOptions(), TRANSCRIPT_OVERLAY, "fullscreen tuiMode, and a TUI that names none, keep the overlay");
   assert.deepEqual(TRANSCRIPT_OVERLAY, { width: "100%", maxHeight: "100%", anchor: "top-left", margin: 0 });
 
   const lines = view.lines(60);
@@ -416,7 +418,7 @@ test("the header shows a routed worker's rung history, live, each rung since whe
   assert.equal(header(view)[1], "anthropic/claude-sonnet-4-5:medium (the agent definition's model, not routed)");
 });
 
-test("the header shows the delegation id, a nested worker's parent delegation with its agent, short ids on a narrow terminal, and the task's first line", async () => {
+test("the header shows the delegation id, a nested worker's parent delegation with its agent, short ids on a narrow terminal, and the task", async () => {
   const LEAD = "0199f0b1-7c2d-7e3f-8a4b-5c6d7e8f9a0b", TESTER = "0199f0c2-5e0a-7c1b-9d3e-3f2a9c1e44b0";
   const board = new WorkerBoard();
   running(board, "Lead the work", LEAD, { agent: "lead" });
@@ -425,8 +427,8 @@ test("the header shows the delegation id, a nested worker's parent delegation wi
   const view = fakeUI(20);
   void openTranscript(view.ui, board, board.workers()[1]!.id);
 
-  assert.deepEqual(header(view, 120).slice(2), [`delegation ${TESTER} · parent delegation ${LEAD} (lead)`, "Check the tests"]);
-  assert.deepEqual(header(view, 60).slice(2), ["delegation 0199f0c2… · parent delegation 0199f0b1… (lead)", "Check the tests"],
+  assert.deepEqual(header(view, 120).slice(2), [`delegation ${TESTER} · parent delegation ${LEAD} (lead)`, "Check the tests", "Then report back"]);
+  assert.deepEqual(header(view, 60).slice(2), ["delegation 0199f0c2… · parent delegation 0199f0b1… (lead)", "Check the tests", "Then report back"],
     "short delegation ids on a narrow terminal");
   view.press(KEY.left);
   assert.equal(header(view)[2], `delegation ${LEAD}`, "a worker of the orchestrator has no parent delegation");
@@ -515,6 +517,131 @@ test("the view redraws every second while open, so the elapsed time ticks, and i
   view.press(KEY.escape);
   await shown;
   assert.deepEqual(cleared, ["timer"], "leaving the view stops its timer");
+});
+
+test("in fullscreen tuiMode the header wraps the task to at most 3 lines, ending in … when it is longer", async () => {
+  const board = new WorkerBoard();
+  const words = Array.from({ length: 60 }, (_, index) => `word${index + 1}`).join(" ");
+  running(board, words, "worker-1");
+  running(board, "Short task", "worker-2");
+  const view = fakeUI(30, "fullscreen");
+  void openTranscript(view.ui, board, board.workers()[0]!.id);
+  const task = header(view, 60).slice(3);
+  assert.equal(task.length, 3, JSON.stringify(task));
+  assert.ok(task.every((line) => line.length <= 60));
+  assert.ok(task[0]!.startsWith("word1 word2"));
+  assert.ok(task[2]!.endsWith("…"), task[2]);
+  assert.ok(!task.join(" ").includes("word60"));
+  view.press(KEY.right);
+  assert.deepEqual(header(view, 60).slice(3), ["Short task"], "a short task takes one line, with no …");
+});
+
+/** ctx.ui.custom in regular tuiMode: pi's root holds its chat, editor and
+ *  widgets as children; the view swaps them out and puts them back. The
+ *  overlay pi mounts is the view's key stub, which draws nothing. */
+function regularUI(rows = 10) {
+  const chat = { render: () => ["chat line"], invalidate() {} };
+  const editor = { render: () => ["editor text"], invalidate() {} };
+  const widget = { render: () => ["worker widget"], invalidate() {} };
+  const forced: boolean[] = [];
+  const tui = {
+    mode: "regular" as const, terminal: { rows }, children: [chat, editor, widget] as { render(width: number): string[] }[],
+    clear() { this.children = []; }, addChild(child: { render(width: number): string[] }) { this.children.push(child); },
+    requestRender(force?: boolean) { forced.push(force === true); },
+  };
+  const original = [...tui.children];
+  let stub: { render(width: number): string[]; handleInput(data: string): void; dispose(): void } | undefined;
+  let overlayOptions: unknown;
+  let childrenAtDone: unknown[] | undefined;
+  let closed = false;
+  const ui: TranscriptUI = {
+    custom: (async (factory: (...args: unknown[]) => unknown, options: { overlay?: boolean; overlayOptions?: unknown }) => {
+      assert.equal(options.overlay, true);
+      return new Promise<void>((resolve) => {
+        stub = factory(tui, PLAIN, new KeybindingsManager(), () => { childrenAtDone = [...tui.children]; closed = true; stub?.dispose(); resolve(); }) as typeof stub;
+        overlayOptions = typeof options.overlayOptions === "function" ? options.overlayOptions() : options.overlayOptions;
+      });
+    }) as TranscriptUI["custom"],
+    getToolsExpanded: () => false,
+  };
+  /** What the terminal shows: every root child's lines. */
+  const text = (width = WIDTH) => tui.children.flatMap((child) => child.render(width)).map((line) => plain(line).trimEnd());
+  return {
+    ui, tui, original, forced, text,
+    get stub() { return stub!; },
+    get overlayOptions() { return overlayOptions; },
+    get childrenAtDone() { return childrenAtDone; },
+    get closed() { return closed; },
+    press(...keys: string[]) { for (const key of keys) stub!.handleInput(key); },
+  };
+}
+
+test("in regular tuiMode the view replaces pi's whole view while open and puts it back intact on leaving", async () => {
+  const board = new WorkerBoard();
+  running(board, "Fix the typo", "worker-1", { agent: "fixer" }, [user("Fix the typo"), reply("Fixed it")]);
+  running(board, "Other work", "worker-2", { agent: "other" }, [user("Other work"), reply("Other reply")]);
+  const view = regularUI();
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+
+  assert.equal(view.tui.children.length, 1, "pi's chat, editor and widgets are swapped out");
+  assert.ok(!view.text().some((line) => ["chat line", "editor text", "worker widget"].includes(line)));
+  assert.ok(view.text().some((line) => line.includes("Fixed it")));
+  assert.deepEqual(view.stub.render(WIDTH), [], "the overlay only takes the keys");
+  assert.deepEqual(view.overlayOptions, { width: 1, maxHeight: 1, anchor: "bottom-left", margin: 0 });
+  assert.equal(view.forced.at(-1), true, "opening reprints the terminal");
+
+  view.forced.length = 0;
+  view.press(KEY.right);
+  assert.ok(view.text().some((line) => line.includes("Other reply")), "→ switches worker");
+  assert.equal(view.forced.at(-1), true, "switching reprints and lands at the bottom");
+  view.press(KEY.left);
+
+  view.press(KEY.escape);
+  await shown;
+  assert.deepEqual(view.childrenAtDone, view.original, "pi's tree is back before pi's close restores the editor and its focus");
+  assert.equal(view.forced.at(-1), true, "leaving reprints");
+});
+
+test("in regular tuiMode the view prints its top once, the whole transcript, and live lines last; scroll keys are gone", async () => {
+  const time = clock();
+  const board = new WorkerBoard({ now: time.now });
+  const task = `Check the tests. ${"Then look further. ".repeat(20)}The very end.`;
+  const numbers = Array.from({ length: 40 }, (_, index) => `number ${index + 1}`).join("\n\n");
+  const { fake } = running(board, task, "0199f0c2-5e0a-7c1b-9d3e-3f2a9c1e44b0", { agent: "tester" }, [user(task), reply(numbers)]);
+  board.add({ callId: "call-2", background: false, task: "Waits its turn", model: { kind: "routed" } });
+  fake.emit({ type: "turn_start" });
+  time.advance(75_000);
+  const view = regularUI(10);
+  void openTranscript(view.ui, board, board.workers()[0]!.id, { now: time.now });
+  const text = view.text(60);
+
+  assert.deepEqual(text.slice(0, 3), ["tester", "routing…", "delegation 0199f0c2-5e0a-7c1b-9d3e-3f2a9c1e44b0"]);
+  const top = text.slice(3, text.findIndex((line) => line.startsWith("─")));
+  assert.ok(top.length > 3, "the whole task, wrapped without a limit");
+  assert.ok(top.every((line) => line.length <= 60));
+  assert.equal(top.join(" ").replace(/\s+/g, " "), task.trim());
+  assert.ok(text.length > 40, "the transcript in full, not windowed to the terminal");
+  assert.ok(text.some((line) => line.trim() === "number 1") && text.some((line) => line.trim() === "number 40"));
+  assert.deepEqual(view.text().slice(-3), [
+    "running · 1m15s · 1 turn · 0 tok · $0.000 · thinking… · worker 1 of 2",
+    "orchestrator idle",
+    "←→ worker · x stop · ctrl+o tool output · Esc back",
+  ]);
+
+  for (const key of [KEY.pageUp, KEY.pageDown, KEY.home, KEY.end]) {
+    view.press(key);
+    assert.deepEqual(view.text(60), text, `${JSON.stringify(key)} does nothing: the terminal scrolls`);
+  }
+  view.forced.length = 0;
+  view.press(KEY.ctrlO);
+  assert.deepEqual(view.forced, [false], "a key that keeps the worker redraws without reprinting");
+  view.press(KEY.ctrlO);
+  view.press("x");
+  assert.equal(view.text(60).at(-1), "Stop this worker? y/n");
+  view.press("n");
+  board.setOrchestratorState("running");
+  assert.equal(view.text(60).at(-2), "orchestrator running", "the live lines follow the board");
+  assert.equal(view.closed, false);
 });
 
 test("the header's token counts and cost read short, and a count never rounds up past its unit", () => {

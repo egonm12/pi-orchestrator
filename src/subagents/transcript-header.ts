@@ -1,6 +1,7 @@
+import { truncateToVisualLines } from "@earendil-works/pi-coding-agent";
 import type { TranscriptFrame } from "./transcript-view.ts";
 import { elapsedMs, type BoardWorker, type RungServing } from "./worker-board.ts";
-import { activityPart, agentLabel, fitted, formatElapsed, oneLine, STATE_COLOR, type Part } from "./worker-widget.ts";
+import { activityPart, agentLabel, fitted, formatElapsed, STATE_COLOR, type Part } from "./worker-widget.ts";
 
 // The transcript view's top (epic a338, vo0z): the orchestrator bar, which
 // keeps the user who reads one worker's transcript aware of the rest, and the
@@ -24,10 +25,11 @@ export function formatCost(usd: number): string {
 }
 
 /** Agent, worker state, and once it has started its elapsed time, turns,
- *  tokens and cost; its activity; then which worker of how many it is. */
-function statsLine(frame: TranscriptFrame): string {
+ *  tokens and cost; its activity; then which worker of how many it is. The
+ *  live stats line of regular tuiMode leaves the agent to the view's top. */
+function statsLine(frame: TranscriptFrame, agent = true): string {
   const { worker } = frame;
-  const parts: Part[] = [["accent", agentLabel(worker)], [STATE_COLOR[worker.state], worker.state]];
+  const parts: Part[] = [...agent ? [["accent", agentLabel(worker)] as Part] : [], [STATE_COLOR[worker.state], worker.state]];
   const elapsed = elapsedMs(worker, frame.now);
   if (elapsed !== undefined) {
     parts.push(["dim", formatElapsed(elapsed)], ["dim", `${worker.turns} ${worker.turns === 1 ? "turn" : "turns"}`],
@@ -95,15 +97,38 @@ function delegationLine(frame: TranscriptFrame): string {
   return fitted("", [["dim", full.length <= frame.width ? full : text(shortId)]], frame.theme, frame.width);
 }
 
-/** The task's first line. */
-function taskLine(frame: TranscriptFrame): string {
-  return fitted("", [["muted", oneLine(frame.worker.task, "first")]], frame.theme, frame.width);
+/** The task wrapped to the width, its blank lines left out, at most `max`
+ *  lines: the last one kept ends in … when the task is longer. */
+function taskLines(frame: TranscriptFrame, max: number): string[] {
+  const text = frame.worker.task.split(/\r?\n/).map((line) => line.replace(/\s+/g, " ").trim()).filter((line) => line !== "").join("\n");
+  const lines = truncateToVisualLines(text, Number.POSITIVE_INFINITY, frame.width).visualLines.map((line) => line.trimEnd());
+  if (lines.length > max) {
+    const last = lines[max - 1]!;
+    lines.splice(max - 1, lines.length, `${last.length < frame.width ? last : last.slice(0, frame.width - 1).trimEnd()}…`);
+  }
+  return lines.map((line) => frame.theme.fg("muted", line));
 }
 
+/** How many lines the overlay's pinned header gives the task. */
+const HEADER_TASK_LINES = 3;
+
 /** The default header: the worker's agent, worker state and progress; its
- *  model; its delegation; and its task. */
+ *  model; its delegation; and its task, wrapped to at most 3 lines. */
 export function transcriptHeader(frame: TranscriptFrame): string[] {
-  return [statsLine(frame), modelLine(frame), delegationLine(frame), taskLine(frame)];
+  return [statsLine(frame), modelLine(frame), delegationLine(frame), ...taskLines(frame, HEADER_TASK_LINES)];
+}
+
+/** Regular tuiMode's top, printed once above the transcript (ADR 0009): the
+ *  agent, the model and rung history, the delegation and the whole task. */
+export function transcriptTop(frame: TranscriptFrame): string[] {
+  return [fitted("", [["accent", agentLabel(frame.worker)]], frame.theme, frame.width), modelLine(frame), delegationLine(frame),
+    ...taskLines(frame, Number.POSITIVE_INFINITY)];
+}
+
+/** Regular tuiMode's live stats line, at the end of the view: the header's
+ *  first line without the agent, which the top shows. */
+export function liveStats(frame: TranscriptFrame): string[] {
+  return [statsLine(frame, false)];
 }
 
 /** `worker 2 (reviewer)`: an asking worker by its place, the one "worker n of m" and ←→ go by. */

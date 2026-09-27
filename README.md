@@ -134,7 +134,7 @@ Alt+a focuses the widget: arrow keys pick a worker and Enter opens its transcrip
 
 ### Transcript view
 
-The transcript view shows one worker's transcript on the whole screen: any worker of the orchestrator's session, foreground, background or nested, running or finished. Leaving it returns to the orchestrator's session as it was, editor text and scrollback included, in regular and fullscreen TUI mode.
+The transcript view shows one worker's transcript in place of the orchestrator's session: any worker of the orchestrator's session, foreground, background or nested, running or finished. Leaving it returns to the orchestrator's session as it was, chat, editor text and worker widget included. How it looks depends on pi's TUI mode (see Regular TUI mode and Fullscreen TUI mode below).
 
 Three ways open it. Alt+a on the worker widget, then Enter on the selected row, opens that worker (see Worker widget above). `/subagents` without arguments opens a picker of every worker of the session, finished ones included: one line per worker as the widget shows it, numbered in board order, nested workers indented under their parent delegation; arrow keys and Enter work as in the widget, and Esc or Ctrl+C cancels. Without a UI to pick in, the same command lists every worker as text instead. `/subagents <delegation id>` or `/subagents <list number>` opens that worker directly, skipping the picker; a delegation id or list number that names no worker is refused.
 
@@ -145,24 +145,54 @@ The transcript looks like pi's own chat: the worker's replies with their thinkin
 
 A forked worker's transcript starts with the orchestrator's conversation it was copied from. A tool from another installed extension keeps its own drawing while the worker runs. In a finished worker's transcript, only pi's built-in tools, `subagents` and `report` keep theirs; other tools are drawn plainly.
 
-The view opens with a bar and a header:
+#### Regular TUI mode
+
+The view replaces pi's whole view, so it scrolls with the terminal's own scrollback, mouse wheel, selection and search. Opening it, leaving it and switching worker reprint the terminal and land at the bottom. While it is open, the orchestrator's output goes to the hidden chat and shows once you leave. The view is printed top to bottom:
+
+```text
+tester
+anthropic/claude-haiku-4-5:low since 12:00:05 (escalated from mechanical to standard)
+delegation 0199f0c2-5e0a-7c1b-9d3e-3f2a9c1e44b0 · parent delegation 0199f0b1-7c2d-7e3f-8a4b-5c6d7e8f9a0b (lead)
+Check the tests, then report back which ones fail and why.
+────────
+…the whole transcript…
+────────
+running · 1m15s · 2 turns · 12.3k tok · $0.042 · bash · worker 2 of 3
+orchestrator idle · 1 worker asking: worker 3 (reviewer)
+←→ worker · x stop · ctrl+o tool output · Esc back
+```
+
+- The top is printed once and scrolls away: the worker's agent, its model and rung history, its delegation, and its whole task, wrapped without a limit.
+- The whole transcript follows, not cut to the screen.
+- The live lines come last and update in place: the worker state, elapsed time, turns, tokens, cost, activity and which worker of how many it is; the orchestrator bar; and the key hints.
+
+| Key | Action |
+|-----|--------|
+| ← → | Show the previous or next worker, in the order they were queued, each nested worker after its parent |
+| x | Stop this worker, after a `Stop this worker? y/n` confirmation. A running worker aborts, a queued one never starts; a nested worker's parent runs on |
+| ctrl+o | Expand or collapse tool output |
+| Esc, ctrl+c | Go back to the orchestrator's session |
+
+#### Fullscreen TUI mode
+
+The view is a full-screen overlay over the orchestrator's session, with a bar and a header pinned at the top:
 
 ```text
 orchestrator idle · 1 worker asking: worker 3 (reviewer)
-tester · running · 1m15s · 2 turns · 12.3k tok · $0.042 · worker 2 of 3
+tester · running · 1m15s · 2 turns · 12.3k tok · $0.042 · bash · worker 2 of 3
 anthropic/claude-haiku-4-5:low since 12:00:05 (escalated from mechanical to standard)
 delegation 0199f0c2-5e0a-7c1b-9d3e-3f2a9c1e44b0 · parent delegation 0199f0b1-7c2d-7e3f-8a4b-5c6d7e8f9a0b (lead)
 Check the tests
 ```
 
-The bar shows whether the orchestrator is running or idle, and which workers are asking it a question, by their place among the workers. It updates live, but it only tells: it never closes the view or takes a key, and the question is answered in the orchestrator's session.
+The bar shows whether the orchestrator is running or idle, and which workers are asking it a question, by their place among the workers. It updates live, but it only tells: it never closes the view or takes a key, and the question is answered in the orchestrator's session. Regular TUI mode shows the same bar among its live lines.
 
 The header shows:
 
-- The worker's agent and worker state; once it has started, its elapsed time, turns, tokens (input, output and cache together) and cost; then which worker of how many it is.
+- The worker's agent and worker state; once it has started, its elapsed time, turns, tokens (input, output and cache together) and cost; its activity; then which worker of how many it is.
 - Its model and effort. A routed worker shows `routing…` before its first request, then its rung history: each rung with the time it started serving, and the escalation that led to it. A forked worker and a worker on its agent definition's model show that fixed model.
 - Its delegation id and, for a nested worker, its parent delegation and that worker's agent. A queued foreground worker gets its delegation id when it starts.
-- The first line of its task.
+- Its task, wrapped to at most 3 lines, ending in `…` when it is longer.
 
 Every line is cut to the terminal's width. On a narrow terminal the rung history drops its oldest rungs first, keeping the rung that serves the latest request, and the delegation ids shrink to their first eight characters. The workers it started are listed below the header. While the worker runs, the view follows the end of its transcript until you scroll.
 
