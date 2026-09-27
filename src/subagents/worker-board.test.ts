@@ -276,3 +276,21 @@ test("a finished worker whose session was not saved keeps its last messages for 
   saved.ended({ state: "completed", sessionFile: "/sessions/saved-1.jsonl" });
   assert.equal(board.unsavedMessages(saved.id), undefined, "its session file holds its transcript");
 });
+
+test("the board keeps the orchestrator's state, signals its changes to views, and a new orchestrator session starts idle", () => {
+  const board = new WorkerBoard();
+  board.startSession("session-1");
+  assert.equal(board.orchestratorState(), "idle");
+  const signals: (BoardWorker | undefined)[] = [];
+  board.subscribe((worker) => { signals.push(worker); });
+  board.setOrchestratorState("running");
+  assert.equal(board.orchestratorState(), "running");
+  assert.deepEqual(signals, [undefined], "no one worker changed");
+  board.setOrchestratorState("running");
+  assert.equal(signals.length, 1, "no change, no signal");
+  board.startSession("session-1");
+  assert.equal(board.orchestratorState(), "running", "a reload of the same session keeps it");
+  board.startSession("session-2");
+  assert.equal(board.orchestratorState(), "idle");
+  assert.deepEqual(signals, [undefined, undefined]);
+});

@@ -7,9 +7,11 @@ import { watchServedRungs, type RungEscalation, type ServedRung } from "../route
 // worker view (epic a338). The subagents extension feeds it; it reads each
 // worker's own session events for turns, tokens, cost and activity, and the
 // router's served rungs (src/router/served-rungs.ts) for a routed worker's
-// model. Views read it and get a change signal. It only observes, with one
-// exception: the transcript view's stop (x) reaches a worker through stop(),
-// which calls the stop the subagents extension handed over for it.
+// model. It also keeps whether the orchestrator itself is running or idle,
+// for the transcript view's bar. Views read it and get a change signal. It
+// only observes, with one exception: the transcript view's stop (x) reaches a
+// worker through stop(), which calls the stop the subagents extension handed
+// over for it.
 
 /** CONTEXT.md, Worker state. Only a background worker can be asking. */
 export type WorkerState = "queued" | "running" | "asking" | "completed" | "failed" | "aborted";
@@ -123,8 +125,13 @@ export interface WorkerControl {
   readonly stop: () => void;
 }
 
-/** Called with the worker that changed, or with `undefined` when the whole
- *  board did, as when a new orchestrator session starts. */
+/** The orchestrator's own agent: running from a prompt until its run settles,
+ *  retries and queued continuations included; idle between. */
+export type OrchestratorState = "running" | "idle";
+
+/** Called with the worker that changed, or with `undefined` when something
+ *  else did: the whole board, as when a new orchestrator session starts, or
+ *  the orchestrator's state. */
 export type BoardListener = (worker: BoardWorker | undefined) => void;
 
 /** How a worker ended, as its result says. */
@@ -153,7 +160,7 @@ export interface WorkerFeed {
 
 /** The board as views read it (the worker widget, the transcript view, the
  *  /subagents picker): they observe, and never feed or steer. */
-export type WorkerBoardView = Pick<WorkerBoard, "workers" | "worker" | "byDelegation" | "subscribe" | "live" | "unsavedMessages">;
+export type WorkerBoardView = Pick<WorkerBoard, "workers" | "worker" | "byDelegation" | "subscribe" | "live" | "unsavedMessages" | "orchestratorState">;
 
 export interface WorkerBoardOptions {
   /** Epoch milliseconds. */
@@ -260,6 +267,7 @@ export class WorkerBoard {
   readonly #listeners = new Set<BoardListener>();
   readonly #now: () => number;
   #sessionId: string | undefined;
+  #orchestrator: OrchestratorState = "idle";
 
   constructor(options: WorkerBoardOptions = {}) {
     this.#now = options.now ?? Date.now;
@@ -321,10 +329,26 @@ export class WorkerBoard {
    *  starts with an empty board. */
   startSession(sessionId: string): void {
     if (sessionId === this.#sessionId) return;
-    const hadEntries = this.#entries.length > 0;
+    const changed = this.#entries.length > 0 || this.#orchestrator !== "idle";
     this.#sessionId = sessionId;
+    // A session starts idle: whatever the last one's agent did is over.
+    this.#orchestrator = "idle";
     for (const entry of this.#entries.splice(0)) entry.unsubscribe?.();
-    if (hadEntries) this.#signal(undefined);
+    if (changed) this.#signal(undefined);
+  }
+
+  /** The orchestrator's agent started a run or settled. The subagents
+   *  extension feeds it from the orchestrator's session only, never a worker's. */
+  setOrchestratorState(state: OrchestratorState): void {
+    if (state === this.#orchestrator) return;
+    this.#orchestrator = state;
+    this.#signal(undefined);
+  }
+
+  /** Whether the orchestrator is working, for the transcript view's bar: a
+   *  user reading a worker's transcript can see when it is their turn again. */
+  orchestratorState(): OrchestratorState {
+    return this.#orchestrator;
   }
 
   /** Calls `listener` with each worker that changes, until the returned function is called. */
