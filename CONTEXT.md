@@ -13,6 +13,18 @@ _Avoid_: Execution agent, subagent (that is the tool that starts workers, not th
 A worker whose context starts as a copy of the orchestrator's conversation up to the delegating call. The only worker that runs on the orchestrator's own session model and effort, unrouted.
 _Avoid_: Clone, branch, fork (alone)
 
+**Result**:
+A worker's final reply to the orchestrator: what it confirmed with evidence, what it changed, what it suspects but did not verify, and what it could not check. Evidence, not a verdict: the orchestrator checks it before acting on it.
+_Avoid_: Report (that is a background worker's message), answer, output
+
+**Quality gate**:
+The orchestrator's duty to judge every implementation result before using it, by its own spot check or an independent reviewer, and to record that judgement as a verdict.
+_Avoid_: Review gate, report gate
+
+**Gate level**:
+How strictly the quality gate treats each tier: low, medium, high or max. Per tier it sets the gate action (none, the orchestrator's spot check, or an independent reviewer). The owner's level is a floor; the orchestrator may raise it for one delegation, never lower it.
+_Avoid_: Verification level (that sounds like the worker's own checks), review level
+
 **Background worker**:
 A worker whose delegating call returned before it finished. The orchestrator can check on it, steer it and answer its questions.
 
@@ -78,12 +90,18 @@ Bounded recovery's retry order after a changes-requested review: one supported e
 _Avoid_: Reclassification, suitability-score escalation
 
 **Verdict**:
-The independent reviewer's outcome for a delegated task: accepted or changes requested. The only feedback signal the router learns from.
+The quality gate's outcome for a delegated task: accepted or changes requested, recorded by the orchestrator whether it came from its own check or an independent reviewer. The only feedback signal the router learns from.
 _Avoid_: Self-report, attestation, score
 
 **Decision record**:
 The append-only record of one routing decision: the tier and why, the resolved tier map, every removed rung, any escalation, the chosen rung or the refusal, the mode, and in shadow mode the model chosen by hand. Keyed by the delegation id, which is how a verdict is attached to it.
 _Avoid_: Log entry, trace (a trace is ticket 18's detailed delegation record)
+
+**Ungated delegation**:
+An editing delegation whose gate action was none at its gate level, so no verdict was needed. Counted apart from missing verdicts; never a learning observation.
+
+**Missing verdict**:
+A verdict the gate level required that the orchestrator's session ended without recording. Never a learning observation.
 
 **Orphaned verdict**:
 A verdict whose delegation id matches no decision record. Kept and counted, never dropped or guessed onto a decision.
