@@ -3,10 +3,11 @@
 title: Shared orchestrator-session check and /pi-orchestrator subcommands
 status: todo
 type: task
+priority: normal
 tags:
     - ready-for-agent
 created_at: 2026-09-27T22:07:20Z
-updated_at: 2026-09-27T22:07:20Z
+updated_at: 2026-09-27T22:18:26Z
 parent: pi-orchestrator-3p1z
 ---
 
@@ -16,7 +17,7 @@ pi-orchestrator-3p1z (orchestrator enforcement)
 
 ## What to build
 
-Prefactor, no behaviour change. One check answers "is this the orchestrator's own session?" (not a worker, not a pi-subagents child, not a herdr pane-native child), used by the guard, the router extension and the subagents extension instead of repeating the environment checks. The /pi-orchestrator command dispatches subcommands, so later tickets can add budget and gate beside init.
+Prefactor, no behaviour change. One check answers "is this the orchestrator's own session?" (not a worker, not a pi-subagents child, not a herdr pane-native child), used by the guard, the router extension and the subagents extension instead of repeating the environment checks. The /pi-orchestrator command dispatches subcommands, so later tickets can add budget and gate beside init. Today the command handles only init; the dispatcher is new.
 
 ## Acceptance criteria
 

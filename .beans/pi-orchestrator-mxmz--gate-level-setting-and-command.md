@@ -7,7 +7,7 @@ priority: normal
 tags:
     - ready-for-agent
 created_at: 2026-09-27T21:58:41Z
-updated_at: 2026-09-27T22:07:20Z
+updated_at: 2026-09-27T22:18:26Z
 parent: pi-orchestrator-3p1z
 blocked_by:
     - pi-orchestrator-vu2o
@@ -30,6 +30,7 @@ ADR 0011. The gate level (low, medium, high, max) sets the gate action per tier 
 - [ ] Personal setting, project override and the session command work; an invalid level is refused with usage
 - [ ] Raising for one delegation works and is recorded; lowering is refused
 - [ ] At max, reviewer instructions include rerunning Verified by
+- [ ] The protocol names the current gate level
 - [ ] Tests
 
 ## Blocked by

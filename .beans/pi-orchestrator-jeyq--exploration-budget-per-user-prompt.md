@@ -7,7 +7,7 @@ priority: normal
 tags:
     - ready-for-agent
 created_at: 2026-09-27T21:58:41Z
-updated_at: 2026-09-27T22:07:20Z
+updated_at: 2026-09-27T22:18:26Z
 parent: pi-orchestrator-3p1z
 blocked_by:
     - pi-orchestrator-vu2o
@@ -33,6 +33,7 @@ The budget binds only the orchestrator's own session. /pi-orchestrator budget of
 
 - [ ] The 4th exploratory call in one user prompt is denied with the delegate instruction; the counter resets on the next user prompt
 - [ ] Actions are never counted; unrecognised bash is counted
+- [ ] Calls the orchestrator makes to spot-check a Result count like any other exploratory call
 - [ ] Workers, forked workers and child processes are never budgeted
 - [ ] The threshold is an owner setting, default 3
 - [ ] /pi-orchestrator budget off lifts the budget until the next user prompt

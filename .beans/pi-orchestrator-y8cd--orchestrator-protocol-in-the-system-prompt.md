@@ -7,7 +7,7 @@ priority: normal
 tags:
     - ready-for-agent
 created_at: 2026-09-27T21:58:41Z
-updated_at: 2026-09-27T22:07:20Z
+updated_at: 2026-09-27T22:18:26Z
 parent: pi-orchestrator-3p1z
 blocked_by:
     - pi-orchestrator-vu2o
@@ -19,7 +19,7 @@ pi-orchestrator-3p1z (orchestrator enforcement)
 
 ## What to build
 
-The orchestrator's session always carries the orchestrator protocol in its system prompt, added on every turn so it survives compaction. The base protocol says: delegate exploration and substantial work to workers, keep small known actions (a single lookup, a small edit, a commit), and treat a worker's Result as evidence, not a verdict. Workers never get it. There is no per-prompt reminder line. Later tickets add their own paragraph (budget, verdicts, reviewer, gate level).
+The orchestrator's session always carries the orchestrator protocol in its system prompt, added when each user prompt starts its agent loop; pi applies the system prompt to every model request, so it survives compaction without a per-turn hook. The base protocol says: delegate exploration and substantial work to workers, keep small known actions (a single lookup, a small edit, a commit), and treat a worker's Result as evidence, not a verdict. Workers never get it. There is no per-prompt reminder line. Later tickets add their own paragraph (budget, verdicts, reviewer, gate level).
 
 ## Acceptance criteria
 

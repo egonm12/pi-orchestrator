@@ -5,7 +5,7 @@ status: in-progress
 type: epic
 priority: normal
 created_at: 2026-09-27T21:45:45Z
-updated_at: 2026-09-27T21:58:41Z
+updated_at: 2026-09-27T22:18:37Z
 ---
 
 Design session (split-plan 'orchestrator enforcement', ADR 0005). Keeps the main session in the orchestrator role.
@@ -72,3 +72,14 @@ Design session (split-plan 'orchestrator enforcement', ADR 0005). Keeps the main
 ## Next
 - [x] Confirm shared understanding with the owner
 - [x] Split into implementation beans (protocol, exploration budget, worker reporting rules, subagents_verdict + commit block, gate level, routing report ungated/missing)
+
+
+## Ticket review (worker 01a0e4ee)
+10 of 11 ok, mxmz needed changes. Applied:
+- mxmz: criterion 'The protocol names the current gate level'. CONTEXT.md gains Gate action.
+- l8af: missing is derived in the report from recorded gate requirements, not recorded at session_shutdown (which also fires for reload, resume, new, fork). Missing verdict definition adjusted.
+- mw81: commit/push matcher is new plumbing; chained commands and git options covered.
+- jeyq: spot checks count, as an explicit criterion.
+- y8cd: before_agent_start runs once per user prompt; system prompt applies to every model request.
+- vu2o: the subcommand dispatcher is new.
+Rejected: jeyq's redundant vu2o edge (it uses vu2o directly, kept); kokv's stale file slug (cosmetic, title is correct).

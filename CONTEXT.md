@@ -25,6 +25,9 @@ _Avoid_: Review gate, report gate
 How strictly the quality gate treats each tier: low, medium, high or max. Per tier it sets the gate action (none, the orchestrator's spot check, or an independent reviewer). The owner's level is a floor; the orchestrator may raise it for one delegation, never lower it.
 _Avoid_: Verification level (that sounds like the worker's own checks), review level
 
+**Gate action**:
+What the quality gate requires for one editing delegation: none, a spot check (the orchestrator's own verdict) or a reviewer (an independent reviewer worker). Set by the gate level and the delegation's tier.
+
 **Background worker**:
 A worker whose delegating call returned before it finished. The orchestrator can check on it, steer it and answer its questions.
 
@@ -101,7 +104,7 @@ _Avoid_: Log entry, trace (a trace is ticket 18's detailed delegation record)
 An editing delegation whose gate action was none at its gate level, so no verdict was needed. Counted apart from missing verdicts; never a learning observation.
 
 **Missing verdict**:
-A verdict the gate level required that the orchestrator's session ended without recording. Never a learning observation.
+A verdict the gate level required that was never recorded. Never a learning observation.
 
 **Orphaned verdict**:
 A verdict whose delegation id matches no decision record. Kept and counted, never dropped or guessed onto a decision.
