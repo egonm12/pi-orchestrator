@@ -21,7 +21,8 @@ import { MAX_WIDGET_ROWS, STATE_COLOR, widgetLines } from "./worker-widget.ts";
 // (rcjm's first live try).
 //
 // The view is drawn in slots, top to bottom: a bar, the header, the worker's
-// nested workers, the transcript and a footer. The header and the bar are
+// nested workers, the transcript and a footer. They make three parts (head,
+// body and live lines) that a layout arranges. The header and the bar are
 // options (TranscriptSlot), drawn by transcript-header.ts by default. The bar
 // only tells: an asking worker or an idle orchestrator never closes the view,
 // moves it or takes a key, so the user leaves when they choose to.
@@ -61,6 +62,25 @@ export interface TranscriptFrame {
 
 /** A slot's lines; the view cuts each to the width. */
 export type TranscriptSlot = (frame: TranscriptFrame) => readonly string[];
+
+/** Where the overlay's window on the body is, for the live lines' hint. */
+export interface BodyWindow {
+  readonly following: boolean;
+  /** The first body line shown, from 0. */
+  readonly top: number;
+  readonly length: number;
+}
+
+/** The view's parts, built apart from how a layout arranges them (s993): the
+ *  head (the bar, the header and the nested workers), the body (the
+ *  transcript with its notices and end state) and the live lines (the footer).
+ *  The live lines take the body's window when a layout windows it; their
+ *  count never depends on it, so a layout can size the window by them. */
+export interface TranscriptParts {
+  readonly head: readonly string[];
+  readonly body: readonly string[];
+  readonly live: (window?: BodyWindow) => readonly string[];
+}
 
 export interface TranscriptViewOptions {
   /** The workers' working directory, for the built-in tools' paths. Default: the process's. */
@@ -188,23 +208,34 @@ export class TranscriptView {
   }
 
   render(width: number): string[] {
-    const rows = Math.max(1, this.#tui.terminal.rows);
+    return this.#overlayLayout(this.#parts(width), width);
+  }
+
+  /** The view's parts at `width`. */
+  #parts(width: number): TranscriptParts {
     const workers = this.#board.workers();
     const index = workers.findIndex((worker) => worker.id === this.#worker.id);
     const frame: TranscriptFrame = { worker: this.#worker, workers, position: index + 1, count: workers.length,
       orchestrator: this.#board.orchestratorState(), now: this.#now(), theme: this.#theme, width };
-    const theme = this.#theme;
-    const top = [...(this.#options.bar ?? orchestratorBar)(frame), ...(this.#options.header ?? transcriptHeader)(frame), ...this.#nestedLines(frame),
-      theme.fg("dim", "─".repeat(width))];
-    const body = this.#body(width);
-    const height = Math.max(1, rows - top.length - 1);
+    const head = [...(this.#options.bar ?? orchestratorBar)(frame), ...(this.#options.header ?? transcriptHeader)(frame), ...this.#nestedLines(frame)];
+    return { head, body: this.#body(width), live: (window) => [this.#footer(window)] };
+  }
+
+  /** The overlay's arrangement: the head pinned at the top above a rule, the
+   *  body windowed and scrolled to fill the terminal, the live lines at the bottom. */
+  #overlayLayout(parts: TranscriptParts, width: number): string[] {
+    const rows = Math.max(1, this.#tui.terminal.rows);
+    const top = [...parts.head, this.#theme.fg("dim", "─".repeat(width))];
+    // The live lines' count sizes the window; their text needs the window's top, known only after.
+    const height = Math.max(1, rows - top.length - parts.live().length);
     this.#bodyHeight = height;
-    this.#bodyLength = body.length;
+    this.#bodyLength = parts.body.length;
     const shownTop = this.#currentTop();
     if (!this.#following) this.#top = shownTop;
-    const shown = body.slice(shownTop, shownTop + height);
+    const shown = parts.body.slice(shownTop, shownTop + height);
     const padding = Array.from({ length: height - shown.length }, () => "");
-    return [...top, ...shown, ...padding, this.#footer(shownTop)].slice(0, rows).map((line) => fit(line, width));
+    const bottom = parts.live({ following: this.#following, top: shownTop, length: parts.body.length });
+    return [...top, ...shown, ...padding, ...bottom].slice(0, rows).map((line) => fit(line, width));
   }
 
   invalidate(): void {}
@@ -363,11 +394,11 @@ export class TranscriptView {
     return lines;
   }
 
-  #footer(shownTop: number): string {
+  #footer(window: BodyWindow | undefined): string {
     const theme = this.#theme;
     if (this.#confirming) return theme.fg("warning", "Stop this worker? y/n");
     if (this.#flash !== undefined) return theme.fg("muted", this.#flash);
-    const where = this.#following ? "following" : `line ${shownTop + 1} of ${this.#bodyLength}, End follows`;
+    const where = window === undefined || window.following ? "following" : `line ${window.top + 1} of ${window.length}, End follows`;
     const hints = [where, "←→ worker", "PgUp PgDn Home End scroll", ...this.#nested().length > 0 ? ["↑↓ Enter nested worker"] : [],
       ...hasEnded(this.#worker) ? [] : ["x stop"], "ctrl+o tool output", "Esc back"];
     return theme.fg("dim", hints.join(SEPARATOR));
