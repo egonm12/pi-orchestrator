@@ -164,11 +164,12 @@ orchestrator idle · 1 worker asking: worker 3 (reviewer)
 
 - The top is printed once and scrolls away: the worker's agent, its model and rung history, its delegation, and its whole task, wrapped without a limit.
 - The whole transcript follows, not cut to the screen.
-- The live lines come last and update in place: the worker state, elapsed time, turns, tokens, cost, activity and which worker of how many it is; the orchestrator bar; and the key hints.
+- The live lines come last and update in place: the workers it started, at most 6 as the worker widget draws them, the selected one marked; the worker state, elapsed time, turns, tokens, cost, activity and which worker of how many it is; the orchestrator bar; and the key hints.
 
 | Key | Action |
 |-----|--------|
 | ← → | Show the previous or next worker, in the order they were queued, each nested worker after its parent |
+| ↑ ↓, Enter | Select one of the worker's nested workers, and open it |
 | x | Stop this worker, after a `Stop this worker? y/n` confirmation. A running worker aborts, a queued one never starts; a nested worker's parent runs on |
 | ctrl+o | Expand or collapse tool output |
 | Esc, ctrl+c | Go back to the orchestrator's session |

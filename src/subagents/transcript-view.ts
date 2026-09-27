@@ -207,15 +207,15 @@ export class TranscriptView {
     else if (keys.matches(data, "tui.editor.cursorRight")) this.#step(1);
     else if (keys.matches(data, "app.tools.expand")) this.#transcript?.setExpanded(this.#expanded = !this.#expanded);
     else if (printable(data)?.toLowerCase() === "x") this.#askStop();
+    else if (keys.matches(data, "tui.select.up")) this.#selected = Math.max(0, this.#selected - 1);
+    else if (keys.matches(data, "tui.select.down")) this.#selected = Math.min(Math.max(0, this.#nested().length - 1), this.#selected + 1);
+    else if (keys.matches(data, "tui.select.confirm")) this.#openNested();
     // In regular tuiMode the terminal scrolls the view: the scroll keys are the overlay's alone.
     else if (this.#regular) return;
     else if (keys.matches(data, "tui.select.pageUp")) this.#scrollTo(this.#currentTop() - this.#bodyHeight);
     else if (keys.matches(data, "tui.select.pageDown")) this.#scrollTo(this.#currentTop() + this.#bodyHeight);
     else if (keys.matches(data, "tui.editor.cursorLineStart")) this.#scrollTo(0, true);
     else if (keys.matches(data, "tui.editor.cursorLineEnd")) this.#following = true;
-    else if (keys.matches(data, "tui.select.up")) this.#selected = Math.max(0, this.#selected - 1);
-    else if (keys.matches(data, "tui.select.down")) this.#selected = Math.min(Math.max(0, this.#nested().length - 1), this.#selected + 1);
-    else if (keys.matches(data, "tui.select.confirm")) this.#openNested();
     else return;
     this.#redraw();
   }
@@ -246,7 +246,8 @@ export class TranscriptView {
       orchestrator: this.#board.orchestratorState(), now: this.#now(), theme: this.#theme, width };
     const bar = (this.#options.bar ?? orchestratorBar)(frame);
     if (this.#regular) {
-      return { head: transcriptTop(frame), body: this.#body(width), live: () => [...liveStats(frame), ...bar, this.#footer(undefined)] };
+      // The nested workers sit just above the stats line, where the user reads the live state (n39l).
+      return { head: transcriptTop(frame), body: this.#body(width), live: () => [...this.#nestedLines(frame), ...liveStats(frame), ...bar, this.#footer(undefined)] };
     }
     const head = [...bar, ...(this.#options.header ?? transcriptHeader)(frame), ...this.#nestedLines(frame)];
     return { head, body: this.#body(width), live: (window) => [this.#footer(window)] };
@@ -439,9 +440,10 @@ export class TranscriptView {
     if (this.#confirming) return theme.fg("warning", "Stop this worker? y/n");
     if (this.#flash !== undefined) return theme.fg("muted", this.#flash);
     const stop = hasEnded(this.#worker) ? [] : ["x stop"];
-    if (this.#regular) return theme.fg("dim", ["←→ worker", ...stop, "ctrl+o tool output", "Esc back"].join(SEPARATOR));
+    const nested = this.#nested().length > 0 ? ["↑↓ Enter nested worker"] : [];
+    if (this.#regular) return theme.fg("dim", ["←→ worker", ...nested, ...stop, "ctrl+o tool output", "Esc back"].join(SEPARATOR));
     const where = window === undefined || window.following ? "following" : `line ${window.top + 1} of ${window.length}, End follows`;
-    const hints = [where, "←→ worker", "PgUp PgDn Home End scroll", ...this.#nested().length > 0 ? ["↑↓ Enter nested worker"] : [],
+    const hints = [where, "←→ worker", "PgUp PgDn Home End scroll", ...nested,
       ...stop, "ctrl+o tool output", "Esc back"];
     return theme.fg("dim", hints.join(SEPARATOR));
   }

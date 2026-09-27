@@ -644,6 +644,42 @@ test("in regular tuiMode the view prints its top once, the whole transcript, and
   assert.equal(view.closed, false);
 });
 
+test("in regular tuiMode the shown worker's nested workers are listed live above the stats line, at most 6, and ↑↓ Enter open one", async () => {
+  const board = new WorkerBoard();
+  running(board, "Lead the work", "lead-1", { agent: "lead" });
+  const feeds: WorkerFeed[] = [];
+  for (let item = 1; item <= 8; item++) feeds.push(running(board, `Nested ${item}`, `nested-${item}`, { parentDelegationId: "lead-1" }, [user(`Nested ${item}`), reply(`Reply ${item}`)]).feed);
+  const view = regularUI();
+  void openTranscript(view.ui, board, board.workers()[0]!.id);
+  const live = () => {
+    const text = view.text();
+    const stats = text.findIndex((line) => line.startsWith("running · "));
+    return { nested: text.slice(stats - 6, stats), rest: text.slice(stats) };
+  };
+
+  assert.equal(view.text().filter((line) => /^[› ] └ /.test(line)).length, 6, "at most 6 rows");
+  assert.match(live().nested[0]!, /^› └ worker · routing… · running · \d+s · 0 turns · Nested 1$/, "right above the stats line, the first selected");
+  assert.match(live().nested[5]!, /^  └ .* · Nested 6$/);
+  assert.equal(live().rest.at(-1), "←→ worker · ↑↓ Enter nested worker · x stop · ctrl+o tool output · Esc back");
+
+  view.press(KEY.down, KEY.down, KEY.down, KEY.down, KEY.down, KEY.down, KEY.down);
+  assert.match(live().nested[5]!, /^› └ .* · Nested 8$/, "scrolled to keep the selection in view");
+  assert.match(live().nested[0]!, /· Nested 3$/);
+  view.press(KEY.up);
+  assert.match(live().nested[5]!, /^› └ .* · Nested 7$/, "the window moves with the selection, as the overlay's does");
+
+  feeds[7]!.ended({ state: "completed" });
+  view.press(KEY.down);
+  assert.match(live().nested[5]!, /^› └ .* · completed · .*Nested 8$/, "the list follows the board live");
+  view.press(KEY.up);
+  view.forced.length = 0;
+  view.press(KEY.enter);
+  assert.ok(view.text().some((line) => line.includes("Reply 7")), "Enter opens the selected worker in the same view");
+  assert.equal(view.forced.at(-1), true, "and reprints");
+  assert.ok(!view.text().some((line) => /^[› ] └ /.test(line)), "a worker without nested workers lists none");
+  assert.equal(view.text().at(-1), "←→ worker · x stop · ctrl+o tool output · Esc back", "and no nested hint");
+});
+
 test("the header's token counts and cost read short, and a count never rounds up past its unit", () => {
   assert.deepEqual([999, 1_000, 12_345, 99_949, 99_950, 999_499, 999_500, 1_234_567].map(formatTokens),
     ["999", "1.0k", "12.3k", "99.9k", "100k", "999k", "1.0M", "1.2M"]);
