@@ -41,6 +41,20 @@ Work the user has authorized to proceed without further scope approval.
 **Shadow decision**:
 An experimental routing recommendation recorded for evaluation but not controlling execution.
 
+## Watching workers
+
+**Worker widget**:
+The compact list below the editor with one line per worker on the board: its agent, model, worker state, progress and activity.
+_Avoid_: Status line, subagent list
+
+**Activity**:
+What a worker is doing right now, in a word: `thinking…`, `writing…`, the name of the tool it runs, or why it failed. It changes by phase, never with each streamed piece of text.
+_Avoid_: Current action, live status
+
+**Transcript view**:
+One worker's whole session, shown in place of the orchestrator's view until the user leaves it.
+_Avoid_: Subagent view, worker view
+
 ## Routing
 
 **Tier**:
