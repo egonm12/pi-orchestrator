@@ -706,6 +706,84 @@ test("agent definitions come from the owner's and the project's agent folders, t
   } finally { h.cleanup(); }
 });
 
+/** Whether a worker's system prompt carries the reporting rules and the Result's five sections (ADR 0010). */
+function hasReportingRules(systemText: string): boolean {
+  return /file:line/.test(systemText) && ["Confirmed", "Changed", "Unverified", "Could not check", "Verified by"]
+    .every((section) => systemText.includes(`## ${section}`));
+}
+
+test("every non-fork worker gets the reporting rules, and an agent definition's instructions follow them", async () => {
+  const h = harness();
+  try {
+    mkdirSync(h.stateDir);
+    saveAuthorization(join(h.stateDir, "authorized-recipients.json"), approvedAnthropic());
+    writeAgentDefinition(join(h.projectDir, ".pi", "agents"), "reviewer.md", { name: "reviewer", description: "Reviews" }, "REVIEWER INSTRUCTIONS");
+    const provider = fakeAnthropic("Done.");
+    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+
+    const plain = await callSubagents(tool, main.ctx, "Say done.");
+    assert.equal(plain.worker.status, "completed", JSON.stringify(plain.worker));
+    assert.ok(hasReportingRules(provider.requests[0]!.systemText), provider.requests[0]!.systemText);
+
+    const reviewer = await callSubagents(tool, main.ctx, "Review the diff.", "reviewer");
+    assert.equal(reviewer.worker.status, "completed", JSON.stringify(reviewer.worker));
+    const systemText = provider.requests[1]!.systemText;
+    assert.ok(hasReportingRules(systemText), systemText);
+    assert.ok(systemText.indexOf("## Verified by") < systemText.indexOf("REVIEWER INSTRUCTIONS"), "the definition's instructions follow the rules");
+
+    // A resumed worker's rebuilt system prompt has them again.
+    await tool.execute("call-2", { items: [{ resume: plain.worker.sessionId, task: "Go on." }] } as never, undefined, undefined, main.ctx);
+    assert.ok(hasReportingRules(provider.requests[2]!.systemText), provider.requests[2]!.systemText);
+  } finally { h.cleanup(); }
+});
+
+test("a Result missing sections gets a note naming them in the tool result; a complete Result gets none", async () => {
+  const h = harness();
+  try {
+    const partial = fakeAnthropic("## Confirmed\nThe typo is fixed (README.md:3).\n\n**Changed**: README.md\n\nVerified by: npm test");
+    const partialCall = await callSubagents(loadSubagentsTool([routerExtension(), partial.extension]), orchestrator(h).ctx, "Fix the typo.");
+    assert.equal(partialCall.worker.status, "completed", JSON.stringify(partialCall.worker));
+    assert.deepEqual(partialCall.worker.missingSections, ["Unverified", "Could not check"]);
+    assert.match(partialCall.text, /The typo is fixed/);
+    assert.match(partialCall.text, /Result check: this Result has no Unverified, Could not check sections/);
+    assert.equal(partialCall.worker.finalText.includes("Result check"), false, "the worker's own text is unchanged");
+
+    const complete = fakeAnthropic(["## Confirmed", "README.md:3", "## Changed", "README.md", "## Unverified", "None.",
+      "## Could not check", "None.", "## Verified by", "npm test: pass"].join("\n"));
+    const completeCall = await callSubagents(loadSubagentsTool([routerExtension(), complete.extension]), orchestrator(h).ctx, "Fix the typo.");
+    assert.equal(completeCall.worker.status, "completed", JSON.stringify(completeCall.worker));
+    assert.equal(completeCall.worker.missingSections, undefined);
+    assert.equal(completeCall.text.includes("Result check"), false, completeCall.text);
+  } finally { h.cleanup(); }
+});
+
+test("a forked worker gets no reporting rules, with or without an agent definition, and neither does its resume", async () => {
+  const h = harness();
+  try {
+    mkdirSync(h.stateDir);
+    saveAuthorization(join(h.stateDir, "authorized-recipients.json"), approvedAnthropic());
+    writeAgentDefinition(join(h.agentDir, "agents"), "reviewer.md", { name: "reviewer", description: "Reviews" }, "Review carefully.");
+    const provider = fakeAnthropic("Reviewed.");
+    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+    const parent = SessionManager.create(h.projectDir, join(h.agentDir, "sessions", "--project--"));
+    parent.appendMessage({ role: "user", content: "Review", timestamp: Date.now() });
+    parent.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "fork-call", name: "subagents", arguments: {} }], timestamp: Date.now() } as never);
+    const ctx = { cwd: h.projectDir, hasUI: false, sessionManager: parent,
+      model: { provider: "anthropic", id: "claude-haiku-4-5" }, thinkingLevel: "high" } as unknown as ExtensionContext;
+    const result = await tool.execute("fork-call", { items: [{ task: "Review", fork: true }, { task: "Review", agent: "reviewer", fork: true }] } as never,
+      undefined, undefined, ctx);
+    const [fork] = (result.details as SubagentsDetails).results;
+    assert.deepEqual((result.details as SubagentsDetails).results.map((worker) => worker.status), ["completed", "completed"]);
+    await tool.execute("call-2", { items: [{ resume: fork!.sessionId, task: "Go on." }] } as never, undefined, undefined, ctx);
+    assert.equal(provider.requests.length, 3);
+    for (const request of provider.requests) assert.equal(hasReportingRules(request.systemText), false, request.systemText);
+    assert.ok(provider.requests.some((request) => request.systemText.includes("Review carefully.")), "the fork's definition still applies");
+    assert.equal(fork!.missingSections, undefined, "a fork's reply is not checked as a Result");
+    assert.equal(result.content.map((part) => part.type === "text" ? part.text : "").join("").includes("Result check"), false);
+  } finally { h.cleanup(); }
+});
+
 test("a definition's tools: list narrows the orchestrator's tools and cannot add one", async () => {
   const h = harness();
   try {

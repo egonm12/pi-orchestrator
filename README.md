@@ -61,7 +61,7 @@ Each item's `task` is the whole task for an ordinary worker, with every fact it 
 ] }
 ```
 
-A fork uses the session model and thinking level at call time, without routing. Later model changes do not move it, even while it is queued. It can use a banned session model as an exception to the subagent ban list; its fork record marks that exception. An `agent` on a fork supplies instructions and narrowed tools, but its `model` and `thinking` are ignored without a warning. Forked workers never receive the `subagents` tool. Forks and ordinary workers may share a call. At most `orchestrator.subagents.maxParallel` items (default 4) run at once, the rest queue. The orchestrator waits for every item; Ctrl+C aborts running workers and drops queued ones.
+A fork uses the session model and thinking level at call time, without routing. Later model changes do not move it, even while it is queued. It can use a banned session model as an exception to the subagent ban list; its fork record marks that exception. An `agent` on a fork supplies instructions and narrowed tools, but its `model` and `thinking` are ignored without a warning. A fork gets no reporting rules (see Results below). Forked workers never receive the `subagents` tool. Forks and ordinary workers may share a call. At most `orchestrator.subagents.maxParallel` items (default 4) run at once, the rest queue. The orchestrator waits for every item; Ctrl+C aborts running workers and drops queued ones.
 
 ### Background calls
 
@@ -83,6 +83,12 @@ Every worker has a `report` tool, `{ "kind": "progress" | "question", "text": st
 A question ends a pending `subagents_status` wait on its call, which would otherwise hold the orchestrator's turn until the call ends: the wait fails with a hint to answer with `subagents_message` and wait again. A new wait on a call with an unanswered question is refused with the same hint. The call runs on, and its completion notice goes to a later wait or to the session as usual.
 
 A worker started by another worker reports to that worker, progress only, since a worker's calls are foreground.
+
+### Results
+
+A worker's final reply is its Result. Every worker except a fork gets the reporting rules appended to its system prompt, whatever its agent definition says, and before that definition's instructions: verify before reporting, give `file:line` for every factual claim, label unverified claims, say what could not be checked and why, and do only what the task asks. The Result ends in five sections, each under its own heading: Confirmed, Changed, Unverified, Could not check and Verified by (the commands the worker ran). A resumed worker gets the rules again; a resumed fork does not.
+
+When a worker other than a fork completes, the runtime checks its Result's section headers, without a model call. A markdown heading or a bold label starting with a section's name counts, as does a plain line of the name alone or followed by a colon. A Result missing one or more sections gets a note naming them after its text in that worker's part of the tool result, and the item's `missingSections` in `details` lists them. The check never rejects a Result, and a complete one gets no note.
 
 ### Status and wait
 
@@ -213,7 +219,7 @@ The view is read-only: answering and steering a worker stay with the orchestrato
 
 ### Agent definitions
 
-An item's `agent` name picks a named, owner-written kind of worker: its instructions and the tools it may use. Agent definitions are markdown files with frontmatter (`name`, `description`, `tools`, `model`, `thinking`) and a body of instructions, read from `~/.pi/agent/agents/` and the project's `.pi/agents/`. A project's definition wins by name. `model` (`provider/model`, optionally with `:effort`) and `thinking` apply only when `agentDefinitionModel.use` is `"preserve"` (see below). A `tools:` list only narrows the orchestrator's tool set for that worker; it cannot add a tool the orchestrator itself does not have. Each definition's name and description are listed in the subagents tool's description at session start. `agent` is optional in a call: without it, a worker gets pi's default tools plus extension tools (except `subagents`) and no agent-specific instructions. Every worker also gets the `report` tool (see Reports above). pi-orchestrator ships no built-in definitions; the owner writes them.
+An item's `agent` name picks a named, owner-written kind of worker: its instructions and the tools it may use. Agent definitions are markdown files with frontmatter (`name`, `description`, `tools`, `model`, `thinking`) and a body of instructions, read from `~/.pi/agent/agents/` and the project's `.pi/agents/`. A project's definition wins by name. `model` (`provider/model`, optionally with `:effort`) and `thinking` apply only when `agentDefinitionModel.use` is `"preserve"` (see below). A `tools:` list only narrows the orchestrator's tool set for that worker; it cannot add a tool the orchestrator itself does not have. Each definition's name and description are listed in the subagents tool's description at session start. `agent` is optional in a call: without it, a worker gets pi's default tools plus extension tools (except `subagents`) and no agent-specific instructions. Every worker also gets the `report` tool (see Reports above), and every worker except a fork gets the reporting rules before the definition's instructions (see Results above). pi-orchestrator ships no built-in definitions; the owner writes them.
 
 ### Nested delegation
 

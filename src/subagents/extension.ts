@@ -12,6 +12,7 @@ import { renderSubagentsCall, renderSubagentsResult, shortTask } from "./render.
 import { forkSession } from "./fork-session.ts";
 import { prepareResume, saveWorkerOutcome } from "./resume.ts";
 import { workerReports, type WorkerReports } from "./report.ts";
+import { missingSectionsNote } from "./result-format.ts";
 import { loadSubagentsSettings } from "./settings.ts";
 import { registerSubagentsStatusTool } from "./status.ts";
 import { runWorker, SUBAGENTS_TOOL, type WorkerResult, type WorkerSetup } from "./worker.ts";
@@ -91,6 +92,7 @@ export type SubagentResult = WorkerModelDetails & (
     readonly status: "failed";
     readonly sessionId?: never;
     readonly sessionFile?: never;
+    readonly missingSections?: never;
     readonly finalText: "";
     readonly error: string;
   })
@@ -98,6 +100,7 @@ export type SubagentResult = WorkerModelDetails & (
     readonly status: "not-started";
     readonly sessionId?: never;
     readonly sessionFile?: never;
+    readonly missingSections?: never;
     readonly finalText: "";
     readonly error?: never;
   }));
@@ -129,6 +132,8 @@ function resultText(result: SubagentResult): string {
     `Session file: ${result.sessionFile ?? "none, the session was not saved"}`,
     "",
     result.finalText,
+    // The runtime's Result check (ADR 0010) annotates and never rejects.
+    ...(result.missingSections === undefined ? [] : ["", missingSectionsNote(result.missingSections)]),
   ].join("\n");
 }
 

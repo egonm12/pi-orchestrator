@@ -6,6 +6,7 @@ import { markWorkerSession } from "./worker-sessions.ts";
 import type { ResumeWorker } from "./resume.ts";
 import type { BackgroundMessageMode } from "./background.ts";
 import { REPORT_TOOL, reportExtension, type WorkerReports } from "./report.ts";
+import { missingResultSections, REPORTING_RULES, type ResultSection } from "./result-format.ts";
 import { setResumePin } from "../router/auto-provider.ts";
 import type { ThinkingLevel } from "../models/model-info.ts";
 import type { WorkerSession } from "./worker-board.ts";
@@ -44,6 +45,9 @@ export interface WorkerResult {
   readonly finalText: string;
   /** Why the worker failed, when it did. */
   readonly error?: string;
+  /** The Result sections a completed non-fork worker's final text has no
+   *  header for (ADR 0010); absent when none is missing, and for a fork. */
+  readonly missingSections?: readonly ResultSection[];
 }
 
 export interface WorkerSetup {
@@ -68,7 +72,8 @@ export interface WorkerSetup {
   readonly sessionId?: string;
   /** Extensions the worker loads besides the installed ones. */
   readonly extensionFactories?: readonly InlineExtension[];
-  /** An agent definition's instructions, appended to the worker's system prompt. */
+  /** An agent definition's instructions, appended to the worker's system
+   *  prompt after the reporting rules a non-fork worker gets. */
   readonly instructions?: string;
   /** The only tools the worker may use; without it, pi's default tools and
    *  every extension tool except the subagents tool. Only a list naming the
@@ -182,6 +187,10 @@ async function runWorkerSession(setup: WorkerSetup, activity: ActivitySoFar, rep
     : { status: "failed", sessionId, sessionFile: saved(), finalText: "", error };
 
   const { instructions, reports } = setup;
+  // Every non-fork worker gets the reporting rules, whatever its agent
+  // definition says (ADR 0010); a fork, resumed or not, runs as the orchestrator.
+  const getsReportingRules = setup.fork === undefined && setup.resume?.fork !== true;
+  const appendedPrompt = [...(getsReportingRules ? [REPORTING_RULES] : []), ...(instructions === undefined ? [] : [instructions])];
   const tools = setup.tools === undefined || reports === undefined ? setup.tools : [...setup.tools, REPORT_TOOL];
   let session: Awaited<ReturnType<typeof createAgentSessionFromServices>>["session"];
   try {
@@ -191,7 +200,7 @@ async function runWorkerSession(setup: WorkerSetup, activity: ActivitySoFar, rep
       resourceLoaderOptions: {
         extensionFactories: [...(setup.extensionFactories ?? []), ...(reports === undefined ? [] : [reportExtension(reports)])],
         ...(setup.tools?.includes(SUBAGENTS_TOOL) ? {} : { extensionsOverride: withoutSubagentsTool }),
-        ...(instructions === undefined ? {} : { appendSystemPromptOverride: (base: string[]) => [...base, instructions] }),
+        ...(appendedPrompt.length === 0 ? {} : { appendSystemPromptOverride: (base: string[]) => [...base, ...appendedPrompt] }),
       },
     });
     const { fork } = setup;
@@ -276,7 +285,8 @@ async function runWorkerSession(setup: WorkerSetup, activity: ActivitySoFar, rep
     if (setup.signal?.aborted || last?.stopReason === "aborted") return { status: "aborted", sessionId, sessionFile: saved(), finalText };
     if (last === undefined) return failed("the worker gave no reply");
     if (last.stopReason === "error") return { ...failed(last.errorMessage ?? "the worker's model call failed"), finalText };
-    return { status: "completed", sessionId, sessionFile: saved(), finalText };
+    const missingSections = getsReportingRules ? missingResultSections(finalText) : [];
+    return { status: "completed", sessionId, sessionFile: saved(), finalText, ...(missingSections.length === 0 ? {} : { missingSections }) };
   } catch (error) {
     return failed(errorText(error));
   } finally {
