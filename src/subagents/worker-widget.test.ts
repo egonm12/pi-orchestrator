@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { AgentSessionEvent, Theme } from "@earendil-works/pi-coding-agent";
 import { WorkerBoard, type WorkerSession } from "./worker-board.ts";
-import { startWorkerWidget, widgetLines, widgetRows, WORKER_WIDGET, type WorkerWidgetUI } from "./worker-widget.ts";
+// pi's own keybindings manager, the one it hands a ctx.ui.custom factory; its public entry exports only the type.
+import { KeybindingsManager } from "../../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js";
+import { startWorkerWidget, widgetLines, widgetRows, WORKER_WIDGET, type WorkerWidgetFocusUI, type WorkerWidgetUI } from "./worker-widget.ts";
 
 // The worker widget above the editor. Its rows come from a real worker board,
 // fed as the subagents extension feeds it; the workers' sessions are fakes
@@ -107,14 +109,25 @@ test("a line longer than the render width is cut with an ellipsis", () => {
 
 type WidgetFactory = Extract<Parameters<WorkerWidgetUI["setWidget"]>[1], (...args: never[]) => unknown>;
 
-/** pi's widget slots as the controller uses them, and a timer the test fires by hand. */
+/** The component pi mounts as an overlay for ctx.ui.custom. */
+interface FocusOverlay {
+  render(width: number): string[];
+  handleInput(data: string): void;
+  dispose?(): void;
+}
+
+/** pi's widget slots as the controller uses them, ctx.ui.custom as pi mounts
+ *  an overlay (pi's own keybindings manager, and a done that hides it), and a
+ *  timer the test fires by hand. */
 function fakeUI() {
   let factory: WidgetFactory | undefined;
   let component: ReturnType<WidgetFactory> | undefined;
   let renders = 0;
   const placements: (string | undefined)[] = [];
   const tui = { requestRender: () => { renders++; } };
-  const ui: WorkerWidgetUI = {
+  let overlay: FocusOverlay | undefined;
+  const customOptions: unknown[] = [];
+  const ui: WorkerWidgetUI & WorkerWidgetFocusUI = {
     setWidget(key: string, content: unknown, options?: { placement?: string }) {
       assert.equal(key, WORKER_WIDGET);
       component?.dispose?.();
@@ -122,14 +135,31 @@ function fakeUI() {
       component = factory?.(tui as never, PLAIN);
       placements.push(options?.placement);
     },
-  } as WorkerWidgetUI;
+    custom: ((factory: (...args: unknown[]) => FocusOverlay, options: unknown) => {
+      customOptions.push(options);
+      return new Promise((resolve) => {
+        const mounted = factory(tui, PLAIN, new KeybindingsManager(), (result: unknown) => {
+          // pi hides the overlay, gives focus back to the editor, then disposes the component.
+          if (overlay === mounted) overlay = undefined;
+          mounted.dispose?.();
+          resolve(result as never);
+        });
+        overlay = mounted;
+      });
+    }) as WorkerWidgetFocusUI["custom"],
+  } as WorkerWidgetUI & WorkerWidgetFocusUI;
   const timers = new Set<() => void>();
   const timer = {
     setInterval: (tick: () => void) => { timers.add(tick); return tick; },
     clearInterval: (handle: unknown) => { timers.delete(handle as () => void); },
   };
   return {
-    ui, timer, placements,
+    ui, timer, placements, customOptions,
+    /** Whether the focus overlay holds the keyboard. */
+    get focused() { return overlay !== undefined; },
+    /** Keys as the terminal sends them, to whatever holds the keyboard. */
+    press(...keys: string[]) { for (const key of keys) overlay?.handleInput(key); },
+    overlayLines: (width = WIDE) => overlay?.render(width),
     /** The widget's lines at `width`, or `undefined` when it is hidden. */
     shown: (width = WIDE) => component?.render(width).map((line) => line.trimEnd()),
     tick: () => { for (const tick of [...timers]) tick(); },
@@ -142,7 +172,7 @@ test("a finished worker stays about 10 s with its end state, then drops out, and
   const time = clock();
   const board = new WorkerBoard({ now: time.now });
   const screen = fakeUI();
-  const stop = startWorkerWidget(screen.ui, board, { now: time.now, ...screen.timer });
+  const widget = startWorkerWidget(screen.ui, board, { now: time.now, ...screen.timer });
   assert.equal(screen.shown(), undefined, "an empty board shows no widget");
   assert.equal(screen.timers, 0, "and runs no timer");
 
@@ -177,7 +207,7 @@ test("a finished worker stays about 10 s with its end state, then drops out, and
 
   board.add({ callId: "call-2", background: true, task: "Third", delegationId: "bg-3", model: { kind: "routed" } });
   assert.deepEqual(screen.shown(), ["worker · routing… · queued · Third"], "a new worker brings it back");
-  stop();
+  widget.stop();
   assert.equal(screen.shown(), undefined, "stopping removes the widget");
   assert.equal(screen.timers, 0);
   board.add({ callId: "call-3", background: true, task: "Fourth", delegationId: "bg-4", model: { kind: "routed" } });
@@ -200,4 +230,87 @@ test("a board change re-renders the shown widget at once, and a new orchestrator
 
   board.startSession("session-2");
   assert.equal(screen.shown(), undefined);
+});
+
+// alt+a's focus (xytd): the widget takes the keyboard through an overlay that
+// draws nothing, so pi gives the keyboard back to the editor, text untouched,
+// when it closes. Keys arrive as the terminal sends them and are matched
+// through pi's keybindings manager: Esc as a kitty sequence too, so the focus
+// cannot trap the user.
+
+const KEY = { up: "\x1b[A", down: "\x1b[B", enter: "\r", escape: "\x1b", kittyEscape: "\x1b[27u", ctrlC: "\x03" };
+const HINT = "↑↓ select · Enter open · Esc back";
+
+test("the focused widget marks the selected worker, arrows move over its rows but not \"+N more\", Enter chooses the worker and Esc or ctrl+c leaves", async () => {
+  const time = clock();
+  const board = new WorkerBoard({ now: time.now });
+  for (let item = 1; item <= 7; item++) board.add({ callId: "call", background: true, task: `Item ${item}`, delegationId: `bg-${item}`, model: { kind: "routed" } });
+  const ids = board.workers().map((worker) => worker.id);
+  const screen = fakeUI();
+  const widget = startWorkerWidget(screen.ui, board, { now: time.now, ...screen.timer });
+
+  const chosen = widget.focus(screen.ui);
+  assert.ok(screen.focused, "the widget holds the keyboard");
+  assert.deepEqual(screen.customOptions, [{ overlay: true, overlayOptions: { width: 1, maxHeight: 1, anchor: "bottom-left", margin: 0 } }]);
+  assert.deepEqual(screen.overlayLines(), [], "the overlay itself draws nothing");
+  assert.deepEqual(screen.shown(), [
+    "› worker · routing… · queued · Item 1",
+    "  worker · routing… · queued · Item 2",
+    "  worker · routing… · queued · Item 3",
+    "  worker · routing… · queued · Item 4",
+    "  worker · routing… · queued · Item 5",
+    "  worker · routing… · queued · Item 6",
+    "  +1 more",
+    HINT,
+  ]);
+  screen.press(KEY.up);
+  assert.equal(screen.shown()![0], "› worker · routing… · queued · Item 1", "up stops at the first row");
+  screen.press(KEY.down, KEY.down);
+  assert.equal(screen.shown()![2], "› worker · routing… · queued · Item 3");
+  screen.press(...Array.from({ length: 9 }, () => KEY.down));
+  assert.equal(screen.shown()![5], "› worker · routing… · queued · Item 6", "down stops at the last row, not on \"+N more\"");
+  screen.press("q", "x");
+  assert.ok(screen.focused, "other keys do nothing");
+  screen.press(KEY.enter);
+  assert.deepEqual(await chosen, { workerId: ids[5] });
+  assert.equal(screen.focused, false, "Enter gives the keyboard back");
+  assert.equal(screen.shown()![0], "worker · routing… · queued · Item 1", "and the mark goes");
+
+  for (const leave of [KEY.escape, KEY.kittyEscape, KEY.ctrlC]) {
+    const left = widget.focus(screen.ui);
+    screen.press(KEY.down, leave);
+    assert.deepEqual(await left, { reason: "left" }, JSON.stringify(leave));
+    assert.equal(screen.focused, false);
+    assert.equal(screen.shown()!.length, 7, "the widget is as it was");
+  }
+});
+
+test("focus on a hidden widget is refused; a selected worker that drops out passes the mark to the row in its place, and an emptied widget gives the keyboard back", async () => {
+  const time = clock();
+  const board = new WorkerBoard({ now: time.now });
+  const screen = fakeUI();
+  const widget = startWorkerWidget(screen.ui, board, { now: time.now, ...screen.timer });
+  assert.deepEqual(await widget.focus(screen.ui), { reason: "empty" });
+  assert.deepEqual(screen.customOptions, [], "no overlay opens");
+
+  const first = board.add({ callId: "call", background: false, task: "First", model: { kind: "routed" } });
+  board.add({ callId: "call", background: false, task: "Second", model: { kind: "routed" } });
+  first.started();
+  const left = widget.focus(screen.ui);
+  first.ended({ state: "completed" });
+  assert.equal(screen.shown()![0], "› worker · routing… · completed · 0s · 0 turns · First", "a finished worker lingers, still selected");
+  time.advance(10_000);
+  screen.tick();
+  assert.deepEqual(screen.shown(), ["› worker · routing… · queued · Second", HINT], "the row in its place takes the mark");
+
+  board.startSession("another-session");
+  assert.equal(screen.shown(), undefined);
+  assert.deepEqual(await left, { reason: "left" });
+  assert.equal(screen.focused, false);
+
+  board.add({ callId: "call-2", background: false, task: "Third", model: { kind: "routed" } });
+  const stopped = widget.focus(screen.ui);
+  widget.stop();
+  assert.deepEqual(await stopped, { reason: "left" }, "stopping the widget gives the keyboard back");
+  assert.equal(screen.focused, false);
 });

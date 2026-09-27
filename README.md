@@ -65,7 +65,7 @@ A fork uses the session model and thinking level at call time, without routing. 
 
 With `"background": true` next to `items`, the call returns at once with its call id and one delegation id per item, in item order. The items run on while the orchestrator does other work, each call with its own `maxParallel`. When every item has finished, one completion notice arrives with the same result text as a foreground call, headed by the call id. It is delivered as a follow-up message: it starts a turn when the orchestrator is idle, and otherwise waits for the current turn to end.
 
-`orchestrator.subagents.maxBackgroundWorkers` (default 8) caps the background workers, queued or running, across the session's background calls; a call that would exceed it is refused with the reason, and starts no worker. Ctrl+C leaves background workers running. The `/subagents` command lists each running background call with its workers' delegation ids and states, and `/subagents stop <id>` stops one: a call id stops the whole call (running workers abort, queued ones are not started), a delegation id stops that worker alone, and `all` stops every call. A stopped call still sends its notice. When the orchestrator's session ends, its background workers are aborted, and each call's notice, with status `aborted`, is recorded in the session without starting a turn. A worker's own `subagents` call cannot be background.
+`orchestrator.subagents.maxBackgroundWorkers` (default 8) caps the background workers, queued or running, across the session's background calls; a call that would exceed it is refused with the reason, and starts no worker. Ctrl+C leaves background workers running. `/subagents stop <id>` stops one: a call id stops the whole call (running workers abort, queued ones are not started), a delegation id stops that worker alone, and `all` stops every call. A stopped call still sends its notice. When the orchestrator's session ends, its background workers are aborted, and each call's notice, with status `aborted`, is recorded in the session without starting a turn. A worker's own `subagents` call cannot be background.
 
 ### Messages
 
@@ -86,7 +86,7 @@ A worker started by another worker reports to that worker, progress only, since 
 
 The `subagents_status` tool, `{ "id"?: string, "wait"?: boolean }`, shows the orchestrator its session's running background calls:
 
-- Without `id` it lists them, as `/subagents list` does: each call's id and done count, and each worker's delegation id, agent, state and short task.
+- Without `id` it lists them: each call's id and done count, and each worker's delegation id, agent, state and short task.
 - With a call id it gives a snapshot of each of the call's items; with a delegation id, a snapshot of that worker alone. A snapshot holds the worker's state, its current tool, the turns it has started, its elapsed time, the last 5 lines of its latest text and its session file.
 - With a call id and `"wait": true` it blocks until the call has finished and returns its results, the same text and details as its completion notice. That notice is then not delivered: a result goes once, to a pending wait, otherwise as the notice. `wait` needs a call id; a delegation id or no id is refused.
 - Ctrl+C during a wait stops only the wait. The workers run on, and the call's completion notice follows.
@@ -130,9 +130,13 @@ worker · routing… · queued · Fix the typo
 
 A worker started by another worker is indented under it. At most 6 workers are listed; a `+N more` line counts the rest. A finished worker stays about 10 seconds with its end state, then drops out, and the widget disappears when no worker is left. The widget only shows workers; it never steers them. A worker's own session shows no widget.
 
+Alt+a focuses the widget: arrow keys pick a worker and Enter opens its transcript view; Esc or Ctrl+C leaves the widget unfocused, the editor's text untouched. Alt+a does nothing when no worker is shown. A worker's own session does not bind alt+a.
+
 ### Transcript view
 
-The transcript view shows one worker's transcript on the whole screen: any worker of the orchestrator's session, foreground, background or nested, running or finished. Leaving it returns to the orchestrator's session as it was, editor text and scrollback included, in regular and fullscreen TUI mode. The ways to open it, alt+a on the worker widget and the `/subagents` picker, come in a later version.
+The transcript view shows one worker's transcript on the whole screen: any worker of the orchestrator's session, foreground, background or nested, running or finished. Leaving it returns to the orchestrator's session as it was, editor text and scrollback included, in regular and fullscreen TUI mode.
+
+Three ways open it. Alt+a on the worker widget, then Enter on the selected row, opens that worker (see Worker widget above). `/subagents` without arguments opens a picker of every worker of the session, finished ones included: one line per worker as the widget shows it, numbered in board order, nested workers indented under their parent delegation; arrow keys and Enter work as in the widget, and Esc or Ctrl+C cancels. Without a UI to pick in, the same command lists every worker as text instead. `/subagents <delegation id>` or `/subagents <list number>` opens that worker directly, skipping the picker; a delegation id or list number that names no worker is refused.
 
 The transcript looks like pi's own chat: the worker's replies with their thinking, its tool calls with their results, and the tool-output expand toggle. Two kinds of message are marked, so they stand out from the task and from ordinary tool calls:
 
