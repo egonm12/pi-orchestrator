@@ -1214,7 +1214,9 @@ test("queued forks keep their call-time rung when the session switches model; or
     assert.deepEqual(workers.map((worker) => worker.model), [HAIKU, HAIKU, undefined]);
     assert.equal(provider.requests[1]?.model, HAIKU);
     assert.equal(provider.requests[1]?.thinkingLevel, "high");
-    assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")).map((record) => record.recordType), ["fork", "fork", "decision"]);
+    // Sorted: the router's clock is fixed at NOW, but fork records carry the real
+    // date, so on any other day they land in a later day file than the decision.
+    assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")).map((record) => record.recordType).sort(), ["decision", "fork", "fork"]);
   } finally { h.cleanup(); }
 });
 
