@@ -8,7 +8,7 @@ import { agentDefinitionDirs, agentDefinitionListing, loadAgentDefinitions, reso
 import { callingDelegation } from "./nested-delegation.ts";
 import { BackgroundCalls, type BackgroundCallResult } from "./background.ts";
 import { registerSubagentsMessageTool } from "./message.ts";
-import { renderSubagentsCall, renderSubagentsResult } from "./render.ts";
+import { renderSubagentsCall, renderSubagentsResult, shortTask } from "./render.ts";
 import { forkSession } from "./fork-session.ts";
 import { prepareResume, saveWorkerOutcome } from "./resume.ts";
 import { workerReports, type WorkerReports } from "./report.ts";
@@ -16,7 +16,9 @@ import { loadSubagentsSettings } from "./settings.ts";
 import { registerSubagentsStatusTool } from "./status.ts";
 import { runWorker, SUBAGENTS_TOOL, type WorkerResult, type WorkerSetup } from "./worker.ts";
 import { workerBoard, type WorkerModelSetup } from "./worker-board.ts";
-import { startWorkerWidget } from "./worker-widget.ts";
+import { agentLabel, startWorkerWidget, type WorkerWidget } from "./worker-widget.ts";
+import { findWorker, pickWorker, workerListing } from "./worker-picker.ts";
+import { openTranscript } from "./transcript-view.ts";
 import { isWorkerSession } from "./worker-sessions.ts";
 
 // The subagents extension (ADR 0007): a third pi extension, separate from the
@@ -163,6 +165,13 @@ const DESCRIPTION = "Hand 1 to 8 tasks to workers. At most orchestrator.subagent
   "With `background: true` the call returns at once with its call id and delegation ids, and one completion notice with the results follows when every item has finished; " +
   "at most orchestrator.subagents.maxBackgroundWorkers background workers may be queued or running at once. " +
   "Use `resume` with `task` (without `agent`) to continue a finished saved worker on its original pin.";
+
+/** Opens `workerId`'s transcript with no header or bar options: the
+ *  transcript view's own defaults (vo0z's fuller header and orchestrator bar)
+ *  apply, so every opener (the picker, a direct jump, alt+a) gets them alike. */
+function openWorker(ctx: Pick<ExtensionContext, "ui">, workerId: string): Promise<void> {
+  return openTranscript(ctx.ui, workerBoard(), workerId);
+}
 
 export function createSubagentsExtension(overrides: Partial<SubagentsDependencies> = {}) {
   const deps: SubagentsDependencies = { workerExtensions: [], ...overrides };
@@ -415,16 +424,60 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
     // when the project's folder is known.
     registerSubagentsTool(DESCRIPTION);
     registerSubagentsMessageTool(pi, backgroundCalls);
+    // The worker widget started at session_start, orchestrator sessions only
+    // (a worker's own copy of this extension shares the board but shows no
+    // widget); alt+a's focus and every /subagents opener reach it here.
+    let widget: WorkerWidget | undefined;
     pi.registerCommand("subagents", {
-      description: "List this session's background subagents calls, or stop one: /subagents stop <call id | delegation id | all>",
-      handler: async (args, ctx) => { ctx.ui.notify(backgroundCalls.command(args), "info"); },
+      description: "Open a worker's transcript by delegation id or list number, list every worker of this session, or stop one: /subagents stop <call id | delegation id | all>",
+      getArgumentCompletions: (prefix) => {
+        const items = [
+          { value: "stop", label: "stop", description: "Stop a running background call or worker" },
+          ...workerBoard().workers().map((worker, index) => ({
+            value: String(index + 1), label: `${index + 1}. ${agentLabel(worker)}`, description: shortTask(worker.task),
+          })),
+        ];
+        const lower = prefix.trim().toLowerCase();
+        const matches = items.filter((item) => item.value.toLowerCase().startsWith(lower));
+        return matches.length > 0 ? matches : null;
+      },
+      handler: async (args, ctx) => {
+        const trimmed = args.trim();
+        if (trimmed === "") {
+          const board = workerBoard();
+          if (!ctx.hasUI) {
+            const workers = board.workers();
+            ctx.ui.notify(workers.length === 0 ? "No workers in this session." : workerListing(workers, Date.now()), "info");
+            return;
+          }
+          const workerId = await pickWorker(ctx.ui, board);
+          if (workerId !== undefined) await openWorker(ctx, workerId);
+          return;
+        }
+        // `stop ...` is unchanged from before the picker (background.ts's own `command`);
+        // every other argument used to fall through to a fixed usage string or the
+        // background-only listing, now replaced by a direct jump or a clear refusal.
+        const [verb] = trimmed.split(/\s+/);
+        if (verb === "stop") { ctx.ui.notify(backgroundCalls.command(args), "info"); return; }
+        const found = findWorker(workerBoard(), trimmed);
+        if (found.workerId !== undefined) { await openWorker(ctx, found.workerId); return; }
+        ctx.ui.notify(found.refusal, "warning");
+      },
+    });
+    pi.registerShortcut("alt+a", {
+      description: "Focus the worker widget: arrows select a worker, Enter opens its transcript, Esc leaves.",
+      handler: async (ctx) => {
+        // Not bound by pi itself; guarded to the orchestrator's session, where the widget runs.
+        if (isWorkerSession(ctx) || widget === undefined) return;
+        const result = await widget.focus(ctx.ui);
+        if (result.workerId !== undefined) await openWorker(ctx, result.workerId);
+      },
     });
     registerSubagentsStatusTool(pi, backgroundCalls);
-    let stopWidget: (() => void) | undefined;
     pi.on("session_shutdown", () => {
       // First, so the workers stopped below never reach the ending session's UI.
-      stopWidget?.();
-      stopWidget = undefined;
+      widget?.stop();
+      widget = undefined;
       // Ctrl+C leaves background workers running; the session's end stops them, and pi waits for that.
       return backgroundCalls.shutdown();
     });
@@ -432,8 +485,8 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
       // A worker's own copy of this extension shares the orchestrator's board, and shows no widget.
       if (!isWorkerSession(ctx)) {
         workerBoard().startSession(ctx.sessionManager.getSessionId());
-        stopWidget?.();
-        stopWidget = ctx.hasUI ? startWorkerWidget(ctx.ui, workerBoard()) : undefined;
+        widget?.stop();
+        widget = ctx.hasUI ? startWorkerWidget(ctx.ui, workerBoard()) : undefined;
       }
       const definitions = loadAgentDefinitions(agentDefinitionDirs(personalAgentDir(), ctx.cwd));
       registerSubagentsTool(`${DESCRIPTION}\n\n${agentDefinitionListing(definitions)}`);

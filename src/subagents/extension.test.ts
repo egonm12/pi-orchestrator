@@ -187,27 +187,42 @@ interface LoadedSubagents {
   shutdownSession(ctx: ExtensionContext): Promise<void>;
   /** Runs a registered command as the owner types it, and returns what it showed. */
   runCommand(name: string, args: string, ctx: ExtensionContext): Promise<string[]>;
+  /** Runs a registered command with `ctx` exactly as given, for a test that
+   *  supplies its own ui.custom to mount the picker or the transcript view. */
+  runCommandWithUI(name: string, args: string, ctx: ExtensionContext): Promise<void>;
+  /** The argument completions a registered command offers for `prefix`. */
+  commandCompletions(name: string, prefix: string): Promise<{ value: string; label: string }[] | null>;
+  /** Runs a registered shortcut's handler, as pi does on the key. */
+  runShortcut(key: string, ctx: ExtensionContext): Promise<void>;
   /** Every message the extension sent into the orchestrator's session. */
   readonly messages: readonly SentMessage[];
 }
 
 type Command = Parameters<ExtensionAPI["registerCommand"]>[1];
+type Shortcut = Parameters<ExtensionAPI["registerShortcut"]>[1];
 
 /** The subagents extension as pi loads it in the orchestrator's session. */
 function loadSubagents(workerExtensions: readonly InlineExtension[]): LoadedSubagents {
   const tools: Tool[] = [];
   const handlers = new Map<string, ((event: unknown, ctx: ExtensionContext) => unknown)[]>();
   const commands = new Map<string, Command>();
+  const shortcuts = new Map<string, Shortcut>();
   const messages: SentMessage[] = [];
   createSubagentsExtension({ workerExtensions })({
     registerTool(tool: Tool) { tools.push(tool); },
     registerCommand(name: string, command: Command) { commands.set(name, command); },
+    registerShortcut(key: string, shortcut: Shortcut) { shortcuts.set(key, shortcut); },
     on(event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) { handlers.set(event, [...handlers.get(event) ?? [], handler]); },
     sendMessage(message: SentMessage["message"], options: SentMessage["options"]) { messages.push({ message, options }); },
     getActiveTools: () => [...ORCHESTRATOR_TOOLS],
   } as unknown as ExtensionAPI);
   const emit = async (event: { type: string; reason: string }, ctx: ExtensionContext) => {
     for (const handler of handlers.get(event.type) ?? []) await handler(event, ctx);
+  };
+  const getCommand = (name: string) => {
+    const command = commands.get(name);
+    assert.ok(command, `command /${name} is registered`);
+    return command;
   };
   return {
     tool(name = "subagents") {
@@ -223,12 +238,17 @@ function loadSubagents(workerExtensions: readonly InlineExtension[]): LoadedSuba
     startSession: (ctx) => emit({ type: "session_start", reason: "startup" }, ctx),
     shutdownSession: (ctx) => emit({ type: "session_shutdown", reason: "quit" }, ctx),
     async runCommand(name, args, ctx) {
-      const command = commands.get(name);
-      assert.ok(command, `command /${name} is registered`);
       const shown: string[] = [];
       const ui = { notify: (text: string) => { shown.push(text); } };
-      await command.handler(args, { ...ctx, hasUI: true, ui } as never);
+      await getCommand(name).handler(args, { ...ctx, hasUI: true, ui } as never);
       return shown;
+    },
+    async runCommandWithUI(name, args, ctx) { await getCommand(name).handler(args, ctx as never); },
+    async commandCompletions(name, prefix) { return getCommand(name).getArgumentCompletions?.(prefix) ?? null; },
+    async runShortcut(key, ctx) {
+      const shortcut = shortcuts.get(key);
+      assert.ok(shortcut, `shortcut ${key} is registered`);
+      await shortcut.handler(ctx);
     },
     messages,
   };
@@ -1689,14 +1709,15 @@ test("Ctrl+C does not stop background workers, and session shutdown aborts them 
     const details = message.details as NoticeDetails;
     assert.equal(details.callId, "call-2");
     assert.deepEqual(details.results.map((result) => result.status), ["aborted", "aborted"]);
-    assert.deepEqual(await subagents.runCommand("subagents", "", ctx), ["No background subagents calls are running."]);
+    // "stop all" is unchanged from before xytd's picker replaced empty args' text notice.
+    assert.deepEqual(await subagents.runCommand("subagents", "stop all", ctx), ["No background subagents calls are running."]);
   } finally {
     for (const finish of pending) finish();
     h.cleanup();
   }
 });
 
-test("/subagents lists background calls with each worker's state, and stops one worker or a whole call", async () => {
+test("/subagents stop is unchanged: it still stops one worker or a whole background call by id, and an unrecognized word (xytd: no longer a usage message) is refused as an unknown direct jump", async () => {
   const h = harness({ orchestrator: { routing: ROUTING, subagents: { maxParallel: 1 } } });
   const pending: (() => void)[] = [];
   try {
@@ -1709,17 +1730,6 @@ test("/subagents lists background calls with each worker's state, and stops one 
     const second = await background("call-2", ["Review the diff", "Run the benchmarks"]);
     await waitFor(() => pending.length === 2, "each call runs its first worker");
 
-    const [listing] = await subagents.runCommand("subagents", "list", ctx);
-    assert.equal(listing, [
-      "Background call call-1: 0/2 workers done",
-      `  ${first.delegationIds[0]} · worker · running · Fix the parser`,
-      `  ${first.delegationIds[1]} · worker · queued · Update the docs`,
-      "",
-      "Background call call-2: 0/2 workers done",
-      `  ${second.delegationIds[0]} · worker · running · Review the diff`,
-      `  ${second.delegationIds[1]} · worker · queued · Run the benchmarks`,
-    ].join("\n"));
-
     // Stopping one worker aborts it; the call's next item then runs.
     assert.deepEqual(await subagents.runCommand("subagents", `stop ${first.delegationIds[0]}`, ctx), [`Stopping worker ${first.delegationIds[0]}.`]);
     await waitFor(() => provider.requests.length === 3, "call-1's second item starts");
@@ -1731,7 +1741,12 @@ test("/subagents lists background calls with each worker's state, and stops one 
     assert.deepEqual(stopped.results.map((result) => result.status), ["aborted", "not-started"]);
 
     assert.deepEqual(await subagents.runCommand("subagents", "stop no-such-id", ctx), ["No running background call or worker has the id no-such-id."]);
-    assert.match((await subagents.runCommand("subagents", "halt", ctx))[0] ?? "", /^Usage: \/subagents/);
+    // Before xytd, an unrecognized word such as a bare "list" fell through backgroundCalls.command
+    // to a fixed usage string; now it is tried as a direct jump like any other ref and refused by name.
+    assert.deepEqual(await subagents.runCommand("subagents", "list", ctx),
+      ["No worker of this session has the delegation id list. /subagents lists every worker."]);
+    assert.deepEqual(await subagents.runCommand("subagents", "halt", ctx),
+      ["No worker of this session has the delegation id halt. /subagents lists every worker."]);
 
     pending.at(-1)!();
     await waitFor(() => subagents.messages.length === 2, "call-1's notice is in");
@@ -2255,5 +2270,173 @@ test("x in the transcript view stops a nested worker alone: its parent hears it 
     assert.equal(view.header(), "worker · aborted · worker 2 of 2");
     view.press("\x1b");
     await view.closed;
+  } finally { h.cleanup(); }
+});
+
+
+// The ways in (xytd): alt+a, the /subagents picker and its direct jumps.
+// Every opener goes through the same ctx.ui.custom pi mounts a component with,
+// so one fake stands in for the picker's overlay, the focus overlay and the
+// transcript view alike; a test drives it with pi's own keybindings manager,
+// never raw bytes, matching openView above.
+
+/** ctx.ui.custom as pi mounts it, generalised over every opener: the picker,
+ *  alt+a's focus overlay and the transcript view all reach it the same way. */
+function fakeCustomUI() {
+  const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as unknown as Theme;
+  let mounted: { render(width: number): string[]; handleInput(data: string): void; dispose?(): void } | undefined;
+  let opens = 0;
+  const ui = {
+    custom: (async (factory: (...args: unknown[]) => unknown) => new Promise<unknown>((resolve) => {
+      opens++;
+      const component = factory({ terminal: { rows: 40 }, requestRender() {} }, plainTheme, new KeybindingsManager(), (result: unknown) => {
+        mounted = undefined;
+        (component as { dispose?(): void }).dispose?.();
+        resolve(result);
+      }) as typeof mounted;
+      mounted = component;
+    })) as never,
+  };
+  return {
+    ui,
+    get opens() { return opens; },
+    get open() { return mounted !== undefined; },
+    lines: (width = 200) => mounted!.render(width).map((line) => line.trimEnd()),
+    press(...keys: string[]) { for (const key of keys) mounted!.handleInput(key); },
+  };
+}
+
+test("/subagents with no arguments opens the picker of every worker when there is a UI, and Esc leaves without opening one; without a UI it lists every worker as text, replacing the old background-only notice", async () => {
+  const h = harness();
+  const pending: (() => void)[] = [];
+  try {
+    const provider = fakeAnthropic("done", (finish) => pending.push(finish));
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h).ctx;
+    await subagents.tool().execute("call-1", { items: [{ task: "Unique widget marker one" }], background: true } as never, undefined, undefined, ctx);
+    await waitFor(() => pending.length === 1, "the worker is running");
+
+    const screen = fakeCustomUI();
+    const opening = subagents.runCommandWithUI("subagents", "", { ...ctx, hasUI: true, ui: screen.ui } as unknown as ExtensionContext);
+    assert.equal(screen.opens, 1, "the picker opened, not the old background-only text notice");
+    assert.ok(screen.lines().some((line) => line.includes("Workers of this session")), screen.lines().join("\n"));
+    assert.ok(screen.lines().some((line) => line.includes("Unique widget marker one")), "every worker of the session, not only background calls");
+    screen.press("\x1b");
+    await opening;
+    assert.equal(screen.opens, 1, "Esc left without opening a transcript next");
+
+    const shown: string[] = [];
+    const noUI = { notify: (text: string) => { shown.push(text); } };
+    await subagents.runCommandWithUI("subagents", "", { ...ctx, hasUI: false, ui: noUI } as unknown as ExtensionContext);
+    assert.equal(shown.length, 1);
+    assert.match(shown[0]!, /Unique widget marker one/, "the same full listing as text, where there is no UI to pick in");
+  } finally {
+    for (const finish of pending) finish();
+    h.cleanup();
+  }
+});
+
+test("/subagents <list number> and /subagents <delegation id> open that worker's transcript directly, with no picker in between; an unrecognized ref is refused", async () => {
+  const h = harness();
+  const pending: (() => void)[] = [];
+  try {
+    const provider = fakeAnthropic("done", (finish) => pending.push(finish));
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h).ctx;
+    const before = workerBoard().workers().length;
+    const started = (await subagents.tool().execute("call-1", { items: [{ task: "Direct jump target" }], background: true } as never,
+      undefined, undefined, ctx)).details as BackgroundStart;
+    await waitFor(() => pending.length === 1, "the worker is running");
+    const listNumber = String(before + 1);
+
+    const byNumber = fakeCustomUI();
+    const openingByNumber = subagents.runCommandWithUI("subagents", listNumber, { ...ctx, hasUI: true, ui: byNumber.ui } as unknown as ExtensionContext);
+    assert.equal(byNumber.opens, 1, "the transcript opened directly by list number");
+    byNumber.press("\x1b");
+    await openingByNumber;
+
+    const byDelegation = fakeCustomUI();
+    const openingByDelegation = subagents.runCommandWithUI("subagents", started.delegationIds[0]!, { ...ctx, hasUI: true, ui: byDelegation.ui } as unknown as ExtensionContext);
+    assert.equal(byDelegation.opens, 1, "the transcript opened directly by delegation id");
+    byDelegation.press("\x1b");
+    await openingByDelegation;
+
+    const shown: string[] = [];
+    const refusing = { notify: (text: string, kind?: string) => { shown.push(`${kind}:${text}`); } };
+    await subagents.runCommandWithUI("subagents", "not-a-worker", { ...ctx, hasUI: true, ui: refusing } as unknown as ExtensionContext);
+    assert.deepEqual(shown, ["warning:No worker of this session has the delegation id not-a-worker. /subagents lists every worker."]);
+  } finally {
+    for (const finish of pending) finish();
+    h.cleanup();
+  }
+});
+
+test("alt+a focuses the worker widget for the orchestrator's session; Enter opens the focused worker's transcript, and a worker session's own alt+a does nothing", async () => {
+  const h = harness();
+  const pending: (() => void)[] = [];
+  try {
+    const provider = fakeAnthropic("done", (finish) => pending.push(finish));
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as unknown as Theme;
+    let widget: { render(width: number): string[] } | undefined;
+    const custom = fakeCustomUI();
+    const ui = {
+      ...custom.ui,
+      notify() {},
+      setWidget(_key: string, content: unknown) {
+        widget = (content as ((tui: unknown, theme: unknown) => typeof widget) | undefined)?.({ requestRender() {} }, plainTheme);
+      },
+    };
+    const ctx = { ...main.ctx, hasUI: true, ui } as unknown as ExtensionContext;
+    await subagents.startSession(ctx);
+    await subagents.tool().execute("call-1", { items: [{ task: "Alt-a focus target" }], background: true } as never, undefined, undefined, ctx);
+    await waitFor(() => pending.length === 1, "a worker is running for the widget to show");
+    assert.ok(widget, "the widget is shown while a worker runs");
+
+    const focusing = subagents.runShortcut("alt+a", ctx);
+    assert.equal(custom.opens, 1, "alt+a opened the widget's focus overlay");
+    custom.press("\r");
+    // The overlay's Enter resolves the focus; the shortcut's own continuation
+    // (opening the transcript) runs on the next microtask, before the overlay
+    // it opens is ever closed, so it cannot be awaited yet.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(custom.opens, 2, "Enter opened the chosen worker's transcript next");
+    custom.press("\x1b");
+    await focusing;
+
+    // A worker's own copy of this extension shows no widget (session_start
+    // guards it), so its alt+a is a no-op even though the shortcut is registered.
+    const unmark = markWorkerSession(ctx.sessionManager.getSessionId());
+    try {
+      await subagents.runShortcut("alt+a", ctx);
+      assert.equal(custom.opens, 2, "no widget to focus in a worker's own session");
+    } finally { unmark(); }
+
+    await subagents.shutdownSession(ctx);
+  } finally {
+    for (const finish of pending) finish();
+    h.cleanup();
+  }
+});
+
+test("the /subagents command's argument completions offer stop and every worker's list number", async () => {
+  const h = harness();
+  try {
+    const provider = fakeAnthropic("done");
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h).ctx;
+    const before = workerBoard().workers().length;
+    await callSubagents(subagents.tool(), ctx, "Completion target");
+    const listNumber = String(before + 1);
+
+    const all = await subagents.commandCompletions("subagents", "");
+    assert.ok(all?.some((item) => item.value === "stop"));
+    assert.ok(all?.some((item) => item.value === listNumber), JSON.stringify(all));
+
+    const stopOnly = await subagents.commandCompletions("subagents", "st");
+    assert.deepEqual(stopOnly?.map((item) => item.value), ["stop"]);
+
+    assert.equal(await subagents.commandCompletions("subagents", "zzz-no-match"), null);
   } finally { h.cleanup(); }
 });
