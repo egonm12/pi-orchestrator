@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { after, test } from "node:test";
@@ -3271,6 +3271,77 @@ test("in a git repository, a change made while two workers ran counts for each o
     const later = await runItems(subagents, main.ctx, "call-later", [runTask("bash", { command: "node -e \"console.log(2)\"" })]);
     assert.equal(later.results[0]!.edited, undefined);
   } finally {
+    repo.cleanup();
+    h.cleanup();
+  }
+});
+
+/** A `git` first on PATH that logs its arguments and fails `git status` while
+ *  `failing` exists, and otherwise runs the real git. */
+function failingGitStatus(dir: string) {
+  const realGit = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+  const bin = join(dir, "bin");
+  const log = join(dir, "git-args.log");
+  const failing = join(dir, "fail-status");
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(bin, "git"), [
+    "#!/bin/sh",
+    `echo "GIT_OPTIONAL_LOCKS=$GIT_OPTIONAL_LOCKS $*" >> '${log}'`,
+    `case " $* " in *" status "*) if [ -f '${failing}' ]; then echo 'fatal: index.lock exists' >&2; exit 128; fi;; esac`,
+    `exec '${realGit}' "$@"`,
+    "",
+  ].join("\n"));
+  chmodSync(join(bin, "git"), 0o755);
+  const path = process.env.PATH;
+  process.env.PATH = `${bin}:${path ?? ""}`;
+  return {
+    failing,
+    /** Each `git status` this git ran, as `GIT_OPTIONAL_LOCKS=<value> <arguments>`. */
+    statusCalls: () => (existsSync(log) ? readFileSync(log, "utf8") : "").split("\n").filter((line) => / status( |$)/.test(line)),
+    restore: () => { process.env.PATH = path; },
+  };
+}
+
+test("in a git repository, git status runs without optional locks, and when it fails as a worker starts or ends the worker completes and the command rule decides", async () => {
+  const h = routedHarness();
+  const repo = createTempRepo();
+  const git = failingGitStatus(h.agentDir);
+  try {
+    const provider = scriptedAnthropic(runningScript);
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const main = orchestratorIn(h, repo.dir);
+    // Overlapping workers can git add or commit: a snapshot takes no index.lock.
+    const snapshots = await runItems(subagents, main.ctx, "call-locks", [runTask("bash", { command: "cat README.md" })]);
+    assert.equal(snapshots.results[0]!.edited, undefined);
+    const calls = git.statusCalls();
+    assert.equal(calls.length, 2, calls.join("\n"));
+    for (const call of calls) assert.match(call, /^GIT_OPTIONAL_LOCKS=0 |--no-optional-locks status /, call);
+
+    // git status fails as the workers start: the command rule decides.
+    writeFileSync(git.failing, "");
+    const atStart = await runItems(subagents, main.ctx, "call-fail-start", [
+      runTask("bash", { command: "cat README.md" }),
+      runTask("bash", { command: "echo notes > notes.md" }),
+    ]);
+    assert.deepEqual(atStart.results.map((worker) => worker.edited), [undefined, true]);
+    assert.deepEqual(atStart.texts.map((text) => text.includes(EDITED_LINE)), [false, true], atStart.texts.join("\n---\n"));
+    rmSync(git.failing);
+    rmSync(join(repo.dir, "notes.md"));
+
+    // git status fails as the workers end: the command rule decides.
+    const go = join(h.agentDir, "go");
+    const reader = runTask("bash", { command: `while ! test -f ${go}; do sleep 0.01; done; cat README.md` });
+    const writer = runTask("bash", { command: `while ! test -f ${go}; do sleep 0.01; done; echo notes > notes.md` });
+    const call = runItems(subagents, main.ctx, "call-fail-end", [reader, writer]);
+    await waitFor(() => [reader, writer].every((task) => provider.requests.some((request) => request.task === task)), "both workers' first requests");
+    writeFileSync(git.failing, "");
+    writeFileSync(go, "");
+    const atEnd = await call;
+    assert.deepEqual(atEnd.results.map((worker) => worker.edited), [undefined, true]);
+    assert.deepEqual(atEnd.texts.map((text) => text.includes(EDITED_LINE)), [false, true], atEnd.texts.join("\n---\n"));
+    assert.deepEqual(editRecords(h).map((record) => record.tool), ["bash", "bash"], "command-rule edit records, no working-tree record");
+  } finally {
+    git.restore();
     repo.cleanup();
     h.cleanup();
   }

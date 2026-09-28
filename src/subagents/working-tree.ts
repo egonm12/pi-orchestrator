@@ -44,14 +44,17 @@ function fingerprint(file: string): string {
 }
 
 /** The working tree of the repository `cwd` is in, or `undefined` when `cwd`
- *  is in no git repository or git cannot be run there. */
+ *  is in no git repository, git cannot be run there or git status fails. */
 export function snapshotWorkingTree(cwd: string): TreeSnapshot | undefined {
   let root: string;
   try { root = git(cwd, ["rev-parse", "--show-toplevel"]).trim(); } catch { return undefined; }
   if (root === "") return undefined;
   let head: string | undefined;
   try { head = git(root, ["rev-parse", "-q", "--verify", "HEAD"]).trim() || undefined; } catch { head = undefined; }
-  const status = git(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames", "--ignore-submodules=none"]);
+  // Overlapping workers can git add or commit: git status must not take index.lock to refresh the index.
+  let status: string;
+  // A failed status, as a lock or a corrupt index, leaves the tree unknown: the command rule decides.
+  try { status = git(root, ["--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames", "--ignore-submodules=none"]); } catch { return undefined; }
   const paths = new Map<string, string>();
   // Each entry is `XY path`, NUL-terminated; without renames there is no second path.
   for (const entry of status.split("\0")) {

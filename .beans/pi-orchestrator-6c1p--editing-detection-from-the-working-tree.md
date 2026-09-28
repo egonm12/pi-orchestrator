@@ -43,3 +43,9 @@ None, can start immediately.
 - `src/subagents/extension.ts`, `src/subagents/tool-call-kind.ts`: stale comments fixed (commit and push are no longer held back; the exploration nudge replaced the budget).
 - README: Verdicts and Reviewers describe the working-tree rule, the extra edit record and the file list.
 - Tests (`src/subagents/extension.test.ts`, routedHarness with createTempRepo): bash that changed nothing, bash that changed the tree with the reviewer's file list, edit and write outside the repository, two overlapping workers, and no repository.
+
+## Review follow-up
+
+- `src/subagents/working-tree.ts`: `git status` runs as `git --no-optional-locks status`, so a snapshot takes no `index.lock` while an overlapping worker runs `git add` or `git commit`. A failed `git status` makes the snapshot `undefined`, at the start or the end, so the worker completes and the command rule decides for that run, as without a repository.
+- README (Verdicts): says the snapshot takes no optional locks and that the command rule decides when either snapshot fails.
+- Test (`src/subagents/extension.test.ts`, routedHarness with createTempRepo and a logging `git` wrapper first on PATH): every snapshot's `git status` carries `--no-optional-locks`; with `git status` failing as the workers start, and as they end, both workers complete, `cat` is not editing, `echo > notes.md` is editing by the command rule, and only `bash` edit records are written.
