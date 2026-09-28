@@ -111,12 +111,14 @@ export function fixtureRoute(
   tier: RiskTier,
   tierMap: ResolvedTierMap = fixtureTierMap(),
   providerUsage: Readonly<Record<string, ProviderUsage>> = { "openai-codex": { state: "out-of-usage", detail: "fixture" } },
+  providerCounts: Readonly<Record<string, number>> = {},
 ): TierRouteDecision {
   return routeTier({
     tier,
     tierMap,
     evidence: {
       providerUsage,
+      providerCounts,
       catalog,
       estimatedPromptTokens: 20_000,
       allowance: NO_BUDGET_CONSTRAINT,

@@ -429,7 +429,7 @@ pi-orchestrator settings live under the `orchestrator` key in personal settings,
       "classifier": { "model": "anthropic/claude-haiku-4-5:off", "timeoutMs": 30000, "fallback": [] },
       "tiers": {
         "mechanical": ["anthropic/claude-haiku-4-5:low"],
-        "standard": ["anthropic/claude-sonnet-5:medium"],
+        "standard": { "order": "ordered", "rungs": ["anthropic/claude-sonnet-5:medium"] },
         "elevated": ["anthropic/claude-opus-5:high"],
         "critical": ["anthropic/claude-opus-5:xhigh"]
       }
@@ -445,13 +445,13 @@ pi-orchestrator settings live under the `orchestrator` key in personal settings,
 | `routing.enabled` | `true` switches routing on. Absent or `false`: a worker on the auto model runs on the orchestrator's session model without a decision record |
 | `routing.mode` | `shadow` (the default) records a shadow decision while the worker runs on the orchestrator's session model. `live` runs the worker on the chosen rung |
 | `routing.classifier` | The model that classifies each task, with its timeout and fallbacks. Every rung must name an installed model |
-| `routing.tiers` | Four tiers, each a list of `provider/model:effort` rungs tried in order |
+| `routing.tiers` | Four tiers, each a list of `provider/model:effort` rungs, or an object with `rungs` and optional `order`: `balanced` (default) or `ordered`. A project tier replaces the personal tier, including its order |
 
 A project's `.pi/settings.json` may replace individual tiers under `orchestrator.routing.tiers`, and, when personal settings switch `orchestrator.subagents.allowProjectOverrides` on, `orchestrator.subagents` keys; nothing else. A project cannot change either ban list. The guard logs each ignored key once.
 
 ### How routing decides
 
-A worker started on the auto model is identified by its pi session id (its delegation id). The router extension classifies its first request from the task text, agent role and named file paths. The task text is the first user message, the delegated prompt; context that other extensions append to the request is not part of it. Keyword signals (credentials, security, destructive operations) set a minimum tier. The first rung that passes the hard filters (subagent ban list, allowed-model list, installed model, approved recipient, usage limits, context window and task allowance) is chosen. If no rung survives, routing escalates through higher tiers, then refuses.
+A worker started on the auto model is identified by its pi session id (its delegation id). The router extension classifies its first request from the task text, agent role and named file paths. The task text is the first user message, the delegated prompt; context that other extensions append to the request is not part of it. Keyword signals (credentials, security, destructive operations) set a minimum tier. The hard filters (subagent ban list, allowed-model list, installed model, approved recipient, usage limits, context window and task allowance) remove ineligible rungs. Among the survivors of one tier, `balanced` chooses the provider with the fewest pinned delegations in the previous 5 hours, across the owner's sessions, projects and tiers. Only live pinned rungs count, including earlier workers in a parallel fan-out; shadow recommendations do not. List order breaks ties. `ordered` keeps first-survivor preference. If no rung survives, routing escalates through higher tiers, then refuses. The effort ladder still tries a higher effort on the same model before the next listed rungs and higher tiers.
 
 pi-orchestrator can set routing constraints for one worker, by its session id, before its first request. A reviewer gets a minimum tier and an excluded rung (see Reviewers above):
 

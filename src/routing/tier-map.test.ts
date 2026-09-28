@@ -143,6 +143,24 @@ test("a tier listing three rungs from three providers loads all three in order",
   assert.deepEqual(map!.drops, []);
 });
 
+test("tier order defaults to balanced and a project tier replaces the personal order", () => {
+  const personal = { orchestrator: { ...OWNER_BAN_LIST_SETTINGS, routing: { enabled: true, tiers: { ...EXAMPLE_TIERS, standard: { order: "ordered", rungs: EXAMPLE_TIERS.standard } } } } };
+  const project = projectTiers({ standard: { rungs: [...EXAMPLE_TIERS.standard].reverse() } });
+  const map = tierMapFromSettings(personal, project, INPUTS);
+  assert.ok(map);
+  assert.equal(map.orders.mechanical, "balanced");
+  assert.equal(map.orders.standard, "balanced");
+  assert.deepEqual(map.tiers.standard.map((rung) => rung.rung), [...EXAMPLE_TIERS.standard].reverse());
+  assert.equal(tierMapFromSettings(personal, undefined, INPUTS)?.orders.standard, "ordered");
+  assert.equal(loadFromFiles(personal, project)?.orders.standard, "balanced");
+});
+
+test("a dropped project tier inherits the personal rungs and order, and an invalid order fails closed", () => {
+  const personal = { orchestrator: { ...OWNER_BAN_LIST_SETTINGS, routing: { enabled: true, tiers: { ...EXAMPLE_TIERS, standard: { order: "ordered", rungs: EXAMPLE_TIERS.standard } } } } };
+  assert.equal(tierMapFromSettings(personal, projectTiers({ standard: { order: "balanced", rungs: ["anthropic/claude-fable-5:medium"] } }), INPUTS)?.orders.standard, "ordered");
+  assert.throws(() => tierMapFromSettings(personal, projectTiers({ standard: { order: "random", rungs: EXAMPLE_TIERS.standard } }), INPUTS), /orchestrator.routing.tiers.standard.order/);
+});
+
 // ---------------------------------------------------------------------------
 // Project override (story 9)
 // ---------------------------------------------------------------------------
@@ -537,7 +555,7 @@ test("the resolved map is a plain frozen value with per-rung origin and the full
   assert.ok(map);
   assert.deepEqual(JSON.parse(JSON.stringify(map)), map);
   assert.deepEqual(structuredClone(map), map);
-  assert.deepEqual(Object.keys(map), ["tiers", "drops", "ignoredProjectKeys"]);
+  assert.deepEqual(Object.keys(map), ["tiers", "orders", "drops", "ignoredProjectKeys"]);
 
   const frozen = (value: unknown): boolean =>
     typeof value !== "object" || value === null || (Object.isFrozen(value) && Object.values(value).every(frozen));

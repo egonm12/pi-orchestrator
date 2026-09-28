@@ -16,12 +16,12 @@ import { RISK_TIERS, type RiskTier } from "./classifier.ts";
 import type { RemovalReason } from "./skip-reasons.ts";
 import type { ResolvedTierMap, TierRung } from "./tier-map.ts";
 
-// Ticket 24, ADR 0001: the router core.
+// Ticket 24, ADR 0001 and ADR 0012: the router core.
 //
 //   stage 1  the classified tier's rungs, in map order, through the hard
 //            filters. Every removed rung carries its reason and a detail.
-//   stage 2  the first survivor. No score, no cost, no preference beyond the
-//            owner's order.
+//   stage 2  the least-used provider among survivors in balanced order, with
+//            list order breaking ties; ordered tiers take the first survivor.
 //
 // A worker's routing constraints narrow this: a minimum tier raises the tier
 // stage 1 starts at, an excluded rung fails stage 1 in every tier, and a
@@ -44,6 +44,8 @@ export interface ProviderUsage {
 export interface RouterEvidence {
   /** Keyed by provider, as `providerOf` spells it. */
   readonly providerUsage: Readonly<Record<string, ProviderUsage>>;
+  /** Pinned delegations in the rolling window, per provider. Unknown providers count as zero. */
+  readonly providerCounts?: Readonly<Record<string, number>>;
   /** Read for `contextWindow` only. */
   readonly catalog: ModelCatalog;
   readonly estimatedPromptTokens: number;
@@ -113,10 +115,13 @@ export interface RemovedRung {
 export interface TierRouteChoice {
   readonly ok: true;
   readonly refused: false;
-  /** The first survivor of `tier`, in map order. */
+  /** The chosen survivor of `tier`. */
   readonly rung: TierRung;
+  readonly tierOrder?: "balanced" | "ordered";
+  /** Counts behind a balanced choice, for providers that survived the filters. */
+  readonly providerCounts?: Readonly<Record<string, number>>;
   readonly model: string;
-  /** Every survivor of `tier`, in map order; `rung` is the first. */
+  /** Every survivor of `tier`, in map order. */
   readonly survivors: readonly TierRung[];
   /** The tier routing started at: the classified tier, or a minimum tier
    *  above it. */
@@ -294,11 +299,24 @@ export function routeTier(input: TierRouteInput): TierRouteDecision {
     }
     const [first] = survivors;
     if (first !== undefined) {
+      const tierOrder = input.tierMap.orders[tier];
+      const providerCounts: Record<string, number> = {};
+      if (tierOrder === "balanced") {
+        for (const rung of survivors) {
+          const provider = providerOf(rung.model);
+          providerCounts[provider] = evidence.providerCounts?.[provider] ?? 0;
+        }
+      }
+      // A future per-provider weight can be added to this score without changing filtering or tier escalation.
+      const score = (rung: TierRung) => providerCounts[providerOf(rung.model)] ?? 0;
+      const chosen = tierOrder === "ordered" ? first : survivors.reduce((best, rung) => score(rung) < score(best) ? rung : best, first);
       return Object.freeze({
         ok: true,
         refused: false,
-        rung: first,
-        model: first.model,
+        rung: chosen,
+        tierOrder,
+        ...(tierOrder === "balanced" ? { providerCounts: Object.freeze(providerCounts) } : {}),
+        model: chosen.model,
         survivors: Object.freeze(survivors),
         startedAtTier: input.tier,
         tier,

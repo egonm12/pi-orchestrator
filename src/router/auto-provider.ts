@@ -147,6 +147,14 @@ function recordLimitError(deps: AutoProviderDependencies, provider: string, text
 
 export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConfig {
   const pins = new Map<string, ServedPin>();
+  // Classifiers can finish together in a fan-out. Keep reading counts, choosing
+  // and appending one pin in one turn before the next worker chooses.
+  let routingQueue: Promise<void> = Promise.resolve();
+  function serializeRouting(work: () => Promise<void>): Promise<void> {
+    const next = routingQueue.then(work, work);
+    routingQueue = next.catch(() => {});
+    return next;
+  }
   return {
     name: "Orchestrator auto", baseUrl: "http://localhost/unused", apiKey: "unused", api: "orchestrator-auto" as never,
     models: [{ id: "auto", name: "Orchestrator auto", reasoning: true, input: ["text", "image"],
@@ -165,44 +173,48 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
           let pin: ServedPin | undefined = resumePins().get(sessionId) ?? pins.get(sessionId);
           wasPinned = pin !== undefined;
           if (!pin) {
-            const router = deps.disabled() ? undefined : deps.router();
-            const constraints = routingConstraints().get(sessionId);
-            if (!router) pin = fallbackPin(deps.banLists(), constraints, "allowed");
-            else {
-              try {
-                const at = deps.now();
-                const { taskText, agentRole } = firstTaskAndRole(context);
-                const latest = router.mode === "live" ? latestDecision(router.recordDir, sessionId) : undefined;
-                // A decision made under other constraints could restore a rung these exclude.
-                if (latest?.mode === "live" && latest.route.outcome === "chosen" &&
-                  (latest.ranOn === undefined || latest.ranOn === `${latest.route.rung.model}:${latest.route.rung.effort}`) &&
-                  madeUnderConstraints(latest, constraints) &&
-                  recordedRungPassesHardFilters(router, latest.route.rung, taskText, at, constraints)) {
-                  pin = { model: latest.route.rung.model, effort: latest.route.rung.effort, ...escalationOf(latest.route) };
-                } else {
-                  const { classification, route, providerUsage } = await routeTask(router, taskText, agentRole, at, constraints);
-                  pin = router.mode === "shadow" ? fallbackPin(router.banLists, constraints, "allowed")
-                    : !route.ok ? fallbackPin(router.banLists, constraints, "refused", providerUsage)
-                    : { model: route.rung.model, effort: route.rung.effort, ...escalationOf(route) };
-                  const ranOn = `${pin.model}:${pin.effort}`;
-                  const parentDelegationId = parentDelegationOf(sessionId);
-                  const reviewedDelegationId = reviewedDelegationOf(sessionId);
-                  const common = { delegationId: sessionId, at, taskText, agentRole, classification, tierMap: router.tierMap, route, ranOn,
-                    ...(parentDelegationId === undefined ? {} : { parentDelegationId }), ...(constraints === undefined ? {} : { constraints }),
-                    ...(reviewedDelegationId === undefined ? {} : { reviewedDelegationId }) };
-                  appendRoutingRecord(router.recordDir, buildDecisionRecord(router.mode === "shadow"
-                    ? { ...common, mode: "shadow", handPickedModel: pin.model }
-                    : { ...common, mode: "live" }));
+            await serializeRouting(async () => {
+              const router = deps.disabled() ? undefined : deps.router();
+              const constraints = routingConstraints().get(sessionId);
+              if (!router) pin = fallbackPin(deps.banLists(), constraints, "allowed");
+              else {
+                try {
+                  const at = deps.now();
+                  const { taskText, agentRole } = firstTaskAndRole(context);
+                  const latest = router.mode === "live" ? latestDecision(router.recordDir, sessionId) : undefined;
+                  // A decision made under other constraints could restore a rung these exclude.
+                  if (latest?.mode === "live" && latest.route.outcome === "chosen" &&
+                    (latest.ranOn === undefined || latest.ranOn === `${latest.route.rung.model}:${latest.route.rung.effort}`) &&
+                    madeUnderConstraints(latest, constraints) &&
+                    recordedRungPassesHardFilters(router, latest.route.rung, taskText, at, constraints)) {
+                    pin = { model: latest.route.rung.model, effort: latest.route.rung.effort, ...escalationOf(latest.route) };
+                  } else {
+                    const { classification, route, providerUsage } = await routeTask(router, taskText, agentRole, at, constraints);
+                    pin = router.mode === "shadow" ? fallbackPin(router.banLists, constraints, "allowed")
+                      : !route.ok ? fallbackPin(router.banLists, constraints, "refused", providerUsage)
+                      : { model: route.rung.model, effort: route.rung.effort, ...escalationOf(route) };
+                    const ranOn = `${pin.model}:${pin.effort}`;
+                    const parentDelegationId = parentDelegationOf(sessionId);
+                    const reviewedDelegationId = reviewedDelegationOf(sessionId);
+                    const common = { delegationId: sessionId, at, taskText, agentRole, classification, tierMap: router.tierMap, route, ranOn,
+                      ...(parentDelegationId === undefined ? {} : { parentDelegationId }), ...(constraints === undefined ? {} : { constraints }),
+                      ...(reviewedDelegationId === undefined ? {} : { reviewedDelegationId }) };
+                    appendRoutingRecord(router.recordDir, buildDecisionRecord(router.mode === "shadow"
+                      ? { ...common, mode: "shadow", handPickedModel: pin.model }
+                      : { ...common, mode: "live" }));
+                  }
+                } catch (error) {
+                  // An unavailable or banned session model is a refusal, not a router bug.
+                  if (error instanceof SessionModelError) throw error;
+                  deps.disable(error);
+                  pin = fallbackPin(deps.banLists(), constraints, "allowed");
                 }
-              } catch (error) {
-                // An unavailable or banned session model is a refusal, not a router bug.
-                if (error instanceof SessionModelError) throw error;
-                deps.disable(error);
-                pin = fallbackPin(deps.banLists(), constraints, "allowed");
               }
-            }
-            pins.set(sessionId, pin);
+              if (!pin) throw new Error("auto model could not pin a rung");
+              pins.set(sessionId, pin);
+            });
           }
+          if (!pin) throw new Error("auto model could not pin a rung");
           probeRung = `${pin.model}:${pin.effort}`;
           const slash = pin.model.indexOf("/");
           const rung = registry.find(pin.model.slice(0, slash), pin.model.slice(slash + 1));

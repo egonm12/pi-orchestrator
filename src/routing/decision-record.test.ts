@@ -122,6 +122,8 @@ test("one shadow write and one live write leave exactly two records, each carryi
       assert.deepEqual(classification.hops.map((hop) => [hop.hop, hop.outcome]), [["openai-codex/gpt-6-luna:low", "decided"]]);
       // The resolved map, unchanged: per-rung origin, every drop, ignored keys.
       assert.deepEqual(record.tierMap, JSON.parse(JSON.stringify(fixtureTierMap())));
+      assert.equal(record.tierMap.orders?.standard, "balanced");
+      assert.equal(record.route.outcome === "chosen" && record.route.tierOrder, "balanced");
       assert.equal(record.tierMap.tiers.elevated[0]?.origin, "project");
       assert.equal(record.tierMap.tiers.standard[0]?.origin, "personal");
       assert.deepEqual(record.tierMap.drops.map((drop) => drop.reason), ["subagent ban list"]);
@@ -140,6 +142,21 @@ test("one shadow write and one live write leave exactly two records, each carryi
   } finally {
     cleanup();
   }
+});
+
+test("a balanced choice records the provider counts that selected it", async () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    const map = fixtureTierMap();
+    const route = fixtureRoute("standard", map, {}, { "openai-codex": 4, anthropic: 1 });
+    const { record } = writeDecisionRecord(dir, await liveInput({ tierMap: map, route, ranOn: route.ok ? route.rung.rung : SONNET }));
+    assert.equal(record.route.outcome, "chosen");
+    if (record.route.outcome === "chosen") {
+      assert.equal(record.route.tierOrder, "balanced");
+      assert.deepEqual(record.route.providerCounts, { "openai-codex": 4, anthropic: 1 });
+    }
+    assert.deepEqual(readRoutingRecords(dir), [record]);
+  } finally { cleanup(); }
 });
 
 test("an escalation and a refusal are both recorded with the tiers tried and every removed rung", async () => {

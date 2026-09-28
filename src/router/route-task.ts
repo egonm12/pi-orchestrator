@@ -8,7 +8,29 @@ import { nextRungAfterFailure, type FailedDecision, type LadderDecision } from "
 import { isAtLeastTier } from "../routing/classifier.ts";
 import { deriveProviderUsage, type RoutingEvidence, type RoutingEvidenceSource } from "./evidence.ts";
 import { readUsageObservations, usageLimits } from "./usage-observations.ts";
-import type { RoutingMode } from "../routing/decision-record.ts";
+import { readUsableRoutingRecords, type RoutingMode } from "../routing/decision-record.ts";
+import { providerOf } from "../recipients/authorized-delegation.ts";
+
+const BALANCING_WINDOW_MS = 5 * 60 * 60 * 1000;
+
+/** Global decisions are written when a rung is pinned, before the next worker
+ * routes. Only live, chosen rungs count; shadow and refusals did not pin the
+ * recommendation. The folder is shared across the owner's sessions/projects. */
+function pinnedProviderCounts(dir: string, at: Date): Readonly<Record<string, number>> {
+  const counts: Record<string, number> = {};
+  const seen = new Set<string>();
+  for (const record of readUsableRoutingRecords(dir)) {
+    if (record.recordType !== "decision" || record.mode !== "live" || record.route.outcome !== "chosen") continue;
+    const timestamp = Date.parse(record.timestamp);
+    if (timestamp < at.getTime() - BALANCING_WINDOW_MS || timestamp > at.getTime() || seen.has(record.delegationId)) continue;
+    const pinned = `${record.route.rung.model}:${record.route.rung.effort}`;
+    if (record.ranOn !== pinned && !(record.ranOn === undefined && record.schemaVersion === "decision-record/2")) continue;
+    seen.add(record.delegationId);
+    const provider = providerOf(record.route.rung.model);
+    counts[provider] = (counts[provider] ?? 0) + 1;
+  }
+  return counts;
+}
 
 export interface ActiveRouter {
   readonly mode: RoutingMode;
@@ -79,7 +101,8 @@ export async function routeTask(router: ActiveRouter, taskText: string, agentRol
   const filters = hardFilterEvidence(router, taskText, at, evidence, constraints);
   const { minimumTier, forcedRung } = constraints;
   const tier = minimumTier === undefined || isAtLeastTier(classification.tier, minimumTier) ? classification.tier : minimumTier;
-  const route = forcedRung === undefined ? routeTier({ tier, tierMap: router.tierMap, evidence: filters }) : routeForcedRung(forcedRung, filters);
+  const route = forcedRung === undefined ? routeTier({ tier, tierMap: router.tierMap,
+    evidence: { ...filters, providerCounts: pinnedProviderCounts(router.recordDir, at) } }) : routeForcedRung(forcedRung, filters);
   return { classification, route, providerUsage: filters.providerUsage };
 }
 
@@ -88,5 +111,6 @@ export async function routeTask(router: ActiveRouter, taskText: string, agentRol
  *  Throws when the failed rung has no position in the tier map. */
 export function climbEffortLadder(router: ActiveRouter, failed: FailedDecision, taskText: string, at: Date): LadderDecision {
   const evidence = hardFilterEvidence(router, taskText, at, router.evidence(), {});
-  return nextRungAfterFailure({ failed, tierMap: router.tierMap, installedModels: router.installedModels, evidence });
+  return nextRungAfterFailure({ failed, tierMap: router.tierMap, installedModels: router.installedModels,
+    evidence: { ...evidence, providerCounts: pinnedProviderCounts(router.recordDir, at) } });
 }

@@ -15,7 +15,8 @@ import { INSTALLED_MODEL_IDS } from "../fixtures/installed-models.ts";
 import { INSTALLED_MODEL_INFO } from "../fixtures/installed-model-info.ts";
 import { resetBanLists } from "../policy/ban-lists.ts";
 import { authorizeRecipient, emptyAuthorization, grantOwnerApproval, type RecipientAuthorization } from "../recipients/authorization.ts";
-import { readRoutingRecords, type RoutingRecord } from "../routing/decision-record.ts";
+import { readRoutingRecords, writeDecisionRecord, type RoutingRecord } from "../routing/decision-record.ts";
+import { fixtureClassification, fixtureRoute, fixtureTierMap } from "../fixtures/routing-decision.ts";
 import { answerEvents, errorEvents, fakeSessionRegistry, assistantMessage } from "../fixtures/session-model-registry.ts";
 import { SettingsManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { TestContext as ExtensionContext } from "../fixtures/extension-context.ts";
@@ -538,6 +539,85 @@ test("shadow mode runs on the session model but records the chosen rung", async 
     assert.equal(record?.recordType === "decision" && record.route.outcome === "chosen" && record.route.rung.rung, `${HAIKU}:low`);
     assert.equal(record?.recordType === "decision" && record.handPickedModel, "anthropic/claude-sonnet-5");
     assert.equal(record?.recordType === "decision" && record.ranOn, "anthropic/claude-sonnet-5:high");
+  } finally { h.cleanup(); }
+});
+
+async function seedDecision(h: Harness, id: string, at: Date, mode: "live" | "shadow", provider: "anthropic" | "openai-codex" = "anthropic", tier: "mechanical" | "standard" = "mechanical"): Promise<void> {
+  const map = fixtureTierMap();
+  const route = fixtureRoute(tier, map, provider === "anthropic" ? { "openai-codex": { state: "out-of-usage" } } : { anthropic: { state: "out-of-usage" } });
+  assert.ok(route.ok);
+  const common = { delegationId: id, at, taskText: "Fix README.md", agentRole: "worker",
+    classification: await fixtureClassification("Fix README.md", tier), tierMap: map, route };
+  writeDecisionRecord(join(h.stateDir, "routing"), mode === "shadow"
+    ? { ...common, mode, handPickedModel: "anthropic/claude-sonnet-5", ranOn: "anthropic/claude-sonnet-5:high" }
+    : { ...common, mode, ranOn: route.rung.rung });
+}
+
+test("balanced routing counts only pinned decisions inside the rolling five hours across sessions and projects", async () => {
+  const h = harness(LIVE);
+  try {
+    await seedDecision(h, "older-project", new Date(NOW.getTime() - 5 * 60 * 60 * 1000 - 1), "live");
+    await seedDecision(h, "future-session", new Date(NOW.getTime() + 1), "live");
+    await seedDecision(h, "other-session", new Date(NOW.getTime() - 5 * 60 * 60 * 1000), "live");
+    await seedDecision(h, "other-tier", NOW, "live", "anthropic", "standard");
+    const otherProject = projectWithMechanicalTier(h, "other-project", [`${HAIKU}:low`]);
+    const other = await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("other") }]), {}, { cwd: otherProject });
+    await autoEvents(other, FIX_README, "other-project-worker");
+    const stream = await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("ok") }]));
+    await autoEvents(stream, FIX_README, "current-session");
+    const record = h.records().find((entry) => entry.delegationId === "current-session");
+    assert.ok(record?.recordType === "decision" && record.route.outcome === "chosen");
+    assert.equal(record.route.rung.model.split("/")[0], "openai-codex");
+    assert.equal(record.route.tierOrder, "balanced");
+    assert.deepEqual(record.route.providerCounts, { anthropic: 3, "openai-codex": 0 });
+  } finally { h.cleanup(); }
+});
+
+test("an ordered project tier pins its first surviving rung even when another provider has fewer pins", async () => {
+  const h = harness(LIVE);
+  try {
+    await seedDecision(h, "previous", NOW, "live");
+    const project = join(h.projectDir, "ordered-project");
+    mkdirSync(join(project, ".pi"), { recursive: true });
+    writeFileSync(join(project, ".pi", "settings.json"), JSON.stringify({ orchestrator: { routing: {
+      tiers: { mechanical: { order: "ordered", rungs: TEST_TIERS.mechanical } },
+    } } }));
+    const stream = await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("ok") }]), {}, { cwd: project });
+    await autoEvents(stream, FIX_README, "ordered-worker");
+    const record = h.records().find((entry) => entry.delegationId === "ordered-worker");
+    assert.ok(record?.recordType === "decision" && record.route.outcome === "chosen");
+    assert.equal(record.route.rung.model, HAIKU);
+    assert.equal(record.route.tierOrder, "ordered");
+    assert.equal(record.route.providerCounts, undefined);
+    assert.equal(record.tierMap.orders?.mechanical, "ordered");
+  } finally { h.cleanup(); }
+});
+
+test("shadow recommendations do not change a live balanced choice", async () => {
+  const h = harness(LIVE);
+  try {
+    await seedDecision(h, "shadow-other-session", NOW, "shadow");
+    const stream = await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("ok") }]));
+    await autoEvents(stream, FIX_README, "live-worker");
+    const record = h.records().find((entry) => entry.delegationId === "live-worker");
+    assert.ok(record?.recordType === "decision" && record.route.outcome === "chosen");
+    assert.equal(record.route.rung.model, HAIKU);
+    assert.deepEqual(record.route.providerCounts, { anthropic: 0, "openai-codex": 0 });
+  } finally { h.cleanup(); }
+});
+
+test("parallel fan-out pins distinct providers and the second record sees the first", async () => {
+  const h = harness(LIVE);
+  try {
+    const registry = fakeSessionRegistry([{ events: answerEvents("one") }, { events: answerEvents("two") }]);
+    const stream = await loadAutoProvider(h, registry);
+    await Promise.all([autoEvents(stream, FIX_README, "fanout-one"), autoEvents(stream, FIX_README, "fanout-two")]);
+    const records = h.records().filter((entry) => entry.recordType === "decision");
+    assert.equal(records.length, 2);
+    assert.deepEqual(records.map((record) => record.route.outcome === "chosen" && record.route.rung.model.split("/")[0]), ["anthropic", "openai-codex"]);
+    assert.deepEqual(records.map((record) => record.route.outcome === "chosen" && record.route.providerCounts), [
+      { anthropic: 0, "openai-codex": 0 }, { anthropic: 1, "openai-codex": 0 },
+    ]);
   } finally { h.cleanup(); }
 });
 
@@ -1219,7 +1299,7 @@ test("a compaction summary request with a new session id is classified and recor
     if (summary?.recordType === "decision") {
       assert.equal(summary.agentRole, "unknown");
       assert.ok(summaryPrompt.startsWith(summary.taskTextPrefix));
-      assert.equal(summary.ranOn, `${HAIKU}:low`);
+      assert.equal(summary.ranOn, "openai-codex/gpt-6-luna:low");
     }
   } finally { h.cleanup(); }
 });
@@ -1455,7 +1535,7 @@ test("routing constraints bind only their worker's session id, and removing them
     await autoEvents(stream, FIX_README, "other-worker");
     clear();
     await autoEvents(stream, FIX_README, "constrained-worker");
-    assert.deepEqual(registry.calls.map((call) => [call.model.id, call.options?.reasoning]), [["claude-haiku-4-5", "low"], ["claude-haiku-4-5", "low"]]);
+    assert.deepEqual(registry.calls.map((call) => [call.model.id, call.options?.reasoning]), [["claude-haiku-4-5", "low"], ["gpt-6-luna", "low"]]);
     const records = h.records();
     assert.deepEqual(records.map((record) => record.delegationId), ["other-worker", "constrained-worker"]);
     for (const record of records) assert.equal("constraints" in record, false, "an unconstrained decision record has no constraints field");
@@ -1473,14 +1553,14 @@ test("a recorded decision pins a constrained worker again only when it was made 
     const rerouted = fakeSessionRegistry([{ events: answerEvents("rerouted") }]);
     await autoEvents(await loadAutoProvider(h, rerouted, { classifierCall: () => classifier.call }), FIX_README, "restored-worker");
     assert.equal(classifier.prompts.length, 1, "classified again");
-    assert.deepEqual(rerouted.calls.map((call) => [call.model.id, call.options?.reasoning]), [["claude-opus-5", "high"]]);
+    assert.deepEqual(rerouted.calls.map((call) => [call.model.id, call.options?.reasoning]), [["gpt-6-sol", "high"]]);
 
     // Recorded under these constraints: restored without classifying.
     const again = answering("critical");
     const restored = fakeSessionRegistry([{ events: answerEvents("restored") }]);
     await autoEvents(await loadAutoProvider(h, restored, { classifierCall: () => again.call }), FIX_README, "restored-worker");
     assert.equal(again.prompts.length, 0, "not classified");
-    assert.deepEqual(restored.calls.map((call) => [call.model.id, call.options?.reasoning]), [["claude-opus-5", "high"]]);
+    assert.deepEqual(restored.calls.map((call) => [call.model.id, call.options?.reasoning]), [["gpt-6-sol", "high"]]);
     assert.equal(h.records().length, 2);
   } finally { clear(); h.cleanup(); }
 });
@@ -1630,7 +1710,7 @@ test("an error that is no limit leaves the provider in routing", async () => {
     await autoEvents(await loadAutoProvider(h, failing), FIX_README, "failed-worker");
     const next = fakeSessionRegistry([{ events: answerEvents("ok") }]);
     await autoEvents(await loadAutoProvider(h, next), FIX_README, "next-worker");
-    assert.deepEqual(forwardedRungs(next), [`${HAIKU}:low`]);
+    assert.deepEqual(forwardedRungs(next), ["openai-codex/gpt-6-luna:low"]);
     assert.deepEqual(removedRungs(h, "next-worker"), []);
   } finally { h.cleanup(); }
 });

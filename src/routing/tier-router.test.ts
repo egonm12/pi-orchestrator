@@ -9,6 +9,7 @@ import { known, unknown } from "../catalog/epistemic.ts";
 import { buildCatalog, type ContextWindow } from "../catalog/model-catalog.ts";
 import { INSTALLED_MODEL_IDS } from "../fixtures/installed-models.ts";
 import { INSTALLED_MODEL_INFO } from "../fixtures/installed-model-info.ts";
+import { fixtureRoute, fixtureTierMap } from "../fixtures/routing-decision.ts";
 import { DEFAULT_BAN_LISTS } from "../policy/ban-lists.ts";
 import { HARNESS_MODEL_SCOPE } from "../policy/model-resolution.ts";
 import { authorizeRecipient, emptyAuthorization, grantOwnerApproval, type RecipientAuthorization } from "../recipients/authorization.ts";
@@ -90,6 +91,33 @@ function evidence(overrides: Partial<RouterEvidence> = {}): RouterEvidence {
 function input(tier: TierRouteInput["tier"], overrides: Partial<RouterEvidence> = {}, tiers: Tiers = TIERS): TierRouteInput {
   return { tier, tierMap: tierMap(tiers), evidence: evidence(overrides) };
 }
+
+test("balanced tier selects the least-used surviving provider, with list-order ties", () => {
+  const map = fixtureTierMap();
+  const tie = fixtureRoute("standard", map, {}, { "openai-codex": 2, anthropic: 2 });
+  assert.equal(tie.ok && tie.rung.model, LUNA);
+  const balanced = fixtureRoute("standard", map, {}, { "openai-codex": 3, anthropic: 1 });
+  assert.equal(balanced.ok && balanced.rung.model, SONNET);
+  if (balanced.ok) {
+    assert.equal(balanced.tierOrder, "balanced");
+    assert.deepEqual(balanced.providerCounts, { "openai-codex": 3, anthropic: 1 });
+  }
+  const filtered = fixtureRoute("standard", map, { anthropic: { state: "throttled" } }, { "openai-codex": 9, anthropic: 0 });
+  assert.equal(filtered.ok && filtered.rung.model, LUNA);
+});
+
+test("ordered tier retains first-survivor preference despite counts", () => {
+  const map = fixtureTierMap({ orchestrator: { routing: { tiers: {
+    mechanical: TIERS.mechanical, standard: { order: "ordered", rungs: TIERS.standard },
+    elevated: TIERS.elevated, critical: TIERS.critical,
+  } } } }, undefined);
+  const choice = fixtureRoute("standard", map, {}, { "openai-codex": 10, anthropic: 0 });
+  assert.equal(choice.ok && choice.rung.model, LUNA);
+  if (choice.ok) {
+    assert.equal(choice.tierOrder, "ordered");
+    assert.equal(choice.providerCounts, undefined);
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Story 23: the first surviving rung of the classified tier

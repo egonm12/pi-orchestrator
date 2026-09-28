@@ -36,7 +36,7 @@ import { appendFileSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { RISK_TIERS, type ClassificationSignal, type RiskTier } from "./classifier.ts";
 import type { HopOutcome, TierClassification } from "./tier-classifier.ts";
-import type { ResolvedTierMap, TierMapDrop, TierRung } from "./tier-map.ts";
+import type { ResolvedTierMap, TierMapDrop, TierOrder, TierRung } from "./tier-map.ts";
 import type { LadderSkippedRung } from "./effort-ladder.ts";
 import { LADDER_SKIP_REASONS } from "./skip-reasons.ts";
 import type { RemovedRung, RoutingConstraints, TierRouteDecision } from "./tier-router.ts";
@@ -222,6 +222,8 @@ export interface RecordedClassification {
 
 export interface RecordedTierMap {
   readonly tiers: Readonly<Record<RiskTier, readonly RecordedRung[]>>;
+  /** Absent on records written before balanced tier order. */
+  readonly orders?: Readonly<Record<RiskTier, TierOrder>>;
   readonly drops: readonly TierMapDrop[];
   readonly ignoredProjectKeys: readonly string[];
 }
@@ -240,6 +242,8 @@ export interface RecordedRouteChoice extends RecordedRouteCommon {
   readonly tier: RiskTier;
   readonly rung: RecordedRung;
   readonly survivors: readonly RecordedRung[];
+  readonly tierOrder?: TierOrder;
+  readonly providerCounts?: Readonly<Record<string, number>>;
 }
 
 export interface RecordedRouteRefusal extends RecordedRouteCommon {
@@ -547,7 +551,12 @@ function checkClassification(record: Json): void {
 function checkTierMap(record: Json): void {
   const path = "tierMap";
   const value = objectAt(record, path, "");
-  checkKeys(value, path, ["tiers", "drops", "ignoredProjectKeys"]);
+  checkKeys(value, path, ["tiers", "drops", "ignoredProjectKeys"], ["orders"]);
+  if (value.orders !== undefined) {
+    const orders = objectAt(value, "orders", path);
+    checkKeys(orders, `${path}.orders`, RISK_TIERS);
+    for (const tier of RISK_TIERS) oneOf(orders, tier, `${path}.orders`, ["balanced", "ordered"] as const);
+  }
   const tiers = objectAt(value, "tiers", path);
   checkKeys(tiers, `${path}.tiers`, RISK_TIERS);
   for (const tier of RISK_TIERS) eachObject(tiers, tier, `${path}.tiers`, checkRung);
@@ -564,8 +573,17 @@ function checkRoute(record: Json): void {
   const outcome = oneOf(value, "outcome", path, ["chosen", "refused"] as const);
   const common = ["outcome", "startedAtTier", "tiersTried", "removed", "allowanceApplied"];
   if (outcome === "chosen") {
-    checkKeys(value, path, [...common, "tier", "rung", "survivors"]);
+    checkKeys(value, path, [...common, "tier", "rung", "survivors"], ["tierOrder", "providerCounts"]);
     oneOf(value, "tier", path, RISK_TIERS);
+    if (value.tierOrder !== undefined) oneOf(value, "tierOrder", path, ["balanced", "ordered"] as const);
+    if (value.providerCounts !== undefined) {
+      const counts = objectAt(value, "providerCounts", path);
+      for (const [provider, count] of Object.entries(counts)) {
+        if (!provider || !Number.isSafeInteger(count) || (count as number) < 0) {
+          throw new RoutingRecordError(`${path}.providerCounts.${provider}`, "must be a non-negative integer provider count");
+        }
+      }
+    }
     checkRung(objectAt(value, "rung", path), `${path}.rung`);
     eachObject(value, "survivors", path, checkRung);
   } else {
@@ -805,7 +823,7 @@ function recordedDrop(drop: TierMapDrop): TierMapDrop {
 function recordedTierMap(tierMap: ResolvedTierMap): RecordedTierMap {
   const tiers = {} as Record<RiskTier, readonly RecordedRung[]>;
   for (const tier of RISK_TIERS) tiers[tier] = tierMap.tiers[tier].map(recordedRung);
-  return { tiers, drops: tierMap.drops.map(recordedDrop), ignoredProjectKeys: [...tierMap.ignoredProjectKeys] };
+  return { tiers, orders: { ...tierMap.orders }, drops: tierMap.drops.map(recordedDrop), ignoredProjectKeys: [...tierMap.ignoredProjectKeys] };
 }
 
 function recordedRemoved(removed: RemovedRung): RecordedRemovedRung {
@@ -826,6 +844,8 @@ function recordedRoute(route: TierRouteDecision): RecordedRoute {
       tier: route.tier,
       rung: recordedRung(route.rung),
       survivors: route.survivors.map(recordedRung),
+      ...(route.tierOrder === undefined ? {} : { tierOrder: route.tierOrder }),
+      ...(route.providerCounts === undefined ? {} : { providerCounts: { ...route.providerCounts } }),
     };
   }
   return { outcome: "refused", ...common, code: route.code, message: route.message };

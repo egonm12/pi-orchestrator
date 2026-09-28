@@ -48,6 +48,7 @@ import { RISK_TIERS, type RiskTier } from "./classifier.ts";
 // extension puts the value unchanged in the decision record.
 
 export type RungOrigin = "personal" | "project";
+export type TierOrder = "balanced" | "ordered";
 
 export interface TierRung {
   /** As written in settings, trimmed: `provider/model:effort`. */
@@ -72,6 +73,7 @@ export type TierMapDrop =
 
 export interface ResolvedTierMap {
   readonly tiers: Readonly<Record<RiskTier, readonly TierRung[]>>;
+  readonly orders: Readonly<Record<RiskTier, TierOrder>>;
   readonly drops: readonly TierMapDrop[];
   readonly ignoredProjectKeys: readonly string[];
 }
@@ -135,12 +137,26 @@ function installedModel(model: string, installedModels: readonly ModelInfo[]): M
   return installedModels.find((entry) => entry.fullId.toLowerCase() === id);
 }
 
-function parsedTier(file: SettingsFile, tier: RiskTier, value: unknown, installedModels: readonly ModelInfo[]): ParsedRung[] {
+function parsedTier(file: SettingsFile, tier: RiskTier, value: unknown, installedModels: readonly ModelInfo[]): { order: TierOrder; rungs: ParsedRung[] } {
   const key = `${TIERS_KEY}.${tier}`;
-  if (!Array.isArray(value) || value.length === 0) {
-    throw keyError(file, key, `must be a non-empty list of rungs; got ${JSON.stringify(value)}.`);
+  let order: TierOrder = "balanced";
+  let rungs = value;
+  if (isPlainObject(value)) {
+    for (const name of Object.keys(value)) {
+      if (name !== "order" && name !== "rungs") throw keyError(file, `${key}.${name}`, "is not a known tier field.");
+    }
+    if (value.order !== undefined) {
+      if (value.order !== "balanced" && value.order !== "ordered") {
+        throw keyError(file, `${key}.order`, `must be balanced or ordered; got ${JSON.stringify(value.order)}.`);
+      }
+      order = value.order;
+    }
+    rungs = value.rungs;
   }
-  return value.map((entry, index) => parsedRung(file, `${key}[${index}]`, entry, installedModels));
+  if (!Array.isArray(rungs) || rungs.length === 0) {
+    throw keyError(file, key, `must be a non-empty list of rungs; got ${JSON.stringify(rungs)}.`);
+  }
+  return { order, rungs: rungs.map((entry, index) => parsedRung(file, `${key}${Array.isArray(value) ? "" : ".rungs"}[${index}]`, entry, installedModels)) };
 }
 
 /** The load-time check a rung fails, if any, in this order: the ban list,
@@ -159,6 +175,7 @@ function frozenRung(rung: ParsedRung, origin: RungOrigin): TierRung {
 
 interface PersonalTiers {
   readonly tiers: Record<RiskTier, readonly TierRung[]>;
+  readonly orders: Record<RiskTier, TierOrder>;
   readonly drops: readonly TierMapDrop[];
 }
 
@@ -188,6 +205,7 @@ function personalTiers(personal: unknown, inputs: Required<TierMapInputs>): Pers
     }
   }
   const resolved = {} as Record<RiskTier, readonly TierRung[]>;
+  const orders = {} as Record<RiskTier, TierOrder>;
   const drops: TierMapDrop[] = [];
   for (const tier of RISK_TIERS) {
     if (!Object.hasOwn(tiers, tier)) {
@@ -195,7 +213,9 @@ function personalTiers(personal: unknown, inputs: Required<TierMapInputs>): Pers
     }
     const kept: TierRung[] = [];
     const reasons: RungDropReason[] = [];
-    for (const rung of parsedTier("personal", tier, tiers[tier], inputs.installedModels)) {
+    const parsed = parsedTier("personal", tier, tiers[tier], inputs.installedModels);
+    orders[tier] = parsed.order;
+    for (const rung of parsed.rungs) {
       const failed = failedHardFilter(rung.model, inputs);
       if (failed === undefined) {
         kept.push(frozenRung(rung, "personal"));
@@ -210,7 +230,7 @@ function personalTiers(personal: unknown, inputs: Required<TierMapInputs>): Pers
     }
     resolved[tier] = Object.freeze(kept);
   }
-  return { tiers: resolved, drops };
+  return { tiers: resolved, orders, drops };
 }
 
 interface ProjectOverride {
@@ -260,27 +280,33 @@ export function tierMapFromSettings(personal: unknown, project: unknown, inputs:
 
   const override = projectOverride(project);
   const tiers = {} as Record<RiskTier, readonly TierRung[]>;
+  const orders = {} as Record<RiskTier, TierOrder>;
   const drops: TierMapDrop[] = [...personalMap.drops];
   for (const tier of RISK_TIERS) {
     if (!Object.hasOwn(override.tiers, tier)) {
       tiers[tier] = personalMap.tiers[tier];
+      orders[tier] = personalMap.orders[tier];
       continue;
     }
     const kept: TierRung[] = [];
-    for (const rung of parsedTier("project", tier, override.tiers[tier], complete.installedModels)) {
+    const parsed = parsedTier("project", tier, override.tiers[tier], complete.installedModels);
+    for (const rung of parsed.rungs) {
       const failed = failedHardFilter(rung.model, complete);
       if (failed === undefined) kept.push(frozenRung(rung, "project"));
       else drops.push(Object.freeze({ tier, rung: rung.rung, origin: "project", reason: failed }));
     }
     if (kept.length > 0) {
       tiers[tier] = Object.freeze(kept);
+      orders[tier] = parsed.order;
     } else {
       tiers[tier] = personalMap.tiers[tier];
+      orders[tier] = personalMap.orders[tier];
       drops.push(Object.freeze({ tier, origin: "project", reason: "inherited after drops" }));
     }
   }
   return Object.freeze({
     tiers: Object.freeze(tiers),
+    orders: Object.freeze(orders),
     drops: Object.freeze(drops),
     ignoredProjectKeys: Object.freeze([...override.ignoredProjectKeys]),
   });
