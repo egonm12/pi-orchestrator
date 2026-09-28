@@ -1,7 +1,10 @@
 import { truncateToVisualLines } from "@earendil-works/pi-coding-agent";
 import type { TranscriptFrame } from "./transcript-view.ts";
 import { elapsedMs, type BoardWorker, type RungServing } from "./worker-board.ts";
-import { activityPart, agentLabel, fitted, formatElapsed, STATE_COLOR, type Part } from "./worker-widget.ts";
+import { activityPart, agentLabel, fitted, formatElapsed, formatTokens, STATE_COLOR, type Part } from "./worker-widget.ts";
+
+// The token count shared with the worker widget's stats.
+export { formatTokens };
 
 // The transcript view's top (epic a338, vo0z): the orchestrator bar, which
 // keeps the user who reads one worker's transcript aware of the rest, and the
@@ -9,15 +12,6 @@ import { activityPart, agentLabel, fitted, formatElapsed, STATE_COLOR, type Part
 // the width.
 
 const SEPARATOR = " · ";
-
-/** `850`, `12.3k`, `456k` or `1.2M` tokens. The bounds sit where rounding
- *  would reach the next step, so no count reads `100.0k` or `1000k`. */
-export function formatTokens(count: number): string {
-  if (count < 1_000) return String(count);
-  if (count < 99_950) return `${(count / 1_000).toFixed(1)}k`;
-  if (count < 999_500) return `${Math.round(count / 1_000)}k`;
-  return `${(count / 1_000_000).toFixed(1)}M`;
-}
 
 /** `$0.042`: the replies' reported cost, as pi's footer shows it. */
 export function formatCost(usd: number): string {

@@ -104,11 +104,15 @@ function clock(start = new Date(2026, 8, 26, 12, 0, 0).getTime()) {
   return { now: () => now, advance: (ms: number) => { now += ms; } };
 }
 
+/** The nested workers' hint, and a nested worker's row: the cursor and a filled dot, or two spaces and a hollow dot. */
+const NESTED_HINT = "  ↑/↓ to select · Enter to open";
+const NESTED_ROW = /^(?:❯ ●|  ○) └ /;
+
 /** The header's lines: after the orchestrator bar, up to the nested workers or the rule. */
 function header(view: ReturnType<typeof fakeUI>, width = WIDTH): string[] {
   const text = view.text(width);
   const start = text[0]!.startsWith("orchestrator ") ? 1 : 0;
-  const end = text.findIndex((line, index) => index > start && (line.startsWith("─") || /^[› ] └ /.test(line)));
+  const end = text.findIndex((line, index) => index > start && (line.startsWith("─") || line === NESTED_HINT));
   return text.slice(start, end);
 }
 
@@ -119,8 +123,8 @@ function shownWorker(view: ReturnType<typeof fakeUI>): string {
 }
 
 /** The shown worker's nested workers' lines, under the header. */
-function nestedLines(view: ReturnType<typeof fakeUI>): string[] {
-  return view.text().filter((line) => /^[› ] └ /.test(line));
+function nestedLines(view: ReturnType<typeof fakeUI>, width = WIDTH): string[] {
+  return view.text(width).filter((line) => NESTED_ROW.test(line));
 }
 
 /** A worker's reply with its usage, as pi reports it at message_end. */
@@ -268,8 +272,10 @@ test("left and right switch to the previous or next worker in the board's order,
   void openTranscript(view.ui, board, board.workers()[0]!.id);
 
   assert.equal(shownWorker(view), "lead · running · worker 1 of 4");
-  assert.match(nestedLines(view)[0]!, /^› └ worker · routing… · running · \d+s · 0 turns · Nested work$/, "its nested workers, the first selected");
-  assert.match(nestedLines(view)[1]!, /^  └ worker · routing… · running · \d+s · 0 turns · Second nested$/);
+  const text = view.text();
+  assert.equal(text[text.findIndex((line) => NESTED_ROW.test(line)) - 1], NESTED_HINT, "a hint with the keys the list takes, above it");
+  assert.match(nestedLines(view)[0]!, /^❯ ● └ worker {15}Nested work +\d+s$/, "its nested workers as the worker widget's agent list, the first selected");
+  assert.match(nestedLines(view)[1]!, /^  ○ └ worker {15}Second nested +\d+s$/);
   assert.ok(view.text().at(-1)!.includes("↑↓ Enter nested worker"));
 
   view.press(KEY.right);
@@ -291,6 +297,33 @@ test("left and right switch to the previous or next worker in the board's order,
   assert.equal(shownWorker(view), "worker · running · worker 3 of 4", "the second nested worker");
   view.press(KEY.enter);
   assert.equal(shownWorker(view), "worker · running · worker 3 of 4", "Enter without nested workers does nothing");
+});
+
+test("the nested workers' stats sit against the right edge, and a narrow terminal cuts the status first, then the tokens, then the elapsed time, never past the width", async () => {
+  const time = clock();
+  const board = new WorkerBoard({ now: time.now });
+  running(board, "Lead the work", "lead-1", { agent: "lead" });
+  const nested = running(board, "Weighing Entra state-parameter guidance", "nested-1", { agent: "orchestrator:verifying-work", parentDelegationId: "lead-1" });
+  running(board, "Check the tests", "nested-2", { agent: "tester", parentDelegationId: "lead-1" });
+  nested.fake.emit({ type: "message_end", message: usage(133_000, 0, 0, 0, 0) });
+  time.advance(488_000);
+  const view = fakeUI(20);
+  void openTranscript(view.ui, board, board.workers()[0]!.id, { now: time.now });
+
+  assert.deepEqual(nestedLines(view, 100), [
+    "❯ ● └ orchestrator:veri…   Weighing Entra state-parameter guidance             8m08s · ↓ 133k tokens",
+    "  ○ └ tester               Check the tests                                                     8m08s",
+  ]);
+  for (const line of nestedLines(view, 100)) assert.equal(line.length, 100, `the stats end at the right edge: ${line}`);
+  assert.deepEqual(nestedLines(view, 50), [
+    "❯ ● └ orchestrat…   Weighi…  8m08s · ↓ 133k tokens",
+    "  ○ └ tester        Check the tests          8m08s",
+  ], "the status cut to the room the stats leave");
+  assert.equal(nestedLines(view, 30)[0], "❯ ● └ orch…   Weighing…  8m08s", "the elapsed time alone when the tokens do not fit");
+  assert.equal(nestedLines(view, 12)[0], "❯ ● └ orc…", "only the name when no stats fit");
+  for (const width of [100, 72, 50, 40, 30, 20, 12, 8, 4, 1]) {
+    for (const line of view.text(width)) assert.ok(line.length <= width, `${width}: ${line}`);
+  }
 });
 
 test("x stops the shown worker after a confirmation, and the view stays open with its aborted end state", async () => {
@@ -657,26 +690,27 @@ test("in regular tuiMode the shown worker's nested workers are listed live above
     return { nested: text.slice(stats - 6, stats), rest: text.slice(stats) };
   };
 
-  assert.equal(view.text().filter((line) => /^[› ] └ /.test(line)).length, 6, "at most 6 rows");
-  assert.match(live().nested[0]!, /^› └ worker · routing… · running · \d+s · 0 turns · Nested 1$/, "right above the stats line, the first selected");
-  assert.match(live().nested[5]!, /^  └ .* · Nested 6$/);
+  assert.equal(view.text().filter((line) => NESTED_ROW.test(line)).length, 6, "at most 6 rows");
+  assert.equal(view.text().filter((line) => line === NESTED_HINT).length, 1, "under one hint");
+  assert.match(live().nested[0]!, /^❯ ● └ worker +Nested 1 +\d+s$/, "right above the stats line, the first selected");
+  assert.match(live().nested[5]!, /^  ○ └ worker +Nested 6 +\d+s$/);
   assert.equal(live().rest.at(-1), "←→ worker · ↑↓ Enter nested worker · x stop · ctrl+o tool output · Esc back");
 
   view.press(KEY.down, KEY.down, KEY.down, KEY.down, KEY.down, KEY.down, KEY.down);
-  assert.match(live().nested[5]!, /^› └ .* · Nested 8$/, "scrolled to keep the selection in view");
-  assert.match(live().nested[0]!, /· Nested 3$/);
+  assert.match(live().nested[5]!, /^❯ ● └ worker +Nested 8 +\d+s$/, "scrolled to keep the selection in view");
+  assert.match(live().nested[0]!, /^  ○ └ worker +Nested 3 +\d+s$/);
   view.press(KEY.up);
-  assert.match(live().nested[5]!, /^› └ .* · Nested 7$/, "the window moves with the selection, as the overlay's does");
+  assert.match(live().nested[5]!, /^❯ ● └ worker +Nested 7 +\d+s$/, "the window moves with the selection, as the overlay's does");
 
   feeds[7]!.ended({ state: "completed" });
   view.press(KEY.down);
-  assert.match(live().nested[5]!, /^› └ .* · completed · .*Nested 8$/, "the list follows the board live");
+  assert.match(live().nested[5]!, /^❯ ● └ worker +completed · Nested 8 +\d+s$/, "the list follows the board live");
   view.press(KEY.up);
   view.forced.length = 0;
   view.press(KEY.enter);
   assert.ok(view.text().some((line) => line.includes("Reply 7")), "Enter opens the selected worker in the same view");
   assert.equal(view.forced.at(-1), true, "and reprints");
-  assert.ok(!view.text().some((line) => /^[› ] └ /.test(line)), "a worker without nested workers lists none");
+  assert.ok(!view.text().some((line) => NESTED_ROW.test(line) || line === NESTED_HINT), "a worker without nested workers lists none");
   assert.equal(view.text().at(-1), "←→ worker · x stop · ctrl+o tool output · Esc back", "and no nested hint");
 });
 

@@ -63,7 +63,7 @@ An experimental routing recommendation recorded for evaluation but not controlli
 ## Watching workers
 
 **Worker widget**:
-The compact list below the editor with one line per worker on the board: its agent, model, worker state, progress and activity.
+The list below the editor, in Claude Code's agent list style: `main`, the orchestrator's own agent, then one row per worker on the board with its agent name, its activity or last status, and its elapsed time and tokens. The /subagents picker and the transcript view's nested workers use the same rows.
 _Avoid_: Status line, subagent list
 
 **Activity**:

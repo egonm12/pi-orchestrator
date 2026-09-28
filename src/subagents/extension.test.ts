@@ -2308,11 +2308,14 @@ test("the orchestrator's session shows its workers in the widget below the edito
     const { worker } = await callSubagents(subagents.tool(), ctx, task, "lead");
     assert.equal(worker.status, "completed", JSON.stringify(worker));
 
-    const nestedShown = seen.find((lines) => lines.length === 2 && lines[1]!.startsWith("└ worker · anthropic/claude-haiku-4-5:low · running"));
+    // The hint, a blank line and main come first; a running worker shows no worker state, only its elapsed time and tokens.
+    const running = (name: string, status: string) =>
+      new RegExp(`^  ○ ${name} {2,}(?!(?:queued|asking|completed|failed|aborted) · )${status} {2,}\\d+s(?: · ↓ \\S+ tokens?)?$`);
+    const nestedShown = seen.find((lines) => lines.length === 5 && lines[2] === "❯ ● main" && running("└ worker", "\\S.*").test(lines[4]!));
     assert.ok(nestedShown, JSON.stringify(seen));
     // Its tool call follows its turn's start within the 1.5 s hold, so the lead still shows thinking.
-    assert.match(nestedShown[0]!, /^lead · anthropic\/claude-haiku-4-5:low · running · \d+s · 1 turn · thinking…$/);
-    assert.match(component!.render(200)[0]!, /^lead · anthropic\/claude-haiku-4-5:low · completed · /, "a finished worker lingers with its end state");
+    assert.match(nestedShown[3]!, running("lead", "thinking…"));
+    assert.match(component!.render(200)[3]!, /^  ○ lead {2,}completed · /, "a finished worker lingers with its end state");
     await subagents.shutdownSession(ctx);
     assert.equal(component, undefined, "the session's end removes the widget");
   } finally { h.cleanup(); }
@@ -2455,8 +2458,8 @@ test("/subagents with no arguments opens the picker of every worker when there i
     const opening = subagents.runCommandWithUI("subagents", "", { ...ctx, hasUI: true, ui: screen.ui } as unknown as ExtensionContext);
     assert.equal(screen.opens, 1, "the picker opened, not the old background-only text notice");
     assert.ok(screen.lines().some((line) => line.includes("Workers of this session")), screen.lines().join("\n"));
-    // A running worker's line ends in its activity, not its task (CONTEXT.md, Activity).
-    assert.ok(screen.lines().some((line) => / · running · \d+s · 1 turn · thinking…$/.test(line.trimEnd())), "every worker of the session, not only background calls");
+    // A running worker's row shows its activity, not its task (CONTEXT.md, Activity).
+    assert.ok(screen.lines().some((line) => /^(?:❯ ●|  ○) \d+\. worker +thinking… +\d+s$/.test(line)), `every worker of the session, not only background calls:\n${screen.lines().join("\n")}`);
     screen.press("\x1b");
     await opening;
     assert.equal(screen.opens, 1, "Esc left without opening a transcript next");

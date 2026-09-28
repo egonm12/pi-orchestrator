@@ -1,17 +1,19 @@
 import { truncateToVisualLines, type ExtensionUIContext, type Theme } from "@earendil-works/pi-coding-agent";
 import type { BoardWorker, WorkerBoardView } from "./worker-board.ts";
-import { moveSelection, selectedRow, widgetLines, workerRows, type RowSelection, type SelectionKeys } from "./worker-widget.ts";
+import { agentLines, agentRow, compactLines, hintLine, moveSelection, SELECT_HINT, selectedRow, workerRows, type RowSelection, type SelectionKeys } from "./worker-widget.ts";
 
 // The /subagents picker (xytd): every worker of the orchestrator session,
-// finished ones included, one worker widget line each, numbered in board
-// order with nested workers indented under their parent delegation. The
-// number is the worker's list number, which `/subagents <n>` opens directly.
+// finished ones included, one row each in the worker widget's agent list
+// style, numbered in board order with nested workers indented under their
+// parent delegation. The number is the worker's list number, which
+// `/subagents <n>` opens directly. `main` has no row: the picker opens a
+// worker's transcript, and the orchestrator has none to open.
 //
 // It is a small component in the editor's place through ctx.ui.custom, as
 // pi's own selector is, rather than ctx.ui.select: the selector wraps a long
 // line instead of cutting it, shows every option however many there are, and
 // draws each option as one plain string that it cannot redraw. Here each line
-// is the widget's line, fitted to the width and redrawn as the board changes,
+// is an agent list row, fitted to the width and redrawn as the board changes,
 // and a long list scrolls. Keys are matched through the keybindings manager
 // pi hands the factory, and Esc or ctrl+c (tui.select.cancel) always leaves
 // (rcjm). Closing it restores the editor with its text, as pi does.
@@ -21,24 +23,28 @@ export const MAX_PICKER_ROWS = 10;
 /** How often an open picker redraws, for the elapsed times. */
 const TICK_MS = 1_000;
 const TITLE = "Workers of this session";
-const HINT = "↑↓ select · Enter open · Esc cancel";
+const HINT = `${SELECT_HINT} · Enter to open · Esc to cancel`;
 const SEPARATOR = " · ";
 /** The text listing has no terminal to fit; its lines are cut at this width. */
 const LISTING_WIDTH = 200;
 const PLAIN = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as unknown as Theme;
 
-/** Each worker's line, `workers` being the board's workers: its list number,
- *  then the worker widget's line, nested workers indented. Each line is at
- *  most `width` columns wide. */
-function workerLines(workers: readonly BoardWorker[], now: number, theme: Theme, width: number): string[] {
-  const digits = String(workers.length).length;
-  return widgetLines({ rows: workerRows(workers), more: 0 }, now, theme, Math.max(1, width - digits - 2))
-    .map((line, index) => `${String(index + 1).padStart(digits)}. ${line}`);
+/** The list numbers' width for `count` workers. */
+function numberWidth(count: number): number {
+  return String(count).length;
 }
 
-/** The picker's list as text, for a session without a UI to pick in. */
+/** A worker's list number, padded to the others' width. */
+function listNumber(index: number, count: number): string {
+  return `${String(index + 1).padStart(numberWidth(count))}. `;
+}
+
+/** The board's workers as text, for a session without a UI to pick in: each
+ *  worker's list number, then its compact worker line (with its model and
+ *  turns, which the picker's rows leave out), nested workers indented. */
 export function workerListing(workers: readonly BoardWorker[], now: number): string {
-  return workerLines(workers, now, PLAIN, LISTING_WIDTH).map((line) => line.trimEnd()).join("\n");
+  return compactLines({ rows: workerRows(workers), more: 0 }, now, PLAIN, LISTING_WIDTH - numberWidth(workers.length) - 2)
+    .map((line, index) => `${listNumber(index, workers.length)}${line}`.trimEnd()).join("\n");
 }
 
 /** Where `/subagents <ref>` leads: a worker on the board, or why there is none. */
@@ -127,13 +133,18 @@ export class WorkerPicker {
     const selected = selectedRow(this.#selection, workerRows(workers));
     const count = workers.length;
     this.#first = Math.max(0, Math.min(this.#first, selected, count - MAX_PICKER_ROWS), selected - MAX_PICKER_ROWS + 1);
-    const lines = workerLines(workers, this.#now(), theme, Math.max(1, width - 2)).slice(this.#first, this.#first + MAX_PICKER_ROWS)
-      .map((line, index) => `${this.#first + index === selected ? theme.fg("accent", "›") : " "} ${line}`);
+    const now = this.#now();
+    // Each row leads its name with its list number, as `/subagents <n>` opens it.
+    const rows = workerRows(workers).map((row, index) => {
+      const shown = agentRow(row, now);
+      return { ...shown, indent: `${listNumber(index, count)}${shown.indent}` };
+    }).slice(this.#first, this.#first + MAX_PICKER_ROWS);
+    const lines = agentLines(rows, selected - this.#first, theme, width);
     // A new orchestrator session empties the board while the picker is open.
     if (count === 0) lines.push(theme.fg("muted", "No workers in this session."));
-    const range = count > MAX_PICKER_ROWS ? `${SEPARATOR}${this.#first + 1}–${this.#first + lines.length} of ${count}` : "";
+    const range = count > MAX_PICKER_ROWS ? `${SEPARATOR}${this.#first + 1}–${this.#first + rows.length} of ${count}` : "";
     const rule = theme.fg("border", "─".repeat(Math.max(1, width)));
-    return [rule, theme.fg("accent", theme.bold(TITLE)), ...lines, theme.fg("dim", `${HINT}${range}`), rule].map((line) => fit(line, width));
+    return [rule, theme.fg("accent", theme.bold(TITLE)), hintLine(`${HINT}${range}`, theme, width), "", ...lines, rule].map((line) => fit(line, width));
   }
 
   invalidate(): void {}

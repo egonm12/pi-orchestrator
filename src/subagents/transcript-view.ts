@@ -2,7 +2,7 @@ import { truncateToVisualLines, type AgentSessionEvent, type ExtensionUIContext,
 import { readWorkerTranscript, Transcript, type TranscriptContext } from "./transcript.ts";
 import { liveStats, orchestratorBar, transcriptHeader, transcriptTop } from "./transcript-header.ts";
 import { hasEnded, type BoardWorker, type OrchestratorState, type WorkerBoard, type WorkerBoardView } from "./worker-board.ts";
-import { MAX_WIDGET_ROWS, STATE_COLOR, widgetLines } from "./worker-widget.ts";
+import { agentLines, agentRow, hintLine, MAX_WIDGET_ROWS, SELECT_HINT, STATE_COLOR } from "./worker-widget.ts";
 
 // The transcript view (epic a338): one worker's transcript on the whole
 // screen, read from the worker board. It is a full-screen overlay through
@@ -110,6 +110,8 @@ export interface TranscriptViewOptions {
 const TICK_MS = 1_000;
 
 const SEPARATOR = " · ";
+/** The nested workers' hint: ↑ and ↓ select one, Enter shows its transcript. */
+const NESTED_HINT = `${SELECT_HINT} · Enter to open`;
 /** pi marks user messages for terminal prompt navigation; an overlay is no prompt. */
 const PROMPT_MARKS = /\x1b\]133;[A-D]\x07/g;
 
@@ -393,7 +395,9 @@ export class TranscriptView {
     return this.#board.workers().filter((worker) => worker.parentId === this.#worker.id);
   }
 
-  /** One line per nested worker, as the worker widget draws it, the selected one marked. */
+  /** The nested workers as the worker widget's agent list: a hint with the
+   *  keys the list takes, then a row per nested worker, the selected one with
+   *  the cursor. */
   #nestedLines(frame: TranscriptFrame): string[] {
     const nested = this.#nested();
     if (nested.length === 0) return [];
@@ -401,8 +405,8 @@ export class TranscriptView {
     // At most as many lines as the widget, scrolled to keep the selected one in view.
     const first = Math.max(0, Math.min(this.#selected - MAX_WIDGET_ROWS + 1, nested.length - MAX_WIDGET_ROWS));
     const window = nested.slice(first, first + MAX_WIDGET_ROWS);
-    const lines = widgetLines({ rows: window.map((worker) => ({ worker, depth: 1 })), more: 0 }, frame.now, this.#theme, Math.max(1, frame.width - 2));
-    return lines.map((line, index) => `${first + index === this.#selected ? this.#theme.fg("accent", "›") : " "} ${line}`);
+    const rows = window.map((worker) => agentRow({ worker, depth: 1 }, frame.now));
+    return [hintLine(NESTED_HINT, this.#theme, frame.width), ...agentLines(rows, this.#selected - first, this.#theme, frame.width)];
   }
 
   #openNested(): void {

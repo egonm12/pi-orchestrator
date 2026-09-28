@@ -2,11 +2,14 @@ import { truncateToVisualLines, type ExtensionUIContext, type Theme, type ThemeC
 import { shortTask } from "./render.ts";
 import { elapsedMs, type BoardWorker, type Activity, type WorkerBoardView, type WorkerModel, type WorkerState } from "./worker-board.ts";
 
-// The worker widget below the editor (epic a338, faal): one line per active worker
-// of the orchestrator session, read from the worker board. Which workers show
-// is a pure function of the board's workers and the time, so alt+a's focus
-// (arrows, Enter) works on the same rows. The widget only observes: it never
-// steers a worker.
+// The worker widget below the editor (epic a338, faal), drawn as Claude
+// Code's agent list: a hint, then `main`, the orchestrator's own agent, then
+// one row per active worker of the orchestrator session, read from the worker
+// board. The selected row has the ❯ cursor and a filled dot, every other row a
+// hollow one; `main` is selected while the editor has the keyboard. Which
+// workers show is a pure function of the board's workers and the time, so
+// alt+a's focus (arrows, Enter) works on the same rows. The widget only
+// observes: it never steers a worker.
 //
 // Focus (xytd, faal): a widget cannot take the keyboard through pi's
 // extension API, and the editor sends a key to an extension only as a
@@ -90,6 +93,15 @@ export const STATE_COLOR: Record<WorkerState, ThemeColor> = {
   queued: "muted", running: "warning", asking: "accent", completed: "success", failed: "error", aborted: "warning",
 };
 
+/** `850`, `12.3k`, `456k` or `1.2M` tokens. The bounds sit where rounding
+ *  would reach the next step, so no count reads `100.0k` or `1000k`. */
+export function formatTokens(count: number): string {
+  if (count < 1_000) return String(count);
+  if (count < 99_950) return `${(count / 1_000).toFixed(1)}k`;
+  if (count < 999_500) return `${Math.round(count / 1_000)}k`;
+  return `${(count / 1_000_000).toFixed(1)}M`;
+}
+
 /** `12s`, `3m04s` or `1h02m`. */
 export function formatElapsed(ms: number): string {
   const seconds = Math.floor(ms / 1_000);
@@ -119,45 +131,188 @@ export function activityPart(activity: Activity): Part {
 /** A piece of a line and its colour. */
 export type Part = readonly [ThemeColor, string];
 
-/** A worker's line, before it is fitted to the render width. */
+/** What leads a nested worker's name: `└ `, two columns further in for each level below the first. */
+function nestIndent(depth: number): string {
+  return depth === 0 ? "" : `${"  ".repeat(depth - 1)}└ `;
+}
+
+/** A worker's compact line, before it is fitted to the render width. */
 function rowParts(row: WidgetRow, now: number): { indent: string; parts: Part[] } {
   const { worker } = row;
   const parts: Part[] = [["accent", agentLabel(worker)], ["dim", modelText(worker.model)], [STATE_COLOR[worker.state], worker.state]];
   const elapsed = elapsedMs(worker, now);
   if (elapsed !== undefined) parts.push(["dim", formatElapsed(elapsed)], ["dim", `${worker.turns} ${worker.turns === 1 ? "turn" : "turns"}`]);
   parts.push(worker.activity === undefined ? ["dim", shortTask(worker.task)] : activityPart(worker.activity));
-  return { indent: row.depth === 0 ? "" : `${"  ".repeat(row.depth - 1)}└ `, parts };
+  return { indent: nestIndent(row.depth), parts };
 }
 
 const SEPARATOR = " · ";
 
-/** `parts` joined and styled, cut with an ellipsis to `width` columns. */
-export function fitted(indent: string, parts: readonly Part[], theme: Theme, width: number): string {
-  let room = width - indent.length;
-  let line = indent;
+/** `parts` joined with muted separators and cut with an ellipsis to `room`
+ *  characters: each part kept follows its separator, the first's empty. */
+function cutParts(parts: readonly Part[], room: number): Part[] {
+  const kept: Part[] = [];
   for (const [index, [color, text]] of parts.entries()) {
     const separator = index === 0 ? "" : SEPARATOR;
     const needed = separator.length + text.length;
     if (needed <= room) {
-      line += `${theme.fg("muted", separator)}${theme.fg(color, text)}`;
+      kept.push(["muted", separator], [color, text]);
       room -= needed;
       continue;
     }
-    const kept = text.slice(0, Math.max(0, room - separator.length - 1)).trimEnd();
-    if (room > separator.length) line += `${theme.fg("muted", separator)}${theme.fg(color, `${kept}…`)}`;
+    const start = text.slice(0, Math.max(0, room - separator.length - 1)).trimEnd();
+    if (room > separator.length) kept.push(["muted", separator], [color, `${start}…`]);
     break;
   }
-  // Character counts undercount wide characters; pi wraps by display width, so its first line always fits.
+  return kept;
+}
+
+/** How many characters `parts` take. */
+function partsWidth(parts: readonly Part[]): number {
+  return parts.reduce((sum, [, text]) => sum + text.length, 0);
+}
+
+/** `line` cut to `width` columns. Character counts undercount wide
+ *  characters; pi wraps by display width, so its first line always fits. */
+function fitLine(line: string, width: number): string {
   return (truncateToVisualLines(line, Number.POSITIVE_INFINITY, width).visualLines[0] ?? "").trimEnd();
 }
 
-/** The widget's lines at `now`, each at most `width` columns wide. */
-export function widgetLines(rows: WidgetRows, now: number, theme: Theme, width: number): string[] {
+/** `parts` joined and styled, cut with an ellipsis to `width` columns. */
+export function fitted(indent: string, parts: readonly Part[], theme: Theme, width: number): string {
+  const kept = cutParts(parts, width - indent.length);
+  return fitLine(`${indent}${kept.map(([color, text]) => theme.fg(color, text)).join("")}`, width);
+}
+
+/** The compact worker lines at `now`, one per row with its agent, model,
+ *  worker state, progress and activity, each at most `width` columns wide:
+ *  the /subagents listing's, where there is no UI to pick in. */
+export function compactLines(rows: WidgetRows, now: number, theme: Theme, width: number): string[] {
   const lines = rows.rows.map((row) => {
     const { indent, parts } = rowParts(row, now);
     return fitted(indent, parts, theme, width);
   });
   if (rows.more > 0) lines.push(fitted("", [["muted", `+${rows.more} more`]], theme, width));
+  return lines;
+}
+
+/** The orchestrator's own agent: the widget's first row, selected while the
+ *  editor has the keyboard, which ↑ on the first worker gives back. */
+export const MAIN_AGENT = "main";
+
+/** The hint above the rows while the editor has the keyboard, and while the widget has it. */
+export const SELECT_HINT = "↑/↓ to select";
+const FOCUS_HINT = `${SELECT_HINT} · Enter to open · Esc to go back`;
+/** The selected row's cursor, and the columns every other row keeps in its place. */
+const CURSOR = "❯ ";
+const NO_CURSOR = "  ";
+/** The selected row's dot, and every other row's. */
+const SELECTED_DOT = "●";
+const DOT = "○";
+/** The cursor's columns, the dot and a space: where the names start. */
+const MARKS_WIDTH = 4;
+/** The name column at most; a narrower terminal gives it about a third of the row. */
+export const NAME_COLUMN = 20;
+const MIN_NAME_COLUMN = 6;
+/** The spaces after the name column, and at least before the stats. */
+const NAME_GAP = 3;
+const STATS_GAP = 2;
+/** Less room than this leaves the middle text out, rather than a lone `…`. */
+const MIN_MIDDLE = 4;
+
+/** One row of an agent list (the widget's, the /subagents picker's and the
+ *  transcript view's nested workers) before it is fitted: what leads the name
+ *  (a nested worker's indent, a list number), the name, its activity or last
+ *  status, and its stats, the fullest first. */
+export interface AgentRow {
+  readonly indent: string;
+  readonly name: string;
+  readonly status: readonly Part[];
+  readonly stats: readonly string[];
+}
+
+const MAIN_ROW: AgentRow = { indent: "", name: MAIN_AGENT, status: [], stats: [] };
+
+/** A worker's activity, or its task before its first activity and once it
+ *  ended; a worker that is not running says its worker state first. */
+function statusParts(worker: BoardWorker): Part[] {
+  const text = worker.activity === undefined ? shortTask(worker.task) : activityPart(worker.activity)[1];
+  const parts: Part[] = worker.state === "running" ? [] : [[STATE_COLOR[worker.state], worker.state]];
+  if (text !== "") parts.push(["dim", text]);
+  return parts;
+}
+
+/** Once the worker started, `3m04s · ↓ 12.3k tokens` and, for a narrow
+ *  terminal, `3m04s`: its elapsed time and, once its replies used any, their
+ *  tokens, input, output and cache summed as the transcript view's header
+ *  counts them. None before it starts. */
+function statsTexts(worker: BoardWorker, now: number): string[] {
+  const elapsed = elapsedMs(worker, now);
+  if (elapsed === undefined) return [];
+  const { total } = worker.tokens;
+  const time = formatElapsed(elapsed);
+  return total === 0 ? [time] : [`${time}${SEPARATOR}↓ ${formatTokens(total)} ${total === 1 ? "token" : "tokens"}`, time];
+}
+
+/** A worker's row in an agent list at `now`. */
+export function agentRow(row: WidgetRow, now: number): AgentRow {
+  return { indent: nestIndent(row.depth), name: agentLabel(row.worker), status: statusParts(row.worker), stats: statsTexts(row.worker, now) };
+}
+
+/** The name column at `width`: NAME_COLUMN, or about a third of a narrower row. */
+function nameColumn(width: number): number {
+  return Math.max(MIN_NAME_COLUMN, Math.min(NAME_COLUMN, Math.floor((width - MARKS_WIDTH) * 0.3)));
+}
+
+/** `row` fitted to `width`: its marks, its name cut to `column` and padded
+ *  to it, its status cut to the room the stats leave, and the fullest of its
+ *  stats that fits after the name against the right edge, none when none fits. */
+function agentLine(row: AgentRow, selected: boolean, column: number, theme: Theme, width: number): string {
+  const marks = selected ? theme.fg("accent", `${CURSOR}${SELECTED_DOT}`) : `${NO_CURSOR}${theme.fg("dim", DOT)}`;
+  const name = cutText(row.name, Math.max(1, column - row.indent.length));
+  let line = `${marks} ${theme.fg("dim", row.indent)}${selected ? theme.fg("accent", theme.bold(name)) : theme.fg("muted", name)}`;
+  let used = MARKS_WIDTH + row.indent.length + name.length;
+  const rest = width - MARKS_WIDTH - column;
+  const stats = row.stats.find((text) => rest >= STATS_GAP + text.length) ?? "";
+  const room = rest - NAME_GAP - (stats === "" ? 0 : STATS_GAP + stats.length);
+  const status = room >= MIN_MIDDLE ? cutParts(row.status, room).filter(([, text]) => text !== "") : [];
+  if (status.length > 0) {
+    const start = MARKS_WIDTH + column + NAME_GAP;
+    line += `${" ".repeat(Math.max(1, start - used))}${status.map(([color, text]) => theme.fg(color, text)).join("")}`;
+    used = Math.max(used + 1, start) + partsWidth(status);
+  }
+  if (stats !== "") line += `${" ".repeat(Math.max(1, width - used - stats.length))}${theme.fg("dim", stats)}`;
+  return fitLine(line, width);
+}
+
+/** `text` cut with an ellipsis to at most `max` characters. */
+function cutText(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1)).trimEnd()}…`;
+}
+
+/** An agent list's dim hint, in line with the names' dots, cut to `width`. */
+export function hintLine(hint: string, theme: Theme, width: number): string {
+  return fitLine(`${NO_CURSOR}${theme.fg("dim", hint)}`, width);
+}
+
+/** An agent list's rows, one line each at most `width` columns wide, with
+ *  one name column: the `selected` one with the cursor and a filled dot,
+ *  every other one indented with a hollow dot. */
+export function agentLines(rows: readonly AgentRow[], selected: number | undefined, theme: Theme, width: number): string[] {
+  const column = nameColumn(width);
+  return rows.map((row, index) => agentLine(row, index === selected, column, theme, width));
+}
+
+/** The widget's lines at `now`, each at most `width` columns wide: the hint,
+ *  a blank line, `main`, then the worker rows and "+N more". `selected` is
+ *  the focused widget's selected worker row; without it `main` is selected. */
+export function widgetLines(rows: WidgetRows, selected: number | undefined, now: number, theme: Theme, width: number): string[] {
+  const lines = [
+    hintLine(selected === undefined ? SELECT_HINT : FOCUS_HINT, theme, width),
+    "",
+    ...agentLines([MAIN_ROW, ...rows.rows.map((row) => agentRow(row, now))], selected === undefined ? 0 : selected + 1, theme, width),
+  ];
+  if (rows.more > 0) lines.push(fitLine(`${" ".repeat(MARKS_WIDTH)}${theme.fg("muted", `+${rows.more} more`)}`, width));
   return lines;
 }
 
@@ -196,7 +351,6 @@ export interface WorkerWidget {
 
 /** The focus overlay draws nothing; it only holds the keyboard. */
 const FOCUS_OVERLAY = { width: 1, maxHeight: 1, anchor: "bottom-left", margin: 0 } as const;
-const FOCUS_HINT = "↑↓ select · Enter open · Esc back";
 
 /** The part of pi's keybindings manager the focus and the picker use. */
 export interface SelectionKeys {
@@ -272,13 +426,6 @@ interface Focus extends RowSelection {
   readonly end: (result: WidgetFocusResult) => void;
 }
 
-/** The focused widget's lines: the selected row marked, and the keys it takes. */
-function focusedLines(rows: WidgetRows, selected: number, now: number, theme: Theme, width: number): string[] {
-  const lines = widgetLines(rows, now, theme, Math.max(1, width - 2))
-    .map((line, index) => `${index === selected ? theme.fg("accent", "›") : " "} ${line}`);
-  return [...lines, fitted("", [["dim", FOCUS_HINT]], theme, width)];
-}
-
 export interface WorkerWidgetOptions {
   /** Epoch milliseconds. */
   readonly now?: () => number;
@@ -320,7 +467,7 @@ export function startWorkerWidget(ui: WorkerWidgetUI, board: WorkerBoardView, op
       const component = {
         render: (width: number) => {
           const rows = widgetRows(board.workers(), now());
-          return focus === undefined ? widgetLines(rows, now(), theme, width) : focusedLines(rows, selectedRow(focus, rows.rows), now(), theme, width);
+          return widgetLines(rows, focus === undefined ? undefined : selectedRow(focus, rows.rows), now(), theme, width);
         },
         invalidate() {},
         // pi drops every widget on its own, as on a reload: the next refresh sets it again.

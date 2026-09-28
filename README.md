@@ -221,20 +221,24 @@ While a call runs, pi shows one line per worker: its agent name (`worker` withou
 
 ### Worker widget
 
-Below the editor, the orchestrator's session lists its active workers: foreground, background and nested, queued ones included. Each worker has one line:
+Below the editor, the orchestrator's session lists its active workers: foreground, background and nested, queued ones included. It is drawn as Claude Code's agent list, with `main`, the orchestrator's own agent, first and one row per worker:
 
 ```text
-lead · anthropic/claude-sonnet-4-5:high ↑elevated · running · 1m15s · 2 turns · subagents
-└ tester · routing… · running · 1m15s · 0 turns · Check the tests
-worker (fork) · anthropic/claude-opus-4-5:high · running · 1m15s · 1 turn · writing…
-worker · routing… · queued · Fix the typo
+  ↑/↓ to select
+
+❯ ● main
+  ○ lead                   subagents                                           8m08s · ↓ 133k tokens
+  ○ └ tester               Check the tests                                                     8m08s
+  ○ worker (fork)          writing…                                                8m08s · ↓ 1 token
+  ○ scout                  asking · Scout the config                                           8m08s
+  ○ worker                 queued · Fix the typo
 ```
 
-- The agent name, `worker` without one, and `(fork)` for a fork.
-- The model and effort. A routed worker shows `routing…` until its first request, then the rung serving its latest request, and `↑<tier>` when its routing decision escalated to that tier. A fork or a worker on a preserved agent model shows its fixed model.
-- The worker state: queued, running, asking, completed, failed or aborted.
-- Once it has started: its elapsed time and the turns it has started.
-- Its activity: `thinking…`, `writing…`, the name of the tool it runs (no arguments), or for a failed worker why it failed. Before its first event, its short task. An activity stays at least 1.5 seconds before a newer one replaces it, so a line never changes with each streamed piece of text; a failure shows at once. The transcript view's header shows the same activity.
+- The selected row has the `❯` cursor and a filled `●`; every other row is indented with a hollow `○`. `main` is selected while the editor has the keyboard; in the widget the hint adds `Enter to open · Esc to go back`.
+- The agent name, `worker` without one, and `(fork)` for a fork, cut with `…` to a name column of 20.
+- Its activity: `thinking…`, `writing…`, the name of the tool it runs (no arguments), or for a failed worker why it failed. Before its first activity, its short task. A worker that is not running says its worker state first: queued, asking, completed, failed or aborted. An activity stays at least 1.5 seconds before a newer one replaces it, so a row never changes with each streamed piece of text; a failure shows at once. The transcript view's header shows the same activity.
+- Once it has started, against the right edge: its elapsed time and, once its replies used any, their tokens (input, output and cache together).
+- A narrow terminal gives the name about a third of the row, and cuts the activity first, then the tokens, then the elapsed time. The model and turns are in the transcript view's header.
 
 A worker started by another worker is indented under it. At most 6 workers are listed; a `+N more` line counts the rest. A finished worker stays about 10 seconds with its end state, then drops out, and the widget disappears when no worker is left. The widget only shows workers; it never steers them. A worker's own session shows no widget.
 
@@ -244,7 +248,7 @@ Down enters the widget when it would do nothing in the editor: the cursor is at 
 
 The transcript view shows one worker's transcript in place of the orchestrator's session: any worker of the orchestrator's session, foreground, background or nested, running or finished. Leaving it returns to the orchestrator's session as it was, chat, editor text and worker widget included. How it looks depends on pi's TUI mode (see Regular TUI mode and Fullscreen TUI mode below).
 
-Three ways open it. Alt+a on the worker widget, then Enter on the selected row, opens that worker (see Worker widget above). `/subagents` without arguments opens a picker of every worker of the session, finished ones included: one line per worker as the widget shows it, numbered in board order, nested workers indented under their parent delegation; arrow keys and Enter work as in the widget, and Esc or Ctrl+C cancels. Without a UI to pick in, the same command lists every worker as text instead. `/subagents <delegation id>` or `/subagents <list number>` opens that worker directly, skipping the picker; a delegation id or list number that names no worker is refused.
+Three ways open it. Alt+a on the worker widget, then Enter on the selected row, opens that worker (see Worker widget above). `/subagents` without arguments opens a picker of every worker of the session, finished ones included: one row per worker as the widget draws it, under a `↑/↓ to select · Enter to open · Esc to cancel` hint, its list number before its name, in board order, nested workers indented under their parent delegation. It has no `main` row, since the orchestrator has no transcript view. Arrow keys and Enter work as in the widget, and Esc or Ctrl+C cancels. Without a UI to pick in, the same command lists every worker as text instead, each with its model, worker state, elapsed time, turns and activity. `/subagents <delegation id>` or `/subagents <list number>` opens that worker directly, skipping the picker; a delegation id or list number that names no worker is refused.
 
 The transcript looks like pi's own chat: the worker's replies with their thinking, its tool calls with their results, and the tool-output expand toggle. Two kinds of message are marked, so they stand out from the task and from ordinary tool calls:
 
@@ -272,7 +276,7 @@ orchestrator idle · 1 worker asking: worker 3 (reviewer)
 
 - The top is printed once and scrolls away: the worker's agent, its model and rung history, its delegation, and its whole task, wrapped without a limit.
 - The whole transcript follows, not cut to the screen.
-- The live lines come last and update in place: the workers it started, at most 6 as the worker widget draws them, the selected one marked; the worker state, elapsed time, turns, tokens, cost, activity and which worker of how many it is; the orchestrator bar; and the key hints.
+- The live lines come last and update in place: the workers it started, at most 6 as the worker widget draws them under a `↑/↓ to select · Enter to open` hint, the selected one with the cursor; the worker state, elapsed time, turns, tokens, cost, activity and which worker of how many it is; the orchestrator bar; and the key hints.
 
 | Key | Action |
 |-----|--------|
