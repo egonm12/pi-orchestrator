@@ -1,0 +1,153 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { classifyBashCommand, classifyToolCall, type BashCommandKind } from "./tool-call-kind.ts";
+
+// What a tool call is, for the exploration budget (ADR 0005) and for telling
+// whether a worker edited (ADR 0010): a kind, never a yes or no, so each
+// caller draws its own line.
+
+function assertBash(kind: BashCommandKind, commands: readonly string[]): void {
+  for (const command of commands) assert.equal(classifyBashCommand(command), kind, command);
+}
+
+test("searches, listings, reads and git's read-only subcommands are read-only", () => {
+  assertBash("read-only", [
+    "rg foo src",
+    "grep -rn 'isOrchestratorSession' src --include=*.ts",
+    "find src -name '*.test.ts'",
+    "ls -la",
+    "cat README.md",
+    "head -40 src/subagents/extension.ts",
+    "wc -l src/**/*.ts",
+    "sed -n 1,80p src/init/setup.ts",
+    "jq .version package.json",
+    "git log --oneline -5",
+    "git show HEAD --stat",
+    "git diff main...HEAD -- src",
+    "git status --short",
+    "git blame -L 10,20 README.md",
+    "git branch -a",
+    "git stash list",
+    "git -C ../other --no-pager log -1",
+    "/usr/bin/grep foo bar.txt",
+    "pwd",
+  ]);
+});
+
+test("builds, tests, type checks and lints are build-test", () => {
+  assertBash("build-test", [
+    "npm test",
+    "npm run typecheck",
+    "npm run build",
+    "pnpm test",
+    "yarn lint",
+    "bun test",
+    "node --test src/subagents/tool-call-kind.test.ts",
+    "npx tsc --noEmit",
+    "tsc -p .",
+    "vitest run",
+    "pytest -x tests/",
+    "python3 -m pytest",
+    "cargo test --all",
+    "go test ./...",
+    "make",
+    "CI=1 npm test",
+  ]);
+});
+
+test("commits, pushes and other changes to the repository are version-control", () => {
+  assertBash("version-control", [
+    "git commit -m 'feat: Add the budget'",
+    "git push origin main",
+    "git add -A",
+    "git -C repo commit --amend --no-edit",
+    "git checkout -- README.md",
+    "git branch feature/budget",
+    "git tag v1.0.0",
+    "git stash",
+    "git rebase -i HEAD~3",
+  ]);
+});
+
+test("anything else, and anything that writes a file, is unrecognised", () => {
+  assertBash("unrecognised", [
+    "rm -rf dist",
+    "sed -i 's/a/b/' README.md",
+    "sed -i.bak 's/a/b/' README.md",
+    "rg foo > matches.txt",
+    "cat src/a.ts >> src/b.ts",
+    "echo hello > notes.md",
+    "ls | tee listing.txt",
+    "find . -name '*.tmp' -delete",
+    "npm install left-pad",
+    "npm run format",
+    "npm run lint -- --fix",
+    "python3 script.py",
+    "curl -X POST https://example.com",
+    "$EDITOR README.md",
+    "sort -o out.txt in.txt",
+    "git config user.name owner",
+    "unknown-tool --flag",
+    "",
+  ]);
+});
+
+test("a chain is as strong as its strongest part", () => {
+  assertBash("read-only", ["cd src && rg foo", "cd dir; ls -la", "echo '---' && git log -1", "rg foo 2>/dev/null"]);
+  assertBash("build-test", ["cd pkg && npm test", "npm run typecheck && npm test"]);
+  assertBash("version-control", [
+    "git add -A && git commit -m 'x'",
+    "git add -A && git status && git commit -m 'x'",
+    "npm test && git commit -am 'x' && git push",
+  ]);
+  assertBash("unrecognised", ["rg foo; rm notes.md", "npm test && sed -i 's/a/b/' x.ts", "cd dir && ./deploy.sh"]);
+  // A search next to a build still explores.
+  assertBash("read-only", ["rg foo && npm test"]);
+});
+
+test("a pipeline takes its first command's kind; a filter only makes it stronger", () => {
+  assertBash("build-test", ["npm test 2>&1 | tail -20", "npm test 2>&1 | grep -c fail", "cargo build |& head"]);
+  assertBash("read-only", ["git log --oneline | head -5", "rg -l foo | xargs grep bar", "find src -name '*.ts' | sort | uniq"]);
+  assertBash("unrecognised", ["rg -l foo | xargs rm", "cat script.sh | sh", "npm test | tee test.log"]);
+});
+
+test("quotes, redirects to /dev/null, heredocs and command substitution are read sensibly", () => {
+  assertBash("read-only", [
+    "rg 'a && b > c' src",
+    "grep \"x | y\" file",
+    "npm test >/dev/null 2>&1 && git status",
+    "cat <<'EOF' | grep foo\nrm -rf /\nEOF",
+    "wc -l $(git ls-files)",
+    "find src -name '*.ts' -exec grep -l foo {} \\;",
+  ]);
+  assertBash("unrecognised", [
+    "cat > src/new.ts <<'EOF'\nexport const x = 1;\nEOF",
+    "echo $(rm -rf dist)",
+    "rg \"$(rm -rf dist)\"",
+    "rg 'unterminated",
+    "find . -exec rm {} \\;",
+  ]);
+});
+
+test("each tool is classified by its name, and bash by its command", () => {
+  const kinds = (calls: readonly [string, unknown][]) => calls.map(([name, input]) => classifyToolCall(name, input));
+  assert.deepEqual(kinds([
+    ["read", { path: "README.md" }], ["grep", { pattern: "x" }], ["find", { pattern: "*.ts" }], ["ls", {}],
+    ["web_search", { query: "pi" }], ["fetch_content", { url: "https://pi.dev" }], ["get_search_content", { responseId: "r" }],
+    ["source_check", { claim: "c" }], ["ctx_execute", { language: "shell", code: "rm -rf x" }], ["ctx_execute_file", {}],
+    ["ctx_search", {}], ["ctx_batch_execute", {}], ["ctx_fetch_and_index", {}],
+    ["mcp", { tool: "linear_list_issues" }], ["mcp", { search: "issues" }], ["mcp", {}], ["mcpScript", { code: "emit(1)" }],
+  ]), Array(17).fill("read-only"));
+  assert.deepEqual(kinds([["edit", { path: "a" }], ["write", { path: "a" }]]), ["edit", "edit"]);
+  assert.deepEqual(kinds([["subagents", { items: [] }], ["subagents_status", {}], ["subagents_message", {}]]), ["delegation", "delegation", "delegation"]);
+  assert.deepEqual(kinds([
+    ["bash", { command: "rg foo" }], ["bash", { command: "npm test" }], ["bash", { command: "git push" }], ["bash", { command: "rm x" }],
+  ]), ["read-only", "build-test", "version-control", "unrecognised"]);
+  // An mcp install or sign-in is an action, and a tool the classification does not know is neither.
+  assert.deepEqual(kinds([
+    ["mcp", { action: "install", url: "https://example.com/mcp" }], ["mcp", { action: "auth-start", server: "s" }],
+    ["mcp", { action: "auth-complete", server: "s" }], ["report", { kind: "progress", text: "x" }], ["create_goal", {}],
+  ]), ["other", "other", "other", "other", "other"]);
+  // A bash call without a command string is not recognised.
+  assert.deepEqual(kinds([["bash", {}], ["bash", undefined], ["powershell", { command: "Get-ChildItem" }]]), ["unrecognised", "unrecognised", "unrecognised"]);
+});

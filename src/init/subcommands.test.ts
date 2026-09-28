@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { commandDescription, commandUsage, dispatchSubcommand, type CommandContext, type Subcommand } from "./subcommands.ts";
+import { createEventBus, type EventBus, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { commandDescription, commandUsage, dispatchSubcommand, registerSubcommands, type CommandContext, type Subcommand } from "./subcommands.ts";
 
 // `/pi-orchestrator <subcommand> [arguments]`: the first word picks the
 // subcommand, which gets the rest. Anything else prints the usage.
@@ -81,4 +82,69 @@ test("without a UI the usage goes to stderr", async () => {
 test("the command's description names every subcommand", () => {
   const { subcommands } = recording("init", "budget");
   assert.equal(commandDescription(subcommands), "pi-orchestrator: init (does init), budget (does budget)");
+});
+
+// Several pi-orchestrator extensions add subcommands to the one
+// `/pi-orchestrator` command. They find each other on the session's event
+// bus: the first to register hosts the command, the others join it, so the
+// command holds whatever extensions are loaded, in any order.
+
+type CommandOptions = Parameters<ExtensionAPI["registerCommand"]>[1];
+
+/** An extension's view of pi: the session's bus and its own command registrations. */
+function extensionPi(events: EventBus | undefined, commands: Map<string, CommandOptions>) {
+  return {
+    ...(events === undefined ? {} : { events }),
+    registerCommand: (name: string, options: CommandOptions) => { commands.set(name, options); },
+  };
+}
+
+function recorded(name: string, calls: string[]): Subcommand<ExtensionCommandContext> {
+  return { name, summary: `does ${name}`, run: (rest) => { calls.push(`${name} ${rest}`.trim()); } };
+}
+
+const commandCtx = (notices: Notice[]) => uiCtx(notices) as unknown as ExtensionCommandContext;
+
+test("extensions on one session's bus share one /pi-orchestrator command, in either load order", async () => {
+  for (const order of [["router", "subagents"], ["subagents", "router"]] as const) {
+    const events = createEventBus();
+    const calls: string[] = [];
+    const registered = new Map<string, Map<string, CommandOptions>>();
+    for (const extension of order) {
+      const commands = new Map<string, CommandOptions>();
+      registered.set(extension, commands);
+      registerSubcommands(extensionPi(events, commands), extension === "router" ? [recorded("init", calls)] : [recorded("budget", calls)]);
+    }
+    const hosts = [...registered].filter(([, commands]) => commands.size > 0);
+    assert.deepEqual(hosts.map(([extension, commands]) => [extension, [...commands.keys()]]), [[order[0], ["pi-orchestrator"]]], "the first extension hosts it alone");
+    const command = hosts[0]![1].get("pi-orchestrator")!;
+    const expectedNames = order[0] === "router" ? ["init", "budget"] : ["budget", "init"];
+    assert.equal(command.description, commandDescription(expectedNames.map((name) => ({ name, summary: `does ${name}` }))));
+    const notices: Notice[] = [];
+    await command.handler("budget off", commandCtx(notices));
+    await command.handler("init", commandCtx(notices));
+    assert.deepEqual(calls, ["budget off", "init"]);
+    await command.handler("", commandCtx(notices));
+    assert.equal(notices.at(-1)!.message, commandUsage(expectedNames.map((name) => ({ name, summary: `does ${name}` }))));
+  }
+});
+
+test("an extension alone, or without an event bus, hosts its own subcommands", async () => {
+  for (const events of [createEventBus(), undefined]) {
+    const calls: string[] = [];
+    const commands = new Map<string, CommandOptions>();
+    registerSubcommands(extensionPi(events, commands), [recorded("budget", calls)]);
+    assert.deepEqual([...commands.keys()], ["pi-orchestrator"]);
+    await commands.get("pi-orchestrator")!.handler("budget off", commandCtx([]));
+    assert.deepEqual(calls, ["budget off"]);
+  }
+});
+
+test("each session's bus has its own command: a worker's extensions never join the orchestrator's", () => {
+  const orchestrator = new Map<string, CommandOptions>();
+  const worker = new Map<string, CommandOptions>();
+  registerSubcommands(extensionPi(createEventBus(), orchestrator), [recorded("init", [])]);
+  registerSubcommands(extensionPi(createEventBus(), worker), [recorded("budget", [])]);
+  assert.equal(orchestrator.get("pi-orchestrator")!.description, "pi-orchestrator: init (does init)");
+  assert.equal(worker.get("pi-orchestrator")!.description, "pi-orchestrator: budget (does budget)");
 });

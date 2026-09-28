@@ -17,8 +17,8 @@ import {
 } from "../routing/tier-classifier.ts";
 import { tierMapFromSettings } from "../routing/tier-map.ts";
 import { runInit } from "../init/command.ts";
-import { INIT_COMMAND, setupNotice, setupStatus } from "../init/setup.ts";
-import { commandDescription, dispatchSubcommand, type Subcommand } from "../init/subcommands.ts";
+import { setupNotice, setupStatus } from "../init/setup.ts";
+import { registerSubcommands, type Subcommand } from "../init/subcommands.ts";
 import { stateFolderEvidence, type EvidenceSetup, type RoutingEvidenceSource } from "./evidence.ts";
 import { isOrchestratorSession } from "../subagents/orchestrator-session.ts";
 
@@ -172,7 +172,8 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
     const probe = process.env.PI_ORCHESTRATOR_ROUTER_PROBE === "1";
 
     // `/pi-orchestrator <subcommand>`. `init` sets up a fresh install. Its
-    // failures are reported by the command and never disable routing.
+    // failures are reported by the command and never disable routing. Other
+    // extensions add their subcommands to the same command (subcommands.ts).
     const subcommands: Subcommand<ExtensionCommandContext>[] = [{
       name: "init",
       summary: "set up a starter tier map, ban list and approved recipients",
@@ -181,10 +182,7 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
         catch (error) { ctx.ui.notify(`pi-orchestrator init failed: ${String(error).split(/\r?\n/, 1)[0]}`, "error"); }
       },
     }];
-    if (typeof pi.registerCommand === "function") pi.registerCommand(INIT_COMMAND, {
-      description: commandDescription(subcommands),
-      handler: async (args, ctx) => { await dispatchSubcommand(args, ctx, subcommands); },
-    });
+    if (typeof pi.registerCommand === "function") registerSubcommands(pi, subcommands);
 
     // The orchestrator's session model, for workers to fall back to. A
     // worker's or a child process's session model is not remembered.

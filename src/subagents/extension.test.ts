@@ -19,7 +19,7 @@ import personalGuard from "../guard/extension.ts";
 import { createSubagentsExtension, MAX_TEXT_BYTES, type SubagentResult, type SubagentsDetails, type SubagentsProgressDetails } from "./extension.ts";
 import { markWorkerSession } from "./worker-sessions.ts";
 import { isOrchestratorSession } from "./orchestrator-session.ts";
-import { ORCHESTRATOR_PROTOCOL } from "./orchestrator-protocol.ts";
+import { orchestratorProtocol } from "./orchestrator-protocol.ts";
 import { workerBoard, type BoardWorker } from "./worker-board.ts";
 import { openTranscript } from "./transcript-view.ts";
 
@@ -2614,11 +2614,11 @@ test("the board's orchestrator state follows the orchestrator's own agent runs, 
 });
 
 /** The orchestrator's own pi session with the subagents extension installed: a
- *  real saved session that loads the subagents extension, whose workers load
- *  `workerExtensions`, and `provider`. */
-async function orchestratorSession(h: Harness, provider: InlineExtension, workerExtensions: readonly InlineExtension[]) {
+ *  real saved session that loads `provider`, `others` and the subagents
+ *  extension, whose workers load `workerExtensions`. */
+async function orchestratorSession(h: Harness, provider: InlineExtension, workerExtensions: readonly InlineExtension[], others: readonly InlineExtension[] = []) {
   const services = await createAgentSessionServices({ cwd: h.projectDir, agentDir: h.agentDir, resourceLoaderOptions: {
-    extensionFactories: [provider, { name: "subagents", factory: createSubagentsExtension({ workerExtensions }) }],
+    extensionFactories: [provider, ...others, { name: "subagents", factory: createSubagentsExtension({ workerExtensions }) }],
   } });
   const model = services.modelRuntime.getModel("anthropic", "claude-haiku-4-5");
   assert.ok(model, "the fake provider serves claude-haiku-4-5");
@@ -2650,7 +2650,7 @@ test("the orchestrator's session has the protocol in its system prompt on every 
     } finally { session.dispose(); }
     const turns = provider.requests.filter((request) => request.tools.length > 0);
     assert.equal(turns.length, 4, "two turns per prompt");
-    for (const turn of turns) assert.ok(turn.systemPrompt.includes(ORCHESTRATOR_PROTOCOL), turn.systemPrompt);
+    for (const turn of turns) assert.ok(turn.systemPrompt.includes(orchestratorProtocol(3)), turn.systemPrompt);
   } finally { h.cleanup(); }
 });
 
@@ -2694,12 +2694,188 @@ test("no worker gets the protocol: not a routed worker, not one that delegates, 
 
     const orchestratorRequests = provider.requests.filter((request) => request.sessionId === orchestratorId);
     assert.equal(orchestratorRequests.length, 2);
-    for (const request of orchestratorRequests) assert.ok(request.systemPrompt.includes(ORCHESTRATOR_PROTOCOL), request.systemPrompt);
+    for (const request of orchestratorRequests) assert.ok(request.systemPrompt.includes(orchestratorProtocol(3)), request.systemPrompt);
     const workerRequests = provider.requests.filter((request) => request.sessionId !== orchestratorId);
     assert.equal(new Set(workerRequests.map((request) => request.sessionId)).size, 4, "three workers and the lead's own worker");
     for (const request of workerRequests) assert.equal(request.systemPrompt.includes("Orchestrator protocol"), false, request.systemPrompt);
     // The fork's copied conversation carried the orchestrator's protocol; its own prompt does not.
     const fork = results[2]!;
     assert.ok(fork.sessionFile && readFileSync(fork.sessionFile, "utf8").includes("Orchestrator protocol"), "the fork's copy has the orchestrator's section");
+  } finally { h.cleanup(); }
+});
+
+// The exploration budget (ADR 0005), in the orchestrator's real pi session:
+// the model's tool calls go through pi's tool_call hooks, the owner's
+// `/pi-orchestrator budget off` through pi's command handling.
+
+const READ: ScriptedReply = { toolCall: { name: "read", arguments: { path: "README.md" } } };
+const BUDGET_DENIED = "pi-orchestrator: 3 exploratory calls this prompt. Hand the rest of the research to a worker with `subagents`.";
+
+/** A scripted provider whose orchestrator follows `plan`, one reply per request, then says done; other sessions follow `worker`. */
+function plannedAnthropic(worker: (request: ScriptedRequest) => ScriptedReply = () => ({ text: "leaf done" })) {
+  const plan: ScriptedReply[] = [];
+  let orchestratorId: string | undefined;
+  const provider = scriptedAnthropic((request) => request.sessionId !== orchestratorId ? worker(request) : plan.shift() ?? { text: "done" });
+  return { ...provider, plan, setOrchestrator: (id: string) => { orchestratorId = id; } };
+}
+
+/** The tool results of `session`'s messages from `from` on: the tool and, for a refused call, its reason. */
+function toolOutcomes(session: { readonly messages: readonly unknown[] }, from = 0): string[] {
+  return (session.messages.slice(from) as { role: string; toolName?: string; isError?: boolean; content?: { type: string; text?: string }[] }[])
+    .filter((message) => message.role === "toolResult")
+    .map((message) => message.isError ? `${message.toolName} refused: ${message.content?.map((part) => part.text ?? "").join("")}` : `${message.toolName} ok`);
+}
+
+test("the orchestrator's 4th exploratory call in one user prompt is denied, actions are not counted, and the next prompt starts again", async () => {
+  const h = harness();
+  try {
+    writeFileSync(join(h.projectDir, "README.md"), "# Project\n");
+    writeFileSync(join(h.projectDir, "index.js"), "export const x = 1;\n");
+    const provider = plannedAnthropic();
+    const session = await orchestratorSession(h, provider.extension, [provider.extension]);
+    try {
+      provider.setOrchestrator(session.sessionId);
+      provider.plan.push(READ, { toolCall: { name: "write", arguments: { path: "notes.md", content: "x\n" } } },
+        { toolCall: { name: "bash", arguments: { command: "node --check index.js" } } }, READ,
+        { toolCall: { name: "bash", arguments: { command: "echo hi > out.txt" } } }, READ);
+      await session.prompt("Look around");
+      assert.deepEqual(toolOutcomes(session), ["read ok", "write ok", "bash ok", "read ok", "bash ok", `read refused: ${BUDGET_DENIED}`]);
+      const second = session.messages.length;
+      provider.plan.push(READ, READ, READ, READ);
+      await session.prompt("Look again");
+      assert.deepEqual(toolOutcomes(session, second), ["read ok", "read ok", "read ok", `read refused: ${BUDGET_DENIED}`]);
+    } finally { session.dispose(); }
+  } finally { h.cleanup(); }
+});
+
+test("the threshold is the owner's explorationBudget setting, and the protocol names it", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { explorationBudget: 1 } } });
+  try {
+    writeFileSync(join(h.projectDir, "README.md"), "# Project\n");
+    const provider = plannedAnthropic();
+    const session = await orchestratorSession(h, provider.extension, [provider.extension]);
+    try {
+      provider.setOrchestrator(session.sessionId);
+      provider.plan.push(READ, READ);
+      await session.prompt("Look around");
+      assert.deepEqual(toolOutcomes(session), ["read ok",
+        "read refused: pi-orchestrator: 1 exploratory call this prompt. Hand the rest of the research to a worker with `subagents`."]);
+    } finally { session.dispose(); }
+    assert.equal(provider.requests.length, 3);
+    for (const request of provider.requests) {
+      assert.ok(request.systemPrompt.includes(orchestratorProtocol(1)), request.systemPrompt);
+      assert.match(request.systemPrompt, /1 exploratory call per user prompt/);
+    }
+  } finally { h.cleanup(); }
+});
+
+test("workers, forked workers and a pi-subagents child's session are never budgeted", async () => {
+  const h = harness();
+  try {
+    writeFileSync(join(h.projectDir, "README.md"), "# Project\n");
+    writeAgentDefinition(join(h.agentDir, "agents"), "lead.md", { name: "lead", description: "Delegates", tools: "read, subagents" }, "Split the work.");
+    // Each worker reads five times, then reports how many of its reads were refused.
+    const provider = plannedAnthropic((request) => request.toolResults.length < 5 ? READ
+      : { text: `refused ${request.toolResults.filter((result) => result.isError).length}` });
+    const session = await orchestratorSession(h, provider.extension, installedWithSubagents(provider.extension, 1));
+    let results: readonly SubagentResult[] = [];
+    try {
+      provider.setOrchestrator(session.sessionId);
+      provider.plan.push({ toolCall: { name: "subagents", arguments: { items: [
+        { task: "Read five times" }, { task: "Read five times", agent: "lead" }, { task: "Read five times", fork: true },
+      ] } } });
+      await session.prompt("Hand out the reading");
+      const toolResult = session.messages.find((message) => message.role === "toolResult") as { details?: SubagentsDetails } | undefined;
+      results = toolResult?.details?.results ?? [];
+    } finally { session.dispose(); }
+    assert.deepEqual(results.map((result) => [result.status, result.finalText]), Array(3).fill(["completed", "refused 0"]), JSON.stringify(results));
+  } finally { h.cleanup(); }
+
+  const child = harness();
+  process.env.PI_SUBAGENT_CHILD = "1";
+  try {
+    writeFileSync(join(child.projectDir, "README.md"), "# Project\n");
+    const provider = plannedAnthropic();
+    const session = await orchestratorSession(child, provider.extension, [provider.extension]);
+    try {
+      provider.setOrchestrator(session.sessionId);
+      provider.plan.push(READ, READ, READ, READ, READ);
+      await session.prompt("Look around");
+      assert.deepEqual(toolOutcomes(session), Array(5).fill("read ok"));
+    } finally { session.dispose(); }
+  } finally {
+    delete process.env.PI_SUBAGENT_CHILD;
+    child.cleanup();
+  }
+});
+
+test("/pi-orchestrator budget off lifts the budget for the running prompt, or for the next user prompt when idle", async () => {
+  const h = harness();
+  try {
+    writeFileSync(join(h.projectDir, "README.md"), "# Project\n");
+    // The owner's side: a tool the model calls to have the owner type a command
+    // mid-prompt, and a command that starts a run with a message, as a
+    // background call's completion notice does.
+    let typeCommand: (text: string) => Promise<void> = async () => {};
+    const owner: InlineExtension = { name: "owner", factory: (pi) => {
+      pi.registerTool({
+        name: "owner_types", label: "Owner types", description: "The owner types a command.",
+        parameters: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } as unknown as Tool["parameters"],
+        async execute(_id, params) { await typeCommand((params as { text: string }).text); return { content: [], details: undefined }; },
+      });
+      pi.registerCommand("notice", { description: "A message starts a run", handler: async () => {
+        pi.sendMessage({ customType: "test-notice", content: "A worker finished", display: true }, { triggerTurn: true });
+      } });
+    } };
+    const provider = plannedAnthropic();
+    const session = await orchestratorSession(h, provider.extension, [provider.extension], [routerExtension(), owner]);
+    typeCommand = (text) => session.prompt(text);
+    try {
+      provider.setOrchestrator(session.sessionId);
+      const commands = session.extensionRunner.getRegisteredCommands().map((command) => command.invocationName);
+      assert.deepEqual(commands.filter((name) => name.startsWith("pi-orchestrator")), ["pi-orchestrator"], "the router and the subagents extension share one command");
+
+      // While the prompt runs: the rest of this prompt is lifted.
+      provider.plan.push(READ, READ, READ, READ, { toolCall: { name: "owner_types", arguments: { text: "/pi-orchestrator budget off" } } }, READ, READ);
+      await session.prompt("Look around");
+      assert.deepEqual(toolOutcomes(session), ["read ok", "read ok", "read ok", `read refused: ${BUDGET_DENIED}`, "owner_types ok", "read ok", "read ok"]);
+
+      // The next user prompt has the budget again.
+      let from = session.messages.length;
+      provider.plan.push(READ, READ, READ, READ);
+      await session.prompt("Look again");
+      assert.deepEqual(toolOutcomes(session, from), ["read ok", "read ok", "read ok", `read refused: ${BUDGET_DENIED}`]);
+
+      // While idle: the next user prompt is lifted, not a run a message starts before it.
+      await session.prompt("/pi-orchestrator budget off");
+      from = session.messages.length;
+      provider.plan.push(READ);
+      await session.prompt("/notice");
+      await session.waitForIdle();
+      assert.deepEqual(toolOutcomes(session, from), [`read refused: ${BUDGET_DENIED}`], "a message-started run counts on from the last prompt");
+      from = session.messages.length;
+      provider.plan.push(READ, READ, READ, READ);
+      await session.prompt("Look once more");
+      assert.deepEqual(toolOutcomes(session, from), ["read ok", "read ok", "read ok", "read ok"]);
+      from = session.messages.length;
+      provider.plan.push(READ, READ, READ, READ);
+      await session.prompt("And again");
+      assert.deepEqual(toolOutcomes(session, from), ["read ok", "read ok", "read ok", `read refused: ${BUDGET_DENIED}`]);
+    } finally { session.dispose(); }
+  } finally { h.cleanup(); }
+});
+
+test("/pi-orchestrator budget takes only off, and tells the owner which prompt it lifts", async () => {
+  const h = harness();
+  try {
+    const subagents = loadSubagents([]);
+    const main = orchestrator(h);
+    await subagents.startSession(main.ctx);
+    const at = (idle: boolean) => ({ ...main.ctx, isIdle: () => idle }) as ExtensionContext;
+    for (const args of ["budget", "budget on", "budget off now"]) {
+      assert.deepEqual(await subagents.runCommand("pi-orchestrator", args, at(true)), ["usage: /pi-orchestrator budget off"], args);
+    }
+    assert.deepEqual(await subagents.runCommand("pi-orchestrator", "budget off", at(false)), ["pi-orchestrator: exploration budget off for the rest of this prompt."]);
+    assert.deepEqual(await subagents.runCommand("pi-orchestrator", "budget off", at(true)), ["pi-orchestrator: exploration budget off for the next prompt."]);
   } finally { h.cleanup(); }
 });

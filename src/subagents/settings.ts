@@ -19,6 +19,8 @@ export interface SubagentsSettings {
     /** Under "preserve", a definition-named model may be on the subagent ban list (ADR 0002 follow-up). */
     readonly allowBanned: boolean;
   };
+  /** Exploratory calls the orchestrator may make per user prompt before the next is denied (ADR 0005). */
+  readonly explorationBudget: number;
 }
 
 export interface LoadedSubagentsSettings {
@@ -32,6 +34,8 @@ export interface LoadedSubagentsSettings {
 }
 
 const SUBAGENTS_KEY = "orchestrator.subagents";
+/** `explorationBudget` when the owner sets none. */
+export const DEFAULT_EXPLORATION_BUDGET = 3;
 const FLAG = "allowProjectOverrides";
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -77,6 +81,10 @@ export function subagentsSettingsFromSettings(personal: unknown, project?: unkno
   if (typeof maxBackgroundWorkers !== "number" || !Number.isInteger(maxBackgroundWorkers) || maxBackgroundWorkers < 1) {
     throw new Error(`${SUBAGENTS_KEY}.maxBackgroundWorkers must be a positive integer`);
   }
+  const explorationBudget = options.explorationBudget ?? DEFAULT_EXPLORATION_BUDGET;
+  if (typeof explorationBudget !== "number" || !Number.isInteger(explorationBudget) || explorationBudget < 1) {
+    throw new Error(`${SUBAGENTS_KEY}.explorationBudget must be a positive integer`);
+  }
   const agentDefinitionModel = options.agentDefinitionModel;
   if (agentDefinitionModel !== undefined && !isPlainObject(agentDefinitionModel)) {
     throw new Error(`${SUBAGENTS_KEY}.agentDefinitionModel must be an object`);
@@ -87,7 +95,7 @@ export function subagentsSettingsFromSettings(personal: unknown, project?: unkno
   if (typeof allowBanned !== "boolean") throw new Error(`${SUBAGENTS_KEY}.agentDefinitionModel.allowBanned must be a boolean`);
 
   return {
-    settings: { maxParallel: Math.min(maxParallel, 8), maxBackgroundWorkers, agentDefinitionModel: { use, allowBanned } },
+    settings: { maxParallel: Math.min(maxParallel, 8), maxBackgroundWorkers, agentDefinitionModel: { use, allowBanned }, explorationBudget },
     allowProjectOverrides,
     ignoredProjectKeys,
   };

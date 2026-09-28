@@ -7,7 +7,7 @@ priority: normal
 tags:
     - ready-for-agent
 created_at: 2026-09-27T21:58:41Z
-updated_at: 2026-09-27T22:07:20Z
+updated_at: 2026-09-28T07:45:59Z
 parent: pi-orchestrator-3p1z
 blocked_by:
     - pi-orchestrator-y8cd
@@ -26,6 +26,7 @@ ADR 0010. The runtime tracks, per delegation, whether it edited: its session ran
 
 - [ ] Editing is recorded per delegation and survives the worker's end; nested workers' edits count for their top-level delegation
 - [ ] bash that the classification does not recognise as read-only or build/test counts as editing
+- [ ] ctx_execute and ctx_execute_file in a worker's session count as editing (they run arbitrary code), although the budget counts them as exploratory (owner decision 2026-09-28)
 - [ ] subagents_verdict records accept and request_changes on editing delegations; the routing report shows them
 - [ ] A verdict on an unknown or non-editing delegation is refused with a reason
 - [ ] A later verdict on the same delegation replaces the earlier one in the report
