@@ -21,6 +21,7 @@ import { agentLabel, startWorkerWidget, type WorkerWidget } from "./worker-widge
 import { findWorker, pickWorker, workerListing } from "./worker-picker.ts";
 import { openTranscript } from "./transcript-view.ts";
 import { isWorkerSession } from "./worker-sessions.ts";
+import { addOrchestratorProtocol } from "./orchestrator-protocol.ts";
 
 // The subagents extension (ADR 0007): a third pi extension, separate from the
 // router and the guard, with a `subagents` tool. Each call starts a worker in
@@ -526,6 +527,8 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
     // compaction or a queued continuation keeps the orchestrator running.
     pi.on("agent_start", (_event, ctx) => { if (!isWorkerSession(ctx)) workerBoard().setOrchestratorState("running"); });
     pi.on("agent_settled", (_event, ctx) => { if (!isWorkerSession(ctx)) workerBoard().setOrchestratorState("idle"); });
+    // The orchestrator protocol joins the orchestrator's system prompt as each user prompt starts its agent loop.
+    pi.on("before_agent_start", addOrchestratorProtocol);
   };
 }
 

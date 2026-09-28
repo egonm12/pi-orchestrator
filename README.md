@@ -2,7 +2,7 @@
 
 A [pi](https://pi.dev) package with three extensions for sessions that delegate work to workers:
 
-- **Subagents**: the built-in `subagents` tool. It starts workers in the orchestrator's own process, on the auto model `orchestrator/auto`.
+- **Subagents**: the built-in `subagents` tool. It starts workers in the orchestrator's own process, on the auto model `orchestrator/auto`, and gives the orchestrator's own session the orchestrator protocol.
 - **Router extension**: serves the auto model `orchestrator/auto`. It classifies a worker's first request into a tier and routes it to a rung from your tier map.
 - **Guard**: enforces a personal subagent ban list for workers and an optional session ban list for the orchestrator.
 
@@ -89,6 +89,12 @@ A worker started by another worker reports to that worker, progress only, since 
 A worker's final reply is its Result. Every worker except a fork gets the reporting rules appended to its system prompt, whatever its agent definition says, and before that definition's instructions: verify before reporting, give `file:line` for every factual claim, label unverified claims, say what could not be checked and why, and do only what the task asks. The Result ends in five sections, each under its own heading: Confirmed, Changed, Unverified, Could not check and Verified by (the commands the worker ran). A resumed worker gets the rules again; a resumed fork does not.
 
 When a worker other than a fork completes, the runtime checks its Result's section headers, without a model call. A markdown heading or a bold label starting with a section's name counts, as does a plain line of the name alone or followed by a colon. A Result missing one or more sections gets a note naming them after its text in that worker's part of the tool result, and the item's `missingSections` in `details` lists them. The check never rejects a Result, and a complete one gets no note.
+
+### Orchestrator protocol
+
+The orchestrator's own session carries the orchestrator protocol as the `orchestrator_protocol` section of its system prompt: delegate exploration and substantial work to workers, keep small known actions (a single lookup, a small edit, a build or test run, a commit), and treat a worker's Result as evidence to check before acting on it. The text lives in `src/subagents/orchestrator-protocol.ts`. The section is added when each user prompt starts its agent loop, so it holds for every turn of that loop and returns after a compaction. There is no per-prompt reminder line. Workers, forked workers and sessions in a pi-subagents child process never get it; a fork's copied conversation holds the orchestrator's section, and pi removes it from the fork's own prompt.
+
+A run that a message starts without a user prompt, such as a background call's completion notice or a worker's question, has the protocol for its first turn only: pi rebuilds the prompt of its later turns without the section, until the next user prompt adds it again.
 
 ### Status and wait
 
@@ -323,7 +329,7 @@ Decision records keep the first 200 characters of the task text, with credential
   { "packages": [{ "source": "git:github.com/egonm12/pi-orchestrator", "extensions": ["!src/router/extension.ts"] }] }
   ```
 
-  Use `!src/guard/extension.ts` to keep the router and drop the guard, or `!src/subagents/extension.ts` to drop only the built-in `subagents` tool and keep routing for other subagent extensions.
+  Use `!src/guard/extension.ts` to keep the router and drop the guard, or `!src/subagents/extension.ts` to drop only the built-in `subagents` tool, and with it the orchestrator protocol, and keep routing for other subagent extensions.
 - **Everything, for one run**: `pi --no-extensions`.
 - **Uninstall**: `pi remove git:github.com/egonm12/pi-orchestrator`.
 

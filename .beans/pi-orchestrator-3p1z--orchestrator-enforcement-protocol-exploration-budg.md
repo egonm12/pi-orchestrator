@@ -5,7 +5,7 @@ status: in-progress
 type: epic
 priority: normal
 created_at: 2026-09-27T21:45:45Z
-updated_at: 2026-09-27T22:18:37Z
+updated_at: 2026-09-28T07:15:20Z
 ---
 
 Design session (split-plan 'orchestrator enforcement', ADR 0005). Keeps the main session in the orchestrator role.
@@ -83,3 +83,6 @@ Design session (split-plan 'orchestrator enforcement', ADR 0005). Keeps the main
 - y8cd: before_agent_start runs once per user prompt; system prompt applies to every model request.
 - vu2o: the subcommand dispatcher is new.
 Rejected: jeyq's redundant vu2o edge (it uses vu2o directly, kept); kokv's stale file slug (cosmetic, title is correct).
+
+
+- y8cd: owner chose to accept and document the protocol gap in message-started runs (no context_with_system fallback).

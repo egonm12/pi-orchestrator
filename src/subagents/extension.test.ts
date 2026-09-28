@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { after, test } from "node:test";
-import { DefaultPackageManager, initTheme, SessionManager, SettingsManager, type ExtensionAPI, type ExtensionContext, type InlineExtension, type Theme } from "@earendil-works/pi-coding-agent";
+import { createAgentSessionFromServices, createAgentSessionServices, DefaultPackageManager, initTheme, SessionManager, SettingsManager, type ExtensionAPI, type ExtensionContext, type InlineExtension, type Theme } from "@earendil-works/pi-coding-agent";
 // pi's own keybindings manager, which pi hands a ctx.ui.custom factory; its public entry exports only the type.
 import { KeybindingsManager } from "../../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js";
 import { buildCatalog } from "../catalog/model-catalog.ts";
@@ -16,9 +16,10 @@ import { buildRoutingReport } from "../routing/routing-report.ts";
 import { autoStream } from "../router/auto-stream.ts";
 import { createRouterExtension } from "../router/extension.ts";
 import personalGuard from "../guard/extension.ts";
-import { createSubagentsExtension, MAX_TEXT_BYTES, type SubagentsDetails, type SubagentsProgressDetails } from "./extension.ts";
+import { createSubagentsExtension, MAX_TEXT_BYTES, type SubagentResult, type SubagentsDetails, type SubagentsProgressDetails } from "./extension.ts";
 import { markWorkerSession } from "./worker-sessions.ts";
 import { isOrchestratorSession } from "./orchestrator-session.ts";
+import { ORCHESTRATOR_PROTOCOL } from "./orchestrator-protocol.ts";
 import { workerBoard, type BoardWorker } from "./worker-board.ts";
 import { openTranscript } from "./transcript-view.ts";
 
@@ -1376,6 +1377,9 @@ interface ScriptedRequest {
   /** The tool results in the request's context, in order. */
   readonly toolResults: readonly { readonly text: string; readonly isError: boolean }[];
   readonly userMessages: readonly string[];
+  /** The system prompt's sections as the model has them at this request: every
+   *  system message's sections applied in order, a removed one dropped. */
+  readonly systemPrompt: string;
 }
 
 /** What a scripted provider answers: a final text, or one tool call, which a text may come before. */
@@ -1392,10 +1396,15 @@ function scriptedAnthropic(script: (request: ScriptedRequest) => ScriptedReply, 
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200_000, maxTokens: 64_000 }],
     streamSimple(model, context, options) {
       const tools = new Set<string>();
+      const sections = new Map<string, string>();
       for (const message of context.messages) {
         if (message.role !== "system") continue;
         for (const tool of message.toolsRemoved ?? []) tools.delete(tool.name);
         for (const tool of message.toolsAdded ?? []) tools.add(tool.name);
+        for (const [name, section] of Object.entries(message.sections ?? {})) {
+          if (section === null) sections.delete(name);
+          else sections.set(name, section);
+        }
       }
       const text = (content: string | readonly { type: string; text?: string }[]) =>
         typeof content === "string" ? content : content.map((part) => part.type === "text" ? part.text ?? "" : "").join("");
@@ -1404,6 +1413,7 @@ function scriptedAnthropic(script: (request: ScriptedRequest) => ScriptedReply, 
         sessionId: options?.sessionId, task: firstUser ? text(firstUser.content) : "", tools: [...tools],
         toolResults: context.messages.flatMap((message) => message.role === "toolResult" ? [{ text: text(message.content), isError: message.isError }] : []),
         userMessages: context.messages.flatMap((message) => message.role === "user" ? [text(message.content)] : []),
+        systemPrompt: [...sections.values()].join("\n\n"),
       };
       requests.push(request);
       const reply = script(request);
@@ -2600,5 +2610,96 @@ test("the board's orchestrator state follows the orchestrator's own agent runs, 
       await subagents.agentEvent("agent_settled", main.ctx);
       assert.equal(workerBoard().orchestratorState(), "idle");
     } finally { unsubscribe(); }
+  } finally { h.cleanup(); }
+});
+
+/** The orchestrator's own pi session with the subagents extension installed: a
+ *  real saved session that loads the subagents extension, whose workers load
+ *  `workerExtensions`, and `provider`. */
+async function orchestratorSession(h: Harness, provider: InlineExtension, workerExtensions: readonly InlineExtension[]) {
+  const services = await createAgentSessionServices({ cwd: h.projectDir, agentDir: h.agentDir, resourceLoaderOptions: {
+    extensionFactories: [provider, { name: "subagents", factory: createSubagentsExtension({ workerExtensions }) }],
+  } });
+  const model = services.modelRuntime.getModel("anthropic", "claude-haiku-4-5");
+  assert.ok(model, "the fake provider serves claude-haiku-4-5");
+  const sessionManager = SessionManager.create(h.projectDir, join(h.agentDir, "sessions", "--project--"));
+  const { session } = await createAgentSessionFromServices({ services, sessionManager, model, thinkingLevel: "low" });
+  await session.bindExtensions({});
+  return session;
+}
+
+test("the orchestrator's session has the protocol in its system prompt on every turn, after a compaction too", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING }, compaction: { keepRecentTokens: 1 } });
+  try {
+    writeFileSync(join(h.projectDir, "README.md"), "# Project\n");
+    // Each prompt reads README.md, then answers: two turns. The compaction's summary request has no tools.
+    let readNext = false;
+    const provider = scriptedAnthropic((request) => {
+      if (!readNext || !request.tools.includes("read")) return { text: "done" };
+      readNext = false;
+      return { toolCall: { name: "read", arguments: { path: "README.md" } } };
+    });
+    const session = await orchestratorSession(h, provider.extension, [provider.extension]);
+    try {
+      readNext = true;
+      await session.prompt("Read README.md");
+      await session.compact();
+      assert.ok(session.sessionManager.getBranch().some((entry) => entry.type === "compaction"), "the session was compacted");
+      readNext = true;
+      await session.prompt("Read README.md again");
+    } finally { session.dispose(); }
+    const turns = provider.requests.filter((request) => request.tools.length > 0);
+    assert.equal(turns.length, 4, "two turns per prompt");
+    for (const turn of turns) assert.ok(turn.systemPrompt.includes(ORCHESTRATOR_PROTOCOL), turn.systemPrompt);
+  } finally { h.cleanup(); }
+});
+
+test("a pi-subagents child's session gets no protocol", async () => {
+  const h = harness();
+  process.env.PI_SUBAGENT_CHILD = "1";
+  try {
+    const provider = scriptedAnthropic(() => ({ text: "done" }));
+    const session = await orchestratorSession(h, provider.extension, [provider.extension]);
+    try { await session.prompt("Say done"); } finally { session.dispose(); }
+    assert.equal(provider.requests.length, 1);
+    assert.equal(provider.requests[0]!.systemPrompt.includes("Orchestrator protocol"), false, provider.requests[0]!.systemPrompt);
+  } finally {
+    delete process.env.PI_SUBAGENT_CHILD;
+    h.cleanup();
+  }
+});
+
+test("no worker gets the protocol: not a routed worker, not one that delegates, not a forked worker", async () => {
+  const h = harness();
+  try {
+    writeAgentDefinition(join(h.agentDir, "agents"), "lead.md", { name: "lead", description: "Delegates", tools: "read, subagents" }, "Split the work.");
+    const items = [
+      { task: "Find the config file" },
+      { task: `Delegate:${JSON.stringify({ items: [{ task: "Find the tests" }] })}`, agent: "lead" },
+      { task: "Finish the work", fork: true },
+    ];
+    // The orchestrator hands out the three items in one call; its workers follow delegatingScript.
+    let orchestratorId: string | undefined;
+    const provider = scriptedAnthropic((request) => request.sessionId !== orchestratorId ? delegatingScript(request)
+      : request.toolResults.length === 0 ? { toolCall: { name: "subagents", arguments: { items } } } : { text: "done" });
+    const session = await orchestratorSession(h, provider.extension, installedWithSubagents(provider.extension, 1));
+    let results: readonly SubagentResult[] = [];
+    try {
+      orchestratorId = session.sessionId;
+      await session.prompt("Hand out the work");
+      const toolResult = session.messages.find((message) => message.role === "toolResult") as { details?: SubagentsDetails } | undefined;
+      results = toolResult?.details?.results ?? [];
+    } finally { session.dispose(); }
+    assert.deepEqual(results.map((result) => result.status), ["completed", "completed", "completed"], JSON.stringify(results));
+
+    const orchestratorRequests = provider.requests.filter((request) => request.sessionId === orchestratorId);
+    assert.equal(orchestratorRequests.length, 2);
+    for (const request of orchestratorRequests) assert.ok(request.systemPrompt.includes(ORCHESTRATOR_PROTOCOL), request.systemPrompt);
+    const workerRequests = provider.requests.filter((request) => request.sessionId !== orchestratorId);
+    assert.equal(new Set(workerRequests.map((request) => request.sessionId)).size, 4, "three workers and the lead's own worker");
+    for (const request of workerRequests) assert.equal(request.systemPrompt.includes("Orchestrator protocol"), false, request.systemPrompt);
+    // The fork's copied conversation carried the orchestrator's protocol; its own prompt does not.
+    const fork = results[2]!;
+    assert.ok(fork.sessionFile && readFileSync(fork.sessionFile, "utf8").includes("Orchestrator protocol"), "the fork's copy has the orchestrator's section");
   } finally { h.cleanup(); }
 });

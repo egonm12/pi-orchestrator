@@ -3,8 +3,8 @@ import { isWorkerSession } from "./worker-sessions.ts";
 
 // Whether a session is the orchestrator's own: not a worker, not a forked
 // worker, not a pi-subagents child. What binds only the orchestrator's session
-// asks here: the session ban list (ADR 0002), the remembered session model and
-// the fresh-install notice.
+// asks here: the session ban list (ADR 0002), the remembered session model,
+// the fresh-install notice and the orchestrator protocol.
 //
 // Two kinds of delegated session load these extensions too:
 // - the subagents tool's workers, forked ones included, which run in the
