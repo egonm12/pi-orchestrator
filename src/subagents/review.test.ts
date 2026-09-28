@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -14,6 +14,7 @@ import { createRouterExtension } from "../router/extension.ts";
 import { createSubagentsExtension, type SubagentResult, type SubagentsDetails } from "./extension.ts";
 import { orchestratorProtocol } from "./orchestrator-protocol.ts";
 import { REVIEW_RULES } from "./review.ts";
+import { REVIEWER_EDIT_DENIED } from "./editing.ts";
 import { markWorkerSession } from "./worker-sessions.ts";
 
 // Independent reviewers of editing delegations (ADR 0010), as the
@@ -272,8 +273,8 @@ test("subagents_verdict refuses a self-judged verdict on an elevated or critical
     assert.equal(await verdict(tools, ctx, accept("critical", reviewerId)), `Recorded accept on delegation ${ids.critical}, reviewed by delegation ${reviewerId}.`);
     // A reviewer is welcome at any tier.
     const mechanicalReviewer = await one(tools, ctx, { task: "Check it", review: ids.mechanical });
-    assert.equal(await verdict(tools, ctx, { ...accept("mechanical", mechanicalReviewer.sessionId!), verdict: "request_changes" }),
-      `Recorded request_changes on delegation ${ids.mechanical}, reviewed by delegation ${mechanicalReviewer.sessionId}. It replaces the earlier accept.`);
+    assert.ok((await verdict(tools, ctx, { ...accept("mechanical", mechanicalReviewer.sessionId!), verdict: "request_changes" }))
+      .startsWith(`Recorded request_changes on delegation ${ids.mechanical}, reviewed by delegation ${mechanicalReviewer.sessionId}. It replaces the earlier accept. `));
     const verdicts = readRoutingRecords(join(h.stateDir, "routing")).flatMap((record) => record.recordType === "verdict" ? [record.delegationId] : []);
     assert.deepEqual(verdicts, [ids.mechanical, ids.standard, ids.critical, ids.mechanical], "a refused verdict is not recorded");
   } finally { h.cleanup(); }
@@ -342,27 +343,65 @@ test("a fork and an agent's named model have no tier: gated as elevated, and rev
   }
 });
 
-test("a reviewer whose only way to run is the implementer's rung fails with the reason, and a verdict cannot name it", async () => {
-  // In shadow mode every worker runs on the session model, the implementer's rung too.
-  const h = harness({ routing: { ...ROUTING, mode: "shadow" } });
+test("in shadow mode and with routing off a reviewer runs on the implementer's rung with a fresh context, and the verdict records a same-rung review", async () => {
+  for (const mode of ["shadow", "off"] as const) {
+    // In shadow mode and with routing off every worker runs on the session model, the implementer's rung too.
+    const h = harness({ routing: mode === "off" ? { ...ROUTING, enabled: false } : { ...ROUTING, mode } });
+    try {
+      const provider = anthropic();
+      const tools = loadSubagents([routerExtension(), provider.extension]);
+      const ctx = orchestrator(h);
+      const implementer = await one(tools, ctx, { task: `[elevated] ${WRITE_NOTES}` });
+      const id = implementer.sessionId!;
+      assert.deepEqual(provider.requests.filter((request) => request.sessionId === id).map((request) => request.rung).at(0), `${HAIKU}:medium`, mode);
+      const reviewer = await one(tools, ctx, { task: "Check it", review: id });
+      assert.equal(reviewer.status, "completed", `${mode}: ${JSON.stringify(reviewer)}`);
+      const requests = provider.requests.filter((request) => request.sessionId === reviewer.sessionId);
+      assert.deepEqual(requests.map((request) => request.rung), [`${HAIKU}:medium`], `${mode}: the same rung`);
+      assert.equal(requests[0]!.task, "Check it", `${mode}: a fresh context, with only the reviewer's own task`);
+      if (mode === "shadow") assert.equal(decisionOf(h, reviewer.sessionId!).ranOn, `${HAIKU}:medium`);
+      assert.equal(await verdict(tools, ctx, { delegationId: id, verdict: "accept", reason: "checked", reviewer: reviewer.sessionId }),
+        `Recorded accept on delegation ${id}, reviewed by delegation ${reviewer.sessionId} on the delegation's own rung (a same-rung review).`, mode);
+      const verdicts = readRoutingRecords(join(h.stateDir, "routing")).flatMap((record) => record.recordType === "verdict" ? [record] : []);
+      assert.deepEqual(verdicts.map((record) => [record.delegationId, record.sameRungReview]), [[id, true]], mode);
+      // A reviewer on another rung backs an ordinary verdict.
+      process.env.PI_ORCHESTRATOR_SESSION_MODEL = `${HAIKU}:high`;
+      const other = await one(tools, ctx, { task: "Check it again", review: id });
+      assert.equal(await verdict(tools, ctx, { delegationId: id, verdict: "accept", reason: "checked", reviewer: other.sessionId }),
+        `Recorded accept on delegation ${id}, reviewed by delegation ${other.sessionId}. It replaces the earlier accept.`, mode);
+      assert.equal(readRoutingRecords(join(h.stateDir, "routing")).flatMap((record) => record.recordType === "verdict" ? [record] : []).at(-1)?.sameRungReview, undefined);
+    } finally { h.cleanup(); }
+  }
+});
+
+test("a reviewer's editing calls are denied with the reason, its reads, searches, builds and tests run, and it never becomes an editing delegation", async () => {
+  const h = harness();
   try {
+    writeFileSync(join(h.projectDir, "index.js"), "export const x = 1;\n");
     const provider = anthropic();
     const tools = loadSubagents([routerExtension(), provider.extension]);
     const ctx = orchestrator(h);
     const implementer = await one(tools, ctx, { task: `[elevated] ${WRITE_NOTES}` });
     const id = implementer.sessionId!;
-    assert.equal(decisionOf(h, id).ranOn, `${HAIKU}:medium`);
-    const reviewer = await one(tools, ctx, { task: "Check it", review: id });
-    assert.equal(reviewer.status, "failed");
-    assert.equal(reviewer.error, `no other rung is left: this worker would fall back to the orchestrator session model ${HAIKU}:medium, which its routing constraints exclude`);
-    assert.equal(provider.requests.some((request) => request.sessionId === reviewer.sessionId), false, "the reviewer never ran");
-    assert.equal(await verdict(tools, ctx, { delegationId: id, verdict: "accept", reason: "checked", reviewer: reviewer.sessionId }),
-      `subagents_verdict: reviewer ${reviewer.sessionId} ended failed; only a completed review counts`);
-    // Another session model lets it run.
-    process.env.PI_ORCHESTRATOR_SESSION_MODEL = `${HAIKU}:high`;
-    const next = await one(tools, ctx, { task: "Check it", review: id });
-    assert.equal(next.status, "completed", JSON.stringify(next));
-    assert.deepEqual(provider.requests.filter((request) => request.sessionId === next.sessionId).map((request) => request.rung), [`${HAIKU}:high`]);
+    const calls = [
+      [runTask("write", { path: "review.md", content: "x\n" }), true],
+      [runTask("bash", { command: "echo fixed > notes.md" }), true],
+      [runTask("read", { path: "notes.md" }), false],
+      [runTask("bash", { command: "grep Notes notes.md" }), false],
+      [runTask("bash", { command: "npm run build" }), false],
+      [runTask("bash", { command: "node --check index.js" }), false],
+    ] as const;
+    for (const [task, denied] of calls) {
+      const reviewer = await one(tools, ctx, { task, review: id });
+      assert.equal(reviewer.status, "completed", JSON.stringify(reviewer));
+      assert.equal(reviewer.edited, undefined, task);
+      const session = readFileSync(reviewer.sessionFile!, "utf8");
+      assert.equal(session.includes(REVIEWER_EDIT_DENIED), denied, task);
+    }
+    assert.equal(readFileSync(join(h.projectDir, "notes.md"), "utf8"), "# Notes\n", "the reviewer changed nothing");
+    assert.equal(existsSync(join(h.projectDir, "review.md")), false);
+    const edits = readRoutingRecords(join(h.stateDir, "routing")).flatMap((record) => record.recordType === "edit" ? [record.delegationId] : []);
+    assert.deepEqual(edits, [id], "only the implementer has an edit record");
   } finally { h.cleanup(); }
 });
 

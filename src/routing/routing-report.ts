@@ -22,6 +22,10 @@
 //     no row: it counts in its own line, once per delegation id, the newest
 //     winning.
 //   - Edit records (ADR 0010) mark editing delegations; they are not counted.
+//   - An effort-ladder record is a retry's link to the attempt it climbs
+//     from (ADR 0010), not its routing decision: each is listed on its own
+//     line. The retry's row is its decision record's; a retry with routing
+//     off has none, so its verdict counts as one on an unrouted delegation.
 //   - Ticket 27's `explicit` records (a call that named its own model) are
 //     not routing decisions and are not counted.
 //
@@ -32,10 +36,9 @@ import { existsSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { RISK_TIERS, type RiskTier } from "./classifier.ts";
 import {
-  isRoutedDecision,
   readRoutingRecords,
   RoutingRecordError,
-  type RoutedDecisionRecord,
+  type DecisionRecord,
   type EffortLadderRecord,
   type RecordFolderReader,
   type Verdict,
@@ -73,23 +76,25 @@ function emptyCounts(): Omit<MutableRow, "tier" | "rung"> {
   return { decisions: 0, verdicts: { accept: 0, request_changes: 0, missing: 0 }, shadowDecisions: 0, shadowAgreements: 0 };
 }
 
-function rowKey(decision: RoutedDecisionRecord): { tier: RiskTier; rung: string | null } {
+function rowKey(decision: DecisionRecord): { tier: RiskTier; rung: string | null } {
   return decision.route.outcome === "chosen"
     ? { tier: decision.route.tier, rung: decision.route.rung.rung }
     : { tier: decision.route.startedAtTier, rung: null };
 }
 
-function agrees(decision: RoutedDecisionRecord): boolean {
-  return decision.route.outcome === "chosen" && decision.recordType === "decision" && decision.route.rung.model === decision.handPickedModel;
+function agrees(decision: DecisionRecord): boolean {
+  return decision.route.outcome === "chosen" && decision.route.rung.model === decision.handPickedModel;
 }
 
 export function buildRoutingReport(folder: string, reader?: RecordFolderReader): RoutingReport {
   const records = readRoutingRecords(folder, reader);
-  const decisions = new Map<string, RoutedDecisionRecord>();
+  const decisions = new Map<string, DecisionRecord>();
+  const ladders: EffortLadderRecord[] = [];
   const verdicts = new Map<string, Verdict>();
   const orphans = new Set<string>();
   for (const record of records) {
-    if (isRoutedDecision(record)) decisions.set(record.delegationId, record);
+    if (record.recordType === "decision") decisions.set(record.delegationId, record);
+    else if (record.recordType === "effort-ladder") ladders.push(record);
     else if (record.recordType === "verdict") verdicts.set(record.delegationId, record.verdict);
     else if (record.recordType === "orphaned-verdict") orphans.add(record.delegationId);
     // An `explicit` record (ticket 27) routed nothing: no row, no orphan.
@@ -122,7 +127,7 @@ export function buildRoutingReport(folder: string, reader?: RecordFolderReader):
     if (b.rung === null) return -1;
     return a.rung < b.rung ? -1 : a.rung > b.rung ? 1 : 0;
   });
-  return { rows: ordered, totals, orphanedVerdicts: orphans.size, unroutedVerdicts, ladders: [...decisions.values()].filter((record): record is EffortLadderRecord => record.recordType === "effort-ladder") };
+  return { rows: ordered, totals, orphanedVerdicts: orphans.size, unroutedVerdicts, ladders };
 }
 
 function agreement(shadowDecisions: number, shadowAgreements: number): string {
@@ -147,7 +152,8 @@ export function renderRoutingReport(folder: string, report: RoutingReport): stri
   const unrouted = report.unroutedVerdicts;
   lines.push(`verdicts on unrouted delegations: accept ${unrouted.accept}, request_changes ${unrouted.request_changes}, missing ${unrouted.missing}`);
   for (const ladder of report.ladders) {
-    lines.push(`effort ladder: ${ladder.previousDecisionId} -> ${ladder.delegationId}; ${ladder.step}; ${ladder.route.tier} ${ladder.route.rung.rung}`);
+    const climb = ladder.step === "unplaced" ? `unplaced (${ladder.detail})` : `${ladder.step}; ${ladder.route.tier} ${ladder.route.rung.rung}`;
+    lines.push(`effort ladder: ${ladder.previousDecisionId} -> ${ladder.delegationId}; ${climb}${ladder.mode === "live" ? "" : `; ${ladder.mode}`}`);
   }
   return `${lines.join("\n")}\n`;
 }

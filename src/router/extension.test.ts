@@ -1483,26 +1483,40 @@ test("a recorded decision pins a constrained worker again only when it was made 
   } finally { clear(); h.cleanup(); }
 });
 
-test("a worker whose fallback would be the rung its constraints exclude fails with the reason instead of running: in shadow mode, on refusal and with routing off", async () => {
+test("a worker whose fallback would be the rung its constraints exclude fails with the reason after a live refusal, and runs on that rung in shadow mode and with routing off", async () => {
   const excluded = { model: "anthropic/claude-sonnet-5", effort: "high" };
   const cases = [
-    { name: "shadow", routing: SHADOW, deps: {} },
+    { name: "shadow", routing: SHADOW, deps: {}, runs: true },
     // Only anthropic is approved, and the one anthropic rung per tier is removed by the recipient filter or the exclusion.
     { name: "refused", routing: { ...LIVE, tiers: { mechanical: ["openai-codex/gpt-6-luna:low"], standard: ["openai-codex/gpt-6-sol:medium"],
       elevated: ["anthropic/claude-sonnet-5:high"], critical: ["openai-codex/gpt-6-sol:xhigh"] } },
-      deps: { evidence: () => () => evidenceOf({ authorization: approved("anthropic") }) } },
-    { name: "off", routing: { ...LIVE, enabled: false }, deps: {} },
+      deps: { evidence: () => () => evidenceOf({ authorization: approved("anthropic") }) }, runs: false },
+    { name: "off", routing: { ...LIVE, enabled: false }, deps: {}, runs: true },
   ] as const;
-  for (const { name, routing, deps } of cases) {
+  for (const { name, routing, deps, runs } of cases) {
     const h = harness(routing);
     const id = `excluded-fallback-${name}`;
     const clear = setRoutingConstraints(id, { minimumTier: "elevated", excludedRung: excluded });
     try {
-      const registry = fakeSessionRegistry([{ events: answerEvents("must not run") }]);
+      const registry = fakeSessionRegistry([{ events: answerEvents("same rung") }, { events: answerEvents("other effort") }]);
       const stream = await loadAutoProvider(h, registry, deps);
       process.env.PI_ORCHESTRATOR_SESSION_MODEL = "anthropic/claude-sonnet-5:high";
       const events = await autoEvents(stream, FIX_README, id);
       const final = events.at(-1);
+      if (runs) {
+        // A same-rung review (ADR 0010): no other rung can be chosen, so the reviewer runs on the excluded one.
+        assert.equal(final?.type, "done", name);
+        assert.deepEqual(registry.calls.map((call) => [call.model.id, call.options?.reasoning]), [["claude-sonnet-5", "high"]], name);
+        const records = h.records();
+        if (name === "shadow") {
+          const [record] = records;
+          assert.ok(record?.recordType === "decision" && record.route.outcome === "chosen", name);
+          assert.notEqual(record.route.rung.rung, "anthropic/claude-sonnet-5:high", "the would-be rung is still another");
+          assert.equal(record.ranOn, "anthropic/claude-sonnet-5:high");
+          assert.equal(record.constraints?.excludedRung, "anthropic/claude-sonnet-5:high");
+        } else assert.deepEqual(records, [], "routing off records nothing");
+        continue;
+      }
       assert.equal(final?.type, "error", name);
       if (final?.type === "error") {
         assert.equal(final.error.errorMessage, "no other rung is left: this worker would fall back to the orchestrator session model " +

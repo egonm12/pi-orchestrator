@@ -110,6 +110,7 @@ const FREE_TEXT_FIELDS: readonly (readonly [path: readonly string[], limit: numb
   [["route", "removed", "[]", "detail"], FREE_TEXT_LIMIT],
   [["skipped", "[]", "detail"], FREE_TEXT_LIMIT],
   [["reason"], FREE_TEXT_LIMIT],
+  [["detail"], FREE_TEXT_LIMIT],
 ];
 
 /** A copy with `change` applied to the string at `keys`; anything that is not
@@ -151,6 +152,13 @@ export const DEFAULT_ROUTING_RECORD_DIR = "src/state/routing";
 
 export const ROUTING_MODES = ["shadow", "live"] as const;
 export type RoutingMode = (typeof ROUTING_MODES)[number];
+
+/** Routing as a retry found it when it started: a routing mode, or `off`. */
+export const LADDER_MODES = [...ROUTING_MODES, "off"] as const;
+export type LadderMode = (typeof LADDER_MODES)[number];
+
+/** A placed climb's step, as the effort ladder took it. */
+export const LADDER_STEPS = ["effort", "same-tier", "next-tier"] as const;
 
 /** The reviewer's verdict as recorded. `missing` is a review that returned no
  *  structured verdict; it is never guessed from prose. */
@@ -271,6 +279,9 @@ export interface VerdictRecord extends RecordCommon {
   /** Why the orchestrator judged so (subagents_verdict); absent on verdicts
    *  read from a reviewer's structured output. */
   readonly reason?: string;
+  /** The verdict rests on a same-rung review: its reviewer ran on the
+   *  delegation's own rung, in shadow mode or with routing off (ADR 0010). */
+  readonly sameRungReview?: true;
 }
 
 /** A verdict whose delegation id matches no decision in the folder. Kept, not
@@ -280,19 +291,41 @@ export interface OrphanedVerdictRecord extends RecordCommon {
   readonly verdict: Verdict;
 }
 
-export interface EffortLadderRecord extends RecordCommon {
+/** A climb on the effort ladder (ADR 0010): the retry `delegationId` of the
+ *  failed attempt `previousDecisionId`, written when the retry starts. It is
+ *  the link, not the routing decision: the retry's own decision record, when
+ *  the router writes one, says what it ran on. */
+interface EffortLadderRecordCommon extends RecordCommon {
   readonly recordType: "effort-ladder";
-  readonly skipped: readonly LadderSkippedRung[];
   readonly cause: "effort-ladder";
   readonly previousDecisionId: string;
-  readonly step: "effort" | "same-tier" | "next-tier";
-  readonly mode: "live";
   readonly taskTextPrefix: string;
   readonly agentRole: string;
+}
+
+/** A climb from the failed attempt's rung to the next one the ladder chose.
+ *  In shadow mode the rung is the one the retry would use; it runs on the
+ *  session model. */
+export interface PlacedLadderRecord extends EffortLadderRecordCommon {
+  readonly step: (typeof LADDER_STEPS)[number];
+  readonly mode: RoutingMode;
+  readonly skipped: readonly LadderSkippedRung[];
   readonly kindOfWork: string;
   readonly tierMap: RecordedTierMap;
   readonly route: RecordedRouteChoice;
 }
+
+/** A retry of a failed attempt the ladder cannot place: routing was off at
+ *  the retry, or no routing decision names the attempt's rung. It names no
+ *  rung, and still counts as a climb. */
+export interface UnplacedLadderRecord extends EffortLadderRecordCommon {
+  readonly step: "unplaced";
+  readonly mode: LadderMode;
+  /** Why the ladder cannot place the failed attempt. */
+  readonly detail: string;
+}
+
+export type EffortLadderRecord = PlacedLadderRecord | UnplacedLadderRecord;
 
 /** Ticket 27: a delegation slot that named its own model, which the retired
  *  `subagent` call rewriting left alone. The router extension no longer
@@ -580,23 +613,33 @@ export function validateRoutingRecord(value: unknown): RoutingRecord {
     checkRoute(value);
     if (value.constraints !== undefined) checkConstraints(value);
   } else if (recordType === "effort-ladder") {
-    checkKeys(value, "", [...COMMON_KEYS, "cause", "previousDecisionId", "step", "mode", "taskTextPrefix", "agentRole", "kindOfWork", "tierMap", "route", "skipped"]);
+    const common = [...COMMON_KEYS, "cause", "previousDecisionId", "step", "mode", "taskTextPrefix", "agentRole"];
+    const step = oneOf(value, "step", "", [...LADDER_STEPS, "unplaced"]);
+    if (step === "unplaced") {
+      if (value.schemaVersion !== DECISION_RECORD_SCHEMA_VERSION) throw new RoutingRecordError("schemaVersion", "is unsupported for unplaced effort-ladder records");
+      checkKeys(value, "", [...common, "detail"]);
+      oneOf(value, "mode", "", LADDER_MODES);
+      stringAt(value, "detail", "", { nonBlank: true });
+    } else {
+      checkKeys(value, "", [...common, "kindOfWork", "tierMap", "route", "skipped"]);
+      eachObject(value, "skipped", "", (entry, path) => {
+        checkKeys(entry, path, ["tier", "rung", "model", "reason", "detail"]);
+        oneOf(entry, "tier", path, RISK_TIERS);
+        oneOf(entry, "reason", path, LADDER_SKIP_REASONS);
+        for (const key of ["rung", "model", "detail"]) stringAt(entry, key, path, { nonBlank: true });
+      });
+      // A placed climb needs a tier map, which routing off does not load.
+      oneOf(value, "mode", "", ROUTING_MODES);
+      stringAt(value, "kindOfWork", "", { nonBlank: true });
+      checkTierMap(value);
+      checkRoute(value);
+      oneOf(objectAt(value, "route", ""), "outcome", "route", ["chosen"]);
+    }
     checkCommon(value);
-    eachObject(value, "skipped", "", (entry, path) => {
-      checkKeys(entry, path, ["tier", "rung", "model", "reason", "detail"]);
-      oneOf(entry, "tier", path, RISK_TIERS);
-      oneOf(entry, "reason", path, LADDER_SKIP_REASONS);
-      for (const key of ["rung", "model", "detail"]) stringAt(entry, key, path, { nonBlank: true });
-    });
     oneOf(value, "cause", "", ["effort-ladder"]);
-    oneOf(value, "step", "", ["effort", "same-tier", "next-tier"]);
-    oneOf(value, "mode", "", ["live"]);
-    for (const key of ["previousDecisionId", "agentRole", "kindOfWork"]) stringAt(value, key, "", { nonBlank: true });
+    for (const key of ["previousDecisionId", "agentRole"]) stringAt(value, key, "", { nonBlank: true });
     if (value.previousDecisionId === value.delegationId) throw new RoutingRecordError("previousDecisionId", "must name a different attempt");
     stringAt(value, "taskTextPrefix", "");
-    checkTierMap(value);
-    checkRoute(value);
-    oneOf(objectAt(value, "route", ""), "outcome", "route", ["chosen"]);
   } else if (recordType === "fork") {
     if (value.schemaVersion !== DECISION_RECORD_SCHEMA_VERSION) throw new RoutingRecordError("schemaVersion", `is unsupported for ${recordType} records`);
     checkKeys(value, "", [...COMMON_KEYS, "model", "effort", "parentSession", "forkPoint", "banListException"]);
@@ -620,12 +663,13 @@ export function validateRoutingRecord(value: unknown): RoutingRecord {
     for (const key of ["slot", "model", "agentRole"]) stringAt(value, key, "", { nonBlank: true });
     stringAt(value, "taskTextPrefix", "");
   } else if (recordType === "verdict") {
-    checkKeys(value, "", [...COMMON_KEYS, "verdict", "decisionFile"], ["reason"]);
+    checkKeys(value, "", [...COMMON_KEYS, "verdict", "decisionFile"], ["reason", "sameRungReview"]);
     checkCommon(value);
     oneOf(value, "verdict", "", VERDICTS);
     const decisionFile = stringAt(value, "decisionFile", "", { nonBlank: true });
     if (!DAY_FILE.test(decisionFile)) throw new RoutingRecordError("decisionFile", `must name a day file YYYY-MM-DD.jsonl; got ${JSON.stringify(decisionFile)}`);
     if (value.reason !== undefined) stringAt(value, "reason", "", { nonBlank: true });
+    if (value.sameRungReview !== undefined && value.sameRungReview !== true) throw new RoutingRecordError("sameRungReview", "must be true when present");
   } else if (recordType === "edit") {
     if (value.schemaVersion !== DECISION_RECORD_SCHEMA_VERSION) throw new RoutingRecordError("schemaVersion", `is unsupported for ${recordType} records`);
     checkKeys(value, "", [...COMMON_KEYS, "orchestratorSession", "tool"], ["nestedDelegationId"]);
@@ -762,23 +806,41 @@ export function buildEffortLadderRecord(input: {
   readonly delegationId: string;
   readonly at: Date;
   readonly previousDecisionId: string;
-  readonly step: EffortLadderRecord["step"];
+  readonly step: PlacedLadderRecord["step"];
+  readonly mode: RoutingMode;
   readonly skipped: readonly LadderSkippedRung[];
   readonly taskText: string;
   readonly agentRole: string;
   readonly kindOfWork: string;
   readonly tierMap: ResolvedTierMap;
   readonly route: Extract<TierRouteDecision, { ok: true }>;
-}): EffortLadderRecord {
-  const record: EffortLadderRecord = {
+}): PlacedLadderRecord {
+  const record: PlacedLadderRecord = {
     recordType: "effort-ladder", schemaVersion: DECISION_RECORD_SCHEMA_VERSION,
     skipped: input.skipped.map((entry) => ({ tier: entry.tier, rung: entry.rung, model: entry.model, reason: entry.reason, detail: entry.detail })),
-    cause: "effort-ladder", mode: "live", delegationId: input.delegationId,
+    cause: "effort-ladder", mode: input.mode, delegationId: input.delegationId,
     timestamp: input.at.toISOString(), previousDecisionId: input.previousDecisionId, step: input.step,
     taskTextPrefix: input.taskText, agentRole: input.agentRole, kindOfWork: input.kindOfWork,
     tierMap: recordedTierMap(input.tierMap), route: recordedRoute(input.route) as RecordedRouteChoice,
   };
   return checkedRecord(record);
+}
+
+/** The effort-ladder record of a retry whose failed attempt the ladder cannot place. */
+export function buildUnplacedLadderRecord(input: {
+  readonly delegationId: string;
+  readonly at: Date;
+  readonly previousDecisionId: string;
+  readonly mode: LadderMode;
+  readonly detail: string;
+  readonly taskText: string;
+  readonly agentRole: string;
+}): UnplacedLadderRecord {
+  return checkedRecord({
+    recordType: "effort-ladder", schemaVersion: DECISION_RECORD_SCHEMA_VERSION, cause: "effort-ladder",
+    delegationId: input.delegationId, timestamp: input.at.toISOString(), previousDecisionId: input.previousDecisionId,
+    step: "unplaced", mode: input.mode, detail: input.detail, taskTextPrefix: input.taskText, agentRole: input.agentRole,
+  });
 }
 
 export function buildForkRecord(input: {

@@ -96,6 +96,9 @@ _Avoid_: Reasoning effort, thinking budget
 Bounded recovery's retry order after a changes-requested review: one supported effort step on the same model, then the next surviving listed rung in the same tier, then the first survivor in higher tiers. Every candidate passes the router's hard filters. Max requires an explicit listing for that model. Each admitted climb links its decision record to the failed attempt, and recovery limits still stop the sequence.
 _Avoid_: Reclassification, suitability-score escalation
 
+**Unplaced climb**:
+A retry of an attempt the effort ladder cannot position: routing is off, the attempt was a fork or named-model worker, its route refused, or its rung is no longer in the tier map. Its effort-ladder record has step `unplaced` and no rung. It counts toward the two-climb limit; with routing on it routes normally, without a forced rung.
+
 **Verdict**:
 The quality gate's outcome for a delegated task: accepted or changes requested, recorded by the orchestrator whether it came from its own check or an independent reviewer. The only feedback signal the router learns from.
 _Avoid_: Self-report, attestation, score
@@ -109,6 +112,9 @@ An editing delegation whose gate action was none at its gate level, so no verdic
 
 **Missing verdict**:
 A verdict the gate level required that was never recorded. Never a learning observation.
+
+**Same-rung review**:
+A review that ran on the implementer's own rung because routing could not choose another, in shadow mode or with routing off. It still starts from a fresh context; the verdict it backs says so, and the routing report counts it apart.
 
 **Orphaned verdict**:
 A verdict whose delegation id matches no decision record. Kept and counted, never dropped or guessed onto a decision.

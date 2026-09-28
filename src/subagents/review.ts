@@ -13,9 +13,13 @@ import { workerSessionDir } from "./worker.ts";
 // delegation of this orchestrator session. The reviewer is routed through the
 // auto model at the delegation's tier or higher, elevated for a delegation
 // without a tier, and never on the rung the delegation ran on: its routing
-// constraints (../router/auto-provider.ts) say so, and when routing leaves no
+// constraints (../router/auto-provider.ts) say so. When a live route leaves no
 // rung and the session model it would fall back to is that rung, the reviewer
-// fails with the reason instead of running.
+// fails with the reason instead of running. In shadow mode and with routing
+// off no other rung can be chosen, so the reviewer runs on that rung with its
+// fresh context: a same-rung review, which its saved outcome and the verdict
+// it backs record (owner decision 2026-09-28). A reviewer's editing calls are
+// denied (./editing.ts), so it never becomes an editing delegation.
 //
 // Where the facts come from: the tier and rung from the delegation's latest
 // decision, fork or agent-model record (./quality-gate.ts), else its rung from
@@ -38,6 +42,8 @@ export interface SavedReview {
   readonly delegationId: string;
   /** ISO-8601: when the reviewer started. */
   readonly startedAt: string;
+  /** It ran on the reviewed delegation's own rung: a same-rung review. */
+  readonly sameRung?: true;
 }
 
 /** What the reviewer is given to find the change. */
@@ -69,7 +75,7 @@ You are a reviewer: an independent check of another worker's finished delegation
 
 - Check the change itself against the delegation's task: read the changed files and the diff (git status, git diff). Its Result is the worker's account, not evidence: check each claim that matters.
 - Rerun nothing, no build, test or command from its Verified by section, unless your task tells you to.
-- Change nothing. Name what falls short instead of fixing it.
+- Change nothing: your editing calls are denied. Name what falls short instead of fixing it.
 - Answer accept or request changes, with the reasons. For request changes, name each shortfall with its file:line and what the task asked for.
 
 Start your Confirmed section with your answer on a line of its own, "Answer: accept" or "Answer: request changes", then write your Result sections as the reporting rules say.`;
@@ -115,7 +121,10 @@ function ownMessages(file: string, forkPoint: string | null | undefined): Messag
   return entries.slice(start).flatMap((entry) => entry.type === "message" ? [entry.message as MessageLike] : []);
 }
 
-function reviewMaterial(ctx: Pick<ExtensionContext, "cwd" | "sessionManager">, id: string, records: readonly RoutingRecord[]): ReviewMaterial {
+/** Delegation `id`'s task, later instructions, Result and edited files, from
+ *  its saved worker session, else from the worker board's copy. A reviewer
+ *  gets them, and a retry takes its original task from them (./retry.ts). */
+export function delegationMaterial(ctx: Pick<ExtensionContext, "cwd" | "sessionManager">, id: string, records: readonly RoutingRecord[]): ReviewMaterial {
   const fork = records.filter((record): record is ForkRecord => record.recordType === "fork" && record.delegationId === id).at(-1);
   const file = savedSession(ctx, id);
   if (file !== undefined) return { ...materialOf(ownMessages(file, fork?.forkPoint)), sessionFile: file };
@@ -139,6 +148,26 @@ function boardRung(id: string): ConstraintRung | undefined {
     ? { model: model.model, effort: model.effort! } : undefined;
 }
 
+function sameRung(a: ConstraintRung | undefined, b: ConstraintRung | undefined): boolean {
+  return a !== undefined && b !== undefined && a.model === b.model && a.effort === b.effort;
+}
+
+/** Whether the reviewer `reviewerId`, as the worker board saw it served, ran
+ *  on `rung`, the rung its constraints excluded: a same-rung review. */
+export function servedOnRung(reviewerId: string, rung: ConstraintRung): boolean {
+  return sameRung(boardRung(reviewerId), rung);
+}
+
+/** Whether the review `reviewerId` of `reviewedId` was a same-rung review:
+ *  as its saved outcome says, else as the worker board shows both rungs. */
+export function isSameRungReview(ctx: Pick<ExtensionContext, "cwd" | "sessionManager">, reviewerId: string, reviewedId: string,
+  records: readonly RoutingRecord[]): boolean {
+  const file = savedSession(ctx, reviewerId);
+  const saved = file === undefined ? undefined : readWorkerOutcome(file)?.review;
+  if (saved !== undefined) return saved.sameRung === true;
+  return sameRung(boardRung(reviewerId), delegationRouting(records, reviewedId).rung ?? boardRung(reviewedId));
+}
+
 /** The finished editing delegation `id` for a review item, or an Error with
  *  the reason no reviewer may start for it. `records` is the record folder in file order. */
 export function reviewTarget(ctx: Pick<ExtensionContext, "cwd" | "sessionManager">, id: string, records: readonly RoutingRecord[]): ReviewTarget {
@@ -157,7 +186,7 @@ export function reviewTarget(ctx: Pick<ExtensionContext, "cwd" | "sessionManager
   return {
     delegationId: id, ...(routing.tier === undefined ? {} : { tier: routing.tier }),
     constraints: { minimumTier: routing.tier ?? "elevated", excludedRung: rung },
-    material: reviewMaterial(ctx, id, records),
+    material: delegationMaterial(ctx, id, records),
   };
 }
 

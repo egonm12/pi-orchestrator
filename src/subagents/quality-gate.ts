@@ -1,6 +1,6 @@
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { isAtLeastTier, type RiskTier } from "../routing/classifier.ts";
-import { isRoutedDecision, type RoutingRecord } from "../routing/decision-record.ts";
+import type { RoutingRecord } from "../routing/decision-record.ts";
 import type { ConstraintRung } from "../routing/tier-router.ts";
 import { splitKnownThinkingSuffix } from "../models/model-info.ts";
 import { delegationEdits, type DelegationEdits } from "./editing.ts";
@@ -45,13 +45,16 @@ function rungOf(rung: string): ConstraintRung | undefined {
  *  agent-model record in `records`, the record folder in file order. A routed
  *  decision's tier is the one it routed at, or started at when it refused;
  *  its rung is the one the worker ran on, which is the session model in
- *  shadow mode and on refusal. */
+ *  shadow mode and on refusal. A retry's effort-ladder record is its link to
+ *  the failed attempt, not what it ran on: it counts only when no other record
+ *  is there, as with routing off, and then gives a placed climb's tier alone. */
 export function delegationRouting(records: readonly RoutingRecord[], delegationId: string): DelegationRouting {
-  const latest = records.filter((record) => record.delegationId === delegationId &&
-    (isRoutedDecision(record) || record.recordType === "fork" || record.recordType === "agent-model")).at(-1);
+  const own = records.filter((record) => record.delegationId === delegationId);
+  const latest = own.filter((record) => record.recordType === "decision" || record.recordType === "fork" || record.recordType === "agent-model").at(-1) ??
+    own.filter((record) => record.recordType === "effort-ladder").at(-1);
   if (latest === undefined) return {};
   if (latest.recordType === "fork" || latest.recordType === "agent-model") return { rung: { model: latest.model, effort: latest.effort } };
-  if (latest.recordType === "effort-ladder") return { tier: latest.route.tier, rung: { model: latest.route.rung.model, effort: latest.route.rung.effort } };
+  if (latest.recordType === "effort-ladder") return latest.step === "unplaced" ? {} : { tier: latest.route.tier };
   if (latest.recordType !== "decision") return {};
   const { route } = latest;
   const tier = route.outcome === "chosen" ? route.tier : route.startedAtTier;

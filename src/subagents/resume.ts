@@ -26,6 +26,8 @@ export interface ResumeWorker {
   readonly fork?: boolean;
   readonly instructions?: string;
   readonly tools?: readonly string[];
+  /** The delegation is a reviewer's, and still may not edit (ADR 0010). */
+  readonly review?: SavedReview;
 }
 
 const RESUMING = Symbol.for("pi-orchestrator.subagents.resuming");
@@ -33,27 +35,31 @@ type ProcessGlobal = typeof globalThis & { [RESUMING]?: Set<string> };
 const resuming = (): Set<string> => (globalThis as ProcessGlobal)[RESUMING] ??= new Set();
 
 /** Saved outcomes distinguish failed or aborted workers from unfinished ones across /resume.
- *  A reviewer's also keeps the delegation it reviewed (./review.ts); a resume keeps what an earlier run saved. */
+ *  A reviewer's also keeps the delegation it reviewed (./review.ts), and a
+ *  worker's the agent definition it followed, which a retry follows too
+ *  (./retry.ts); a resume keeps what an earlier run saved. */
 export function saveWorkerOutcome(file: string | undefined, status: WorkerStatus,
-  setup?: Pick<WorkerSetup, "instructions" | "tools"> & { readonly review?: SavedReview }): void {
+  setup?: Pick<WorkerSetup, "instructions" | "tools"> & { readonly review?: SavedReview; readonly agent?: string }): void {
   if (!file || !existsSync(file)) return;
   const previous = existsSync(`${file}.outcome.json`) ? JSON.parse(readFileSync(`${file}.outcome.json`, "utf8")) as Record<string, unknown> : {};
   writeFileSync(`${file}.outcome.json`, JSON.stringify({ ...previous, status,
     ...(setup?.instructions === undefined ? {} : { instructions: setup.instructions }),
     ...(setup?.tools === undefined ? {} : { tools: setup.tools }),
+    ...(setup?.agent === undefined ? {} : { agent: setup.agent }),
     ...(setup?.review === undefined ? {} : { review: setup.review }) }));
 }
 
 /** A saved worker's outcome: how its latest run ended and, for a reviewer, what it
  *  reviewed; `undefined` when none was saved or it cannot be read. */
-export function readWorkerOutcome(file: string): { readonly status?: WorkerStatus; readonly review?: SavedReview } | undefined {
-  let outcome: { status?: unknown; review?: { delegationId?: unknown; startedAt?: unknown } };
+export function readWorkerOutcome(file: string): { readonly status?: WorkerStatus; readonly review?: SavedReview; readonly agent?: string } | undefined {
+  let outcome: { status?: unknown; agent?: unknown; review?: { delegationId?: unknown; startedAt?: unknown; sameRung?: unknown } };
   try { outcome = JSON.parse(readFileSync(`${file}.outcome.json`, "utf8")) as typeof outcome; } catch { return undefined; }
-  const { status, review } = outcome;
+  const { status, review, agent } = outcome;
   return {
     ...(status === "completed" || status === "failed" || status === "aborted" ? { status } : {}),
     ...(typeof review?.delegationId === "string" && typeof review.startedAt === "string"
-      ? { review: { delegationId: review.delegationId, startedAt: review.startedAt } } : {}),
+      ? { review: { delegationId: review.delegationId, startedAt: review.startedAt, ...(review.sameRung === true ? { sameRung: true } : {}) } } : {}),
+    ...(typeof agent === "string" ? { agent } : {}),
   };
 }
 
@@ -135,9 +141,11 @@ export function prepareResume(id: string, task: string, setup: Pick<WorkerSetup,
   });
   if (failure) refuse(`pin ${pin.model} fails ${failure.reason}: ${failure.detail}`);
   const outcome = existsSync(`${file}.outcome.json`) ? JSON.parse(readFileSync(`${file}.outcome.json`, "utf8")) as { instructions?: unknown; tools?: unknown } : {};
+  const review = readWorkerOutcome(file)?.review;
   resuming().add(id);
   return { file, release: () => { resuming().delete(id); }, pin: { model: pin.model, effort: pin.effort },
     ...(typeof outcome.instructions === "string" ? { instructions: outcome.instructions } : {}),
     ...(Array.isArray(outcome.tools) && outcome.tools.every((tool) => typeof tool === "string") ? { tools: outcome.tools as string[] } : {}),
-    ...(pin.namedModel ? { namedModel: { ...pin.namedModel, banListException } } : {}), ...(pin.fork ? { fork: true } : {}) };
+    ...(pin.namedModel ? { namedModel: { ...pin.namedModel, banListException } } : {}), ...(pin.fork ? { fork: true } : {}),
+    ...(review === undefined ? {} : { review }) };
 }

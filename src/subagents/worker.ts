@@ -2,8 +2,8 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { appendRoutingRecord, buildAgentModelRecord, buildForkRecord } from "../routing/decision-record.ts";
 import { stateDir } from "../router/extension.ts";
-import { markWorkerSession } from "./worker-sessions.ts";
-import { trackEdits } from "./editing.ts";
+import { markWorkerSession, reviewedDelegationOf } from "./worker-sessions.ts";
+import { READ_ONLY_REVIEWER, trackEdits } from "./editing.ts";
 import type { ResumeWorker } from "./resume.ts";
 import type { BackgroundMessageMode } from "./background.ts";
 import { REPORT_TOOL, reportExtension, type WorkerReports } from "./report.ts";
@@ -221,13 +221,17 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
   const appendedPrompt = [...(getsReportingRules ? [REPORTING_RULES] : []), ...(review === undefined ? [] : [review.prompt]),
     ...(instructions === undefined ? [] : [instructions])];
   const tools = setup.tools === undefined || reports === undefined ? setup.tools : [...setup.tools, REPORT_TOOL];
+  // A reviewer, resumed or not, and a worker it started never edit (ADR 0010).
+  const reviewed = review?.delegationId ?? setup.resume?.review?.delegationId;
+  const readOnly = reviewed !== undefined || (setup.parentDelegationId !== undefined && reviewedDelegationOf(setup.parentDelegationId) !== undefined);
   let session: Awaited<ReturnType<typeof createAgentSessionFromServices>>["session"];
   try {
     const services = await createAgentSessionServices({
       cwd: setup.cwd,
       agentDir: setup.agentDir,
       resourceLoaderOptions: {
-        extensionFactories: [...(setup.extensionFactories ?? []), editTracking, ...(reports === undefined ? [] : [reportExtension(reports)])],
+        extensionFactories: [...(setup.extensionFactories ?? []), ...(readOnly ? [READ_ONLY_REVIEWER] : []), editTracking,
+          ...(reports === undefined ? [] : [reportExtension(reports)])],
         ...(setup.tools?.includes(SUBAGENTS_TOOL) ? {} : { extensionsOverride: withoutSubagentsTool }),
         ...(appendedPrompt.length === 0 ? {} : { appendSystemPromptOverride: (base: string[]) => [...base, ...appendedPrompt] }),
       },
@@ -294,7 +298,7 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
     setup.onTool?.([...runningTools.values()].at(-1));
   });
   // Before binding, so the extensions see the mark at session_start.
-  const unmarkWorkerSession = markWorkerSession(sessionId, setup.parentDelegationId, review?.delegationId);
+  const unmarkWorkerSession = markWorkerSession(sessionId, setup.parentDelegationId, reviewed);
   const unsetResumePin = setup.resume && !setup.resume.namedModel ? setResumePin(sessionId, setup.resume.pin) : undefined;
   const unsetConstraints = setup.routingConstraints === undefined ? undefined : setRoutingConstraints(sessionId, setup.routingConstraints);
   let unregisterMessage: (() => void) | undefined;

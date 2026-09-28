@@ -18,6 +18,7 @@ import {
   buildAgentModelRecord,
   buildEditRecord,
   buildEffortLadderRecord,
+  buildUnplacedLadderRecord,
   DECISION_RECORD_SCHEMA_VERSION,
   decisionRecordPath,
   FREE_TEXT_LIMIT,
@@ -320,7 +321,7 @@ test("new effort-ladder records use /3, while legacy /2 remains readable and unk
     assert.equal(route.ok, true);
     if (!route.ok) return;
     const record = buildEffortLadderRecord({
-      delegationId: "attempt-2", at: NOW, previousDecisionId: "attempt-1", step: "effort", skipped: [],
+      delegationId: "attempt-2", at: NOW, previousDecisionId: "attempt-1", step: "effort", mode: "live", skipped: [],
       taskText: TASK, agentRole: "worker", kindOfWork: "implement", tierMap, route,
     });
     assert.equal(record.schemaVersion, "decision-record/3");
@@ -331,6 +332,39 @@ test("new effort-ladder records use /3, while legacy /2 remains readable and unk
     assert.throws(() => validateRoutingRecord({ ...record, ranOn: SONNET }), /field 'ranOn' is not a known field/);
     assert.throws(() => validateRoutingRecord({ ...record, surprise: true }), /field 'surprise' is not a known field/);
   } finally { cleanup(); }
+});
+
+test("a placed climb names its routing mode, live or shadow, never off; an unplaced climb names no rung, only why, in any mode", async () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    const tierMap = fixtureTierMap();
+    const route = fixtureRoute("standard", tierMap);
+    assert.ok(route.ok);
+    const placed = { delegationId: "attempt-2", at: NOW, previousDecisionId: "attempt-1", step: "same-tier", skipped: [],
+      taskText: TASK, agentRole: "worker", kindOfWork: "implement", tierMap, route } as const;
+    const shadow = buildEffortLadderRecord({ ...placed, mode: "shadow" });
+    assert.equal(shadow.mode, "shadow");
+    assert.throws(() => validateRoutingRecord({ ...shadow, mode: "off" }), /field 'mode' must be one of shadow, live/);
+    const unplaced = buildUnplacedLadderRecord({ delegationId: "attempt-3", at: NOW, previousDecisionId: "attempt-2", mode: "off",
+      detail: "routing is off, so no tier map is loaded", taskText: TASK, agentRole: "unknown" });
+    assert.deepEqual(Object.keys(unplaced).sort(), ["agentRole", "cause", "delegationId", "detail", "mode", "previousDecisionId", "recordType",
+      "schemaVersion", "step", "taskTextPrefix", "timestamp"]);
+    appendRoutingRecord(dir, shadow);
+    appendRoutingRecord(dir, unplaced);
+    assert.deepEqual(readRoutingRecords(dir).map((record) => record.recordType === "effort-ladder" ? [record.step, record.mode] : []),
+      [["same-tier", "shadow"], ["unplaced", "off"]]);
+    assert.throws(() => validateRoutingRecord({ ...unplaced, route: shadow.route }), /field 'route' is not a known field/);
+    assert.throws(() => validateRoutingRecord({ ...unplaced, detail: " " }), /field 'detail'/);
+    assert.throws(() => validateRoutingRecord({ ...unplaced, schemaVersion: "decision-record/2" }), /unplaced effort-ladder records/);
+    assert.throws(() => validateRoutingRecord({ ...unplaced, previousDecisionId: "attempt-3" }), /must name a different attempt/);
+  } finally { cleanup(); }
+});
+
+test("a verdict record may say it rests on a same-rung review, and nothing else there", () => {
+  const verdict = { recordType: "verdict", schemaVersion: DECISION_RECORD_SCHEMA_VERSION, delegationId: "worker-1", timestamp: NOW.toISOString(),
+    verdict: "accept", decisionFile: "2026-09-25.jsonl", sameRungReview: true } as const;
+  assert.deepEqual(validateRoutingRecord(verdict), verdict);
+  assert.throws(() => validateRoutingRecord({ ...verdict, sameRungReview: false }), /field 'sameRungReview' must be true when present/);
 });
 
 test("an explicit record with a missing or an unknown field fails validation on write and on read, naming the field", async () => {

@@ -4,6 +4,7 @@ import type { BanLists } from "../policy/ban-lists.ts";
 import { classifyTier, type ClassifierModelCall, type LoadedClassifierChain } from "../routing/tier-classifier.ts";
 import type { ResolvedTierMap } from "../routing/tier-map.ts";
 import { failedHardFilter, routeForcedRung, routeTier, type ConstraintRung, type RouterEvidence, type RoutingConstraints } from "../routing/tier-router.ts";
+import { nextRungAfterFailure, type FailedDecision, type LadderDecision } from "../routing/effort-ladder.ts";
 import { isAtLeastTier } from "../routing/classifier.ts";
 import { deriveProviderUsage, type RoutingEvidenceSource } from "./evidence.ts";
 import type { RoutingMode } from "../routing/decision-record.ts";
@@ -66,4 +67,12 @@ export async function routeTask(router: ActiveRouter, taskText: string, agentRol
   const tier = minimumTier === undefined || isAtLeastTier(classification.tier, minimumTier) ? classification.tier : minimumTier;
   const route = forcedRung === undefined ? routeTier({ tier, tierMap: router.tierMap, evidence: filters }) : routeForcedRung(forcedRung, filters);
   return { classification, route };
+}
+
+/** The effort ladder's next rung after `failed` (ADR 0010), through the same
+ *  hard filters as a first request, for a retry whose task is `taskText`.
+ *  Throws when the failed rung has no position in the tier map. */
+export function climbEffortLadder(router: ActiveRouter, failed: FailedDecision, taskText: string, at: Date): LadderDecision {
+  const evidence = hardFilterEvidence(router, taskText, at, router.evidence(), {});
+  return nextRungAfterFailure({ failed, tierMap: router.tierMap, installedModels: router.installedModels, evidence });
 }

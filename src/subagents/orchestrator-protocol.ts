@@ -15,7 +15,7 @@ import { isOrchestratorSession } from "./orchestrator-session.ts";
 export const ORCHESTRATOR_PROTOCOL_SECTION = "orchestrator_protocol";
 
 // One entry per rule, in the order the orchestrator reads them. A later rule
-// (retries, gate level) is one more entry here. The exploration
+// (the gate level) is one more entry here. The exploration
 // budget's entry names the owner's threshold (exploration-budget.ts).
 const paragraphs = (explorationBudget: number): readonly string[] => [
   "You are the orchestrator. You own clarification, task decomposition, delegation, synthesis and acceptance. " +
@@ -46,8 +46,16 @@ const paragraphs = (explorationBudget: number): readonly string[] => [
     "gets its task, Result and changed files, reruns nothing unless the task tells it to, and answers accept or request changes with reasons. " +
     "Judge the reviewer's Result like any other, then record the verdict with `subagents_verdict`, naming the reviewer delegation as " +
     "`reviewer`; without it the verdict is refused. A review started before the delegation's latest edit does not count. For a mechanical " +
-    "or standard delegation your own spot check is enough, and a reviewer is welcome. If a review fails because the reviewer would run on " +
-    "the delegation's own rung, tell the user: switching the session model or turning on live routing lets it run.",
+    "or standard delegation your own spot check is enough, and a reviewer is welcome. In shadow mode or with routing off no other rung can be " +
+    "chosen, so the reviewer runs on the delegation's own rung with a fresh context, and the verdict records a same-rung review. If a review " +
+    "fails because live routing left no rung but the delegation's own, tell the user.",
+  "When you record request_changes, the reply names the effort ladder's next rung for a retry, or says why there is none. To retry, start " +
+    "a `subagents` item whose `retry` is the delegation id and whose `task` is your feedback: each shortfall with its file:line and what the " +
+    "task asked for. The retry is a new delegation on that rung; it gets the original task, your feedback and the failed attempt's saved " +
+    "session, follows the same agent definition, and needs its own verdict. `retry` takes no `agent`, `fork`, `resume` or `review`, and only " +
+    "a delegation whose latest verdict is request_changes can be retried. A task climbs the ladder at most twice, a retry of a retry included. " +
+    "When a retry is refused because the ladder is exhausted or the task has climbed twice, take the task back to the user: say what fell short, " +
+    "and do not work around the limit by starting a new worker.",
 ];
 
 /** The protocol text, as the orchestrator's system prompt carries it, for

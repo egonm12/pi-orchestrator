@@ -28,6 +28,18 @@ export function isEditingToolCall(toolName: string, input: unknown): boolean {
   return kind === "edit" || kind === "version-control" || kind === "unrecognised";
 }
 
+/** Why a reviewer's editing call is denied (ADR 0010, owner decision 2026-09-28). */
+export const REVIEWER_EDIT_DENIED = "pi-orchestrator: a reviewer changes nothing, and this call would edit. " +
+  "Name the shortfall in your Result instead; reading, searching, building and testing stay allowed.";
+
+/** The extension that denies every editing call in a reviewer's session, and
+ *  in a worker a reviewer started, so a reviewer never becomes an editing
+ *  delegation. A denied call runs nothing, so it writes no edit record. */
+export const READ_ONLY_REVIEWER: InlineExtension = {
+  name: "pi-orchestrator-read-only-reviewer",
+  factory: (pi) => { pi.on("tool_call", (event) => isEditingToolCall(event.toolName, event.input) ? { block: true, reason: REVIEWER_EDIT_DENIED } : undefined); },
+};
+
 /** One run of a delegation: the orchestrator's delegation its edits count for. */
 interface DelegationRun {
   readonly delegationId: string;

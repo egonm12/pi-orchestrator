@@ -2997,7 +2997,8 @@ test("subagents_verdict records accept and request_changes with a reason; the re
     assert.equal(worker.status, "completed", JSON.stringify(worker));
     const id = worker.sessionId!;
     assert.equal(await recordVerdict(subagents, main.ctx, { delegationId: id, verdict: "request_changes", reason: "notes.md lacks a heading" }),
-      `Recorded request_changes on delegation ${id}.`);
+      `Recorded request_changes on delegation ${id}. The effort ladder cannot place it: routing is off, so no tier map is loaded to climb. ` +
+      `A retry runs on the session model, climb 1 of 2. To retry, start a subagents item whose retry is ${id} and whose task is your feedback.`);
     const recordDir = join(h.stateDir, "routing");
     assert.deepEqual(buildRoutingReport(recordDir).totals.verdicts, { accept: 0, request_changes: 1, missing: 0 });
     assert.equal(await recordVerdict(subagents, main.ctx, { delegationId: id, verdict: "accept", reason: "checked notes.md:1" }),
@@ -3138,7 +3139,9 @@ test("a verdict on a fork, an agent's named model or an unrouted worker attaches
       const reviewer = (review.details as SubagentsDetails).results[0]!;
       assert.equal(reviewer.status, "completed", `${kind}: ${JSON.stringify(reviewer)}`);
       assert.equal(await recordVerdict(subagents, ctx, { delegationId: id, verdict: "request_changes", reason: "no heading", reviewer: reviewer.sessionId }),
-        `Recorded request_changes on delegation ${id}, reviewed by delegation ${reviewer.sessionId}.`);
+        `Recorded request_changes on delegation ${id}, reviewed by delegation ${reviewer.sessionId}. ` +
+        `The effort ladder cannot place it: routing is off, so no tier map is loaded to climb. A retry runs on the session model, climb 1 of 2. ` +
+        `To retry, start a subagents item whose retry is ${id} and whose task is your feedback.`);
       const records = readRoutingRecords(join(h.stateDir, "routing"));
       // The reviewer's decision carries the router's fixed clock, so it may sit in another day file.
       assert.deepEqual(records.map((record) => record.recordType).sort(), (kind === "unrouted" ? ["edit", "verdict"] : [kind, "edit", "decision", "verdict"]).sort(), kind);

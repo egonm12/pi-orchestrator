@@ -5,7 +5,8 @@ import { attachVerdict, REVIEW_VERDICTS, type ReviewVerdict } from "../routing/v
 import { stateDir } from "../router/extension.ts";
 import { isOrchestratorSession } from "./orchestrator-session.ts";
 import { delegationRouting, editingDelegationProblem, gateAction, type EditingDelegationProblem } from "./quality-gate.ts";
-import { reviewerProblem } from "./review.ts";
+import { isSameRungReview, reviewerProblem } from "./review.ts";
+import { planRetry, planText, retrySetup } from "./retry.ts";
 
 // The subagents_verdict tool (ADR 0010): the orchestrator records its verdict
 // on an editing delegation, whether it came from its own spot check or a
@@ -15,7 +16,10 @@ import { reviewerProblem } from "./review.ts";
 // orchestrator's session may record one, and only on an editing delegation
 // of its own that has finished. Where the gate action is a reviewer
 // (./quality-gate.ts), a verdict must name a completed review of the same
-// delegation (./review.ts); a verdict naming one is taken at any tier.
+// delegation (./review.ts); a verdict naming one is taken at any tier, and
+// one resting on a same-rung review says so in its record. A request_changes
+// reply names the effort ladder's next rung for a retry (./retry.ts), or says
+// the ladder cannot place the delegation, or why no retry may start.
 
 export const SUBAGENTS_VERDICT_TOOL = "subagents_verdict";
 
@@ -52,6 +56,19 @@ function problemText(id: string, problem: EditingDelegationProblem): string {
   }
 }
 
+/** What a retry of `id` would do now, with `feedback` as its task, as a request_changes reply says it. */
+function nextClimb(ctx: Parameters<typeof retrySetup>[0], id: string, feedback: string, recordDir: string): string {
+  const records = readRoutingRecords(recordDir);
+  let task: string;
+  try { task = retrySetup(ctx, id, feedback, records).task; } catch (error) {
+    const message = (error as Error).message;
+    return `${message.charAt(0).toUpperCase()}${message.slice(1)}.`;
+  }
+  const plan = planRetry(ctx.sessionManager.getSessionId(), id, records, task, new Date());
+  if (plan.kind === "refused") return `A retry is refused: ${plan.why}.`;
+  return `${planText(plan)} To retry, start a subagents item whose retry is ${id} and whose task is your feedback.`;
+}
+
 /** Registers `subagents_verdict` for the orchestrator's session. */
 export function registerSubagentsVerdictTool(pi: ExtensionAPI): void {
   pi.registerTool({
@@ -60,6 +77,7 @@ export function registerSubagentsVerdictTool(pi: ExtensionAPI): void {
     description: "Record your verdict on an editing delegation once it has finished: accept, or request_changes, with the reason. " +
       "Judge the Result first, by your own spot check or a reviewer's Result. A later verdict on the same delegation replaces the earlier one. " +
       "An elevated or critical delegation, or one without a tier, needs a reviewer: name the finished review delegation as `reviewer`. " +
+      "A request_changes reply names the effort ladder's next rung for a retry, or says why there is none. " +
       "A delegation that did not edit gets no verdict.",
     parameters: {
       type: "object",
@@ -81,9 +99,11 @@ export function registerSubagentsVerdictTool(pi: ExtensionAPI): void {
       const checked = editingDelegationProblem(ctx, records, id);
       if (checked.problem !== undefined) throw refusal(problemText(id, checked.problem));
       const { edits } = checked;
+      let sameRungReview = false;
       if (reviewer !== undefined) {
         const why = reviewerProblem(ctx, reviewer, id, records);
         if (why !== undefined) throw refusal(why);
+        sameRungReview = isSameRungReview(ctx, reviewer, id, records);
       } else {
         const { tier } = delegationRouting(records, id);
         if (gateAction(tier) === "reviewer") {
@@ -91,10 +111,11 @@ export function registerSubagentsVerdictTool(pi: ExtensionAPI): void {
             `start one with a subagents item whose review is ${id}, judge its Result, then name it here as reviewer`);
         }
       }
-      attachVerdict({ recordDir, delegationId: id, verdict, reason, refreshStatePath: join(stateDir(), "refresh-state.json") });
+      attachVerdict({ recordDir, delegationId: id, verdict, reason, sameRungReview, refreshStatePath: join(stateDir(), "refresh-state.json") });
       const replaced = edits.verdict === undefined ? "" : ` It replaces the earlier ${edits.verdict}.`;
-      const reviewed = reviewer === undefined ? "" : `, reviewed by delegation ${reviewer}`;
-      return { content: [{ type: "text", text: `Recorded ${verdict} on delegation ${id}${reviewed}.${replaced}` }], details: undefined };
+      const reviewed = reviewer === undefined ? "" : `, reviewed by delegation ${reviewer}${sameRungReview ? " on the delegation's own rung (a same-rung review)" : ""}`;
+      const next = verdict === "request_changes" ? ` ${nextClimb(ctx, id, reason, recordDir)}` : "";
+      return { content: [{ type: "text", text: `Recorded ${verdict} on delegation ${id}${reviewed}.${replaced}${next}` }], details: undefined };
     },
   });
 }

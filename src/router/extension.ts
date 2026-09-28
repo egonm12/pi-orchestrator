@@ -21,6 +21,7 @@ import { setupNotice, setupStatus } from "../init/setup.ts";
 import { registerSubcommands, type Subcommand } from "../init/subcommands.ts";
 import { stateFolderEvidence, type EvidenceSetup, type RoutingEvidenceSource } from "./evidence.ts";
 import { isOrchestratorSession } from "../subagents/orchestrator-session.ts";
+import { publishOrchestratorRouter } from "./orchestrator-router.ts";
 
 export type { RoutingEvidence, RoutingEvidenceSource, EvidenceSetup } from "./evidence.ts";
 
@@ -150,6 +151,8 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
     // on the orchestrator's model.
     let disabled = false;
     let active: ActiveRouter | undefined;
+    /** This copy's session when it is the orchestrator's, whose router retries climb through (./orchestrator-router.ts). */
+    let orchestratorSessionId: string | undefined;
     let sessionRegistry: ExtensionContext["modelRegistry"];
     const autoConfig = autoProviderConfig({
       router: () => active, registry: () => sessionRegistry, now: deps.now,
@@ -161,6 +164,7 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
     refuseAutoModelForMainThread(pi);
     const disable = (error: unknown) => {
       active = undefined;
+      if (orchestratorSessionId !== undefined) publishOrchestratorRouter(orchestratorSessionId, undefined);
       if (disabled) return;
       disabled = true;
       if ((globalThis as ProcessGlobal)[DISABLED_LINE_REPORTED]) return;
@@ -196,6 +200,8 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
     pi.on("session_start", (_event, ctx) => {
       rememberSessionModel(ctx.model, ctx.thinkingLevel ?? "off", ctx);
       sessionRegistry = ctx.modelRegistry;
+      if (orchestratorSessionId !== undefined) publishOrchestratorRouter(orchestratorSessionId, undefined);
+      orchestratorSessionId = isOrchestratorSession(ctx) ? ctx.sessionManager?.getSessionId() : undefined;
       if (disabled) return;
       try {
         // One line on a fresh install, in the owner's session only.
@@ -209,11 +215,17 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
           }
         }
         active = startRouting(ctx, deps);
+        if (orchestratorSessionId !== undefined) publishOrchestratorRouter(orchestratorSessionId, active);
         if (active && typeof pi.registerProvider === "function") {
           pi.registerProvider("orchestrator", withAutoModelLimits(autoConfig, autoModelLimits(active.tierMap, active.installedModels)));
         }
         if (probe && active) process.stderr.write(`${ROUTER_PREFIX} routing enabled, mode ${active.mode}, records ${active.recordDir}\n`);
       } catch (error) { disable(error); }
+    });
+
+    pi.on("session_shutdown", () => {
+      if (orchestratorSessionId !== undefined) publishOrchestratorRouter(orchestratorSessionId, undefined);
+      orchestratorSessionId = undefined;
     });
 
     pi.on("model_select", (event, ctx) => {

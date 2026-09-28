@@ -14,7 +14,10 @@
 //      off, or switched off by an error), its edit record. An unknown id
 //      appends an `orphaned-verdict` record. Both go into the day file of the
 //      verdict's own timestamp. The orchestrator's `subagents_verdict`
-//      (../subagents/verdict.ts) passes its reason on.
+//      (../subagents/verdict.ts) passes its reason on, and whether the verdict
+//      rests on a same-rung review. A retry's effort-ladder record is its link
+//      to the failed attempt: the verdict attaches to it only when the retry
+//      has no decision record, as with routing off.
 //   3. Learning data. An `accept` or `request_changes` attached to a decision
 //      that chose a rung is also recorded in ticket 08's observation ledger as
 //      a `verified-task-outcome`: taskType is the classifier's kind of work,
@@ -99,6 +102,8 @@ export interface AttachVerdictInput {
   readonly verdict: Verdict;
   /** Why the orchestrator judged so; an attached verdict records it, an orphan does not. */
   readonly reason?: string;
+  /** The verdict rests on a same-rung review (ADR 0010); an attached verdict records it. */
+  readonly sameRungReview?: boolean;
   /** Defaults to now. */
   readonly at?: Date;
   /** Ticket 08's refresh state file holding the observation ledger. */
@@ -144,8 +149,10 @@ function isDecisionOfSomeKind(record: RoutingRecord): record is RoutedDecisionRe
 export function attachVerdict(input: AttachVerdictInput): AttachVerdictOutcome {
   const timestamp = (input.at ?? new Date()).toISOString();
   const entries = readRoutingRecordEntries(input.recordDir).filter((entry) => entry.record.delegationId === input.delegationId);
-  // An edit record stands in only when the delegation has no decision at all.
-  const latest = entries.filter((entry) => isDecisionOfSomeKind(entry.record)).at(-1) ??
+  // An effort-ladder record stands in only for a retry without a decision
+  // record, and an edit record only when the delegation has no decision at all.
+  const latest = entries.filter((entry) => isDecisionOfSomeKind(entry.record) && entry.record.recordType !== "effort-ladder").at(-1) ??
+    entries.filter((entry) => entry.record.recordType === "effort-ladder").at(-1) ??
     entries.filter((entry) => entry.record.recordType === "edit").at(-1);
   if (latest === undefined) {
     const recordPath = appendRoutingRecord(input.recordDir, {
@@ -166,6 +173,7 @@ export function attachVerdict(input: AttachVerdictInput): AttachVerdictOutcome {
     verdict: input.verdict,
     decisionFile: latest.file,
     ...(input.reason === undefined ? {} : { reason: input.reason }),
+    ...(input.sameRungReview === true ? { sameRungReview: true } : {}),
   });
   // Only a routing decision teaches the router: a fork, an agent's named model
   // and an unrouted worker chose no rung.
