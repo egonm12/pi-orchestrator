@@ -1,35 +1,31 @@
-import { closeSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { randomUUID } from "node:crypto";
-import { dirname } from "node:path";
+/** The orchestrator's workers run in one process, but each loads its own
+ * router extension instance. A process-wide queue makes their choices atomic
+ * with respect to one another, including the decision append or pending
+ * reservation that the next worker counts. Different processes still share
+ * completed decisions and reservations through the owner's state folder.
+ * Simultaneous choices in separate processes are not guaranteed to spread. */
+const CHOICES = Symbol.for("pi-orchestrator.router.choice-queues");
+type ProcessGlobal = typeof globalThis & { [CHOICES]?: Map<string, Promise<void>> };
 
-/** One choice and its first request/decision append are atomic across router
- * instances and processes sharing the owner's record folder. Classification
- * happens before acquiring this short-lived lock. */
+function queues(): Map<string, Promise<void>> {
+  return (globalThis as ProcessGlobal)[CHOICES] ??= new Map();
+}
+
+/** Serialize routing choices by state folder across extension copies in one
+ * process. Classification normally runs before the queue; an invalidated
+ * restored decision can require reclassification inside it. The first worker
+ * model event is always awaited only after the queue is released. */
 export async function withRoutingChoice<T>(recordDir: string, choose: () => Promise<T>): Promise<T> {
-  const lock = `${recordDir}.choice.lock`;
-  mkdirSync(dirname(lock), { recursive: true });
-  const token = `${process.pid}:${randomUUID()}`;
-  for (;;) {
-    try {
-      closeSync(openSync(lock, "wx"));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      try {
-        // A process killed while holding the lock must not block later work.
-        if (Date.now() - statSync(lock).mtimeMs > 60_000) rmSync(lock, { force: true });
-      } catch (statError) {
-        if ((statError as NodeJS.ErrnoException).code !== "ENOENT") throw statError;
-      }
-      await new Promise<void>((resolve) => setTimeout(resolve, 5));
-      continue;
-    }
-    try { writeFileSync(lock, token); }
-    catch (error) { rmSync(lock, { force: true }); throw error; }
-    break;
-  }
+  const all = queues();
+  const previous = all.get(recordDir) ?? Promise.resolve();
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const tail = previous.then(() => held);
+  all.set(recordDir, tail);
+  await previous;
   try { return await choose(); }
   finally {
-    try { if (readFileSync(lock, "utf8") === token) rmSync(lock, { force: true }); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    release();
+    if (all.get(recordDir) === tail) all.delete(recordDir);
   }
 }

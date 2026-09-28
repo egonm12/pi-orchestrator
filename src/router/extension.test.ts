@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -649,6 +649,115 @@ test("parallel fan-out across separate worker providers reserves each choice in 
     assert.deepEqual(records.map((record) => record.route.outcome === "chosen" && record.route.providerCounts), [
       { anthropic: 0, "openai-codex": 0 }, { anthropic: 1, "openai-codex": 0 },
     ]);
+  } finally { h.cleanup(); }
+});
+
+test("separate workers spread while the first request is pending but has not emitted an event", async () => {
+  const h = harness(LIVE);
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  try {
+    const firstRegistry = fakeSessionRegistry([{ events: answerEvents("one") }]);
+    const delayed = { ...firstRegistry, streamSimple(model: Parameters<SessionModelRegistry["streamSimple"]>[0],
+      context: Parameters<SessionModelRegistry["streamSimple"]>[1], options: Parameters<SessionModelRegistry["streamSimple"]>[2]) {
+      const inner = firstRegistry.streamSimple(model, context, options);
+      return (async function* () { await pending; yield* inner; })();
+    } };
+    const secondRegistry = fakeSessionRegistry([{ events: answerEvents("two") }]);
+    const first = await loadAutoProvider(h, delayed);
+    const second = await loadAutoProvider(h, secondRegistry);
+    const firstResult = autoEvents(first, FIX_README, "pending-first");
+    for (let i = 0; firstRegistry.calls.length === 0 && i < 100; i++) await new Promise((resolve) => setTimeout(resolve, 2));
+    assert.equal(firstRegistry.calls.length, 1);
+    const secondResult = await autoEvents(second, FIX_README, "while-pending");
+    assert.equal(secondResult.at(-1)?.type, "done");
+    assert.equal(secondRegistry.calls[0]?.model.provider, "openai-codex");
+    const [record] = h.records();
+    assert.equal(record?.recordType === "decision" && record.delegationId, "while-pending", "only the started request has a decision");
+    assert.equal(record?.recordType === "decision" && record.route.outcome === "chosen" && record.route.providerCounts?.anthropic, 1);
+    release();
+    assert.equal((await firstResult).at(-1)?.type, "done");
+    assert.equal(h.records().length, 2);
+  } finally { release(); h.cleanup(); }
+});
+
+test("a slower classifier sees a later worker's pin when it finally chooses", async () => {
+  const h = harness(LIVE);
+  let release!: () => void;
+  let arrived!: () => void;
+  const wait = new Promise<void>((resolve) => { release = resolve; });
+  const entered = new Promise<void>((resolve) => { arrived = resolve; });
+  try {
+    const slowRegistry = fakeSessionRegistry([{ events: answerEvents("slow") }]);
+    const fastRegistry = fakeSessionRegistry([{ events: answerEvents("fast") }]);
+    let slowClock = NOW;
+    const slow = await loadAutoProvider(h, slowRegistry, {
+      now: () => slowClock,
+      classifierCall: () => async () => { arrived(); await wait; return classifierAnswer("mechanical"); },
+    });
+    const fast = await loadAutoProvider(h, fastRegistry, { now: () => new Date(NOW.getTime() + 1_000) });
+    const slowResult = autoEvents(slow, FIX_README, "slow-classifier");
+    await entered;
+    assert.equal((await autoEvents(fast, FIX_README, "fast-classifier")).at(-1)?.type, "done");
+    slowClock = new Date(NOW.getTime() + 2_000);
+    release();
+    assert.equal((await slowResult).at(-1)?.type, "done");
+    assert.equal(slowRegistry.calls[0]?.model.provider, "openai-codex", "the choice uses the clock after classification");
+    const slowRecord = h.records().find((record) => record.delegationId === "slow-classifier");
+    assert.ok(slowRecord?.recordType === "decision" && slowRecord.route.outcome === "chosen");
+    assert.deepEqual(slowRecord.route.providerCounts, { anthropic: 1, "openai-codex": 0 });
+  } finally { release(); h.cleanup(); }
+});
+
+test("a corrupt pending-choice file cannot disable routing for later workers", async () => {
+  const h = harness(LIVE);
+  try {
+    const dir = join(h.stateDir, "routing.choice-reservations");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "torn.json"), "{not valid json");
+    writeFileSync(join(dir, "null.json"), "null");
+    const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
+    const stream = await loadAutoProvider(h, registry);
+    assert.equal((await autoEvents(stream, FIX_README, "after-corrupt-reservation")).at(-1)?.type, "done");
+    assert.equal(registry.calls[0]?.model.provider, "anthropic");
+    const decision = h.records().find((record) => record.delegationId === "after-corrupt-reservation");
+    assert.ok(decision?.recordType === "decision" && decision.mode === "live");
+  } finally { h.cleanup(); }
+});
+
+test("a decision write failure disables the router after a request has started", async () => {
+  const h = harness(LIVE);
+  const dir = join(h.stateDir, "routing");
+  try {
+    const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
+    // Classification and routing can read this folder, and the provider can
+    // start, but appending the decision after its first event fails.
+    mkdirSync(dir, { recursive: true });
+    chmodSync(dir, 0o500);
+    const output = await stderrOf(async () => {
+      const stream = await loadAutoProvider(h, registry);
+      assert.equal((await autoEvents(stream, FIX_README, "cannot-write-decision")).at(-1)?.type, "error");
+    });
+    assert.match(output, /router disabled/);
+  } finally { if (existsSync(dir)) chmodSync(dir, 0o700); h.cleanup(); }
+});
+
+test("a lazy request preparation failure does not count as a pinned delegation", async () => {
+  const h = harness(LIVE);
+  try {
+    const registry = fakeSessionRegistry([{ events: answerEvents("unused") }]);
+    const lazy = { ...registry, streamSimple(model: Parameters<SessionModelRegistry["streamSimple"]>[0],
+      context: Parameters<SessionModelRegistry["streamSimple"]>[1], options: Parameters<SessionModelRegistry["streamSimple"]>[2]) {
+      registry.streamSimple(model, context, options);
+      return (async function* (): AsyncGenerator<ReturnType<typeof answerEvents>[number]> { throw new Error("lazy request preparation failed"); })();
+    } };
+    const first = await loadAutoProvider(h, lazy);
+    assert.equal((await autoEvents(first, FIX_README, "lazy-failed")).at(-1)?.type, "error");
+    assert.deepEqual(h.records(), []);
+    const next = fakeSessionRegistry([{ events: answerEvents("ok") }]);
+    const second = await loadAutoProvider(h, next);
+    assert.equal((await autoEvents(second, FIX_README, "after-lazy-failure")).at(-1)?.type, "done");
+    assert.equal(next.calls[0]?.model.provider, "anthropic");
   } finally { h.cleanup(); }
 });
 

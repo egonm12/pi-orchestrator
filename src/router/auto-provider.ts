@@ -8,6 +8,7 @@ import { autoStream } from "./auto-stream.ts";
 import { ROUTER_PREFIX } from "./prefix.ts";
 import { classifyTask, recordedRungPassesHardFilters, routeTask, type ActiveRouter } from "./route-task.ts";
 import { withRoutingChoice } from "./routing-choice-lock.ts";
+import { releaseRoutingChoice, reserveRoutingChoice } from "./routing-choice-reservations.ts";
 import { parentDelegationOf, reviewedDelegationOf } from "../subagents/worker-sessions.ts";
 import { publishServedRung, type RungEscalation } from "./served-rungs.ts";
 import type { RiskTier } from "../routing/classifier.ts";
@@ -169,6 +170,8 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
         const sessionId = options?.sessionId;
         let wasPinned = false;
         let probeRung: string | undefined;
+        let pendingDecision: DecisionRecord | undefined;
+        let pendingRecordDir: string | undefined;
         try {
           if (!sessionId) throw new Error("auto model request has no sessionId");
           const registry = deps.registry();
@@ -196,15 +199,14 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
             else {
               const { taskText, agentRole } = firstTaskAndRole(context);
               // Classification may call a provider. Do it before taking the
-              // shared lock; only choice and reservation must be serialized.
+              // shared queue; only choice and reservation must be serialized.
               let existing: DecisionRecord | undefined;
               try { existing = router.mode === "live" ? latestDecision(router.recordDir, sessionId) : undefined; }
               catch (error) {
                 deps.disable(error);
                 pin = fallbackPin(deps.banLists(), constraints, "allowed");
               }
-              const at = deps.now();
-              const resumable = canRestoreDecision(router, existing, sessionId, constraints, taskText, at);
+              const resumable = canRestoreDecision(router, existing, sessionId, constraints, taskText, deps.now());
               let classification;
               if (!resumable && !pin) {
                 try { classification = await classifyTask(router, taskText, agentRole); }
@@ -215,6 +217,10 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
               }
               if (existing || classification) await withRoutingChoice(router.recordDir, async () => {
                 try {
+                  // The classifier may be slower than another worker's. Take
+                  // the timestamp when choosing, after prior pins/reservations
+                  // have been written, not before classification.
+                  const at = deps.now();
                   const latest = router.mode === "live" ? latestDecision(router.recordDir, sessionId) : undefined;
                   // A decision made under other constraints could restore a rung these exclude.
                   if (canRestoreDecision(router, latest, sessionId, constraints, taskText, at) && latest?.route.outcome === "chosen") {
@@ -234,14 +240,19 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
                     const decision = buildDecisionRecord(router.mode === "shadow"
                       ? { ...common, mode: "shadow", handPickedModel: pin.model }
                       : { ...common, mode: "live" });
-                    // Fail before starting a request if the record folder is
-                    // unavailable. A missing rung or failed request start then
-                    // leaves no chosen decision to inflate balancing counts.
+                    // A live chosen request may be lazy. Reserve its choice
+                    // now, then commit the decision only after its first event
+                    // proves that request preparation succeeded. Other choices
+                    // see the reservation while it is pending.
                     mkdirSync(router.recordDir, { recursive: true });
                     startingRequest = true;
                     request = beginRequest(pin);
                     startingRequest = false;
-                    appendRoutingRecord(router.recordDir, decision);
+                    if (router.mode === "live" && route.ok) {
+                      reserveRoutingChoice(router.recordDir, sessionId, providerOf(pin.model), at);
+                      pendingDecision = decision;
+                      pendingRecordDir = router.recordDir;
+                    } else appendRoutingRecord(router.recordDir, decision);
                   }
                 } catch (error) {
                   // An unavailable or banned session model is a refusal, not a router bug.
@@ -258,18 +269,59 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
           if (!pin) throw new Error("auto model could not pin a rung");
           probeRung = `${pin.model}:${pin.effort}`;
           const { rung, inner } = request ?? beginRequest(pin);
-          // The worker board shows the rung, which the relabelled replies below never name.
-          publishServedRung({ delegationId: sessionId, model: pin.model, effort: pin.effort, ...(pin.escalation ? { escalation: pin.escalation } : {}) });
-          for await (const event of inner) {
-            // Recorded before the worker sees the error, so a delegation started on it routes elsewhere.
+          const iterator = inner[Symbol.asyncIterator]();
+          // Calling next() starts a lazy model request. A synchronous stream
+          // factory is not evidence that a provider request was attempted.
+          const first = await iterator.next();
+          // Any first event shows the request was attempted on the rung, a
+          // provider's error reply included (an overflow keeps its pin). Known
+          // limit: pi-ai reports its own setup failures (an unconfigured
+          // provider) as an error event of the same shape, so those count too.
+          // The registry lookup and the authorization filter run first, which
+          // keeps that case rare. First-request limit errors are ticket 09's.
+          const accepted = !first.done;
+          if (pendingRecordDir) {
+            const dir = pendingRecordDir;
+            try {
+              await withRoutingChoice(dir, async () => {
+                if (accepted && pendingDecision) appendRoutingRecord(dir, pendingDecision);
+                releaseRoutingChoice(dir, sessionId);
+                pendingRecordDir = undefined;
+                pendingDecision = undefined;
+              });
+            } catch (error) {
+              deps.disable(error);
+              // Nobody will read the started request once the worker fails.
+              await iterator.return?.();
+              throw error;
+            }
+            // A worker whose request was never accepted keeps no pin, so the
+            // decision it did not record cannot be restored on a later request.
+            if (!accepted) pins.delete(sessionId);
+          }
+          // The worker board shows the rung, which the relabelled replies below
+          // never name. It reads the tier from the decision, so publish only
+          // after the decision is persisted.
+          if (!first.done) publishServedRung({ delegationId: sessionId, model: pin.model, effort: pin.effort, ...(pin.escalation ? { escalation: pin.escalation } : {}) });
+          const forward = (event: Awaited<ReturnType<typeof iterator.next>> extends IteratorResult<infer E> ? E : never) => {
+            // Recorded before the worker sees the error, so later delegations route elsewhere.
             if (event.type === "error" && event.reason === "error") recordLimitError(deps, rung.provider, event.error.errorMessage);
             const label = <T extends { provider: string; model: string; api: string }>(message: T): T =>
               ({ ...message, provider: model.provider, model: model.id, api: model.api });
             push({ ...event, ...("partial" in event && event.partial ? { partial: label(event.partial) } : {}),
               ...("message" in event && event.message ? { message: label(event.message) } : {}),
               ...("error" in event && event.error ? { error: label(event.error) } : {}) } as Parameters<typeof push>[0]);
-          }
+          };
+          if (!first.done) forward(first.value);
+          for (let next = first.done ? first : await iterator.next(); !next.done; next = await iterator.next()) forward(next.value);
         } catch (error) {
+          // A lazy request that fails during preparation must not leave a
+          // choice behind. The lock protects cancellation from a new choice.
+          if (pendingRecordDir && sessionId) {
+            try { await withRoutingChoice(pendingRecordDir, async () => releaseRoutingChoice(pendingRecordDir!, sessionId)); }
+            catch { /* preserve the original request error */ }
+            pins.delete(sessionId);
+          }
           const text = error instanceof Error ? error.message : String(error);
           push({ type: "error", reason: "error", error: { role: "assistant", content: [], api: model.api,
             provider: model.provider, model: model.id, stopReason: "error", errorMessage: text, timestamp: Date.now(),

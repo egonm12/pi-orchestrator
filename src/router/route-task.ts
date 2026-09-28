@@ -10,12 +10,14 @@ import { deriveProviderUsage, type RoutingEvidence, type RoutingEvidenceSource }
 import { readUsageObservations, usageLimits } from "./usage-observations.ts";
 import { readUsableRoutingRecords, type RoutingMode } from "../routing/decision-record.ts";
 import { providerOf } from "../recipients/authorized-delegation.ts";
+import { pendingRoutingChoiceCounts } from "./routing-choice-reservations.ts";
 
 const BALANCING_WINDOW_MS = 5 * 60 * 60 * 1000;
 
-/** Global decisions are written when a rung is pinned, before the next worker
- * routes. Only live, chosen rungs count; shadow and refusals did not pin the
- * recommendation. The folder is shared across the owner's sessions/projects. */
+/** Live decisions count rungs that started a request. Pending reservations
+ * count choices in flight before their first event. Shadow and refusals did
+ * not pin the recommendation. Both stores are shared across projects and
+ * sessions; the in-process queue makes a fan-out's choices sequential. */
 function pinnedProviderCounts(dir: string, at: Date): Readonly<Record<string, number>> {
   const counts: Record<string, number> = {};
   const seen = new Set<string>();
@@ -28,6 +30,9 @@ function pinnedProviderCounts(dir: string, at: Date): Readonly<Record<string, nu
     seen.add(record.delegationId);
     const provider = providerOf(record.route.rung.model);
     counts[provider] = (counts[provider] ?? 0) + 1;
+  }
+  for (const [provider, pending] of Object.entries(pendingRoutingChoiceCounts(dir, at, seen))) {
+    counts[provider] = (counts[provider] ?? 0) + pending;
   }
   return counts;
 }
@@ -88,7 +93,7 @@ export function recordedRungPassesHardFilters(router: ActiveRouter, rung: Constr
   return failedHardFilter(rung, hardFilterEvidence(router, taskText, at, router.evidence(), constraints)) === undefined;
 }
 
-/** Classify the worker's task before taking the shared choice lock. */
+/** Classify the worker's task before entering the shared choice queue. */
 export async function classifyTask(router: ActiveRouter, taskText: string, agentRole: string): Promise<TierClassification> {
   const evidence = router.evidence();
   return classifyTier(
@@ -98,7 +103,7 @@ export async function classifyTask(router: ActiveRouter, taskText: string, agent
 }
 
 /** Route under the worker's constraints after classification, while the
- * shared choice lock is held. A minimum tier raises where routing starts,
+ * shared choice queue is held. A minimum tier raises where routing starts,
  * an excluded rung is removed in every tier, and a forced rung replaces the
  * tier choice. The provider usage returned is what the hard filters read. */
 export function routeTask(router: ActiveRouter, taskText: string, classification: TierClassification, at: Date, constraints: RoutingConstraints = {}) {
