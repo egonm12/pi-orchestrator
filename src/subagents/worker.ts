@@ -176,11 +176,12 @@ export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
     const sessionManager = workerSessionManager(setup);
     // An edit counts for the orchestrator's delegation, however the worker ends (editing.ts).
     const edits = trackEdits({ sessionId: sessionManager.getSessionId(), orchestratorSession: setup.orchestratorSession.getSessionId(),
-      recordDir: join(stateDir(), "routing"), ...(setup.parentDelegationId === undefined ? {} : { parentDelegationId: setup.parentDelegationId }) });
+      recordDir: join(stateDir(), "routing"), cwd: setup.cwd, readOnly: isReadOnly(setup),
+      ...(setup.parentDelegationId === undefined ? {} : { parentDelegationId: setup.parentDelegationId }) });
     try {
       const result = await runWorkerSession(setup, sessionManager, edits.extension, activity, () => report(false));
-      return edits.edited() ? { ...result, edited: true } : result;
-    } finally { edits.stop(); }
+      return edits.finish() ? { ...result, edited: true } : result;
+    } finally { edits.finish(); }
   } finally { report(true); }
 }
 
@@ -193,6 +194,12 @@ function workerSessionManager(setup: WorkerSetup): SessionManager {
     : setup.fork?.sessionManager ?? (setup.orchestratorSession.getSessionFile() === undefined
       ? SessionManager.inMemory(setup.cwd, sessionOptions)
       : SessionManager.create(setup.cwd, workerSessionDir(setup.orchestratorSession), sessionOptions));
+}
+
+/** A reviewer, resumed or not, and a worker it started never edit (ADR 0010). */
+function isReadOnly(setup: WorkerSetup): boolean {
+  return (setup.review?.delegationId ?? setup.resume?.review?.delegationId) !== undefined ||
+    (setup.parentDelegationId !== undefined && reviewedDelegationOf(setup.parentDelegationId) !== undefined);
 }
 
 /** `runWorker`'s body: it moves `activity` on and calls `report` at each
@@ -221,9 +228,8 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
   const appendedPrompt = [...(getsReportingRules ? [REPORTING_RULES] : []), ...(review === undefined ? [] : [review.prompt]),
     ...(instructions === undefined ? [] : [instructions])];
   const tools = setup.tools === undefined || reports === undefined ? setup.tools : [...setup.tools, REPORT_TOOL];
-  // A reviewer, resumed or not, and a worker it started never edit (ADR 0010).
   const reviewed = review?.delegationId ?? setup.resume?.review?.delegationId;
-  const readOnly = reviewed !== undefined || (setup.parentDelegationId !== undefined && reviewedDelegationOf(setup.parentDelegationId) !== undefined);
+  const readOnly = isReadOnly(setup);
   let session: Awaited<ReturnType<typeof createAgentSessionFromServices>>["session"];
   try {
     const services = await createAgentSessionServices({

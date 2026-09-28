@@ -14,6 +14,7 @@ import { authorizeRecipient, emptyAuthorization, grantOwnerApproval, saveAuthori
 import { readRoutingRecords, readUsableRoutingRecordEntries } from "../routing/decision-record.ts";
 import { attachVerdict } from "../routing/verdicts.ts";
 import { buildRoutingReport } from "../routing/routing-report.ts";
+import { createTempRepo } from "../fixtures/temp-repo.ts";
 import { autoStream } from "../router/auto-stream.ts";
 import { createRouterExtension } from "../router/extension.ts";
 import personalGuard from "../guard/extension.ts";
@@ -3165,6 +3166,129 @@ test("edit, write, unrecognised bash, git and ctx_execute in a worker make its d
     const byDelegation = (rows: readonly (readonly unknown[])[]) => [...rows].sort((a, b) => String(a[0]).localeCompare(String(b[0])));
     assert.deepEqual(byDelegation(editRecords(h).map((record) => [record.delegationId, record.tool, record.orchestratorSession, record.nestedDelegationId])),
       byDelegation(edited.results.map((worker, index) => [worker.sessionId, ["write", "edit", "bash", "bash", "ctx_execute"][index], main.sessionId, undefined])));
+  } finally { h.cleanup(); }
+});
+
+// Editing detection from the working tree (pi-orchestrator-6c1p): in a git
+// repository a delegation is editing when the working tree (tracked changes
+// plus untracked files) differs between its worker's start and end, or when
+// the worker ran edit or write. Without a repository the command rule above stays.
+
+/** The orchestrator's context with `dir`, a git repository, as its working directory. */
+function orchestratorIn(h: Harness, dir: string): Orchestrator {
+  const sessionManager = SessionManager.create(dir, join(h.agentDir, "sessions", "--repo--"));
+  const ctx = { cwd: dir, hasUI: false, sessionManager } as unknown as ExtensionContext;
+  return { ctx, sessionDir: sessionManager.getSessionDir(), sessionId: sessionManager.getSessionId() };
+}
+
+/** One subagents call of `tasks` in parallel: each worker's result and its item's text in the tool result. */
+async function runItems(subagents: LoadedSubagents, ctx: ExtensionContext, id: string, tasks: readonly string[]) {
+  const result = await subagents.tool().execute(id, { items: tasks.map((task) => ({ task })) } as never, undefined, undefined, ctx);
+  const { results } = result.details as SubagentsDetails;
+  assert.deepEqual(results.map((worker) => worker.status), tasks.map(() => "completed"), JSON.stringify(results));
+  return { results, texts: toolText(result).split(/\n\n(?=Worker )/) };
+}
+
+test("in a git repository, bash that changed nothing is not editing and asks no verdict; bash that changed the tree is editing, and its reviewer gets the changed paths", async () => {
+  const h = routedHarness();
+  const repo = createTempRepo();
+  try {
+    const provider = scriptedAnthropic(runningScript);
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const main = orchestratorIn(h, repo.dir);
+    // Each of these commands made a delegation editing by the command rule.
+    const unchanged = await runItems(subagents, main.ctx, "call-unchanged", [
+      runTask("bash", { command: "node -e \"console.log(1)\"" }),
+      runTask("bash", { command: `git stash list > /dev/null; mkdir -p ${join(h.agentDir, "probe")}` }),
+    ]);
+    assert.deepEqual(unchanged.results.map((worker) => worker.edited), [undefined, undefined]);
+    assert.deepEqual(unchanged.texts.map((text) => text.includes(EDITED_LINE)), [false, false], unchanged.texts.join("\n---\n"));
+    assert.deepEqual(editRecords(h), []);
+    assert.deepEqual(gateRequirements(h), [], "no verdict is asked");
+    const researchId = unchanged.results[0]!.sessionId!;
+    assert.equal(await refusal(subagents, main.ctx, { delegationId: researchId, verdict: "accept", reason: "checked" }),
+      `subagents_verdict: delegation ${researchId} did not edit; a research Result is checked but gets no verdict`);
+
+    const changed = await runItems(subagents, main.ctx, "call-changed", [runTask("bash", { command: "echo notes > notes.md && echo more >> README.md" })]);
+    const worker = changed.results[0]!;
+    assert.equal(worker.edited, true);
+    assert.ok(changed.texts[0]!.includes(EDITED_LINE), changed.texts[0]);
+    assert.deepEqual(gateRequirements(h), [[worker.sessionId, "medium", "spot-check"]]);
+    const review = await subagents.tool().execute("call-review", { items: [{ task: "Check the notes", review: worker.sessionId }] } as never,
+      undefined, undefined, main.ctx);
+    const reviewer = (review.details as SubagentsDetails).results[0]!;
+    assert.equal(reviewer.status, "completed", JSON.stringify(reviewer));
+    const prompt = provider.requests.find((request) => request.sessionId === reviewer.sessionId)?.systemPrompt ?? "";
+    assert.ok(prompt.includes("Files it changed: README.md, notes.md."), prompt);
+  } finally {
+    repo.cleanup();
+    h.cleanup();
+  }
+});
+
+test("in a git repository, an edit or write outside it is editing", async () => {
+  const h = routedHarness();
+  const repo = createTempRepo();
+  try {
+    writeFileSync(join(h.agentDir, "outside.md"), "# Outside\n");
+    const provider = scriptedAnthropic(runningScript);
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const main = orchestratorIn(h, repo.dir);
+    const { results, texts } = await runItems(subagents, main.ctx, "call-outside", [
+      runTask("write", { path: join(h.agentDir, "written.md"), content: "x\n" }),
+      runTask("edit", { path: join(h.agentDir, "outside.md"), edits: [{ oldText: "# Outside", newText: "# Edited outside" }] }),
+    ]);
+    assert.equal(readFileSync(join(h.agentDir, "outside.md"), "utf8"), "# Edited outside\n");
+    assert.equal(execFileSync("git", ["status", "--porcelain"], { cwd: repo.dir, encoding: "utf8" }), "", "the repository did not change");
+    assert.deepEqual(results.map((worker) => worker.edited), [true, true]);
+    assert.deepEqual(texts.map((text) => text.includes(EDITED_LINE)), [true, true], texts.join("\n---\n"));
+  } finally {
+    repo.cleanup();
+    h.cleanup();
+  }
+});
+
+test("in a git repository, a change made while two workers ran counts for each of them", async () => {
+  const h = routedHarness();
+  const repo = createTempRepo();
+  try {
+    const provider = scriptedAnthropic(runningScript);
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const main = orchestratorIn(h, repo.dir);
+    // The reader only reads, and the command rule calls it research. The writer changes the tree once the reader runs.
+    const started = join(h.agentDir, "reader-started");
+    const reader = runTask("bash", { command: "while ! test -f notes.md; do sleep 0.01; done; cat notes.md" });
+    const writer = runTask("bash", { command: `while ! test -f ${started}; do sleep 0.01; done; echo notes > notes.md` });
+    const call = runItems(subagents, main.ctx, "call-overlap", [reader, writer]);
+    await waitFor(() => provider.requests.some((request) => request.task === reader), "the reader's first request");
+    writeFileSync(started, "");
+    const { results, texts } = await call;
+    assert.equal(readFileSync(join(repo.dir, "notes.md"), "utf8"), "notes\n");
+    assert.deepEqual(results.map((worker) => worker.edited), [true, true]);
+    assert.deepEqual(texts.map((text) => text.includes(EDITED_LINE)), [true, true], texts.join("\n---\n"));
+    assert.deepEqual(gateRequirements(h).map(([id]) => id).sort(), results.map((worker) => worker.sessionId!).sort());
+    // A worker that starts after the change and changes nothing is not editing.
+    const later = await runItems(subagents, main.ctx, "call-later", [runTask("bash", { command: "node -e \"console.log(2)\"" })]);
+    assert.equal(later.results[0]!.edited, undefined);
+  } finally {
+    repo.cleanup();
+    h.cleanup();
+  }
+});
+
+test("without a git repository the command rule decides: bash that is neither read-only nor a build or test is editing", async () => {
+  const h = routedHarness();
+  try {
+    const provider = scriptedAnthropic(runningScript);
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    assert.throws(() => execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: h.projectDir, stdio: "ignore" }), "the project is no repository");
+    const { results, texts } = await runItems(subagents, main.ctx, "call-no-repo", [
+      runTask("bash", { command: "node -e \"console.log(1)\"" }),
+      runTask("bash", { command: "ls" }),
+    ]);
+    assert.deepEqual(results.map((worker) => worker.edited), [true, undefined]);
+    assert.deepEqual(texts.map((text) => text.includes(EDITED_LINE)), [true, false], texts.join("\n---\n"));
   } finally { h.cleanup(); }
 });
 

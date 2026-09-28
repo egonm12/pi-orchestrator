@@ -115,6 +115,7 @@ const FREE_TEXT_FIELDS: readonly (readonly [path: readonly string[], limit: numb
   [["reason"], FREE_TEXT_LIMIT],
   [["gateLevelRaise", "reason"], FREE_TEXT_LIMIT],
   [["detail"], FREE_TEXT_LIMIT],
+  [["paths", "[]"], FREE_TEXT_LIMIT],
 ];
 
 /** A copy with `change` applied to the string at `keys`; anything that is not
@@ -394,8 +395,10 @@ export interface ForkRecord extends RecordCommon {
 }
 
 /** An editing delegation's edit (ADR 0010): written the first time in a run
- *  that its worker, or a worker it started, runs an editing tool call. A
- *  resumed delegation writes another in each run that edits. */
+ *  that its worker, or a worker it started, runs an editing tool call, and
+ *  again as a run ends when the working tree changed while it ran
+ *  (../subagents/working-tree.ts), naming the changed paths. A resumed
+ *  delegation writes more in each run that edits. */
 export interface EditRecord extends RecordCommon {
   readonly recordType: "edit";
   /** The orchestrator session the delegation belongs to. */
@@ -405,7 +408,16 @@ export interface EditRecord extends RecordCommon {
   /** The worker's own worker that made the edit, which counts for the
    *  delegation that started it; absent when the delegation's worker did. */
   readonly nestedDelegationId?: string;
+  /** For a working-tree record (tool `working-tree`): the paths that changed
+   *  while the run lasted, relative to the worker's working directory, at
+   *  most EDIT_RECORD_PATH_LIMIT; empty when only HEAD moved. */
+  readonly paths?: readonly string[];
+  /** How many more changed paths there were than `paths` holds. */
+  readonly omittedPaths?: number;
 }
+
+/** The most changed paths one edit record names. */
+export const EDIT_RECORD_PATH_LIMIT = 100;
 
 /** An editing delegation's gate requirement (ADR 0010, ADR 0011): written
  *  when a run of it that edited ends, at the gate level then in force. A
@@ -757,9 +769,17 @@ export function validateRoutingRecord(value: unknown): RoutingRecord {
     }
   } else if (recordType === "edit") {
     if (value.schemaVersion !== DECISION_RECORD_SCHEMA_VERSION) throw new RoutingRecordError("schemaVersion", `is unsupported for ${recordType} records`);
-    checkKeys(value, "", [...COMMON_KEYS, "orchestratorSession", "tool"], ["nestedDelegationId"]);
+    checkKeys(value, "", [...COMMON_KEYS, "orchestratorSession", "tool"], ["nestedDelegationId", "paths", "omittedPaths"]);
     checkCommon(value);
     for (const key of ["orchestratorSession", "tool"]) stringAt(value, key, "", { nonBlank: true });
+    if (value.paths !== undefined) {
+      const paths = arrayAt(value, "paths", "");
+      if (paths.length > EDIT_RECORD_PATH_LIMIT) throw new RoutingRecordError("paths", `must hold at most ${EDIT_RECORD_PATH_LIMIT} paths; got ${paths.length}`);
+      paths.forEach((_, index) => stringAt(paths as unknown as Json, String(index), "paths", { nonBlank: true }));
+    }
+    if (value.omittedPaths !== undefined && (!Number.isInteger(value.omittedPaths) || (value.omittedPaths as number) < 1)) {
+      throw new RoutingRecordError("omittedPaths", `must be a positive integer when present; got ${JSON.stringify(value.omittedPaths)}`);
+    }
     if (value.nestedDelegationId !== undefined) {
       stringAt(value, "nestedDelegationId", "", { nonBlank: true });
       if (value.nestedDelegationId === value.delegationId) throw new RoutingRecordError("nestedDelegationId", "must name a different delegation");
@@ -992,13 +1012,19 @@ export function buildEditRecord(input: {
   readonly orchestratorSession: string;
   readonly tool: string;
   readonly nestedDelegationId?: string;
+  /** The changed paths of a working-tree record; more than EDIT_RECORD_PATH_LIMIT are counted, not named. */
+  readonly paths?: readonly string[];
   readonly at?: Date;
 }): EditRecord {
+  const paths = input.paths?.slice(0, EDIT_RECORD_PATH_LIMIT);
+  const omitted = (input.paths?.length ?? 0) - (paths?.length ?? 0);
   return checkedRecord({
     recordType: "edit", schemaVersion: DECISION_RECORD_SCHEMA_VERSION,
     delegationId: input.delegationId, timestamp: (input.at ?? new Date()).toISOString(),
     orchestratorSession: input.orchestratorSession, tool: input.tool,
     ...(input.nestedDelegationId === undefined ? {} : { nestedDelegationId: input.nestedDelegationId }),
+    ...(paths === undefined ? {} : { paths }),
+    ...(omitted > 0 ? { omittedPaths: omitted } : {}),
   });
 }
 

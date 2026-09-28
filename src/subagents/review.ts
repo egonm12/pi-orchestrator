@@ -32,7 +32,8 @@ import { workerSessionDir } from "./worker.ts";
 // the worker board, which shows the rung that served it; whether it edited from
 // its edit records (./editing.ts); its task, Result and the files its edit and
 // write calls named from its saved worker session, or from the board's copy of
-// its messages when the session was not saved.
+// its messages when the session was not saved. In a git repository its
+// working-tree edit records add the paths that changed while it ran.
 //
 // A compaction summary request arrives with a new session id and is routed
 // without the reviewer's constraints (ADR 0006). It only condenses the
@@ -58,8 +59,12 @@ export interface ReviewMaterial {
   readonly tasks: readonly string[];
   /** Its latest reply's text, its Result; empty when it gave none. */
   readonly result: string;
-  /** The paths its edit and write calls named; `undefined` when its messages are not known. */
+  /** The paths its edit and write calls named, then the paths its working-tree
+   *  edit records name; `undefined` when neither is known. */
   readonly files?: readonly string[];
+  /** Its working tree was compared: `files` holds what changed in it, and how
+   *  many changed paths the records did not name. */
+  readonly treeCompared?: { readonly omittedPaths: number };
   /** Its saved session, with the whole transcript. */
   readonly sessionFile?: string;
 }
@@ -142,6 +147,16 @@ function ownMessages(file: string, forkPoint: string | null | undefined): Messag
  *  its saved worker session, else from the worker board's copy. A reviewer
  *  gets them, and a retry takes its original task from them (./retry.ts). */
 export function delegationMaterial(ctx: Pick<ExtensionContext, "cwd" | "sessionManager">, id: string, records: readonly RoutingRecord[]): ReviewMaterial {
+  const material = messageMaterial(ctx, id, records);
+  const tree = records.filter((record): record is EditRecord => record.recordType === "edit" && record.delegationId === id && record.paths !== undefined);
+  if (tree.length === 0) return material;
+  const files = [...material.files ?? []];
+  for (const path of tree.flatMap((record) => record.paths ?? [])) if (!files.includes(path)) files.push(path);
+  return { ...material, files, treeCompared: { omittedPaths: tree.reduce((sum, record) => sum + (record.omittedPaths ?? 0), 0) } };
+}
+
+/** `delegationMaterial` from the delegation's messages alone. */
+function messageMaterial(ctx: Pick<ExtensionContext, "cwd" | "sessionManager">, id: string, records: readonly RoutingRecord[]): ReviewMaterial {
   const fork = records.filter((record): record is ForkRecord => record.recordType === "fork" && record.delegationId === id).at(-1);
   const file = savedSession(ctx, id);
   if (file !== undefined) return { ...materialOf(ownMessages(file, fork?.forkPoint)), sessionFile: file };
@@ -211,10 +226,16 @@ export function reviewTarget(ctx: Pick<ExtensionContext, "cwd" | "sessionManager
 export function reviewerPrompt(target: ReviewTarget, level: GateLevel): string {
   const { delegationId, tier, material } = target;
   const [task, ...later] = material.tasks;
+  const { treeCompared } = material;
   const files = material.files === undefined
     ? "The files it changed are not known: check git status and git diff."
-    : `Files its edit and write calls named: ${material.files.length === 0 ? "none" : material.files.join(", ")}. ` +
-      "Changes it made through bash, ctx_execute or a worker it started are not listed: check git status and git diff.";
+    : treeCompared !== undefined
+      ? `Files it changed: ${material.files.length === 0 ? "none named" : material.files.join(", ")}` +
+        `${treeCompared.omittedPaths > 0 ? `, and ${treeCompared.omittedPaths} more` : ""}. ` +
+        "These are the paths its edit and write calls named and the paths that changed in the working tree while it ran, " +
+        "which can hold changes of workers that ran at the same time: check git status and git diff."
+      : `Files its edit and write calls named: ${material.files.length === 0 ? "none" : material.files.join(", ")}. ` +
+        "Changes it made through bash, ctx_execute or a worker it started are not listed: check git status and git diff.";
   return [
     reviewRules(level),
     "# The reviewed delegation",

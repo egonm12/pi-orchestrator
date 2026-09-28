@@ -1,9 +1,10 @@
 import { basename } from "node:path";
 
 // What a tool call is: a kind, not a yes or no, so each caller draws its own
-// line. The exploration budget (ADR 0005) counts read-only and unrecognised
-// calls. Telling whether a worker edited (ADR 0010, ./editing.ts) counts edit,
-// any bash that is neither read-only nor build-test, and ctx_execute. The
+// line. The exploration nudge (ADR 0013) counts read-only and unrecognised
+// calls. Telling whether a worker edited (ADR 0010, ./editing.ts) counts edit
+// and write, and, without a git repository to compare, any bash that is
+// neither read-only nor build-test, and ctx_execute. The
 // commit gate (ADR 0010, ./commit-gate.ts) asks which git subcommands a bash
 // command runs, from the same reading.
 //

@@ -1,14 +1,25 @@
 import type { InlineExtension } from "@earendil-works/pi-coding-agent";
 import { appendRoutingRecord, buildEditRecord, type EditRecord, type RoutingRecord, type Verdict, type VerdictRecord } from "../routing/decision-record.ts";
 import { classifyToolCall } from "./tool-call-kind.ts";
+import { snapshotWorkingTree, workingTreeChanges } from "./working-tree.ts";
 
 // Editing delegations (ADR 0010). A delegation edited when its worker, or a
-// worker it started, ran an editing tool call; the orchestrator must then
-// record a verdict on it (./verdict.ts). The fact is kept as an edit record in
-// the routing record folder, keyed by the delegation id and naming the
-// orchestrator session, so it outlives the worker and a pi reload. Each run
-// of a worker writes at most one: a resumed delegation writes another when it
-// edits again, and a verdict recorded before that edit no longer covers it.
+// worker it started, changed files; the orchestrator must then record a
+// verdict on it (./verdict.ts). In a git repository that is when the working
+// tree changed while the worker ran (./working-tree.ts), or when it ran edit
+// or write, which count wherever they write (pi-orchestrator-6c1p). Commands
+// alone do not count there: bash that changed nothing is research. The tree
+// is compared per worker, so a change made while workers overlapped counts
+// for each of them. Where there is no repository to compare, the command rule
+// decides: any editing tool call (isEditingToolCall) counts.
+//
+// The fact is kept as edit records in the routing record folder, keyed by the
+// delegation id and naming the orchestrator session, so it outlives the
+// worker and a pi reload. A run writes one at its first counted tool call,
+// so a running worker's edit waits for a verdict at once, and one naming the
+// changed paths as it ends with a changed tree, for its reviewer's file list.
+// A resumed delegation writes more when it edits again, and a verdict
+// recorded before that edit no longer covers it.
 //
 // A worker's own worker writes the record under the delegation that started
 // it, with its own id beside it. Workers run in the orchestrator's process
@@ -40,6 +51,9 @@ export const READ_ONLY_REVIEWER: InlineExtension = {
   factory: (pi) => { pi.on("tool_call", (event) => isEditingToolCall(event.toolName, event.input) ? { block: true, reason: REVIEWER_EDIT_DENIED } : undefined); },
 };
 
+/** The tool name a working-tree edit record carries. */
+export const WORKING_TREE_TOOL = "working-tree";
+
 /** One run of a delegation: the orchestrator's delegation its edits count for. */
 interface DelegationRun {
   readonly delegationId: string;
@@ -55,10 +69,10 @@ const runs = (): Map<string, DelegationRun> => (globalThis as ProcessGlobal)[RUN
 export interface EditTracking {
   /** The worker's extension that watches its executed tool calls. */
   readonly extension: InlineExtension;
-  /** Whether the worker, or a worker it started, edited in this run. */
-  edited(): boolean;
-  /** Ends the run's tracking, once the worker has ended. */
-  stop(): void;
+  /** Ends the run's tracking once the worker has ended: compares the working
+   *  tree, records a change, and says whether the worker, or a worker it
+   *  started, edited in this run. A second call gives the same answer. */
+  finish(): boolean;
 }
 
 export interface EditTrackingSetup {
@@ -70,9 +84,14 @@ export interface EditTrackingSetup {
    *  delegation that started it names the orchestrator's instead. */
   readonly orchestratorSession: string;
   readonly recordDir: string;
+  /** The worker's working directory, whose repository's tree is compared. */
+  readonly cwd: string;
+  /** A reviewer, or a worker it started: it never edits, so the tree, which
+   *  the reviewed work may still change, is not compared. */
+  readonly readOnly?: boolean;
 }
 
-/** Tracks one run of a worker from before its session starts until `stop`. */
+/** Tracks one run of a worker from before its session starts until `finish`. */
 export function trackEdits(setup: EditTrackingSetup): EditTracking {
   const { sessionId, parentDelegationId } = setup;
   // The parent runs for as long as its worker does, so it is found; the
@@ -80,32 +99,62 @@ export function trackEdits(setup: EditTrackingSetup): EditTracking {
   const run: DelegationRun = (parentDelegationId === undefined ? undefined : runs().get(parentDelegationId)) ??
     { delegationId: parentDelegationId ?? sessionId, orchestratorSession: setup.orchestratorSession, edited: false };
   runs().set(sessionId, run);
+  const before = setup.readOnly ? undefined : snapshotWorkingTree(setup.cwd);
   let editedHere = false;
   let recorded = false;
+  // The tool of the latest call the command rule counts, for when the tree cannot be compared as the worker ends.
+  let commandRuleTool: string | undefined;
+  const markEdited = () => { editedHere = true; run.edited = true; };
+  const record = (tool: string, paths?: readonly string[]): boolean => {
+    try {
+      appendRoutingRecord(setup.recordDir, buildEditRecord({
+        delegationId: run.delegationId, orchestratorSession: run.orchestratorSession, tool,
+        ...(run.delegationId === sessionId ? {} : { nestedDelegationId: sessionId }),
+        ...(paths === undefined ? {} : { paths }),
+      }));
+      return true;
+    } catch (error) {
+      process.stderr.write(`pi-orchestrator subagents: could not record delegation ${run.delegationId}'s edit: ${error instanceof Error ? error.message : String(error)}\n`);
+      return false;
+    }
+  };
   const extension: InlineExtension = {
     name: "pi-orchestrator-edit-tracking",
     factory: (pi) => { pi.on("tool_result", (event) => {
       // tool_result follows only a call that ran: one a hook blocked edited nothing.
       if (!isEditingToolCall(event.toolName, event.input)) return;
-      editedHere = true;
-      run.edited = true;
-      if (recorded) return;
-      try {
-        appendRoutingRecord(setup.recordDir, buildEditRecord({
-          delegationId: run.delegationId, orchestratorSession: run.orchestratorSession, tool: event.toolName,
-          ...(run.delegationId === sessionId ? {} : { nestedDelegationId: sessionId }),
-        }));
-        recorded = true;
-      } catch (error) {
-        // The next editing call tries again.
-        process.stderr.write(`pi-orchestrator subagents: could not record delegation ${run.delegationId}'s edit: ${error instanceof Error ? error.message : String(error)}\n`);
-      }
+      commandRuleTool = event.toolName;
+      // In a repository only edit and write count as calls; the tree comparison catches the rest.
+      if (before !== undefined && classifyToolCall(event.toolName, event.input) !== "edit") return;
+      markEdited();
+      // The next editing call tries again.
+      if (!recorded) recorded = record(event.toolName);
     }); },
   };
+  let finished: boolean | undefined;
   return {
     extension,
-    edited: () => run.delegationId === sessionId ? run.edited : editedHere,
-    stop: () => { if (runs().get(sessionId) === run) runs().delete(sessionId); },
+    finish: () => {
+      if (finished !== undefined) return finished;
+      if (runs().get(sessionId) === run) runs().delete(sessionId);
+      if (before !== undefined) {
+        const after = snapshotWorkingTree(setup.cwd);
+        if (after === undefined) {
+          if (commandRuleTool !== undefined) {
+            markEdited();
+            if (!recorded) recorded = record(commandRuleTool);
+          }
+        } else {
+          const changes = workingTreeChanges(before, after, setup.cwd);
+          if (changes.paths.length > 0 || changes.moved) {
+            markEdited();
+            record(WORKING_TREE_TOOL, changes.paths);
+          }
+        }
+      }
+      finished = run.delegationId === sessionId ? run.edited : editedHere;
+      return finished;
+    },
   };
 }
 

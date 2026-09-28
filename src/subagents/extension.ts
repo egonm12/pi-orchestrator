@@ -690,7 +690,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
     pi.on("agent_settled", (_event, ctx) => { if (!isWorkerSession(ctx)) workerBoard().setOrchestratorState("idle"); });
     // The exploration nudge reminds the orchestrator to delegate research (exploration-nudge.ts).
     const explorationNudge = registerExplorationNudge(pi, logOnce);
-    // Unjudged edits hold back the orchestrator's git commit and git push, and a turn end names them (commit-gate.ts).
+    // The orchestrator's git commit and git push always run, and their result and a turn end name the unjudged edits (commit-gate.ts).
     registerCommitGate(pi, logOnce, gateLevels);
     // The orchestrator protocol is in the system prompt of every request of every orchestrator run: added as a
     // prompt starts its run, and put back into any request whose prompt lost it, as in a run a message started
