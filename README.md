@@ -2,7 +2,7 @@
 
 A [pi](https://pi.dev) package with three extensions for sessions that delegate work to workers:
 
-- **Subagents**: the built-in `subagents` tool. It starts workers in the orchestrator's own process, on the auto model `orchestrator/auto`, and gives the orchestrator's own session the orchestrator protocol, the exploration budget and the `subagents_verdict` tool.
+- **Subagents**: the built-in `subagents` tool. It starts workers in the orchestrator's own process, on the auto model `orchestrator/auto`, and gives the orchestrator's own session the orchestrator protocol, the exploration budget, the `subagents_verdict` tool and a block on git commit and git push while edits wait for a verdict.
 - **Router extension**: serves the auto model `orchestrator/auto`. It classifies a worker's first request into a tier and routes it to a rung from your tier map.
 - **Guard**: enforces a personal subagent ban list for workers and an optional session ban list for the orchestrator.
 
@@ -118,11 +118,21 @@ The orchestrator records its verdict with `subagents_verdict`, `{ "delegationId"
 - the verdict is not `accept` or `request_changes`, or the reason is blank;
 - a worker calls it: workers never get `subagents_verdict`, even when their agent definition's `tools:` list names it.
 
+While any editing delegation of the orchestrator's session waits for a verdict, its `bash` calls that run `git commit` or `git push` are denied. A delegation waits from its latest edit record until a verdict of either kind, `accept` or `request_changes`, is recorded after it, so a resume that edits again waits again. The reason names each waiting delegation, with its agent and whether it still runs when the orchestrator's process knows them:
+
+```text
+pi-orchestrator: git commit is denied while 2 editing delegations wait for your verdict: delegation <id>, delegation <id> (agent scribe, still running). Judge each Result and record its verdict with `subagents_verdict`, then commit.
+```
+
+A commit or push is found anywhere in the command: in a chain or a pipe (`npm test && git commit -m x`, `git status; git push`), after git's own options (`git -C <dir> commit`, `git -c k=v push`), through `env` or `xargs`. A command the bash reader cannot follow, such as `git commit -m "$(cat <<'EOF' ...)"`, is matched by its text: `git`, git's options, then `commit` or `push`. Other `bash`, `git add` included, and the final reply are never blocked, nor are new delegations: the runtime cannot tell before a worker runs whether it will edit. When the record folder cannot be read, a commit or push is denied with the reason.
+
+At the end of each orchestrator turn with delegations waiting, a notice names them the same way, and says that commit and push are denied until each has a verdict. It is sent like a worker's progress report: shown at once, read by the model at its next request, and never starting a turn, so it follows a final reply without holding it back. It repeats only when the waiting delegations change, and once at the first turn end of each user prompt. Workers, forked workers and sessions in a pi-subagents child process commit and push unhindered.
+
 The routing report, `node src/routing/routing-report.ts <state dir>/routing`, counts each delegation's latest verdict in its tier and rung's row. Verdicts on delegations without a routing decision (forks, agent-model workers and unrouted workers) have no row; they are counted on their own line, `verdicts on unrouted delegations: ...`.
 
 ### Orchestrator protocol
 
-The orchestrator's own session carries the orchestrator protocol as the `orchestrator_protocol` section of its system prompt: delegate exploration and substantial work to workers, keep small known actions (a single lookup, a small edit, a build or test run, a commit), stay within the exploration budget, which it names with the configured threshold, treat a worker's Result as evidence to check before acting on it, and judge each editing delegation's Result and record the verdict with `subagents_verdict` (see Verdicts above). The text lives in `src/subagents/orchestrator-protocol.ts`. The section is added when each user prompt starts its agent loop, so it holds for every turn of that loop and returns after a compaction. There is no per-prompt reminder line. Workers, forked workers and sessions in a pi-subagents child process never get it; a fork's copied conversation holds the orchestrator's section, and pi removes it from the fork's own prompt.
+The orchestrator's own session carries the orchestrator protocol as the `orchestrator_protocol` section of its system prompt: delegate exploration and substantial work to workers, keep small known actions (a single lookup, a small edit, a build or test run, a commit), stay within the exploration budget, which it names with the configured threshold, treat a worker's Result as evidence to check before acting on it, and judge each editing delegation's Result and record the verdict with `subagents_verdict`, since its git commit and git push wait for every verdict (see Verdicts above). The text lives in `src/subagents/orchestrator-protocol.ts`. The section is added when each user prompt starts its agent loop, so it holds for every turn of that loop and returns after a compaction. There is no per-prompt reminder line. Workers, forked workers and sessions in a pi-subagents child process never get it; a fork's copied conversation holds the orchestrator's section, and pi removes it from the fork's own prompt.
 
 A run that a message starts without a user prompt, such as a background call's completion notice or a worker's question, has the protocol for its first turn only: pi rebuilds the prompt of its later turns without the section, until the next user prompt adds it again.
 
@@ -381,7 +391,7 @@ Decision records keep the first 200 characters of the task text, with credential
   { "packages": [{ "source": "git:github.com/egonm12/pi-orchestrator", "extensions": ["!src/router/extension.ts"] }] }
   ```
 
-  Use `!src/guard/extension.ts` to keep the router and drop the guard, or `!src/subagents/extension.ts` to drop only the built-in `subagents` tool, and with it the orchestrator protocol, the exploration budget, `/pi-orchestrator budget` and `subagents_verdict`, and keep routing for other subagent extensions.
+  Use `!src/guard/extension.ts` to keep the router and drop the guard, or `!src/subagents/extension.ts` to drop only the built-in `subagents` tool, and with it the orchestrator protocol, the exploration budget, `/pi-orchestrator budget`, `subagents_verdict` and the commit block on unjudged edits, and keep routing for other subagent extensions.
 - **Everything, for one run**: `pi --no-extensions`.
 - **Uninstall**: `pi remove git:github.com/egonm12/pi-orchestrator`.
 

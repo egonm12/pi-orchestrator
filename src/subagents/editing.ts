@@ -125,3 +125,24 @@ export function delegationEdits(records: readonly RoutingRecord[], delegationId:
   const nested = edits.find((record) => record.nestedDelegationId === delegationId);
   return nested === undefined ? { kind: "none" } : { kind: "nested", delegationId: nested.delegationId };
 }
+
+/** An editing delegation that waits for a verdict. */
+export interface UnjudgedDelegation {
+  readonly delegationId: string;
+  /** Its latest edit record's timestamp: a later edit is a new wait. */
+  readonly lastEdit: string;
+}
+
+/** The editing delegations of `orchestratorSession` in `records`, the record
+ *  folder in file order, whose latest edit record has no verdict after it,
+ *  in the order of their latest edits. A verdict of either kind judges a delegation. */
+export function unjudgedDelegations(records: readonly RoutingRecord[], orchestratorSession: string): UnjudgedDelegation[] {
+  const waiting = new Map<string, UnjudgedDelegation>();
+  for (const record of records) {
+    if (record.recordType === "edit" && record.orchestratorSession === orchestratorSession) {
+      waiting.delete(record.delegationId);
+      waiting.set(record.delegationId, { delegationId: record.delegationId, lastEdit: record.timestamp });
+    } else if (record.recordType === "verdict") waiting.delete(record.delegationId);
+  }
+  return [...waiting.values()];
+}

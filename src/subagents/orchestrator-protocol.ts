@@ -38,7 +38,8 @@ const paragraphs = (explorationBudget: number): readonly string[] => [
     "read-only search or a build or test run) needs your verdict; its Result says so. Judge the change itself, not the worker's " +
     "account of it: spot-check the diff and the claims that matter, or read a reviewer's Result. Then record the verdict with " +
     "`subagents_verdict`: the delegation id, accept or request_changes, and a reason naming what you checked. A later verdict on " +
-    "the same delegation replaces the earlier one, and a resume that edits again needs a new one. A research Result gets no verdict.",
+    "the same delegation replaces the earlier one, and a resume that edits again needs a new one. A research Result gets no verdict. " +
+    "Your git commit and git push are denied until every editing delegation has a verdict.",
 ];
 
 /** The protocol text, as the orchestrator's system prompt carries it, for

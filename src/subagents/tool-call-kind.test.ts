@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { classifyBashCommand, classifyToolCall, type BashCommandKind } from "./tool-call-kind.ts";
+import { classifyBashCommand, classifyToolCall, gitSubcommands, type BashCommandKind } from "./tool-call-kind.ts";
 
 // What a tool call is, for the exploration budget (ADR 0005) and for telling
 // whether a worker edited (ADR 0010): a kind, never a yes or no, so each
@@ -151,4 +151,28 @@ test("each tool is classified by its name, and bash by its command", () => {
   ]), ["other", "other", "other", "other", "other"]);
   // A bash call without a command string is not recognised.
   assert.deepEqual(kinds([["bash", {}], ["bash", undefined], ["powershell", { command: "Get-ChildItem" }]]), ["unrecognised", "unrecognised", "unrecognised"]);
+});
+
+test("gitSubcommands names the subcommand of each git command, after git's own options, in chains and pipes", () => {
+  const cases: readonly [string, readonly string[] | undefined][] = [
+    ["git commit -m wip", ["commit"]],
+    ["git add -A && git commit -m 'fix: a && b'", ["add", "commit"]],
+    ["npm test; git push origin main", ["push"]],
+    ["git log -1 | cat", ["log"]],
+    ["git status || git push", ["status", "push"]],
+    ["git -C ../other commit -am x", ["commit"]],
+    ["git -c user.name=me -c user.email=me@x.test commit -m x", ["commit"]],
+    ["git --git-dir .git --work-tree . push", ["push"]],
+    ["git --no-pager -C sub push --force", ["push"]],
+    ["/usr/bin/git commit", ["commit"]],
+    ["cd repo && GIT_EDITOR=true git commit", ["commit"]],
+    ["env GIT_AUTHOR_NAME=me git commit -m x", ["commit"]],
+    ["echo HEAD | xargs git push origin", ["push"]],
+    ["git commit-tree HEAD^{tree}", ["commit-tree"]],
+    ["echo 'git commit'", []],
+    ["rg 'git push' README.md", []],
+    ["npm test", []],
+    ["git commit -m \"$(date)\"", undefined],
+  ];
+  for (const [command, subcommands] of cases) assert.deepEqual(gitSubcommands(command), subcommands, command);
 });

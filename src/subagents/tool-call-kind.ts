@@ -3,7 +3,9 @@ import { basename } from "node:path";
 // What a tool call is: a kind, not a yes or no, so each caller draws its own
 // line. The exploration budget (ADR 0005) counts read-only and unrecognised
 // calls. Telling whether a worker edited (ADR 0010, ./editing.ts) counts edit,
-// any bash that is neither read-only nor build-test, and ctx_execute.
+// any bash that is neither read-only nor build-test, and ctx_execute. The
+// commit gate (ADR 0010, ./commit-gate.ts) asks which git subcommands a bash
+// command runs, from the same reading.
 //
 // A bash command is read as a list of simple commands joined by `&&`, `||`,
 // `;`, `&`, newlines, pipes and command substitution. Each simple command gets
@@ -278,7 +280,7 @@ function commandKind(words: readonly string[]): CommandKind {
   const name = basename(first);
   if (name === "git") return gitKind(args);
   if (name === "find") return findKind(args);
-  if (name === "xargs") return commandKind(afterOptions(args, ["-I", "-J", "-L", "-n", "-P", "-s", "-d", "-E", "-a"]));
+  if (name === "xargs") return commandKind(afterOptions(args, XARGS_OPTIONS_WITH_VALUE));
   if (name === "sed") return args.some((arg) => /^-[^-]*i/.test(arg) || arg.startsWith("--in-place")) ? "unrecognised" : "read-only";
   if (name === "tee") return positional(args).every((arg) => HARMLESS_TARGETS.has(arg)) ? "read-only" : "unrecognised";
   const writeOptions = READ_ONLY_COMMANDS[name];
@@ -315,9 +317,14 @@ function packageManagerKind(name: string, args: readonly string[]): BashCommandK
   return script !== undefined && BUILD_TEST_SCRIPT.test(script) && !WRITES_FILES.test(script) ? "build-test" : "unrecognised";
 }
 
+/** xargs options whose value follows them. */
+const XARGS_OPTIONS_WITH_VALUE = ["-I", "-J", "-L", "-n", "-P", "-s", "-d", "-E", "-a"];
+/** git's own options, before its subcommand, whose value follows them: `git -C <dir> commit`, `git -c k=v push`. */
+const GIT_OPTIONS_WITH_VALUE = ["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"];
+
 /** The kind of a git command, after git's own options. */
 function gitKind(args: readonly string[]): BashCommandKind {
-  const [subcommand = "", ...options] = afterOptions(args, ["-C", "-c"]);
+  const [subcommand = "", ...options] = afterOptions(args, GIT_OPTIONS_WITH_VALUE);
   // branch and tag list without a name, or with a listing option; with a name, or a changing option, they change the repository.
   const listsOnly = (listing: readonly string[], changing: readonly string[]): BashCommandKind =>
     !hasOption(options, changing) && (positional(options).length === 0 || hasOption(options, listing)) ? "read-only" : "version-control";
@@ -365,6 +372,22 @@ function findKind(args: readonly string[]): BashCommandKind {
     index = end;
   }
   return "read-only";
+}
+
+/** The git subcommand a simple command runs, directly or through xargs, if it runs git. */
+function gitSubcommand(words: readonly string[]): string | undefined {
+  const [first, ...args] = commandWords(words);
+  if (first === undefined) return undefined;
+  const name = basename(first);
+  if (name === "xargs") return gitSubcommand(afterOptions(args, XARGS_OPTIONS_WITH_VALUE));
+  return name === "git" ? afterOptions(args, GIT_OPTIONS_WITH_VALUE)[0] : undefined;
+}
+
+/** The subcommand of each git command in `command`, in order, after git's own
+ *  options (`git -C <dir> commit` runs `commit`), or `undefined` when the reader
+ *  cannot follow the command. The commit gate (./commit-gate.ts) asks it. */
+export function gitSubcommands(command: string): readonly string[] | undefined {
+  return simpleCommands(command)?.flatMap((simple) => gitSubcommand(simple.words) ?? []);
 }
 
 /** Which kind wins when a command holds several: the one that does the most, for the budget and the edit check alike. */
