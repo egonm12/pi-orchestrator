@@ -296,8 +296,8 @@ function orchestrator(h: Harness): Orchestrator {
   return { ctx, sessionDir: sessionManager.getSessionDir(), sessionId: sessionManager.getSessionId() };
 }
 
-async function callSubagents(tool: Tool, ctx: ExtensionContext, task: string, agent?: string) {
-  const result = await tool.execute("call-1", { items: [agent === undefined ? { task } : { task, agent }] } as never, undefined, undefined, ctx);
+async function callSubagents(tool: Tool, ctx: ExtensionContext, task: string, agent?: string, label?: string) {
+  const result = await tool.execute("call-1", { items: [{ task, ...(agent === undefined ? {} : { agent }), ...(label === undefined ? {} : { label }) }] } as never, undefined, undefined, ctx);
   const details = result.details as SubagentsDetails;
   assert.equal(details.results.length, 1);
   const text = result.content.map((part) => part.type === "text" ? part.text : "").join("");
@@ -315,6 +315,25 @@ interface SessionLine {
 function sessionLines(file: string): SessionLine[] {
   return readFileSync(file, "utf8").split("\n").filter((line) => line.trim() !== "").map((line) => JSON.parse(line) as SessionLine);
 }
+
+test("a labelled subagents item appears on the routed worker board with its tier", async () => {
+  const h = harness();
+  try {
+    mkdirSync(h.stateDir);
+    saveAuthorization(join(h.stateDir, "authorized-recipients.json"), approvedAnthropic());
+    const tool = loadSubagentsTool([routerExtension(), fakeAnthropic("Done").extension]);
+    const itemSchema = (tool.parameters as unknown as { properties: { items: { items: { properties: Record<string, unknown>; required: string[] } } } }).properties.items.items;
+    assert.ok(itemSchema.properties.label);
+    assert.ok(!itemSchema.required.includes("label"));
+    const main = orchestrator(h);
+    const result = await tool.execute("label-call", { items: [{ task: "Check budget", label: "research: budget code" }] } as never, undefined, undefined, main.ctx);
+    const worker = (result.details as SubagentsDetails).results[0]!;
+    assert.equal(worker.label, "research: budget code");
+    const shown = workerBoard().byDelegation(worker.sessionId!);
+    assert.equal(shown?.label, "research: budget code");
+    assert.equal(shown?.tier, "mechanical");
+  } finally { h.cleanup(); }
+});
 
 test("a completed worker resumes its saved session with the same delegation and pinned rung", async () => {
   const h = harness();
@@ -1950,7 +1969,7 @@ test("subagents_status lists background calls, snapshots each item of a call, an
       ? { text: "Reading the parser.\nFound the bug.", toolCall: { name: "hold", arguments: {} } } : { text: "done" });
     const subagents = loadSubagents([routerExtension(), provider.extension, hold.extension]);
     const main = orchestrator(h);
-    const start = (await subagents.tool().execute("call-1", { items: [{ task: "Fix the parser" }, { task: "Update the docs" }], background: true } as never,
+    const start = (await subagents.tool().execute("call-1", { items: [{ task: "Fix the parser", label: "parser repair" }, { task: "Update the docs" }], background: true } as never,
       undefined, undefined, main.ctx)).details as BackgroundStart;
     const [runningId, queuedId] = start.delegationIds;
     await waitFor(() => hold.running() === 1, "the first worker is in its hold tool");
@@ -1962,8 +1981,8 @@ test("subagents_status lists background calls, snapshots each item of a call, an
     const listing = await status({});
     assert.equal(listing.text, [
       "Background call call-1: 0/2 workers done",
-      `  ${runningId} · worker · running: hold · Fix the parser`,
-      `  ${queuedId} · worker · queued · Update the docs`,
+      `  ${runningId} · parser repair · mechanical · anthropic/claude-haiku-4-5:low · running · 0s · 1 turn · thinking…`,
+      `  ${queuedId} · worker · routing… · queued · Update the docs`,
     ].join("\n"));
 
     const call = await status({ id: "call-1" });
@@ -2307,17 +2326,16 @@ test("the orchestrator's session shows its workers in the widget below the edito
     await subagents.startSession(ctx);
     assert.equal(component, undefined, "no widget while no worker runs");
     const task = `Delegate:${JSON.stringify({ items: [{ task: "Find the config file" }] })}`;
-    const { worker } = await callSubagents(subagents.tool(), ctx, task, "lead");
+    const { worker } = await callSubagents(subagents.tool(), ctx, task, "lead", "coordinate config");
     assert.equal(worker.status, "completed", JSON.stringify(worker));
 
-    // The hint, a blank line and main come first; a running worker shows no worker state, only its elapsed time and tokens.
     const running = (name: string, status: string) =>
-      new RegExp(`^  ○ ${name} {2,}(?!(?:queued|asking|completed|failed|aborted) · )${status} {2,}\\d+s(?: · ↓ \\S+ tokens?)?$`);
+      new RegExp(`^  ○ ${name} {2,}mechanical · [^ ]+ · running · \\d+s · \\d+ turns? · ${status}$`);
     const nestedShown = seen.find((lines) => lines.length === 5 && lines[2] === "❯ ● main" && running("└ worker", "\\S.*").test(lines[4]!));
     assert.ok(nestedShown, JSON.stringify(seen));
     // Its tool call follows its turn's start within the 1.5 s hold, so the lead still shows thinking.
-    assert.match(nestedShown[3]!, running("lead", "thinking…"));
-    assert.match(component!.render(200)[3]!, /^  ○ lead {2,}completed · /, "a finished worker lingers with its end state");
+    assert.match(nestedShown[3]!, running("coordinate config", "thinking…"));
+    assert.match(component!.render(200)[3]!, /^  ○ coordinate config {2,}mechanical · [^ ]+ · completed · /, "a finished worker lingers with its end state");
     await subagents.shutdownSession(ctx);
     assert.equal(component, undefined, "the session's end removes the widget");
   } finally { h.cleanup(); }
@@ -2461,7 +2479,7 @@ test("/subagents with no arguments opens the picker of every worker when there i
     assert.equal(screen.opens, 1, "the picker opened, not the old background-only text notice");
     assert.ok(screen.lines().some((line) => line.includes("Workers of this session")), screen.lines().join("\n"));
     // A running worker's row shows its activity, not its task (CONTEXT.md, Activity).
-    assert.ok(screen.lines().some((line) => /^(?:❯ ●|  ○) \d+\. worker +thinking… +\d+s$/.test(line)), `every worker of the session, not only background calls:\n${screen.lines().join("\n")}`);
+    assert.ok(screen.lines().some((line) => /^(?:❯ ●|  ○) \d+\. worker +mechanical · [^ ]+ · running · \d+s · 1 turn · thinking…$/.test(line)),  `every worker of the session, not only background calls:\n${screen.lines().join("\n")}`);
     screen.press("\x1b");
     await opening;
     assert.equal(screen.opens, 1, "Esc left without opening a transcript next");
@@ -2470,7 +2488,7 @@ test("/subagents with no arguments opens the picker of every worker when there i
     const noUI = { notify: (text: string) => { shown.push(text); } };
     await subagents.runCommandWithUI("subagents", "", { ...ctx, hasUI: false, ui: noUI } as unknown as ExtensionContext);
     assert.equal(shown.length, 1);
-    assert.match(shown[0]!, /^\d+\. worker · .* · running · \d+s · 1 turn · thinking…$/m, "the same full listing as text, where there is no UI to pick in");
+    assert.match(shown[0]!, /^\d+\. worker · mechanical · .* · running · \d+s · 1 turn · thinking…$/m, "the same full listing as text, where there is no UI to pick in");
   } finally {
     for (const finish of pending) finish();
     h.cleanup();

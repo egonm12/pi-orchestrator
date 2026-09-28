@@ -1,5 +1,6 @@
 import { truncateToVisualLines, type AgentToolResult, type Theme, type ToolDefinition, type ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
 import type { SubagentProgress, SubagentsProgressDetails } from "./extension.ts";
+import { compactLines, workerRows } from "./worker-widget.ts";
 
 // The subagents tool in pi's TUI: the call is one header line, and the result,
 // partial or final, is one line per worker with its agent, its short task and
@@ -36,7 +37,8 @@ function stateText(item: SubagentProgress, theme: Theme): string {
   }
 }
 
-function workerLine(item: SubagentProgress, theme: Theme): string {
+function workerLine(item: SubagentProgress, theme: Theme, width = 1_000): string {
+  if (item.boardWorker !== undefined) return compactLines({ rows: workerRows([item.boardWorker]), more: 0 }, Date.now(), theme, width)[0] ?? "";
   const separator = theme.fg("muted", " · ");
   const parts = [theme.fg("accent", `${item.agent ?? NO_AGENT}${item.fork === true ? " (fork)" : ""}`), theme.fg("dim", shortTask(item.task)), stateText(item, theme)];
   const model = item.model;
@@ -82,6 +84,12 @@ export function renderSubagentsResult(result: AgentToolResult<unknown>, options:
   const details = result.details as SubagentsProgressDetails | undefined;
   if (details === undefined || !Array.isArray(details.results) || details.results.length === 0) {
     return textComponent(result.content.map((part) => part.type === "text" ? part.text : "").join(""));
+  }
+  if (details.results.some((item) => item.boardWorker !== undefined)) {
+    return { render(width: number) {
+      return details.results.flatMap((item) => [workerLine(item, theme, width),
+        ...(options.expanded ? workerBody(item, theme).flatMap((line) => truncateToVisualLines(line, Number.POSITIVE_INFINITY, width).visualLines) : [])]);
+    }, invalidate() {} };
   }
   return textComponent(subagentsResultText(details, options.expanded, theme));
 }

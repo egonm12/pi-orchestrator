@@ -61,7 +61,7 @@ const toolResult = (toolCallId: string, toolName: string, text: string): Message
 });
 
 /** A worker that has started, with a live session. */
-function running(board: WorkerBoard, task: string, sessionId: string, extra: { agent?: string; parentDelegationId?: string; background?: boolean } = {}, messages: Message[] = [user(task)]) {
+function running(board: WorkerBoard, task: string, sessionId: string, extra: { agent?: string; label?: string; review?: string; parentDelegationId?: string; background?: boolean } = {}, messages: Message[] = [user(task)]) {
   const feed = board.add({ callId: "call-1", background: false, task, ...extra, model: { kind: "routed" } });
   feed.started();
   const fake = fakeSession(sessionId, messages);
@@ -675,6 +675,18 @@ test("in regular tuiMode the view prints its top once, the whole transcript, and
   board.setOrchestratorState("running");
   assert.equal(view.text(60).at(-2), "orchestrator running", "the live lines follow the board");
   assert.equal(view.closed, false);
+});
+
+test("the transcript's nested worker row shows its label, tier and rung", () => {
+  const board = new WorkerBoard();
+  running(board, "Lead", "lead-1");
+  running(board, "Check budget", "nested-1", { parentDelegationId: "lead-1", label: "budget code" });
+  board.setTier("nested-1", "standard");
+  board.served({ delegationId: "nested-1", model: "anthropic/sonnet", effort: "high" });
+  const view = regularUI();
+  void openTranscript(view.ui, board, board.workers()[0]!.id);
+  assert.match(view.text(160).find((line) => line.includes("budget code"))!, /budget code\s+standard · anthropic\/sonnet:high · running · \d+s · 0 turns · Check budget/);
+  view.press(KEY.escape);
 });
 
 test("in regular tuiMode the shown worker's nested workers are listed live above the stats line, at most 6, and ↑↓ Enter open one", async () => {

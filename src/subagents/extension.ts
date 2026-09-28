@@ -16,7 +16,7 @@ import { missingSectionsNote } from "./result-format.ts";
 import { loadSubagentsSettings } from "./settings.ts";
 import { registerSubagentsStatusTool } from "./status.ts";
 import { runWorker, SUBAGENTS_TOOL, type WorkerResult, type WorkerSetup } from "./worker.ts";
-import { workerBoard, type WorkerModelSetup } from "./worker-board.ts";
+import { workerBoard, type BoardWorker, type WorkerModelSetup } from "./worker-board.ts";
 import { agentLabel, startWorkerWidget, type WorkerWidget } from "./worker-widget.ts";
 import { findWorker, pickWorker, workerListing } from "./worker-picker.ts";
 import { openTranscript } from "./transcript-view.ts";
@@ -63,6 +63,7 @@ const PARAMETERS = {
       type: "object", properties: {
         task: { type: "string", description: "The whole task for an ordinary worker. Forks also see the current branch." },
         agent: { type: "string", description: "Optional: the name of an agent definition the worker follows." },
+        label: { type: "string", description: "Optional short label saying what this delegation is for, such as research: budget code." },
         fork: { type: "boolean", description: "Start from the orchestrator's current branch on its session model." },
         resume: { type: "string", description: "Continue a finished delegation by id, in its saved session and on its original pin." },
         review: { type: "string", description: "Start an independent reviewer of a finished editing delegation, by its id; `task` says what to check." },
@@ -91,6 +92,7 @@ export function cutText(text: string, sessionFile: string | undefined): string {
 interface SubagentItem {
   readonly task: string;
   readonly agent?: string;
+  readonly label?: string;
   readonly fork?: boolean;
   readonly resume?: string;
   /** The delegation a reviewer reviews. */
@@ -100,14 +102,16 @@ interface SubagentItem {
 }
 
 /** An item's own fields, without anything else the call's arguments carry. */
-function itemFields({ task, agent, fork, resume, review, retry }: SubagentItem): SubagentItem {
-  return { task, ...(agent === undefined ? {} : { agent }), ...(fork === true ? { fork: true } : {}),
+function itemFields({ task, agent, label, fork, resume, review, retry }: SubagentItem): SubagentItem {
+  return { task, ...(agent === undefined ? {} : { agent }), ...(label === undefined ? {} : { label }), ...(fork === true ? { fork: true } : {}),
     ...(resume === undefined ? {} : { resume }), ...(review === undefined ? {} : { review }), ...(retry === undefined ? {} : { retry }) };
 }
 
 /** The model an unrouted worker used, and whether its exception to the
  *  subagent ban list let it run. Absent for a routed worker. */
 interface WorkerModelDetails {
+  /** The live board snapshot used by the tool renderer, not a tool argument. */
+  readonly boardWorker?: BoardWorker;
   readonly model?: string;
   readonly banListException?: boolean;
   readonly fork?: boolean;
@@ -225,6 +229,7 @@ const DESCRIPTION = "Hand 1 to 8 tasks to workers. At most orchestrator.subagent
   "Results keep item order; abort stops running workers and leaves queued workers not started. " +
   "An ordinary worker sees only its task text, so put every fact it needs in it. " +
   "An item's `agent` is optional: it names an agent definition, whose instructions the worker follows and whose tools list narrows the worker's tools. " +
+  "An optional short `label` says what the delegation is for in the worker list. " +
   "An unknown agent fails that item without starting its worker. " +
   "Set `fork: true` to copy the current branch before this call and run on the session model and effort, without routing. " +
   "With `background: true` the call returns at once with its call id and delegation ids, and one completion notice with the results follows when every item has finished; " +
@@ -317,20 +322,29 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
             ...(forks[index].banListException ? { banListException: true } : {}) }), status: "queued" }));
         const sendProgress = () => {
           const done = progress.filter((item) => item.status !== "queued" && item.status !== "running").length;
-          const update: SubagentsProgressDetails = { results: [...progress] };
+          const update: SubagentsProgressDetails = { results: progress.map((item, index) => ({ ...item, boardWorker: board.worker(feeds[index]!.id) })) };
           // A background call has returned, so its progress has no tool result to update.
           if (!background) onUpdate?.({ content: [{ type: "text", text: `${done}/${items.length} workers done` }], details: update });
         };
         const board = workerBoard();
+        // The routing decision is persisted before the served rung reaches the board.
+        // Resumes also learn their tier from the earlier delegation's record.
+        const unsubscribeTier = board.subscribe((worker) => {
+          if (worker?.delegationId === undefined || worker.tier !== undefined || worker.model.kind !== "routed") return;
+          try {
+            const { tier } = delegationRouting(readRoutingRecords(join(stateDir(), "routing")), worker.delegationId);
+            if (tier !== undefined) board.setTier(worker.delegationId, tier);
+          } catch { /* Routing may not have made a decision yet. */ }
+        });
         // Each item can be stopped alone from the transcript view (x), foreground,
         // background or nested; a nested worker's stop leaves its parent running.
         const itemStops = items.map(() => new AbortController());
-        const feeds = items.map(({ task: itemTask, agent: itemAgent, resume, review }, index) => {
+        const feeds = items.map(({ task: itemTask, agent: itemAgent, label, resume, review }, index) => {
           const fork = forks[index];
           const delegationId = delegationIds?.[index] ?? resume;
           const retried = retrySetups[index] instanceof Error ? undefined : retrySetups[index];
           const task = retried?.task ?? itemTask, agent = itemAgent ?? retried?.agent;
-          return board.add({ callId: toolCallId, background, task, ...(agent === undefined ? {} : { agent }), ...(review === undefined ? {} : { review }),
+          return board.add({ callId: toolCallId, background, task, ...(agent === undefined ? {} : { agent }), ...(label === undefined ? {} : { label }), ...(review === undefined ? {} : { review }),
             ...(delegationId === undefined ? {} : { delegationId }), ...(parentDelegationId === undefined ? {} : { parentDelegationId }),
             model: fork?.model === undefined ? { kind: "routed" } : { kind: "fork", model: fork.model, effort: fork.effort } },
           { stop: () => stopItem(index) });
@@ -538,14 +552,14 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
         };
         const lanes = Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => runQueue()));
         const finishCall = async (): Promise<BackgroundCallResult> => {
-          await lanes;
+          try { await lanes; } finally { unsubscribeTier(); }
           for (let index = 0; index < items.length; index++) {
             if (results[index] === undefined) {
               results[index] = notStarted(index);
               feeds[index]!.ended({ state: "aborted" });
             }
           }
-          const details: SubagentsDetails = { results };
+          const details: SubagentsDetails = { results: results.map((item, index) => ({ ...item, boardWorker: board.worker(feeds[index]!.id) })) };
           const level = gateLevels.inForce(ctx).level;
           return { text: results.map((result) => resultText(result, parentDelegationId === undefined, level)).join("\n\n"), details };
         };

@@ -86,6 +86,20 @@ const HINT = "  ↑/↓ to select · Enter to open · Esc to cancel";
 const TAGGED_WIDTH = 200;
 const TAGGED = { fg: (color: string, text: string) => text === "" ? "" : `<${color}>${text}</>`, bold: (text: string) => `**${text}**` } as unknown as Theme;
 
+test("the picker shows a labelled worker's tier and rung in one row", async () => {
+  const { time, board } = session();
+  const feed = board.add({ callId: "call-3", background: false, task: "Check budget", label: "budget code", model: { kind: "routed" } });
+  feed.started();
+  feed.session(fakeSession("budget-1"));
+  board.setTier("budget-1", "elevated");
+  board.served({ delegationId: "budget-1", model: "anthropic/sonnet", effort: "high" });
+  const screen = fakeUI();
+  const picked = pickWorker(screen.ui, board, { now: time.now });
+  assert.match(screen.lines(140)[7]!, /budget code\s+elevated · anthropic\/sonnet:high · running · 0s · 0 turns · Check budget/);
+  screen.press(KEY.escape);
+  await picked;
+});
+
 test("the picker lists every worker of the session, finished ones included, as the worker widget's agent list: numbered in board order with nested workers indented; Enter picks one and Esc none", async () => {
   const { time, board } = session();
   const [lead, nested] = board.workers();

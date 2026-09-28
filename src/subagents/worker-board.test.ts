@@ -26,6 +26,19 @@ function fakeSession(sessionId: string, sessionFile: string | undefined = `/sess
 
 const shape = (workers: readonly BoardWorker[]) => workers.map((worker) => ({ task: worker.task, parent: worker.parentDelegationId, state: worker.state }));
 
+test("the board keeps a delegation's label and tier through its states", () => {
+  const board = new WorkerBoard();
+  const feed = board.add({ callId: "call", background: true, task: "Check budget", label: "research: budget code", model: { kind: "routed" } });
+  assert.equal(board.worker(feed.id)?.label, "research: budget code");
+  feed.started();
+  feed.session(fakeSession("budget-1").session);
+  board.setTier("budget-1", "standard");
+  assert.equal(board.worker(feed.id)?.tier, "standard");
+  feed.ended({ state: "completed" });
+  assert.equal(board.worker(feed.id)?.label, "research: budget code");
+  assert.equal(board.worker(feed.id)?.tier, "standard");
+});
+
 test("foreground, background and nested workers appear, each nested worker right after its parent", () => {
   const board = new WorkerBoard();
   const lead = board.add({ callId: "call-1", background: false, task: "Lead the work", agent: "lead", model: { kind: "routed" } });

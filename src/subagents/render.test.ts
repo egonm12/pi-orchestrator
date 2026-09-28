@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { SubagentProgress, SubagentsProgressDetails } from "./extension.ts";
+import { WorkerBoard } from "./worker-board.ts";
 import { renderSubagentsResult, subagentsCallText, subagentsResultText } from "./render.ts";
 
 // The subagents tool's TUI rendering as pure functions: a call's header, and
@@ -17,6 +18,19 @@ function details(...results: SubagentProgress[]): SubagentsProgressDetails {
 }
 
 const DONE = { status: "completed", sessionId: "s1", sessionFile: undefined } as const;
+
+test("the tool result renders a labelled worker from the board on one line", () => {
+  const board = new WorkerBoard();
+  const feed = board.add({ callId: "call", background: false, task: "Check budget", label: "budget code", model: { kind: "routed" } });
+  feed.started();
+  feed.session({ sessionId: "budget-1", sessionFile: undefined, effort: "high", messages: () => [], subscribe: () => () => {} });
+  board.setTier("budget-1", "standard");
+  board.served({ delegationId: "budget-1", model: "anthropic/sonnet", effort: "high" });
+  const result = { content: [{ type: "text", text: "" }], details: details({ task: "Check budget", status: "running", boardWorker: board.worker(feed.id) }) };
+  const lines = renderSubagentsResult(result as never, { expanded: false } as never, PLAIN).render(120);
+  assert.match(lines[0]!, /^budget code · standard · anthropic\/sonnet:high · running · \d+s · 0 turns · Check budget$/);
+  assert.equal(lines.length, 1);
+});
 
 test("the call header names the tool and counts the tasks, also while the arguments stream", () => {
   assert.equal(subagentsCallText({ items: [{ task: "a" }, { task: "b" }, { task: "c" }] }, PLAIN), "subagents 3 tasks");

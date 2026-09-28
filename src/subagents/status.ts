@@ -1,5 +1,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { BackgroundCalls, CallSnapshot, CompletionNoticeDetails, WorkerSnapshot } from "./background.ts";
+import { workerBoard } from "./worker-board.ts";
+import { compactLines, workerRows } from "./worker-widget.ts";
+import type { Theme } from "@earendil-works/pi-coding-agent";
 
 // The subagents_status tool (ADR 0008): the orchestrator's view of its
 // background calls. Without an id it lists them; with a call id it gives a
@@ -50,8 +53,19 @@ function workerText(worker: WorkerSnapshot): string {
   ].join("\n");
 }
 
+const PLAIN = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as Theme;
+
+function boardRow(delegationId: string): string | undefined {
+  const worker = workerBoard().byDelegation(delegationId);
+  if (worker === undefined) return undefined;
+  return compactLines({ rows: workerRows([worker]), more: 0 }, Date.now(), PLAIN, 200)[0];
+}
+
 function snapshotText(calls: readonly CallSnapshot[]): string {
-  return calls.map((call) => [`Background call ${call.callId}:`, ...call.workers.map(workerText)].join("\n\n")).join("\n\n");
+  return calls.map((call) => [`Background call ${call.callId}:`, ...call.workers.map((worker) => {
+    const row = boardRow(worker.delegationId);
+    return row === undefined ? workerText(worker) : `${workerText(worker)}\n${row}`;
+  })].join("\n\n")).join("\n\n");
 }
 
 /** Registers `subagents_status` over this session's `backgroundCalls`. */
@@ -71,7 +85,7 @@ export function registerSubagentsStatusTool(pi: ExtensionAPI, backgroundCalls: B
       }
       const calls = backgroundCalls.snapshots(id);
       const details: SubagentsStatusDetails = { calls };
-      const text = id === undefined ? backgroundCalls.listing() : snapshotText(calls);
+      const text = id === undefined ? backgroundCalls.listing(boardRow) : snapshotText(calls);
       return { content: [{ type: "text", text }], details };
     },
   });

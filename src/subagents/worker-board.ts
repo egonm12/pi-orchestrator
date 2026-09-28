@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { AgentSession, AgentSessionEvent, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { watchServedRungs, type RungEscalation, type ServedRung } from "../router/served-rungs.ts";
+import type { RiskTier } from "../routing/classifier.ts";
 
 // The worker board: one in-process record of every worker of the
 // orchestrator session, foreground, background and nested, for the live
@@ -50,6 +51,7 @@ export interface NewWorker {
   readonly background: boolean;
   readonly task: string;
   readonly agent?: string;
+  readonly label?: string;
   /** Known before the worker starts for a background item and a resume item. */
   readonly delegationId?: string;
   /** The delegation of the worker that made this delegation (ADR 0008). */
@@ -100,6 +102,7 @@ export interface WorkerSession {
  *  new entry with the same delegation id. */
 export interface BoardWorker extends Omit<NewWorker, "model"> {
   readonly model: WorkerModel;
+  readonly tier?: RiskTier;
   /** The board's own id for this entry; a queued foreground worker has no delegation id yet. */
   readonly id: string;
   /** The board id of the parent delegation's entry, for a nested worker. */
@@ -187,6 +190,7 @@ interface Entry {
   readonly id: string;
   readonly setup: Omit<NewWorker, "model">;
   model: WorkerModelSetup;
+  tier: RiskTier | undefined;
   readonly parentId: string | undefined;
   state: WorkerState;
   delegationId: string | undefined;
@@ -348,7 +352,7 @@ export class WorkerBoard {
   add(setup: NewWorker, control?: WorkerControl): WorkerFeed {
     const parent = setup.parentDelegationId === undefined ? undefined : this.#entryOf(setup.parentDelegationId);
     const { model, ...rest } = setup;
-    const entry: Entry = { id: randomUUID(), setup: rest, model, parentId: parent?.id, state: "queued", delegationId: setup.delegationId,
+    const entry: Entry = { id: randomUUID(), setup: rest, model, tier: undefined, parentId: parent?.id, state: "queued", delegationId: setup.delegationId,
       sessionFile: undefined, queuedAt: this.#now(), startedAt: undefined, endedAt: undefined, error: undefined,
       rungs: pinned(model, this.#now()),
       turns: 0, tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0, tools: new Map(), activity: undefined, pending: undefined,
@@ -492,6 +496,14 @@ export class WorkerBoard {
     return entry === undefined ? undefined : this.#snapshot(entry);
   }
 
+  /** Records the tier of a routed delegation after its routing decision is available. */
+  setTier(delegationId: string, tier: RiskTier): void {
+    const entry = this.#entryOf(delegationId);
+    if (entry === undefined || entry.tier === tier) return;
+    entry.tier = tier;
+    this.#changed(entry);
+  }
+
   /** The router served a request on `rung` (src/router/served-rungs.ts). A
    *  request of no running routed worker, such as a compaction summary's, changes nothing. */
   served(rung: ServedRung): void {
@@ -544,7 +556,7 @@ function modelOf(entry: Entry): WorkerModel {
 
 function snapshot(entry: Entry): BoardWorker {
   return Object.freeze({
-    ...entry.setup, model: modelOf(entry), id: entry.id, state: entry.state, queuedAt: entry.queuedAt,
+    ...entry.setup, model: modelOf(entry), ...(entry.tier === undefined ? {} : { tier: entry.tier }), id: entry.id, state: entry.state, queuedAt: entry.queuedAt,
     ...(entry.startedAt === undefined ? {} : { startedAt: entry.startedAt }),
     ...(entry.endedAt === undefined ? {} : { endedAt: entry.endedAt }),
     ...(entry.error === undefined ? {} : { error: entry.error }),

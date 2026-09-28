@@ -68,6 +68,19 @@ function lines(board: WorkerBoard, now: number, width = WIDE, selected?: number,
   return widgetLines(widgetRows(board.workers(), now), selected, now, theme, width);
 }
 
+test("labelled routed workers show label, tier, rung, state, elapsed, turns and activity in widget and status", () => {
+  const time = clock();
+  const board = new WorkerBoard({ now: time.now });
+  const feed = board.add({ callId: "call", background: false, task: "Check budget", agent: "scout", label: "research: budget code", model: { kind: "routed" } });
+  feed.started();
+  feed.session(fakeSession("budget-1").session);
+  board.setTier("budget-1", "standard");
+  board.served({ delegationId: "budget-1", model: "anthropic/sonnet", effort: "high" });
+  time.advance(2_000);
+  assert.deepEqual(compact(board, time.now()), ["research: budget code · standard · anthropic/sonnet:high · running · 2s · 0 turns · Check budget"]);
+  assert.match(lines(board, time.now(), 200)[3]!, /research: budget co…\s+standard · anthropic\/sonnet:high · running · 2s · 0 turns · Check budget/);
+});
+
 test("each compact worker line, the /subagents listing's, shows its agent, model and effort, worker state, elapsed time, turns and activity, nested workers indented under their parent", () => {
   const time = clock();
   const board = new WorkerBoard({ now: time.now });
@@ -114,6 +127,20 @@ test("each compact worker line, the /subagents listing's, shows its agent, model
   const rows = widgetRows(board.workers(), time.now()).rows;
   assert.deepEqual(rows.map((row) => [row.worker.id, row.depth]), [[lead.id, 0], [nested.id, 1], [fork.id, 0], [preserved.id, 0], [queued.id, 0], [fails.id, 0]],
     "each row knows its worker, so a later selection can open it");
+});
+
+test("reviewers ignore their labels and long labels stay on one line", () => {
+  const time = clock();
+  const board = new WorkerBoard({ now: time.now });
+  board.add({ callId: "call", background: false, task: "Review", agent: "scout", label: "misleading label", review: "original", model: { kind: "routed" } });
+  board.add({ callId: "call", background: false, task: "Research", label: "a long description that should not wrap\nonto another line", model: { kind: "routed" } });
+  board.add({ callId: "call", background: false, task: "Unlabelled", agent: "scout", model: { kind: "routed" } });
+  board.add({ callId: "call", background: false, task: "No definition", model: { kind: "routed" } });
+  assert.deepEqual(compact(board, time.now()).map((line) => line.split(" · ")[0]), ["reviewer", "a long description that should not wrap", "scout", "worker"]);
+  const widget = lines(board, time.now(), 100);
+  assert.equal(widget.length, 7, "one line per worker");
+  assert.match(widget[4]!, /a long description…/);
+  assert.ok(widget.every((line) => !line.includes("onto another line")));
 });
 
 test("a compact worker line longer than the render width is cut with an ellipsis", () => {

@@ -326,12 +326,12 @@ export class BackgroundCalls {
   }
 
   /** The `/subagents` listing of the running calls, which `subagents_status` also shows without an id. */
-  listing(): string {
+  listing(row?: (delegationId: string) => string | undefined): string {
     if (this.#running.size === 0) return "No background subagents calls are running.";
     return [...this.#running.values()].map(({ call, delegationIds }) => {
       const done = call.progress.filter((item) => !unfinished(item)).length;
       const lines = call.progress.map((item, index) =>
-        `  ${delegationIds[index]} · ${item.agent ?? "worker"} · ${stateText(item)} · ${shortTask(item.task)}`);
+        `  ${delegationIds[index]} · ${row?.(delegationIds[index]!) ?? `${item.agent ?? "worker"} · ${stateText(item)} · ${shortTask(item.task)}`}`);
       return [`Background call ${call.callId}: ${done}/${call.progress.length} workers done`, ...lines].join("\n");
     }).join("\n\n");
   }

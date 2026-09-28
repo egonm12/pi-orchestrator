@@ -70,8 +70,10 @@ export function widgetRows(workers: readonly BoardWorker[], now: number): Widget
 const NO_AGENT = "worker";
 
 /** A worker's agent name, `worker` without one, and `(fork)` for a fork. */
-export function agentLabel(worker: Pick<BoardWorker, "agent" | "model">): string {
-  return `${worker.agent ?? NO_AGENT}${worker.model.kind === "fork" ? " (fork)" : ""}`;
+export function agentLabel(worker: Pick<BoardWorker, "label" | "agent" | "review" | "model">): string {
+  if (worker.review !== undefined) return "reviewer";
+  const label = oneLine(worker.label ?? "", "first") || worker.agent || NO_AGENT;
+  return `${label}${worker.model.kind === "fork" ? " (fork)" : ""}`;
 }
 
 /** A worker's model and effort: a routed worker's latest rung, marked when its routing escalated. */
@@ -139,7 +141,8 @@ function nestIndent(depth: number): string {
 /** A worker's compact line, before it is fitted to the render width. */
 function rowParts(row: WidgetRow, now: number): { indent: string; parts: Part[] } {
   const { worker } = row;
-  const parts: Part[] = [["accent", agentLabel(worker)], ["dim", modelText(worker.model)], [STATE_COLOR[worker.state], worker.state]];
+  const parts: Part[] = [["accent", agentLabel(worker)], ...(worker.tier === undefined ? [] : [["dim", worker.tier] as Part]),
+    ["dim", modelText(worker.model)], [STATE_COLOR[worker.state], worker.state]];
   const elapsed = elapsedMs(worker, now);
   if (elapsed !== undefined) parts.push(["dim", formatElapsed(elapsed)], ["dim", `${worker.turns} ${worker.turns === 1 ? "turn" : "turns"}`]);
   parts.push(worker.activity === undefined ? ["dim", shortTask(worker.task)] : activityPart(worker.activity));
@@ -256,7 +259,12 @@ function statsTexts(worker: BoardWorker, now: number): string[] {
 
 /** A worker's row in an agent list at `now`. */
 export function agentRow(row: WidgetRow, now: number): AgentRow {
-  return { indent: nestIndent(row.depth), name: agentLabel(row.worker), status: statusParts(row.worker), stats: statsTexts(row.worker, now) };
+  const worker = row.worker;
+  if (worker.tier !== undefined) {
+    const { parts } = rowParts(row, now);
+    return { indent: nestIndent(row.depth), name: agentLabel(worker), status: parts.slice(1), stats: [] };
+  }
+  return { indent: nestIndent(row.depth), name: agentLabel(worker), status: statusParts(worker), stats: statsTexts(worker, now) };
 }
 
 /** The name column at `width`: NAME_COLUMN, or about a third of a narrower row. */
