@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { commitDenial, gatedGitAction, UnjudgedNotices } from "./commit-gate.ts";
+import { fixtureClassification, fixtureRoute, fixtureTierMap, SONNET } from "../fixtures/routing-decision.ts";
+import type { RiskTier } from "../routing/classifier.ts";
+import { buildDecisionRecord, buildEditRecord, type RoutingRecord } from "../routing/decision-record.ts";
+import { commitDenial, gatedGitAction, UnjudgedNotices, waitingForVerdict } from "./commit-gate.ts";
 
 // The commit gate (ADR 0010): while an editing delegation waits for a verdict,
 // the orchestrator's git commit and git push are denied, and a turn end names
 // the delegations. Seams: `gatedGitAction` over a bash command, the deny text,
-// and `UnjudgedNotices` over the unjudged delegations at each turn end.
+// `waitingForVerdict` over the record folder's records and the gate level, and
+// `UnjudgedNotices` over the unjudged delegations at each turn end.
 
 test("git commit and git push are found in chains, pipes and after git's own options; other git and other commands are not", () => {
   const cases: readonly [string, "commit" | "push" | undefined][] = [
@@ -69,4 +73,27 @@ test("a resume that edits again after the verdict is a new wait, named again", (
   const notices = new UnjudgedNotices();
   assert.ok(notices.atTurnEnd([{ delegationId: "a", lastEdit: "2026-09-28T10:00:00.000Z" }], label));
   assert.ok(notices.atTurnEnd([{ delegationId: "a", lastEdit: "2026-09-28T11:00:00.000Z" }], label));
+});
+
+const AT = new Date("2026-09-28T10:00:00.000Z");
+
+async function editedAt(delegationId: string, tier: RiskTier | undefined): Promise<RoutingRecord[]> {
+  const edit = buildEditRecord({ delegationId, orchestratorSession: "main", tool: "write", at: AT });
+  if (tier === undefined) return [edit];
+  const tierMap = fixtureTierMap();
+  const route = fixtureRoute(tier, tierMap);
+  const decision = buildDecisionRecord({ delegationId, at: AT, taskText: "Fix it", agentRole: "worker", classification: await fixtureClassification("Fix it", tier),
+    tierMap, route, ranOn: route.ok ? route.rung.rung : `${SONNET}:medium`, mode: "live" });
+  return [decision, edit];
+}
+
+test("only editing delegations whose gate action is not none wait for a verdict: the commit gate and the turn-end notice never name an ungated one", async () => {
+  const records = [
+    ...await editedAt("mechanical", "mechanical"), ...await editedAt("standard", "standard"), ...await editedAt("elevated", "elevated"),
+    ...await editedAt("critical", "critical"), ...await editedAt("tierless", undefined),
+  ];
+  const ids = (level: "low" | "medium" | "high" | "max") => waitingForVerdict(records, "main", level).map((item) => item.delegationId);
+  assert.deepEqual(ids("low"), ["elevated", "critical", "tierless"], "at low mechanical and standard are ungated; no tier counts as elevated");
+  for (const level of ["medium", "high", "max"] as const) assert.deepEqual(ids(level), ["mechanical", "standard", "elevated", "critical", "tierless"], level);
+  assert.deepEqual(waitingForVerdict(records, "other", "max"), [], "another session's delegations never wait here");
 });

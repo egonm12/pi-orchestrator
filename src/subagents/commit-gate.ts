@@ -1,9 +1,11 @@
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { readRoutingRecords } from "../routing/decision-record.ts";
+import { readRoutingRecords, type RoutingRecord } from "../routing/decision-record.ts";
 import { stateDir } from "../router/extension.ts";
 import { unjudgedDelegations, type UnjudgedDelegation } from "./editing.ts";
+import type { GateLevels } from "./gate-level.ts";
 import { isOrchestratorSession } from "./orchestrator-session.ts";
+import { delegationRouting, gateAction, type GateLevel } from "./quality-gate.ts";
 import { gitSubcommands } from "./tool-call-kind.ts";
 import { hasEnded, workerBoard } from "./worker-board.ts";
 import { isRunningWorkerSession } from "./worker-sessions.ts";
@@ -14,9 +16,9 @@ import { isRunningWorkerSession } from "./worker-sessions.ts";
 // git push are denied, with the delegations named. Nothing else is blocked:
 // other bash, new delegations (the runtime cannot tell before a worker runs
 // whether it will edit) and the final reply go on. A verdict of either kind
-// judges a delegation. For now every editing delegation needs one; the gate
-// level (ADR 0011) will leave out a delegation whose gate action is none, in
-// `waiting` below.
+// judges a delegation. A delegation whose gate action is none at the gate
+// level in force (./quality-gate.ts, ./gate-level.ts) needs no verdict, so it
+// never waits: neither the gate nor the notice names it.
 //
 // At a turn end with delegations waiting, a notice names them. It goes the way
 // a worker's progress report does (./report.ts): a custom message sent
@@ -101,16 +103,24 @@ function firstLine(error: unknown): string {
   return String(error instanceof Error ? error.message : error).split(/\r?\n/, 1)[0]!;
 }
 
+/** The editing delegations of `orchestratorSession` in `records`, the record
+ *  folder in file order, that wait for a verdict at the gate level `level`:
+ *  the unjudged ones (./editing.ts) whose gate action is not none. */
+export function waitingForVerdict(records: readonly RoutingRecord[], orchestratorSession: string, level: GateLevel): UnjudgedDelegation[] {
+  return unjudgedDelegations(records, orchestratorSession)
+    .filter((delegation) => gateAction(delegationRouting(records, delegation.delegationId).tier, level) !== "none");
+}
+
 /** The editing delegations of `ctx`'s orchestrator session that wait for a verdict. */
-function waiting(ctx: Pick<ExtensionContext, "sessionManager">): UnjudgedDelegation[] {
-  return unjudgedDelegations(readRoutingRecords(join(stateDir(), "routing")), ctx.sessionManager.getSessionId());
+function waiting(ctx: Pick<ExtensionContext, "cwd" | "sessionManager">, gateLevels: GateLevels): UnjudgedDelegation[] {
+  return waitingForVerdict(readRoutingRecords(join(stateDir(), "routing")), ctx.sessionManager.getSessionId(), gateLevels.inForce(ctx).level);
 }
 
 /** Hooks the commit gate and the turn-end notice into this extension's
  *  session. A record folder that cannot be read denies a commit or push, with
  *  the reason, since the gate cannot tell whether one is outstanding; at a
  *  turn end it skips the notice and is logged once. */
-export function registerCommitGate(pi: ExtensionAPI, logOnce: (line: string) => void): void {
+export function registerCommitGate(pi: ExtensionAPI, logOnce: (line: string) => void, gateLevels: GateLevels): void {
   const notices = new UnjudgedNotices();
   pi.on("session_start", () => { notices.userPrompt(); });
   pi.on("input", (event, ctx) => {
@@ -123,7 +133,7 @@ export function registerCommitGate(pi: ExtensionAPI, logOnce: (line: string) => 
     if (action === undefined) return undefined;
     let unjudged: UnjudgedDelegation[];
     try {
-      unjudged = waiting(ctx);
+      unjudged = waiting(ctx, gateLevels);
     } catch (error) {
       return { block: true, reason: `pi-orchestrator: git ${action} is denied: the edit records cannot be read to tell whether every editing delegation has a verdict (${firstLine(error)}).` };
     }
@@ -132,7 +142,7 @@ export function registerCommitGate(pi: ExtensionAPI, logOnce: (line: string) => 
   pi.on("turn_end", (_event, ctx) => {
     if (!isOrchestratorSession(ctx)) return;
     try {
-      const unjudged = waiting(ctx);
+      const unjudged = waiting(ctx, gateLevels);
       const notice = notices.atTurnEnd(unjudged, delegationLabel);
       if (notice === undefined) return;
       pi.sendMessage({ customType: UNJUDGED_NOTICE, content: notice, display: true, details: { delegationIds: unjudged.map((item) => item.delegationId) } },

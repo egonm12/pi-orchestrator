@@ -110,6 +110,7 @@ const FREE_TEXT_FIELDS: readonly (readonly [path: readonly string[], limit: numb
   [["route", "removed", "[]", "detail"], FREE_TEXT_LIMIT],
   [["skipped", "[]", "detail"], FREE_TEXT_LIMIT],
   [["reason"], FREE_TEXT_LIMIT],
+  [["gateLevelRaise", "reason"], FREE_TEXT_LIMIT],
   [["detail"], FREE_TEXT_LIMIT],
 ];
 
@@ -164,6 +165,18 @@ export const LADDER_STEPS = ["effort", "same-tier", "next-tier"] as const;
  *  structured verdict; it is never guessed from prose. */
 export const VERDICTS = ["accept", "request_changes", "missing"] as const;
 export type Verdict = (typeof VERDICTS)[number];
+
+/** How strictly the quality gate treats each tier (ADR 0011), lowest first. */
+export const GATE_LEVELS = ["low", "medium", "high", "max"] as const;
+export type GateLevel = (typeof GATE_LEVELS)[number];
+
+/** The orchestrator's raise of the gate level for one delegation (ADR 0011):
+ *  from the level in force to a higher one, with its reason. */
+export interface GateLevelRaise {
+  readonly from: GateLevel;
+  readonly to: GateLevel;
+  readonly reason: string;
+}
 
 // ---------------------------------------------------------------------------
 // The record shapes
@@ -282,6 +295,9 @@ export interface VerdictRecord extends RecordCommon {
   /** The verdict rests on a same-rung review: its reviewer ran on the
    *  delegation's own rung, in shadow mode or with routing off (ADR 0010). */
   readonly sameRungReview?: true;
+  /** The orchestrator raised the gate level for this delegation in its
+   *  verdict call (ADR 0011); absent when the verdict was judged at the level in force. */
+  readonly gateLevelRaise?: GateLevelRaise;
 }
 
 /** A verdict whose delegation id matches no decision in the folder. Kept, not
@@ -663,13 +679,21 @@ export function validateRoutingRecord(value: unknown): RoutingRecord {
     for (const key of ["slot", "model", "agentRole"]) stringAt(value, key, "", { nonBlank: true });
     stringAt(value, "taskTextPrefix", "");
   } else if (recordType === "verdict") {
-    checkKeys(value, "", [...COMMON_KEYS, "verdict", "decisionFile"], ["reason", "sameRungReview"]);
+    checkKeys(value, "", [...COMMON_KEYS, "verdict", "decisionFile"], ["reason", "sameRungReview", "gateLevelRaise"]);
     checkCommon(value);
     oneOf(value, "verdict", "", VERDICTS);
     const decisionFile = stringAt(value, "decisionFile", "", { nonBlank: true });
     if (!DAY_FILE.test(decisionFile)) throw new RoutingRecordError("decisionFile", `must name a day file YYYY-MM-DD.jsonl; got ${JSON.stringify(decisionFile)}`);
     if (value.reason !== undefined) stringAt(value, "reason", "", { nonBlank: true });
     if (value.sameRungReview !== undefined && value.sameRungReview !== true) throw new RoutingRecordError("sameRungReview", "must be true when present");
+    if (value.gateLevelRaise !== undefined) {
+      const raise = objectAt(value, "gateLevelRaise", "");
+      checkKeys(raise, "gateLevelRaise", ["from", "to", "reason"]);
+      const from = oneOf(raise, "from", "gateLevelRaise", GATE_LEVELS);
+      const to = oneOf(raise, "to", "gateLevelRaise", GATE_LEVELS);
+      if (GATE_LEVELS.indexOf(to) <= GATE_LEVELS.indexOf(from)) throw new RoutingRecordError("gateLevelRaise.to", `must be a higher gate level than ${from}; got ${JSON.stringify(to)}`);
+      stringAt(raise, "reason", "gateLevelRaise", { nonBlank: true });
+    }
   } else if (recordType === "edit") {
     if (value.schemaVersion !== DECISION_RECORD_SCHEMA_VERSION) throw new RoutingRecordError("schemaVersion", `is unsupported for ${recordType} records`);
     checkKeys(value, "", [...COMMON_KEYS, "orchestratorSession", "tool"], ["nestedDelegationId"]);

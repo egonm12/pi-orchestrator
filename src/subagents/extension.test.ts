@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { after, test } from "node:test";
-import { createAgentSessionFromServices, createAgentSessionServices, DefaultPackageManager, initTheme, SessionManager, SettingsManager, type ExtensionAPI, type ExtensionContext, type InlineExtension, type Theme } from "@earendil-works/pi-coding-agent";
+import { createAgentSessionFromServices, createAgentSessionServices, createEventBus, DefaultPackageManager, initTheme, SessionManager, SettingsManager, type ExtensionAPI, type ExtensionContext, type InlineExtension, type Theme } from "@earendil-works/pi-coding-agent";
 // pi's own keybindings manager, which pi hands a ctx.ui.custom factory; its public entry exports only the type.
 import { KeybindingsManager } from "../../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js";
 import { buildCatalog } from "../catalog/model-catalog.ts";
@@ -189,7 +189,7 @@ interface LoadedSubagents {
   /** Runs the extension's session_shutdown handlers, as pi does when the orchestrator's session ends. */
   shutdownSession(ctx: ExtensionContext): Promise<void>;
   /** Runs the extension's handlers of an agent event, as pi does for the agent of the session `ctx` is. */
-  agentEvent(type: "agent_start" | "agent_settled", ctx: ExtensionContext): Promise<void>;
+  agentEvent(type: "agent_start" | "agent_settled" | "turn_end", ctx: ExtensionContext): Promise<void>;
   /** Runs the extension's tool_call handlers, as pi does before a call runs, and returns the first block. */
   toolCall(toolName: string, input: Record<string, unknown>, ctx: ExtensionContext): Promise<unknown>;
   /** Runs a registered command as the owner types it, and returns what it showed. */
@@ -222,6 +222,8 @@ function loadSubagents(workerExtensions: readonly InlineExtension[]): LoadedSuba
     on(event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) { handlers.set(event, [...handlers.get(event) ?? [], handler]); },
     sendMessage(message: SentMessage["message"], options: SentMessage["options"]) { messages.push({ message, options }); },
     getActiveTools: () => [...ORCHESTRATOR_TOOLS],
+    // As pi gives each session's extensions one bus: the gate and budget subcommands join one command.
+    events: createEventBus(),
   } as unknown as ExtensionAPI);
   const emit = async (event: { type: string; reason?: string }, ctx: ExtensionContext) => {
     for (const handler of handlers.get(event.type) ?? []) await handler(event, ctx);
@@ -2663,7 +2665,7 @@ test("the orchestrator's session has the protocol in its system prompt on every 
     } finally { session.dispose(); }
     const turns = provider.requests.filter((request) => request.tools.length > 0);
     assert.equal(turns.length, 4, "two turns per prompt");
-    for (const turn of turns) assert.ok(turn.systemPrompt.includes(orchestratorProtocol(3)), turn.systemPrompt);
+    for (const turn of turns) assert.ok(turn.systemPrompt.includes(orchestratorProtocol(3, "medium")), turn.systemPrompt);
   } finally { h.cleanup(); }
 });
 
@@ -2707,7 +2709,7 @@ test("no worker gets the protocol: not a routed worker, not one that delegates, 
 
     const orchestratorRequests = provider.requests.filter((request) => request.sessionId === orchestratorId);
     assert.equal(orchestratorRequests.length, 2);
-    for (const request of orchestratorRequests) assert.ok(request.systemPrompt.includes(orchestratorProtocol(3)), request.systemPrompt);
+    for (const request of orchestratorRequests) assert.ok(request.systemPrompt.includes(orchestratorProtocol(3, "medium")), request.systemPrompt);
     const workerRequests = provider.requests.filter((request) => request.sessionId !== orchestratorId);
     assert.equal(new Set(workerRequests.map((request) => request.sessionId)).size, 4, "three workers and the lead's own worker");
     for (const request of workerRequests) assert.equal(request.systemPrompt.includes("Orchestrator protocol"), false, request.systemPrompt);
@@ -2761,8 +2763,8 @@ test("the orchestrator's 4th exploratory call in one user prompt is denied, acti
   } finally { h.cleanup(); }
 });
 
-test("the threshold is the owner's explorationBudget setting, and the protocol names it", async () => {
-  const h = harness({ orchestrator: { routing: ROUTING, subagents: { explorationBudget: 1 } } });
+test("the threshold is the owner's explorationBudget setting, and the protocol names it and the owner's gate level", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { explorationBudget: 1, gateLevel: "high" } } });
   try {
     writeFileSync(join(h.projectDir, "README.md"), "# Project\n");
     const provider = plannedAnthropic();
@@ -2776,8 +2778,9 @@ test("the threshold is the owner's explorationBudget setting, and the protocol n
     } finally { session.dispose(); }
     assert.equal(provider.requests.length, 3);
     for (const request of provider.requests) {
-      assert.ok(request.systemPrompt.includes(orchestratorProtocol(1)), request.systemPrompt);
+      assert.ok(request.systemPrompt.includes(orchestratorProtocol(1, "high")), request.systemPrompt);
       assert.match(request.systemPrompt, /1 exploratory call per user prompt/);
+      assert.match(request.systemPrompt, /Your gate level is high\./);
     }
   } finally { h.cleanup(); }
 });
@@ -3275,8 +3278,39 @@ test("a record folder that cannot be read denies a commit with the reason, and n
   } finally { h.cleanup(); }
 });
 
+test("/pi-orchestrator gate sets the session's gate level: an ungated delegation is never named by the commit gate or the turn-end notice, and an invalid level prints the usage", async () => {
+  const h = routedHarness();
+  try {
+    const provider = scriptedAnthropic(runningScript);
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    await subagents.startSession(main.ctx);
+    const usage = "usage: /pi-orchestrator gate [low|medium|high|max]";
+    assert.deepEqual(await subagents.runCommand("pi-orchestrator", "gate", main.ctx), [`pi-orchestrator: gate level medium, from settings.\n${usage}`]);
+    for (const args of ["gate none", "gate high please"]) assert.deepEqual(await subagents.runCommand("pi-orchestrator", args, main.ctx), [usage], args);
+    assert.deepEqual(await subagents.runCommand("pi-orchestrator", "gate low", main.ctx), ["pi-orchestrator: gate level low for this session (settings say medium)."]);
+    // The classifier says mechanical: at low its gate action is none.
+    const result = await subagents.tool().execute("call-1", { items: [{ task: runTask("write", { path: "notes.md", content: "x\n" }) }] } as never, undefined, undefined, main.ctx);
+    const worker = (result.details as SubagentsDetails).results[0]!;
+    assert.equal(worker.edited, true, JSON.stringify(worker));
+    assert.ok(toolText(result).includes("At the low gate level a mechanical delegation needs no verdict: it is ungated."), toolText(result));
+    assert.equal(await subagents.toolCall("bash", { command: "git commit -m x" }, main.ctx), undefined, "an ungated delegation holds back no commit");
+    await subagents.agentEvent("turn_end", main.ctx);
+    assert.deepEqual(subagents.messages.filter(({ message }) => message.customType === "subagents-unjudged"), [], "nor is it named at the turn end");
+    // Back at medium it needs the orchestrator's spot check, and waits for it.
+    await subagents.runCommand("pi-orchestrator", "gate medium", main.ctx);
+    const denied = await subagents.toolCall("bash", { command: "git commit -m x" }, main.ctx) as { block: boolean; reason: string } | undefined;
+    assert.ok(denied?.reason.includes(`waits for your verdict: delegation ${worker.sessionId}.`), JSON.stringify(denied));
+    await subagents.agentEvent("turn_end", main.ctx);
+    assert.equal(subagents.messages.filter(({ message }) => message.customType === "subagents-unjudged").length, 1);
+    // Another session starts from the settings' level.
+    const other = orchestrator(h);
+    assert.deepEqual(await subagents.runCommand("pi-orchestrator", "gate", other.ctx), [`pi-orchestrator: gate level medium, from settings.\n${usage}`]);
+  } finally { h.cleanup(); }
+});
+
 test("the protocol tells the orchestrator to judge an editing delegation's Result and record the verdict with subagents_verdict", () => {
-  const protocol = orchestratorProtocol(3);
+  const protocol = orchestratorProtocol(3, "medium");
   const paragraph = protocol.split("\n\n").find((text) => text.includes("subagents_verdict"));
   assert.ok(paragraph, protocol);
   for (const phrase of ["edited", "accept", "request_changes", "reason", "replaces", "research", "resume", "git commit and git push are denied"]) {

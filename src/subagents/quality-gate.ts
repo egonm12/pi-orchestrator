@@ -1,6 +1,6 @@
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { isAtLeastTier, type RiskTier } from "../routing/classifier.ts";
-import type { RoutingRecord } from "../routing/decision-record.ts";
+import { RISK_TIERS, type RiskTier } from "../routing/classifier.ts";
+import { GATE_LEVELS, type GateLevel, type RoutingRecord } from "../routing/decision-record.ts";
 import type { ConstraintRung } from "../routing/tier-router.ts";
 import { splitKnownThinkingSuffix } from "../models/model-info.ts";
 import { delegationEdits, type DelegationEdits } from "./editing.ts";
@@ -13,18 +13,46 @@ import { workerSessionDir } from "./worker.ts";
 // it ran on, from its latest decision of some kind, and whether it is a
 // finished editing delegation of this orchestrator session. Both
 // subagents_verdict (./verdict.ts) and a review item (./review.ts) use them.
+// The gate action is the one place that says whether a delegation needs a
+// verdict and whether it needs a reviewer: the commit gate
+// (./commit-gate.ts), subagents_verdict, an editing delegation's Result and
+// the orchestrator protocol all read it.
 
-/** CONTEXT.md, Gate action. The medium gate level yields no `none`; the
- *  configurable gate level (ADR 0011) adds it. */
-export type GateAction = "spot-check" | "reviewer";
+export { GATE_LEVELS, type GateLevel } from "../routing/decision-record.ts";
 
-/** The gate action for an editing delegation of `tier`, at the medium gate
- *  level (ADR 0011): elevated and critical need an independent reviewer,
- *  mechanical and standard the orchestrator's spot check. A delegation without
- *  a tier (a forked worker, one whose agent definition names a model, or an
- *  unrouted one) is gated as elevated. */
-export function gateAction(tier: RiskTier | undefined): GateAction {
-  return isAtLeastTier(tier ?? "elevated", "elevated") ? "reviewer" : "spot-check";
+/** CONTEXT.md, Gate action: no verdict, the orchestrator's spot check, or an independent reviewer. */
+export const GATE_ACTIONS = ["none", "spot-check", "reviewer"] as const;
+export type GateAction = (typeof GATE_ACTIONS)[number];
+
+/** ADR 0011's table: the gate action per tier and gate level. Critical needs
+ *  a reviewer at every level, so low never means "gate nothing". */
+const GATE_TABLE: Readonly<Record<RiskTier, Readonly<Record<GateLevel, GateAction>>>> = {
+  mechanical: { low: "none", medium: "spot-check", high: "spot-check", max: "reviewer" },
+  standard: { low: "none", medium: "spot-check", high: "reviewer", max: "reviewer" },
+  elevated: { low: "spot-check", medium: "reviewer", high: "reviewer", max: "reviewer" },
+  critical: { low: "reviewer", medium: "reviewer", high: "reviewer", max: "reviewer" },
+};
+
+export function isGateLevel(value: unknown): value is GateLevel {
+  return GATE_LEVELS.includes(value as GateLevel);
+}
+
+/** Whether `level` is stricter than `than`. */
+export function isHigherGateLevel(level: GateLevel, than: GateLevel): boolean {
+  return GATE_LEVELS.indexOf(level) > GATE_LEVELS.indexOf(than);
+}
+
+/** The gate action for an editing delegation of `tier` at the gate level
+ *  `level` (ADR 0011). A delegation without a tier (a forked worker, one whose
+ *  agent definition names a model, or an unrouted one) is gated as elevated. */
+export function gateAction(tier: RiskTier | undefined, level: GateLevel): GateAction {
+  return GATE_TABLE[tier ?? "elevated"][level];
+}
+
+/** The tiers of each gate action at `level`, in tier order, as the protocol names them. */
+export function tiersByGateAction(level: GateLevel): Readonly<Record<GateAction, readonly RiskTier[]>> {
+  const tiers = (action: GateAction) => RISK_TIERS.filter((tier) => GATE_TABLE[tier][level] === action);
+  return { none: tiers("none"), "spot-check": tiers("spot-check"), reviewer: tiers("reviewer") };
 }
 
 /** A delegation's tier and the rung it ran on, as its records name them. */

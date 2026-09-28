@@ -38,7 +38,7 @@ Run `/pi-orchestrator init` in an interactive session. It:
 
 Review the written map in `~/.pi/agent/settings.json`, then start a new session. Workers started through the built-in `subagents` tool always run on `orchestrator/auto` already; nothing else needs setting up for them.
 
-`/pi-orchestrator` takes a subcommand as its first word: `init` comes with the router extension, `budget` with the subagents extension (see Exploration budget below). With one of them switched off, its subcommand is gone and the other stays. Without a subcommand, or with one it does not know, it prints the usage with every subcommand.
+`/pi-orchestrator` takes a subcommand as its first word: `init` comes with the router extension, `budget` and `gate` with the subagents extension (see Exploration budget and Gate level below). With one of them switched off, its subcommands are gone and the other's stay. Without a subcommand, or with one it does not know, it prints the usage with every subcommand.
 
 ## Subagents tool
 
@@ -92,7 +92,7 @@ When a worker other than a fork completes, the runtime checks its Result's secti
 
 ### Verdicts
 
-A delegation that edited needs the orchestrator's verdict. It edited when its worker, or a worker it started (see Nested delegation below), ran one of these calls:
+A delegation that edited needs the orchestrator's verdict, unless the gate level leaves it ungated (see Gate level below). It edited when its worker, or a worker it started (see Nested delegation below), ran one of these calls:
 
 - `edit` or `write`;
 - `bash` that is neither a read-only search nor a build or test run, as the exploration budget classifies it (see Exploration budget below): unrecognised commands, redirects into a file, and version-control actions such as `git commit` or `git checkout` all count; so does `powershell`;
@@ -106,27 +106,36 @@ The first editing call in a worker's run writes an edit record into the routing 
 This delegation edited. Judge its Result, then record a verdict with subagents_verdict.
 ```
 
-For a delegation that needs a reviewer (see Reviewers below), the line says so instead:
+That line is for a delegation whose gate action is a spot check (see Gate level below). For one that needs a reviewer (see Reviewers below), the line says so instead:
 
 ```text
-This delegation edited and is elevated: it needs an independent reviewer. Start one with a subagents item whose review is <id>, judge the reviewer's Result, then record a verdict with subagents_verdict naming it as reviewer.
+This delegation edited and is elevated: at the medium gate level it needs an independent reviewer. Start one with a subagents item whose review is <id>, judge the reviewer's Result, then record a verdict with subagents_verdict naming it as reviewer.
 ```
+
+For an ungated delegation, one whose gate action is none, it says that no verdict is needed:
+
+```text
+This delegation edited. At the low gate level a mechanical delegation needs no verdict: it is ungated. You may still judge its Result and record a verdict with subagents_verdict.
+```
+
+The line follows the gate level in force when the call's results are written.
 
 A worker's own `subagents` call does not show the line: its workers' edits count for the worker's delegation, whose own Result shows it.
 
-The orchestrator records its verdict with `subagents_verdict`, `{ "delegationId": string, "verdict": "accept" | "request_changes", "reason": string, "reviewer"?: string }`, whether it judged the Result by its own spot check or by a reviewer's Result; `reviewer` is the delegation id of that reviewer. The verdict is attached to the delegation's decision record, its fork or agent-model record, or, for an unrouted retry, its effort-ladder record, or otherwise its edit record; a verdict on a known editing delegation is never orphaned. The reason is recorded with the verdict, credential-shaped text redacted and cut to 500 characters. A verdict on a routed delegation that chose a rung is also a learning observation, as before. The tool replies `Recorded <verdict> on delegation <id>.`, with `, reviewed by delegation <reviewer id>` before the full stop when it names a reviewer. A same-rung review is named in the reply and marked on the verdict record. A later verdict adds `It replaces the earlier <verdict>.`: it replaces the earlier one in the routing report, and the record keeps both. For `request_changes`, the reply also names the next effort-ladder rung and how to retry, says why the ladder cannot place the failed attempt, or refuses a retry when the ladder is exhausted or the task has climbed twice. It refuses, and records nothing, when:
+The orchestrator records its verdict with `subagents_verdict`, `{ "delegationId": string, "verdict": "accept" | "request_changes", "reason": string, "reviewer"?: string, "gateLevel"?: "low" | "medium" | "high" | "max", "gateLevelReason"?: string }`, whether it judged the Result by its own spot check or by a reviewer's Result; `reviewer` is the delegation id of that reviewer, and `gateLevel` with `gateLevelReason` raises the gate level for this delegation (see Gate level below). An ungated delegation takes a verdict too. The verdict is attached to the delegation's decision record, its fork or agent-model record, or, for an unrouted retry, its effort-ladder record, or otherwise its edit record; a verdict on a known editing delegation is never orphaned. The reason is recorded with the verdict, credential-shaped text redacted and cut to 500 characters. A verdict on a routed delegation that chose a rung is also a learning observation, as before. The tool replies `Recorded <verdict> on delegation <id>.`, with `, reviewed by delegation <reviewer id>` before the full stop when it names a reviewer, and `, with its gate level raised from <level> to <level>` when it raises the level. A same-rung review is named in the reply and marked on the verdict record. A later verdict adds `It replaces the earlier <verdict>.`: it replaces the earlier one in the routing report, and the record keeps both. For `request_changes`, the reply also names the next effort-ladder rung and how to retry, says why the ladder cannot place the failed attempt, or refuses a retry when the ladder is exhausted or the task has climbed twice. It refuses, and records nothing, when:
 
 - the delegation id is unknown;
 - the delegation did not edit: a research Result is checked but gets no verdict;
 - the id is a worker's own worker: the refusal names the delegation its edits count for;
 - the delegation is still queued or running;
 - the delegation belongs to another orchestrator session;
-- the delegation needs a reviewer and the verdict names none (see Reviewers below);
+- the delegation needs a reviewer at the gate level in force, or at the one the verdict raises it to, and the verdict names none (see Reviewers below);
+- `gateLevel` is not higher than the gate level in force (the orchestrator may raise it, never lower it), is not a gate level, or comes without a `gateLevelReason`, or a `gateLevelReason` comes without it;
 - the named reviewer is not a completed review of this delegation by this orchestrator session, started after the delegation's latest edit: the refusal says which;
 - the verdict is not `accept` or `request_changes`, or the reason is blank, or a given `reviewer` is blank;
 - a worker calls it: workers never get `subagents_verdict`, even when their agent definition's `tools:` list names it.
 
-While any editing delegation of the orchestrator's session waits for a verdict, its `bash` calls that run `git commit` or `git push` are denied. A delegation waits from its latest edit record until a verdict of either kind, `accept` or `request_changes`, is recorded after it, so a resume that edits again waits again. The reason names each waiting delegation, with its agent and whether it still runs when the orchestrator's process knows them:
+While any editing delegation of the orchestrator's session waits for a verdict, its `bash` calls that run `git commit` or `git push` are denied. A delegation waits from its latest edit record until a verdict of either kind, `accept` or `request_changes`, is recorded after it, so a resume that edits again waits again. An ungated delegation, one whose gate action is none at the gate level in force, never waits: neither the deny nor the turn-end notice names it. The reason names each waiting delegation, with its agent and whether it still runs when the orchestrator's process knows them:
 
 ```text
 pi-orchestrator: git commit is denied while 2 editing delegations wait for your verdict: delegation <id>, delegation <id> (agent scribe, still running). Judge each Result and record its verdict with `subagents_verdict`, then commit.
@@ -138,9 +147,28 @@ At the end of each orchestrator turn with delegations waiting, a notice names th
 
 The routing report, `node src/routing/routing-report.ts <state dir>/routing`, counts each delegation's latest verdict in its tier and rung's row. Verdicts on delegations without a routing decision (forks, agent-model workers and unrouted workers) have no row; they are counted on their own line, `verdicts on unrouted delegations: ...`.
 
+### Gate level
+
+The gate level sets, per tier, what an editing delegation needs before it is judged: its gate action. *None* needs no verdict (the delegation is ungated), a *spot check* is the orchestrator's own verdict, and a *reviewer* is an independent reviewer worker (see Reviewers below).
+
+| Tier | low | medium | high | max |
+|---|---|---|---|---|
+| mechanical | none | spot check | spot check | reviewer |
+| standard | none | spot check | reviewer | reviewer |
+| elevated | spot check | reviewer | reviewer | reviewer |
+| critical | reviewer | reviewer | reviewer | reviewer |
+
+A delegation without a tier (a fork, a worker on an agent definition's named model, or a worker the router did not route) counts as elevated. The tier is the one its latest decision, fork or agent-model record names (see Reviewers below). At max, every reviewer is told to rerun the Result's Verified by commands.
+
+The level is `orchestrator.subagents.gateLevel` in personal settings, default `medium`; a project may override it when personal settings allow project overrides (see `orchestrator.subagents` settings below). `/pi-orchestrator gate <level>` sets it for the current orchestrator session, higher or lower, until the next session start (a new or resumed session, or a reload); `/pi-orchestrator gate` shows the level in force and whether it comes from settings or the session. Any other argument prints `usage: /pi-orchestrator gate [low|medium|high|max]` and changes nothing. The setting is read each time the level is needed, so a changed setting applies at once unless the session has its own level.
+
+The orchestrator may raise the level for one delegation, never lower it: `subagents_verdict` with `gateLevel` above the level in force and a `gateLevelReason`. The verdict is then held to the raised level, so a raise that calls for a reviewer needs one named, and the verdict record keeps the raise as `gateLevelRaise: { from, to, reason }`, its reason redacted and cut like other free text. A reviewer's rules follow the level in force when it starts, so to have a reviewer rerun the Verified by commands below max, the orchestrator says so in its task.
+
+The gate level reads the same everywhere: the editing delegation's line in its Result, `subagents_verdict`, the commit block and turn-end notice, a reviewer's rules and the orchestrator protocol.
+
 ### Reviewers
 
-At the medium gate level, an elevated or critical editing delegation needs an independent reviewer before its verdict, and so does one without a tier: a fork, a worker on an agent definition's named model, and a worker the router did not route count as elevated. For mechanical and standard delegations the orchestrator's own spot check is enough, and a reviewer is allowed too. The gate level that makes this configurable comes later.
+Where the gate level calls for one (see Gate level above), an editing delegation needs an independent reviewer before its verdict. At medium that is an elevated or critical delegation, and one without a tier. Where the orchestrator's own spot check is enough, a reviewer is allowed too.
 
 A reviewer is a `subagents` item whose `review` is the delegation id and whose `task` says what to check:
 
@@ -158,7 +186,7 @@ no other rung is left: this worker would fall back to the orchestrator session m
 
 Switching the session model or making another rung available lets a live review run.
 
-The reviewer's system prompt carries the reporting rules, then review rules: check the change itself against the delegation's task, read the changed files and the diff, rerun nothing from its Verified by section unless the task says to, change nothing, and answer accept or request changes with the reasons, first in its Confirmed section. Editing calls are denied with a reason; reading, searching, building and testing remain allowed. This applies to a resumed reviewer and a worker it starts too. After them it gets the reviewed delegation: its tier, its saved session file, its task and any later instruction (a resume task or a steering message), its Result, cut at 50 KB like a tool result, and the files its `edit` and `write` calls named. These come from the delegation's saved worker session, or the worker board's copy of its messages when the session was not saved; a fork's copy of the orchestrator's branch is left out. Changes made through `bash`, `ctx_execute` or a worker it started are not listed, and the reviewer is told to check `git status` and `git diff`. An agent definition's instructions follow the review rules.
+The reviewer's system prompt carries the reporting rules, then review rules: check the change itself against the delegation's task, read the changed files and the diff, rerun nothing from its Verified by section unless the task says to (at the max gate level instead: rerun every command there and say what each gave, naming one that would edit under Could not check), change nothing, and answer accept or request changes with the reasons, first in its Confirmed section. Editing calls are denied with a reason; reading, searching, building and testing remain allowed. This applies to a resumed reviewer and a worker it starts too. After them it gets the reviewed delegation: its tier, its saved session file, its task and any later instruction (a resume task or a steering message), its Result, cut at 50 KB like a tool result, and the files its `edit` and `write` calls named. These come from the delegation's saved worker session, or the worker board's copy of its messages when the session was not saved; a fork's copy of the orchestrator's branch is left out. Changes made through `bash`, `ctx_execute` or a worker it started are not listed, and the reviewer is told to check `git status` and `git diff`. An agent definition's instructions follow the review rules.
 
 The reviewer's decision record has `reviewedDelegationId`: the delegation it reviewed. Its saved outcome keeps the same link, so a resumed reviewer keeps its review rules and still counts. A compaction summary of a reviewer is routed without its constraints, like any compaction summary; it only condenses the reviewer's own context.
 
@@ -180,7 +208,7 @@ One task may climb at most twice, including a retry of a retry or two retries of
 
 ### Orchestrator protocol
 
-The orchestrator's own session carries the orchestrator protocol as the `orchestrator_protocol` section of its system prompt: delegate exploration and substantial work to workers, keep small known actions (a single lookup, a small edit, a build or test run, a commit), stay within the exploration budget, which it names with the configured threshold, treat a worker's Result as evidence to check before acting on it, judge each editing delegation's Result and record the verdict with `subagents_verdict`, since its git commit and git push wait for every verdict (see Verdicts above), and start a reviewer for an elevated, critical or tierless delegation and name it in the verdict (see Reviewers above). After `request_changes`, it can retry the delegation with feedback on the effort ladder, at most twice; when refused, it takes the task back to the user (see Retries above). The text lives in `src/subagents/orchestrator-protocol.ts`. The section is added when each user prompt starts its agent loop, so it holds for every turn of that loop and returns after a compaction. There is no per-prompt reminder line. Workers, forked workers and sessions in a pi-subagents child process never get it; a fork's copied conversation holds the orchestrator's section, and pi removes it from the fork's own prompt.
+The orchestrator's own session carries the orchestrator protocol as the `orchestrator_protocol` section of its system prompt: delegate exploration and substantial work to workers, keep small known actions (a single lookup, a small edit, a build or test run, a commit), stay within the exploration budget, which it names with the configured threshold, treat a worker's Result as evidence to check before acting on it, judge each editing delegation's Result and record the verdict with `subagents_verdict`, since its git commit and git push wait for every verdict that is needed (see Verdicts above), follow the gate level in force, which it names with what each tier needs and how to raise it for one delegation (see Gate level above), and start a reviewer where the level calls for one and name it in the verdict (see Reviewers above). After `request_changes`, it can retry the delegation with feedback on the effort ladder, at most twice; when refused, it takes the task back to the user (see Retries above). The text lives in `src/subagents/orchestrator-protocol.ts`. The section is added when each user prompt starts its agent loop, so it holds for every turn of that loop and returns after a compaction. There is no per-prompt reminder line. Workers, forked workers and sessions in a pi-subagents child process never get it; a fork's copied conversation holds the orchestrator's section, and pi removes it from the fork's own prompt.
 
 A run that a message starts without a user prompt, such as a background call's completion notice or a worker's question, has the protocol for its first turn only: pi rebuilds the prompt of its later turns without the section, until the next user prompt adds it again.
 
@@ -353,6 +381,7 @@ A worker may start workers of its own only when its agent definition lists `suba
       "maxBackgroundWorkers": 8,
       "agentDefinitionModel": { "use": "route", "allowBanned": false },
       "explorationBudget": 3,
+      "gateLevel": "medium",
       "allowProjectOverrides": false
     }
   }
@@ -366,11 +395,12 @@ A worker may start workers of its own only when its agent definition lists `suba
 | `subagents.agentDefinitionModel.use` | `"route"` (the default) ignores an agent definition's `model` and `thinking`, with one warning, and routes the worker as usual. `"preserve"` runs a worker whose definition names a model on that model and thinking, unrouted, and writes an agent-model record (delegation id, agent name, definition file, model, effort). A definition without a model is routed either way |
 | `subagents.agentDefinitionModel.allowBanned` | Default `false`. With `"preserve"`, a worker whose agent definition names a model on the subagent ban list runs on it; with `false`, that item fails before a worker starts. For a definition from the project's `.pi/agents/` this also needs `allowProjectOverrides` in personal settings. With that flag on, a project's `agentDefinitionModel` replaces the personal one, `allowBanned` included. When the exception lets a worker run, its agent-model record gets `banListException: true`, its item result gets `banListException: true`, and its line is marked `(ban-list exception)`. The guard and the router extension do not stop such a worker. Under `"route"`, a `true` value has no effect and warns once per session. Every other path still refuses a banned model: the tier map drops its rungs, and the guard refuses a tool call that names it |
 | `subagents.explorationBudget` | Exploratory calls the orchestrator's own session may make per user prompt before the next is denied (see Exploration budget above). A positive integer, default 3. Read at the session's start and at each user prompt |
+| `subagents.gateLevel` | How strictly the quality gate treats each tier: `low`, `medium`, `high` or `max`, default `medium` (see Gate level above). `/pi-orchestrator gate <level>` replaces it for one session. Read each time the gate level is needed; a malformed value keeps the default, and the failure is logged once to stderr |
 | `subagents.allowProjectOverrides` | Personal settings only, default `false`. Lets a project's `.pi/settings.json` set every `orchestrator.subagents` key except this one. A project key replaces the personal value whole: a project's `agentDefinitionModel` replaces the personal object, it is not merged into it. Without the flag every project `orchestrator.subagents` key is ignored; with it, a project value for the flag itself is ignored. Each ignored key is logged once to stderr, as `pi-orchestrator subagents: ignored project settings key <key>`, the way the guard logs ignored ban-list keys |
 
 ## Settings
 
-pi-orchestrator settings live under the `orchestrator` key in personal settings, `${PI_CODING_AGENT_DIR:-~/.pi/agent}/settings.json`. The guard and the router extension read them at session start, so a change to their keys needs a new session. The subagents extension reads `orchestrator.subagents`, the subagent ban list and the agent definitions on every call, and `orchestrator.subagents.explorationBudget` at the session's start and at each user prompt.
+pi-orchestrator settings live under the `orchestrator` key in personal settings, `${PI_CODING_AGENT_DIR:-~/.pi/agent}/settings.json`. The guard and the router extension read them at session start, so a change to their keys needs a new session. The subagents extension reads `orchestrator.subagents`, the subagent ban list and the agent definitions on every call, `orchestrator.subagents.explorationBudget` at the session's start and at each user prompt, and `orchestrator.subagents.gateLevel` each time the gate level is needed.
 
 ```json
 {
@@ -443,7 +473,7 @@ Decision records keep the first 200 characters of the task text, with credential
   { "packages": [{ "source": "git:github.com/egonm12/pi-orchestrator", "extensions": ["!src/router/extension.ts"] }] }
   ```
 
-  Use `!src/guard/extension.ts` to keep the router and drop the guard, or `!src/subagents/extension.ts` to drop only the built-in `subagents` tool, and with it the orchestrator protocol, the exploration budget, `/pi-orchestrator budget`, `subagents_verdict` and the commit block on unjudged edits, and keep routing for other subagent extensions.
+  Use `!src/guard/extension.ts` to keep the router and drop the guard, or `!src/subagents/extension.ts` to drop only the built-in `subagents` tool, and with it the orchestrator protocol, the exploration budget, `/pi-orchestrator budget`, the gate level and `/pi-orchestrator gate`, `subagents_verdict` and the commit block on unjudged edits, and keep routing for other subagent extensions.
 - **Everything, for one run**: `pi --no-extensions`.
 - **Uninstall**: `pi remove git:github.com/egonm12/pi-orchestrator`.
 

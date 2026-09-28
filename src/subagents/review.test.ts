@@ -13,7 +13,7 @@ import { autoStream } from "../router/auto-stream.ts";
 import { createRouterExtension } from "../router/extension.ts";
 import { createSubagentsExtension, type SubagentResult, type SubagentsDetails } from "./extension.ts";
 import { orchestratorProtocol } from "./orchestrator-protocol.ts";
-import { REVIEW_RULES } from "./review.ts";
+import { reviewRules } from "./review.ts";
 import { REVIEWER_EDIT_DENIED } from "./editing.ts";
 import { markWorkerSession } from "./worker-sessions.ts";
 
@@ -212,7 +212,7 @@ test("a review item is routed at or above the implementer's tier and never on it
     assert.equal(implementer.status, "completed", JSON.stringify(implementer));
     const id = implementer.sessionId!;
     assert.equal(decisionOf(h, id).ranOn, `${HAIKU}:high`);
-    assert.ok(implementer.text.includes(`This delegation edited and is elevated: it needs an independent reviewer. Start one with a subagents item whose review is ${id}`), implementer.text);
+    assert.ok(implementer.text.includes(`This delegation edited and is elevated: at the medium gate level it needs an independent reviewer. Start one with a subagents item whose review is ${id}`), implementer.text);
 
     const reviewer = await one(tools, ctx, { task: "Check that notes.md has a heading", review: id });
     assert.equal(reviewer.status, "completed", JSON.stringify(reviewer));
@@ -227,8 +227,8 @@ test("a review item is routed at or above the implementer's tier and never on it
     const requests = provider.requests.filter((request) => request.sessionId === reviewer.sessionId);
     assert.deepEqual(requests.map((request) => request.rung), [`${SONNET}:high`]);
     const prompt = requests[0]!.systemPrompt;
-    assert.ok(prompt.includes(REVIEW_RULES), prompt);
-    assert.ok(prompt.indexOf("# Reporting rules") < prompt.indexOf(REVIEW_RULES), "the review rules follow the reporting rules");
+    assert.ok(prompt.includes(reviewRules("medium")), prompt);
+    assert.ok(prompt.indexOf("# Reporting rules") < prompt.indexOf(reviewRules("medium")), "the review rules follow the reporting rules");
     for (const part of [`Delegation ${id}, routed at the elevated tier.`, `Its saved session, with the whole transcript: ${implementer.sessionFile}`,
       `<task>\n[elevated] ${WRITE_NOTES}\n</task>`, "<result>\nran\n</result>", "Files its edit and write calls named: notes.md."]) {
       assert.ok(prompt.includes(part), `${part}\n---\n${prompt}`);
@@ -252,7 +252,7 @@ test("subagents_verdict refuses a self-judged verdict on an elevated or critical
     }
     const accept = (tier: string, reviewer?: string) => ({ delegationId: ids[tier], verdict: "accept", reason: "checked", ...(reviewer === undefined ? {} : { reviewer }) });
     for (const tier of ["elevated", "critical"]) {
-      assert.equal(await verdict(tools, ctx, accept(tier)), `subagents_verdict: delegation ${ids[tier]} is ${tier} and needs an independent reviewer: ` +
+      assert.equal(await verdict(tools, ctx, accept(tier)), `subagents_verdict: delegation ${ids[tier]} is ${tier} and needs an independent reviewer at the medium gate level: ` +
         `start one with a subagents item whose review is ${ids[tier]}, judge its Result, then name it here as reviewer`);
     }
     for (const tier of ["mechanical", "standard"]) assert.equal(await verdict(tools, ctx, accept(tier)), `Recorded accept on delegation ${ids[tier]}.`);
@@ -318,9 +318,9 @@ test("a fork and an agent's named model have no tier: gated as elevated, and rev
       const id = implementer.sessionId!;
       const rung = kind === "fork" ? `${HAIKU}:low` : `${HAIKU}:high`;
       assert.deepEqual(provider.requests.filter((request) => request.sessionId === id).map((request) => request.rung).at(0), rung, kind);
-      assert.ok(implementer.text.includes("This delegation edited and is without a tier, so it is gated as elevated: it needs an independent reviewer."), implementer.text);
+      assert.ok(implementer.text.includes("This delegation edited and is without a tier, so it is gated as elevated: at the medium gate level it needs an independent reviewer."), implementer.text);
       assert.equal(await verdict(tools, ctx, { delegationId: id, verdict: "accept", reason: "checked" }),
-        `subagents_verdict: delegation ${id} is without a tier, so it is gated as elevated, and needs an independent reviewer: ` +
+        `subagents_verdict: delegation ${id} is without a tier, so it is gated as elevated, and needs an independent reviewer at the medium gate level: ` +
         `start one with a subagents item whose review is ${id}, judge its Result, then name it here as reviewer`, kind);
       // An agent gives the reviewer instructions, but its model does not bypass the constraints.
       const reviewer = await one(tools, ctx, { task: "Check it", review: id, agent: "scribe" });
@@ -333,7 +333,7 @@ test("a fork and an agent's named model have no tier: gated as elevated, and rev
       assert.equal(record.reviewedDelegationId, id);
       const prompt = provider.requests.find((request) => request.sessionId === reviewer.sessionId)!.systemPrompt;
       assert.ok(prompt.includes(`Delegation ${id}, without a tier, so it is gated as elevated.`), prompt);
-      assert.ok(prompt.indexOf(REVIEW_RULES) < prompt.indexOf("Write notes."), "the agent's instructions follow the review rules");
+      assert.ok(prompt.indexOf(reviewRules("medium")) < prompt.indexOf("Write notes."), "the agent's instructions follow the review rules");
       // A fork's review names only its own task, not the orchestrator's conversation it copied.
       assert.ok(prompt.includes(`<task>\n${WRITE_NOTES}\n</task>`), prompt);
       assert.equal(prompt.includes("<task>\nWrite the notes"), false, prompt);
@@ -437,10 +437,109 @@ test("a review item is refused, without starting a worker, with fork or resume, 
 });
 
 test("the protocol describes reviewers: when one is needed, how to start one and how to name it in the verdict", () => {
-  const paragraph = orchestratorProtocol(3).split("\n\n").find((text) => text.includes("independent reviewer"));
+  const paragraph = orchestratorProtocol(3, "medium").split("\n\n").find((text) => text.includes("`review`"));
   assert.ok(paragraph);
-  for (const phrase of ["elevated or critical", "without a tier", "`review`", "never on its rung", "reruns nothing", "accept or request changes",
-    "`reviewer`", "refused", "latest edit", "spot check", "tell the user"]) {
+  for (const phrase of ["gate level calls for an independent reviewer", "`review`", "never on its rung", "reruns nothing", "accept or request changes",
+    "`reviewer`", "refused", "latest edit", "spot check", "tell the user", "raise the gate level to max"]) {
     assert.ok(paragraph.includes(phrase), `${phrase}: ${paragraph}`);
+  }
+  const atMax = orchestratorProtocol(3, "max").split("\n\n").find((text) => text.includes("`review`"));
+  assert.ok(atMax?.includes("reruns the Result's Verified by commands"), atMax);
+  assert.equal(atMax?.includes("reruns nothing"), false, atMax);
+});
+
+test("the protocol names the gate level in force and what it asks of each tier", () => {
+  const gateParagraph = (level: "low" | "medium" | "high" | "max") =>
+    orchestratorProtocol(3, level).split("\n\n").find((text) => text.startsWith("Your gate level is")) ?? "";
+  assert.ok(gateParagraph("medium").startsWith("Your gate level is medium. It sets what an editing delegation needs by its tier: " +
+    "mechanical and standard need your spot check; elevated and critical need an independent reviewer. " +
+    "A delegation without a tier (a forked worker, or one whose agent definition names a model) counts as elevated."), gateParagraph("medium"));
+  assert.ok(gateParagraph("low").includes("mechanical and standard need no verdict; elevated needs your spot check; critical needs an independent reviewer."));
+  assert.ok(gateParagraph("low").includes("An ungated delegation needs no verdict"));
+  assert.ok(gateParagraph("high").includes("mechanical needs your spot check; standard, elevated and critical need an independent reviewer."));
+  assert.ok(gateParagraph("max").includes("mechanical, standard, elevated and critical need an independent reviewer. "));
+  assert.ok(gateParagraph("max").includes("Every reviewer reruns the Result's Verified by commands."));
+  for (const level of ["medium", "high", "max"] as const) {
+    assert.equal(gateParagraph(level).includes("ungated"), false, level);
+    for (const phrase of ["raise it for one delegation, never lower it", "`gateLevel`", "`gateLevelReason`", "`subagents_verdict`"]) {
+      assert.ok(gateParagraph(level).includes(phrase), `${level}: ${phrase}`);
+    }
+  }
+});
+
+test("the owner's gate level sets each tier's gate action: at low mechanical and standard are ungated and elevated takes a spot check, at high standard needs a reviewer", async () => {
+  for (const [gateLevel, needsReviewer, ungated] of [["low", ["critical"], ["mechanical", "standard"]], ["high", ["standard", "elevated", "critical"], []]] as const) {
+    const h = harness({ routing: ROUTING, subagents: { gateLevel } });
+    try {
+      const provider = anthropic();
+      const tools = loadSubagents([routerExtension(), provider.extension]);
+      const ctx = orchestrator(h);
+      for (const tier of ["mechanical", "standard", "elevated", "critical"] as const) {
+        const worker = await one(tools, ctx, { task: `[${tier}] ${runTask("write", { path: `${tier}.md`, content: "x\n" })}` });
+        assert.equal(worker.status, "completed", JSON.stringify(worker));
+        const id = worker.sessionId!;
+        const reviewer = (needsReviewer as readonly string[]).includes(tier);
+        const note = (ungated as readonly string[]).includes(tier)
+          ? `This delegation edited. At the ${gateLevel} gate level a ${tier} delegation needs no verdict: it is ungated. You may still judge its Result and record a verdict with subagents_verdict.`
+          : reviewer ? `This delegation edited and is ${tier}: at the ${gateLevel} gate level it needs an independent reviewer.`
+          : "This delegation edited. Judge its Result, then record a verdict with subagents_verdict.";
+        assert.ok(worker.text.includes(note), `${gateLevel} ${tier}: ${worker.text}`);
+        // A self-judged verdict: refused where the gate action is a reviewer, taken for a spot check and for an ungated delegation.
+        assert.equal(await verdict(tools, ctx, { delegationId: id, verdict: "accept", reason: "checked" }), reviewer
+          ? `subagents_verdict: delegation ${id} is ${tier} and needs an independent reviewer at the ${gateLevel} gate level: ` +
+            `start one with a subagents item whose review is ${id}, judge its Result, then name it here as reviewer`
+          : `Recorded accept on delegation ${id}.`, `${gateLevel} ${tier}`);
+      }
+    } finally { h.cleanup(); }
+  }
+});
+
+test("a verdict may raise the gate level for its delegation with a reason, and is then held to it; lowering, keeping the level or a raise without a reason is refused", async () => {
+  const h = harness();
+  try {
+    const provider = anthropic();
+    const tools = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h);
+    const worker = await one(tools, ctx, { task: `[mechanical] ${WRITE_NOTES}` });
+    const id = worker.sessionId!;
+    const accept = { delegationId: id, verdict: "accept", reason: "checked" };
+    const lower = "subagents_verdict: the gate level is medium, and a verdict may only raise it for its delegation, never lower it: name high or max, or leave gateLevel out";
+    assert.equal(await verdict(tools, ctx, { ...accept, gateLevel: "low", gateLevelReason: "trivial" }), lower);
+    assert.equal(await verdict(tools, ctx, { ...accept, gateLevel: "medium", gateLevelReason: "as it is" }), lower);
+    for (const params of [{ ...accept, gateLevel: "high" }, { ...accept, gateLevelReason: "risky" }, { ...accept, gateLevel: "high", gateLevelReason: " " }]) {
+      assert.equal(await verdict(tools, ctx, params),
+        "subagents_verdict: a raised gateLevel needs a gateLevelReason saying why, and a gateLevelReason needs a gateLevel", JSON.stringify(params));
+    }
+    assert.equal(await verdict(tools, ctx, { ...accept, gateLevel: "strict", gateLevelReason: "risky" }), "subagents_verdict: a gateLevel, when given, is one of low, medium, high, max");
+    // At max a mechanical delegation needs a reviewer: the raised level holds the verdict to it.
+    assert.equal(await verdict(tools, ctx, { ...accept, gateLevel: "max", gateLevelReason: "it rewrites the notes format" }),
+      `subagents_verdict: delegation ${id} is mechanical and needs an independent reviewer at the max gate level: ` +
+      `start one with a subagents item whose review is ${id}, judge its Result, then name it here as reviewer`);
+    assert.equal(await verdict(tools, ctx, { ...accept, gateLevel: "high", gateLevelReason: "the user asked for care" }),
+      `Recorded accept on delegation ${id}, with its gate level raised from medium to high.`);
+    const reviewer = await one(tools, ctx, { task: "Check it", review: id });
+    assert.equal(await verdict(tools, ctx, { ...accept, reviewer: reviewer.sessionId, gateLevel: "max", gateLevelReason: "it rewrites the notes format" }),
+      `Recorded accept on delegation ${id}, reviewed by delegation ${reviewer.sessionId}, with its gate level raised from medium to max. It replaces the earlier accept.`);
+    const verdicts = readRoutingRecords(join(h.stateDir, "routing")).flatMap((record) => record.recordType === "verdict" ? [record.gateLevelRaise] : []);
+    assert.deepEqual(verdicts, [{ from: "medium", to: "high", reason: "the user asked for care" }, { from: "medium", to: "max", reason: "it rewrites the notes format" }],
+      "each raise is recorded on its verdict, and a refused one records nothing");
+  } finally { h.cleanup(); }
+});
+
+test("at the max gate level a reviewer is told to rerun the Result's Verified by commands; below it, to rerun nothing", async () => {
+  for (const gateLevel of ["high", "max"] as const) {
+    const h = harness({ routing: ROUTING, subagents: { gateLevel } });
+    try {
+      const provider = anthropic();
+      const tools = loadSubagents([routerExtension(), provider.extension]);
+      const ctx = orchestrator(h);
+      const implementer = await one(tools, ctx, { task: `[elevated] ${WRITE_NOTES}` });
+      const reviewer = await one(tools, ctx, { task: "Check it", review: implementer.sessionId });
+      assert.equal(reviewer.status, "completed", JSON.stringify(reviewer));
+      const prompt = provider.requests.find((request) => request.sessionId === reviewer.sessionId)!.systemPrompt;
+      assert.ok(prompt.includes(reviewRules(gateLevel)), prompt);
+      assert.equal(prompt.includes("Rerun every command in its Verified by section"), gateLevel === "max", gateLevel);
+      assert.equal(prompt.includes("Rerun nothing"), gateLevel !== "max", gateLevel);
+    } finally { h.cleanup(); }
   }
 });

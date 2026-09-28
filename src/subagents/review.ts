@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { parseSessionEntries, SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { RiskTier } from "../routing/classifier.ts";
-import type { EditRecord, ForkRecord, RoutingRecord } from "../routing/decision-record.ts";
+import type { EditRecord, ForkRecord, GateLevel, RoutingRecord } from "../routing/decision-record.ts";
 import type { ConstraintRung } from "../routing/tier-router.ts";
 import { delegationRouting, editingDelegationProblem, isRunningDelegation } from "./quality-gate.ts";
 import { readWorkerOutcome } from "./resume.ts";
@@ -19,7 +19,9 @@ import { workerSessionDir } from "./worker.ts";
 // off no other rung can be chosen, so the reviewer runs on that rung with its
 // fresh context: a same-rung review, which its saved outcome and the verdict
 // it backs record (owner decision 2026-09-28). A reviewer's editing calls are
-// denied (./editing.ts), so it never becomes an editing delegation.
+// denied (./editing.ts), so it never becomes an editing delegation. Its review
+// rules follow the gate level in force when it starts (./gate-level.ts): at
+// max it reruns the Result's Verified by commands (ADR 0011).
 //
 // Where the facts come from: the tier and rung from the delegation's latest
 // decision, fork or agent-model record (./quality-gate.ts), else its rung from
@@ -68,17 +70,27 @@ export interface ReviewTarget {
   readonly material: ReviewMaterial;
 }
 
-/** Appended to a reviewer's system prompt after the reporting rules, with the reviewed delegation after it. */
-export const REVIEW_RULES = `# Review rules
+/** Below the max gate level a reviewer reruns nothing unless told to. */
+const RERUN_NOTHING = "- Rerun nothing, no build, test or command from its Verified by section, unless your task tells you to.";
+
+/** At the max gate level every reviewer reruns the Result's Verified by commands (ADR 0011). */
+const RERUN_VERIFIED_BY = "- Rerun every command in its Verified by section, as it names them, and say in your Result what each one gave: " +
+  "the max gate level asks every reviewer to. A command that would edit is denied: name it under Could not check.";
+
+/** The review rules at the gate level `level`, appended to a reviewer's
+ *  system prompt after the reporting rules, with the reviewed delegation after them. */
+export function reviewRules(level: GateLevel): string {
+  return `# Review rules
 
 You are a reviewer: an independent check of another worker's finished delegation. The orchestrator judges that delegation by your Result. Its task, its Result and the files it changed follow below.
 
 - Check the change itself against the delegation's task: read the changed files and the diff (git status, git diff). Its Result is the worker's account, not evidence: check each claim that matters.
-- Rerun nothing, no build, test or command from its Verified by section, unless your task tells you to.
+${level === "max" ? RERUN_VERIFIED_BY : RERUN_NOTHING}
 - Change nothing: your editing calls are denied. Name what falls short instead of fixing it.
 - Answer accept or request changes, with the reasons. For request changes, name each shortfall with its file:line and what the task asked for.
 
 Start your Confirmed section with your answer on a line of its own, "Answer: accept" or "Answer: request changes", then write your Result sections as the reporting rules say.`;
+}
 
 interface MessageLike {
   readonly role?: string;
@@ -190,8 +202,8 @@ export function reviewTarget(ctx: Pick<ExtensionContext, "cwd" | "sessionManager
   };
 }
 
-/** The review rules and the reviewed delegation, for the reviewer's system prompt. */
-export function reviewerPrompt(target: ReviewTarget): string {
+/** The review rules at the gate level `level` and the reviewed delegation, for the reviewer's system prompt. */
+export function reviewerPrompt(target: ReviewTarget, level: GateLevel): string {
   const { delegationId, tier, material } = target;
   const [task, ...later] = material.tasks;
   const files = material.files === undefined
@@ -199,7 +211,7 @@ export function reviewerPrompt(target: ReviewTarget): string {
     : `Files its edit and write calls named: ${material.files.length === 0 ? "none" : material.files.join(", ")}. ` +
       "Changes it made through bash, ctx_execute or a worker it started are not listed: check git status and git diff.";
   return [
-    REVIEW_RULES,
+    reviewRules(level),
     "# The reviewed delegation",
     `Delegation ${delegationId}, ${tier === undefined ? "without a tier, so it is gated as elevated" : `routed at the ${tier} tier`}. ` +
       (material.sessionFile === undefined ? "Its session was not saved." : `Its saved session, with the whole transcript: ${material.sessionFile}`),

@@ -21,13 +21,15 @@ import { agentLabel, startWorkerWidget, type WorkerWidget } from "./worker-widge
 import { findWorker, pickWorker, workerListing } from "./worker-picker.ts";
 import { openTranscript } from "./transcript-view.ts";
 import { isWorkerSession } from "./worker-sessions.ts";
+import { isOrchestratorSession } from "./orchestrator-session.ts";
 import { addOrchestratorProtocol } from "./orchestrator-protocol.ts";
 import { registerCommitGate } from "./commit-gate.ts";
 import { registerExplorationBudget } from "./exploration-budget.ts";
 import { registerSubagentsVerdictTool } from "./verdict.ts";
+import { registerGateLevel } from "./gate-level.ts";
 import { reviewerPrompt, reviewTarget, servedOnRung, type ReviewTarget } from "./review.ts";
 import { retrySetup, startRetry, type RetrySetup, type StartedRetry } from "./retry.ts";
-import { delegationRouting, gateAction } from "./quality-gate.ts";
+import { delegationRouting, gateAction, type GateLevel } from "./quality-gate.ts";
 import { readRoutingRecords, type RoutingRecord } from "../routing/decision-record.ts";
 import { stateDir } from "../router/extension.ts";
 
@@ -45,9 +47,10 @@ import { stateDir } from "../router/extension.ts";
 // A worker that edits leaves an edit record (editing.ts), its Result asks for
 // a verdict, and the orchestrator records one with subagents_verdict (verdict.ts).
 // An item with `review` starts an independent reviewer for a finished editing
-// delegation (review.ts), which an elevated, critical or tierless one needs
-// before its verdict (quality-gate.ts). An item with `retry` retries a
-// delegation whose changes were requested on the effort ladder's next rung (retry.ts).
+// delegation (review.ts), which one whose gate action is a reviewer needs
+// before its verdict (quality-gate.ts, at the gate level of gate-level.ts).
+// An item with `retry` retries a delegation whose changes were requested on
+// the effort ladder's next rung (retry.ts).
 
 type ToolParameters = Parameters<ExtensionAPI["registerTool"]>[0]["parameters"];
 
@@ -160,24 +163,25 @@ export interface SubagentsProgressDetails {
 /** The line that asks the orchestrator for a verdict on an editing delegation (ADR 0010). */
 const EDITED_NOTE = "This delegation edited. Judge its Result, then record a verdict with subagents_verdict.";
 
-/** EDITED_NOTE's counterpart for a delegation whose gate action is a reviewer (quality-gate.ts). */
-function reviewerNote(id: string, records: readonly RoutingRecord[]): string {
-  const { tier } = delegationRouting(records, id);
-  return `This delegation edited and is ${tier ?? "without a tier, so it is gated as elevated"}: it needs an independent reviewer. ` +
-    `Start one with a subagents item whose review is ${id}, judge the reviewer's Result, then record a verdict with subagents_verdict naming it as reviewer.`;
-}
-
-/** The note an editing delegation's Result gets: a reviewer's note where its
- *  gate action is a reviewer, else EDITED_NOTE, also when the records cannot be read. */
-function editedNote(id: string): string {
+/** The note an editing delegation's Result gets at the gate level `level`,
+ *  by its gate action (quality-gate.ts): EDITED_NOTE for a spot check, and
+ *  also when the records cannot be read. */
+function editedNote(id: string, level: GateLevel): string {
   let records: RoutingRecord[];
   try { records = readRoutingRecords(join(stateDir(), "routing")); } catch { return EDITED_NOTE; }
-  return gateAction(delegationRouting(records, id).tier) === "reviewer" ? reviewerNote(id, records) : EDITED_NOTE;
+  const { tier } = delegationRouting(records, id);
+  switch (gateAction(tier, level)) {
+    case "none": return `This delegation edited. At the ${level} gate level a ${tier} delegation needs no verdict: it is ungated. ` +
+      "You may still judge its Result and record a verdict with subagents_verdict.";
+    case "spot-check": return EDITED_NOTE;
+    case "reviewer": return `This delegation edited and is ${tier ?? "without a tier, so it is gated as elevated"}: at the ${level} gate level it needs an independent reviewer. ` +
+      `Start one with a subagents item whose review is ${id}, judge the reviewer's Result, then record a verdict with subagents_verdict naming it as reviewer.`;
+  }
 }
 
-/** One item's text in the tool result. `forOrchestrator` is false in a
+/** One item's text in the tool result, at the gate level `level`. `forOrchestrator` is false in a
  *  worker's own call, whose workers' edits count for the worker's delegation. */
-function resultText(result: SubagentResult, forOrchestrator: boolean): string {
+function resultText(result: SubagentResult, forOrchestrator: boolean, level: GateLevel): string {
   if (result.status === "not-started") return `Worker not started: ${result.task}`;
   if (result.sessionId === undefined) return `No worker started: ${result.error}`;
   const outcome = result.status === "completed" ? "completed." : `${result.status}${result.error ? `: ${result.error}` : "."}`;
@@ -185,7 +189,7 @@ function resultText(result: SubagentResult, forOrchestrator: boolean): string {
     `Worker ${result.sessionId} ${outcome}`,
     `Session file: ${result.sessionFile ?? "none, the session was not saved"}`,
     ...(result.climb === undefined ? [] : [result.climb]),
-    ...(result.edited && forOrchestrator ? [editedNote(result.sessionId)] : []),
+    ...(result.edited && forOrchestrator ? [editedNote(result.sessionId, level)] : []),
     "",
     result.finalText,
     // The runtime's Result check (ADR 0010) annotates and never rejects.
@@ -257,6 +261,8 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
       logged.add(line);
       process.stderr.write(`pi-orchestrator subagents: ${line}\n`);
     };
+    // The gate level in force, and `/pi-orchestrator gate` to set it for the session (gate-level.ts).
+    const gateLevels = registerGateLevel(pi, logOnce);
     const backgroundCalls = new BackgroundCalls(({ text, details }, startTurn) => pi.sendMessage(
       { customType: COMPLETION_NOTICE, content: text, display: true, details },
       startTurn ? { triggerTurn: true, deliverAs: "followUp" } : { triggerTurn: false },
@@ -494,7 +500,8 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
             const reviewStartedAt = new Date().toISOString();
             // The Result is cut as the tool result cuts it; the reviewer can read the whole of it in the saved session.
             const reviewing = target === undefined ? undefined : { delegationId: target.delegationId,
-              prompt: reviewerPrompt({ ...target, material: { ...target.material, result: cutText(target.material.result, target.material.sessionFile) } }) };
+              prompt: reviewerPrompt({ ...target, material: { ...target.material, result: cutText(target.material.result, target.material.sessionFile) } },
+                gateLevels.inForce(ctx).level) };
             const worker = await runWorker({
               task: retried?.task ?? task, cwd: ctx.cwd, agentDir, orchestratorSession: ctx.sessionManager, signal: itemSignals[index],
               ...(climb !== undefined ? { sessionId: climb.delegationId } : backgroundCall === undefined ? {} : { sessionId: backgroundCall.delegationIds[index]! }),
@@ -530,7 +537,8 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
             }
           }
           const details: SubagentsDetails = { results };
-          return { text: results.map((result) => resultText(result, parentDelegationId === undefined)).join("\n\n"), details };
+          const level = gateLevels.inForce(ctx).level;
+          return { text: results.map((result) => resultText(result, parentDelegationId === undefined, level)).join("\n\n"), details };
         };
         if (backgroundCall) {
           backgroundCall.finish(finishCall());
@@ -615,7 +623,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
       },
     });
     registerSubagentsStatusTool(pi, backgroundCalls);
-    registerSubagentsVerdictTool(pi);
+    registerSubagentsVerdictTool(pi, gateLevels);
     pi.on("session_shutdown", () => {
       // First, so the workers stopped below never reach the ending session's UI.
       stopDownEntry?.();
@@ -652,9 +660,11 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
     // The exploration budget holds the orchestrator to delegating research (exploration-budget.ts).
     const explorationBudget = registerExplorationBudget(pi, logOnce);
     // Unjudged edits hold back the orchestrator's git commit and git push, and a turn end names them (commit-gate.ts).
-    registerCommitGate(pi, logOnce);
+    registerCommitGate(pi, logOnce, gateLevels);
     // The orchestrator protocol joins the orchestrator's system prompt as each user prompt starts its agent loop.
-    pi.on("before_agent_start", (event, ctx) => { addOrchestratorProtocol(event, ctx, explorationBudget.threshold); });
+    pi.on("before_agent_start", (event, ctx) => {
+      if (isOrchestratorSession(ctx)) addOrchestratorProtocol(event, ctx, explorationBudget.threshold, gateLevels.inForce(ctx).level);
+    });
   };
 }
 

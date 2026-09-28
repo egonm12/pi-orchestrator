@@ -14,10 +14,11 @@
 //      off, or switched off by an error), its edit record. An unknown id
 //      appends an `orphaned-verdict` record. Both go into the day file of the
 //      verdict's own timestamp. The orchestrator's `subagents_verdict`
-//      (../subagents/verdict.ts) passes its reason on, and whether the verdict
-//      rests on a same-rung review. A retry's effort-ladder record is its link
-//      to the failed attempt: the verdict attaches to it only when the retry
-//      has no decision record, as with routing off.
+//      (../subagents/verdict.ts) passes its reason on, whether the verdict
+//      rests on a same-rung review, and any gate level raise it made. A
+//      retry's effort-ladder record is its link to the failed attempt: the
+//      verdict attaches to it only when the retry has no decision record, as
+//      with routing off.
 //   3. Learning data. An `accept` or `request_changes` attached to a decision
 //      that chose a rung is also recorded in ticket 08's observation ledger as
 //      a `verified-task-outcome`: taskType is the classifier's kind of work,
@@ -46,6 +47,7 @@ import {
   type AgentModelRecord,
   type EditRecord,
   type ForkRecord,
+  type GateLevelRaise,
   type RoutedDecisionRecord,
   type RoutingRecord,
   type Verdict,
@@ -104,6 +106,8 @@ export interface AttachVerdictInput {
   readonly reason?: string;
   /** The verdict rests on a same-rung review (ADR 0010); an attached verdict records it. */
   readonly sameRungReview?: boolean;
+  /** The orchestrator raised the gate level for this delegation (ADR 0011); an attached verdict records it. */
+  readonly gateLevelRaise?: GateLevelRaise;
   /** Defaults to now. */
   readonly at?: Date;
   /** Ticket 08's refresh state file holding the observation ledger. */
@@ -174,6 +178,7 @@ export function attachVerdict(input: AttachVerdictInput): AttachVerdictOutcome {
     decisionFile: latest.file,
     ...(input.reason === undefined ? {} : { reason: input.reason }),
     ...(input.sameRungReview === true ? { sameRungReview: true } : {}),
+    ...(input.gateLevelRaise === undefined ? {} : { gateLevelRaise: input.gateLevelRaise }),
   });
   // Only a routing decision teaches the router: a fork, an agent's named model
   // and an unrouted worker chose no rung.

@@ -4,7 +4,7 @@ import { subagentsSettingsFromSettings } from "./settings.ts";
 
 test("without personal settings the defaults apply and allowProjectOverrides is off", () => {
   assert.deepEqual(subagentsSettingsFromSettings({}), {
-    settings: { maxParallel: 4, maxBackgroundWorkers: 8, agentDefinitionModel: { use: "route", allowBanned: false }, explorationBudget: 3 },
+    settings: { maxParallel: 4, maxBackgroundWorkers: 8, agentDefinitionModel: { use: "route", allowBanned: false }, explorationBudget: 3, gateLevel: "medium" },
     allowProjectOverrides: false,
     ignoredProjectKeys: [],
   });
@@ -14,7 +14,7 @@ test("with allowProjectOverrides a project key replaces the personal value and t
   const personal = { orchestrator: { subagents: { allowProjectOverrides: true, maxParallel: 3, agentDefinitionModel: { use: "preserve" } } } };
   const project = { orchestrator: { subagents: { maxParallel: 6, allowProjectOverrides: false } } };
   assert.deepEqual(subagentsSettingsFromSettings(personal, project), {
-    settings: { maxParallel: 6, maxBackgroundWorkers: 8, agentDefinitionModel: { use: "preserve", allowBanned: false }, explorationBudget: 3 },
+    settings: { maxParallel: 6, maxBackgroundWorkers: 8, agentDefinitionModel: { use: "preserve", allowBanned: false }, explorationBudget: 3, gateLevel: "medium" },
     allowProjectOverrides: true,
     ignoredProjectKeys: ["orchestrator.subagents.allowProjectOverrides"],
   });
@@ -61,5 +61,16 @@ test("explorationBudget defaults to 3, takes a positive integer, and a project m
   assert.equal(subagentsSettingsFromSettings({ orchestrator: { subagents: { allowProjectOverrides: true } } }, project).settings.explorationBudget, 20);
   for (const value of [0, 2.5, "3", -1]) {
     assert.throws(() => subagentsSettingsFromSettings({ orchestrator: { subagents: { explorationBudget: value } } }), /explorationBudget must be a positive integer/);
+  }
+});
+
+test("gateLevel defaults to medium, takes low, medium, high or max, and a project may replace it only with allowProjectOverrides", () => {
+  assert.equal(subagentsSettingsFromSettings({ orchestrator: { subagents: { gateLevel: "high" } } }).settings.gateLevel, "high");
+  const project = { orchestrator: { subagents: { gateLevel: "low" } } };
+  assert.equal(subagentsSettingsFromSettings({ orchestrator: { subagents: { gateLevel: "max" } } }, project).settings.gateLevel, "max");
+  assert.deepEqual(subagentsSettingsFromSettings({}, project).ignoredProjectKeys, ["orchestrator.subagents.gateLevel"]);
+  assert.equal(subagentsSettingsFromSettings({ orchestrator: { subagents: { allowProjectOverrides: true, gateLevel: "max" } } }, project).settings.gateLevel, "low");
+  for (const value of ["strict", "Medium", 2]) {
+    assert.throws(() => subagentsSettingsFromSettings({ orchestrator: { subagents: { gateLevel: value } } }), /gateLevel must be low, medium, high or max/);
   }
 });

@@ -367,6 +367,25 @@ test("a verdict record may say it rests on a same-rung review, and nothing else 
   assert.throws(() => validateRoutingRecord({ ...verdict, sameRungReview: false }), /field 'sameRungReview' must be true when present/);
 });
 
+test("a verdict record may name a gate level raise for its delegation: from a level to a higher one, with a reason bounded like other free text", async () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    const verdict = { recordType: "verdict", schemaVersion: DECISION_RECORD_SCHEMA_VERSION, delegationId: "worker-1", timestamp: NOW.toISOString(),
+      verdict: "accept", decisionFile: "2026-09-25.jsonl", gateLevelRaise: { from: "medium", to: "max", reason: "touches the auth flow" } } as const;
+    assert.deepEqual(validateRoutingRecord(verdict), verdict);
+    appendRoutingRecord(dir, { ...verdict, gateLevelRaise: { ...verdict.gateLevelRaise, reason: `token=abc123 ${"x".repeat(2 * FREE_TEXT_LIMIT)}` } });
+    const reason = (readRoutingRecords(dir)[0] as { gateLevelRaise?: { reason: string } }).gateLevelRaise?.reason ?? "";
+    assert.ok(reason.startsWith("token=[redacted] x"), reason);
+    assert.equal(reason.length, FREE_TEXT_LIMIT);
+    const raise = (change: Record<string, unknown>) => ({ ...verdict, gateLevelRaise: { ...verdict.gateLevelRaise, ...change } });
+    assert.throws(() => validateRoutingRecord(raise({ to: "medium" })), /field 'gateLevelRaise.to' must be a higher gate level than medium/);
+    assert.throws(() => validateRoutingRecord(raise({ to: "low" })), /field 'gateLevelRaise.to' must be a higher gate level than medium/);
+    assert.throws(() => validateRoutingRecord(raise({ from: "strict" })), /field 'gateLevelRaise.from' must be one of low, medium, high, max/);
+    assert.throws(() => validateRoutingRecord(raise({ reason: " " })), /field 'gateLevelRaise.reason'/);
+    assert.throws(() => validateRoutingRecord(raise({ by: "owner" })), /field 'gateLevelRaise.by' is not a known field/);
+  } finally { cleanup(); }
+});
+
 test("an explicit record with a missing or an unknown field fails validation on write and on read, naming the field", async () => {
   const { dir, cleanup } = tempDir();
   try {

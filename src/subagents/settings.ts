@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { personalOrchestrator, readSettingsFile } from "../policy/ban-lists.ts";
+import { GATE_LEVELS, type GateLevel } from "../routing/decision-record.ts";
 
 // The subagents extension's settings (ADR 0007), under `orchestrator.subagents`
 // in personal settings. `allowProjectOverrides` is read from personal settings
@@ -21,6 +22,8 @@ export interface SubagentsSettings {
   };
   /** Exploratory calls the orchestrator may make per user prompt before the next is denied (ADR 0005). */
   readonly explorationBudget: number;
+  /** How strictly the quality gate treats each tier (ADR 0011); the owner's floor. */
+  readonly gateLevel: GateLevel;
 }
 
 export interface LoadedSubagentsSettings {
@@ -36,6 +39,8 @@ export interface LoadedSubagentsSettings {
 const SUBAGENTS_KEY = "orchestrator.subagents";
 /** `explorationBudget` when the owner sets none. */
 export const DEFAULT_EXPLORATION_BUDGET = 3;
+/** `gateLevel` when the owner sets none (ADR 0011). */
+export const DEFAULT_GATE_LEVEL: GateLevel = "medium";
 const FLAG = "allowProjectOverrides";
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -85,6 +90,8 @@ export function subagentsSettingsFromSettings(personal: unknown, project?: unkno
   if (typeof explorationBudget !== "number" || !Number.isInteger(explorationBudget) || explorationBudget < 1) {
     throw new Error(`${SUBAGENTS_KEY}.explorationBudget must be a positive integer`);
   }
+  const gateLevel = options.gateLevel ?? DEFAULT_GATE_LEVEL;
+  if (!GATE_LEVELS.includes(gateLevel as GateLevel)) throw new Error(`${SUBAGENTS_KEY}.gateLevel must be ${GATE_LEVELS.slice(0, -1).join(", ")} or ${GATE_LEVELS.at(-1)}`);
   const agentDefinitionModel = options.agentDefinitionModel;
   if (agentDefinitionModel !== undefined && !isPlainObject(agentDefinitionModel)) {
     throw new Error(`${SUBAGENTS_KEY}.agentDefinitionModel must be an object`);
@@ -95,7 +102,7 @@ export function subagentsSettingsFromSettings(personal: unknown, project?: unkno
   if (typeof allowBanned !== "boolean") throw new Error(`${SUBAGENTS_KEY}.agentDefinitionModel.allowBanned must be a boolean`);
 
   return {
-    settings: { maxParallel: Math.min(maxParallel, 8), maxBackgroundWorkers, agentDefinitionModel: { use, allowBanned }, explorationBudget },
+    settings: { maxParallel: Math.min(maxParallel, 8), maxBackgroundWorkers, agentDefinitionModel: { use, allowBanned }, explorationBudget, gateLevel: gateLevel as GateLevel },
     allowProjectOverrides,
     ignoredProjectKeys,
   };

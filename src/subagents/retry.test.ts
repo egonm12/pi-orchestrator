@@ -491,7 +491,7 @@ test("the orchestrator's session publishes its router for retries, and its end u
 });
 
 test("the protocol describes retries: how to start one, what it gets, what it excludes and when to take the task back to the user", () => {
-  const paragraph = orchestratorProtocol(3).split("\n\n").find((text) => text.includes("`retry`"));
+  const paragraph = orchestratorProtocol(3, "medium").split("\n\n").find((text) => text.includes("`retry`"));
   assert.ok(paragraph);
   for (const phrase of ["request_changes", "next rung", "`retry`", "feedback", "new delegation", "original task", "own verdict",
     "`agent`, `fork`, `resume` or `review`", "latest verdict is request_changes", "at most twice", "retry of a retry", "exhausted", "back to the user"]) {
