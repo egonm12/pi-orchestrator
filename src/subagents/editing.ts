@@ -15,8 +15,8 @@ import { classifyToolCall } from "./tool-call-kind.ts";
 // and each extension gets a fresh module copy, so the running delegations are
 // kept on the process's global object, as worker-sessions.ts keeps its marks.
 
-/** Tools that run whatever code they are given. The exploration budget counts
- *  them as exploratory (ADR 0005); in a worker they may edit (owner decision
+/** Tools that run whatever code they are given. The exploration nudge counts
+ *  them as exploratory (ADR 0013); in a worker they may edit (owner decision
  *  2026-09-28). */
 const ARBITRARY_CODE_TOOLS = new Set(["ctx_execute", "ctx_execute_file"]);
 

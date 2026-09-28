@@ -17,7 +17,7 @@ test("edit, write, and bash that is neither read-only nor a build or test run ar
   ]), Array(10).fill(true));
 });
 
-test("ctx_execute and ctx_execute_file are editing, although the exploration budget counts them as exploratory", () => {
+test("ctx_execute and ctx_execute_file are editing, although the exploration nudge counts them as exploratory", () => {
   assert.deepEqual(editing([["ctx_execute", { language: "shell", code: "ls" }], ["ctx_execute_file", { path: "a.log", code: "x" }]]), [true, true]);
 });
 

@@ -20,8 +20,8 @@ export interface SubagentsSettings {
     /** Under "preserve", a definition-named model may be on the subagent ban list (ADR 0002 follow-up). */
     readonly allowBanned: boolean;
   };
-  /** Exploratory calls the orchestrator may make per user prompt before the next is denied (ADR 0005). */
-  readonly explorationBudget: number;
+  /** Exploratory calls the orchestrator makes per user prompt before each further one carries the exploration nudge (ADR 0013). */
+  readonly explorationNudge: number;
   /** How strictly the quality gate treats each tier (ADR 0011); the owner's floor. */
   readonly gateLevel: GateLevel;
 }
@@ -37,8 +37,8 @@ export interface LoadedSubagentsSettings {
 }
 
 const SUBAGENTS_KEY = "orchestrator.subagents";
-/** `explorationBudget` when the owner sets none. */
-export const DEFAULT_EXPLORATION_BUDGET = 3;
+/** `explorationNudge` when the owner sets none. */
+export const DEFAULT_EXPLORATION_NUDGE = 3;
 /** `gateLevel` when the owner sets none (ADR 0011). */
 export const DEFAULT_GATE_LEVEL: GateLevel = "medium";
 const FLAG = "allowProjectOverrides";
@@ -86,9 +86,11 @@ export function subagentsSettingsFromSettings(personal: unknown, project?: unkno
   if (typeof maxBackgroundWorkers !== "number" || !Number.isInteger(maxBackgroundWorkers) || maxBackgroundWorkers < 1) {
     throw new Error(`${SUBAGENTS_KEY}.maxBackgroundWorkers must be a positive integer`);
   }
-  const explorationBudget = options.explorationBudget ?? DEFAULT_EXPLORATION_BUDGET;
-  if (typeof explorationBudget !== "number" || !Number.isInteger(explorationBudget) || explorationBudget < 1) {
-    throw new Error(`${SUBAGENTS_KEY}.explorationBudget must be a positive integer`);
+  // `explorationBudget` is the key's name from before ADR 0013; it still counts when `explorationNudge` is absent.
+  const nudgeKey = options.explorationNudge === undefined && options.explorationBudget !== undefined ? "explorationBudget" : "explorationNudge";
+  const explorationNudge = options[nudgeKey] ?? DEFAULT_EXPLORATION_NUDGE;
+  if (typeof explorationNudge !== "number" || !Number.isInteger(explorationNudge) || explorationNudge < 1) {
+    throw new Error(`${SUBAGENTS_KEY}.${nudgeKey} must be a positive integer`);
   }
   const gateLevel = options.gateLevel ?? DEFAULT_GATE_LEVEL;
   if (!GATE_LEVELS.includes(gateLevel as GateLevel)) throw new Error(`${SUBAGENTS_KEY}.gateLevel must be ${GATE_LEVELS.slice(0, -1).join(", ")} or ${GATE_LEVELS.at(-1)}`);
@@ -102,7 +104,7 @@ export function subagentsSettingsFromSettings(personal: unknown, project?: unkno
   if (typeof allowBanned !== "boolean") throw new Error(`${SUBAGENTS_KEY}.agentDefinitionModel.allowBanned must be a boolean`);
 
   return {
-    settings: { maxParallel: Math.min(maxParallel, 8), maxBackgroundWorkers, agentDefinitionModel: { use, allowBanned }, explorationBudget, gateLevel: gateLevel as GateLevel },
+    settings: { maxParallel: Math.min(maxParallel, 8), maxBackgroundWorkers, agentDefinitionModel: { use, allowBanned }, explorationNudge, gateLevel: gateLevel as GateLevel },
     allowProjectOverrides,
     ignoredProjectKeys,
   };

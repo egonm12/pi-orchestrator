@@ -2,7 +2,7 @@
 
 A [pi](https://pi.dev) package with three extensions for sessions that delegate work to workers:
 
-- **Subagents**: the built-in `subagents` tool. It starts workers in the orchestrator's own process, on the auto model `orchestrator/auto`, and gives the orchestrator's own session the orchestrator protocol, the exploration budget, the `subagents_verdict` tool and a block on git commit and git push while edits wait for a verdict.
+- **Subagents**: the built-in `subagents` tool. It starts workers in the orchestrator's own process, on the auto model `orchestrator/auto`, and gives the orchestrator's own session the orchestrator protocol, the exploration nudge, the `subagents_verdict` tool and a block on git commit and git push while edits wait for a verdict.
 - **Router extension**: serves the auto model `orchestrator/auto`. It classifies a worker's first request into a tier and routes it to a rung from your tier map.
 - **Guard**: enforces a personal subagent ban list for workers and an optional session ban list for the orchestrator.
 
@@ -38,7 +38,7 @@ Run `/pi-orchestrator init` in an interactive session. It:
 
 Review the written map in `~/.pi/agent/settings.json`, then start a new session. Workers started through the built-in `subagents` tool always run on `orchestrator/auto` already; nothing else needs setting up for them.
 
-`/pi-orchestrator` takes a subcommand as its first word: `init` comes with the router extension, `budget` and `gate` with the subagents extension (see Exploration budget and Gate level below). With one of them switched off, its subcommands are gone and the other's stay. Without a subcommand, or with one it does not know, it prints the usage with every subcommand.
+`/pi-orchestrator` takes a subcommand as its first word: `init` comes with the router extension, `gate` with the subagents extension (see Gate level below). With one of them switched off, its subcommands are gone and the other's stay. Without a subcommand, or with one it does not know, it prints the usage with every subcommand.
 
 ## Subagents tool
 
@@ -95,8 +95,8 @@ When a worker other than a fork completes, the runtime checks its Result's secti
 A delegation that edited needs the orchestrator's verdict, unless the gate level leaves it ungated (see Gate level below). It edited when its worker, or a worker it started (see Nested delegation below), ran one of these calls:
 
 - `edit` or `write`;
-- `bash` that is neither a read-only search nor a build or test run, as the exploration budget classifies it (see Exploration budget below): unrecognised commands, redirects into a file, and version-control actions such as `git commit` or `git checkout` all count; so does `powershell`;
-- `ctx_execute` or `ctx_execute_file`, which run whatever code they are given, although the budget counts them as exploratory.
+- `bash` that is neither a read-only search nor a build or test run, as the exploration nudge classifies it (see Exploration nudge below): unrecognised commands, redirects into a file, and version-control actions such as `git commit` or `git checkout` all count; so does `powershell`;
+- `ctx_execute` or `ctx_execute_file`, which run whatever code they are given, although the exploration nudge counts them as exploratory.
 
 Only a call that ran counts: one a `tool_call` hook blocked, or one for a tool the worker does not have, edited nothing. Other tools, `mcp` and `ctx_batch_execute` included, do not count.
 
@@ -224,16 +224,16 @@ One task may climb at most twice, including a retry of a retry or two retries of
 
 ### Orchestrator protocol
 
-The orchestrator's own session carries the orchestrator protocol as the `orchestrator_protocol` section of its system prompt: delegate exploration and substantial work to workers, keep small known actions (a single lookup, a small edit, a build or test run, a commit), stay within the exploration budget, which it names with the configured threshold, treat a worker's Result as evidence to check before acting on it, judge each editing delegation's Result and record the verdict with `subagents_verdict`, since its git commit and git push wait for every verdict that is needed (see Verdicts above), follow the gate level in force, which it names with what each tier needs and how to raise it for one delegation (see Gate level above), and start a reviewer where the level calls for one and name it in the verdict (see Reviewers above). After `request_changes`, it can retry the delegation with feedback on the effort ladder, at most twice; when refused, it takes the task back to the user (see Retries above). The text lives in `src/subagents/orchestrator-protocol.ts`. The section is added when each user prompt starts its agent loop, so it holds for every turn of that loop and returns after a compaction. There is no per-prompt reminder line. Workers, forked workers and sessions in a pi-subagents child process never get it; a fork's copied conversation holds the orchestrator's section, and pi removes it from the fork's own prompt.
+The orchestrator's own session carries the orchestrator protocol as the `orchestrator_protocol` section of its system prompt: delegate exploration and substantial work to workers, keep small known actions (a single lookup, a small edit, a build or test run, a commit), expect no exploratory call to be denied, and hand the rest of the research to a worker once the exploration nudge appears after the configured threshold, which it names, treat a worker's Result as evidence to check before acting on it, judge each editing delegation's Result and record the verdict with `subagents_verdict`, since its git commit and git push wait for every verdict that is needed (see Verdicts above), follow the gate level in force, which it names with what each tier needs and how to raise it for one delegation (see Gate level above), and start a reviewer where the level calls for one and name it in the verdict (see Reviewers above). After `request_changes`, it can retry the delegation with feedback on the effort ladder, at most twice; when refused, it takes the task back to the user (see Retries above). The text lives in `src/subagents/orchestrator-protocol.ts`. The section is added when each user prompt starts its agent loop, so it holds for every turn of that loop and returns after a compaction. There is no per-prompt reminder line. Workers, forked workers and sessions in a pi-subagents child process never get it; a fork's copied conversation holds the orchestrator's section, and pi removes it from the fork's own prompt.
 
 A run that a message starts without a user prompt, such as a background call's completion notice or a worker's question, has the protocol for its first turn only: pi rebuilds the prompt of its later turns without the section, until the next user prompt adds it again.
 
-### Exploration budget
+### Exploration nudge
 
-The orchestrator's own session may make `orchestrator.subagents.explorationBudget` exploratory calls (default 3) per user prompt. The next one is denied, and the model gets the reason as the call's result:
+No exploratory call of the orchestrator's own session is ever denied (ADR 0013). After `orchestrator.subagents.explorationNudge` exploratory calls (default 3) in one user prompt, each further exploratory call still runs, and its result ends with an exploration nudge that counts the calls so far. The 4th call's result ends with:
 
 ```text
-pi-orchestrator: 3 exploratory calls this prompt. Hand the rest of the research to a worker with `subagents`.
+4 exploratory calls this prompt: consider handing the rest to a worker.
 ```
 
 - **Exploratory:** `read`, pi's `grep`, `find` and `ls` tools, `web_search`, `fetch_content`, `get_search_content`, `source_check`, the `ctx_*` tools (`ctx_execute`, `ctx_execute_file`, `ctx_search`, `ctx_batch_execute`, `ctx_fetch_and_index`), `mcp` and `mcpScript`, and `bash` searches, listings and reads (`rg`, `grep`, `find`, `ls`, `cat`, `git log`, `git show`, `git diff` and similar). A spot check of a worker's Result counts like any other.
@@ -242,13 +242,11 @@ pi-orchestrator: 3 exploratory calls this prompt. Hand the rest of the research 
 
 A chained command (`&&`, `||`, `;`) is as strong as its strongest part: anything unrecognised, then a version-control action, then a search, then a build or test run. `cd src && rg foo` is a search, `git add -A && git commit -m x` a version-control action, and `rg foo && npm test` a search. A search that only filters a pipe adds nothing, so `npm test 2>&1 | tail -20` is a test run.
 
-`beans prime`, `beans show` and `beans list` are reads; any other `beans` command is unrecognised. A command run through `rtk` has the kind of the command it runs: its Claude Code hook, which pi-claude-hooks runs as a `tool_call` hook, rewrites the command in place, so `git show` can reach this package as `rtk git show` and `head -5 x` as `rtk read x --max-lines 5`. So `rtk read` is a read like `cat`, `rtk lint` is `eslint`, and `rtk test`, `rtk err`, `rtk summary` and `rtk proxy` take the command after them. The commit gate reads `rtk git commit` as a commit.
+`beans prime`, `beans show` and `beans list` are reads, after `beans`' own `--beans-path` and `--config` options and their values; any other `beans` command is unrecognised. A command run through `rtk` has the kind of the command it runs: its Claude Code hook, which pi-claude-hooks runs as a `tool_call` hook, rewrites the command in place, so `git show` can reach this package as `rtk git show` and `head -5 x` as `rtk read x --max-lines 5`. So `rtk read` is a read like `cat`, and `rtk lint` is `eslint`. `rtk err`, `rtk test`, `rtk summary` and `rtk proxy` are unrecognised, as `sh -c` is: the first three join their arguments and run them through a shell, and `proxy` splits a lone argument with spaces into a command, so `rtk err cat x ';' rm -rf src` removes `src`. rtk's hook never produces them. The commit gate reads `rtk git commit` as a commit, and sees through those four no better than through `sh -c`.
 
 The count starts again at each user prompt: each prompt the user sends, one typed while the orchestrator runs included. A run that a message starts, such as a background call's completion notice or a worker's question, goes on counting the last prompt's calls; so does a user message another extension sends. The threshold is read at the session's start and at each user prompt. A malformed setting keeps the default, and the failure is logged once to stderr.
 
-`/pi-orchestrator budget off` lifts the budget for one user prompt: while the orchestrator runs, for the rest of the current prompt; while it is idle, for the next user prompt, not for a run a message starts before it. pi runs the command at once, even while the orchestrator runs. The model cannot lift the budget: no tool does it, and nothing it writes is read as the command.
-
-The budget binds only the orchestrator's own session. Workers, forked workers and sessions in a pi-subagents child process are never budgeted. It comes with the subagents extension, because its deny sends the orchestrator to the `subagents` tool: switching that extension off drops the budget too.
+The nudge binds only the orchestrator's own session. Workers, forked workers and sessions in a pi-subagents child process are never nudged. It comes with the subagents extension, because it sends the orchestrator to the `subagents` tool: switching that extension off drops the nudge too.
 
 ### Status and wait
 
@@ -398,7 +396,7 @@ A worker may start workers of its own only when its agent definition lists `suba
       "maxParallel": 4,
       "maxBackgroundWorkers": 8,
       "agentDefinitionModel": { "use": "route", "allowBanned": false },
-      "explorationBudget": 3,
+      "explorationNudge": 3,
       "gateLevel": "medium",
       "allowProjectOverrides": false
     }
@@ -412,13 +410,13 @@ A worker may start workers of its own only when its agent definition lists `suba
 | `subagents.maxBackgroundWorkers` | At most this many background workers, queued or running, across the session's background calls; a background call that would exceed it is refused. Default 8 |
 | `subagents.agentDefinitionModel.use` | `"route"` (the default) ignores an agent definition's `model` and `thinking`, with one warning, and routes the worker as usual. `"preserve"` runs a worker whose definition names a model on that model and thinking, unrouted, and writes an agent-model record (delegation id, agent name, definition file, model, effort). A definition without a model is routed either way |
 | `subagents.agentDefinitionModel.allowBanned` | Default `false`. With `"preserve"`, a worker whose agent definition names a model on the subagent ban list runs on it; with `false`, that item fails before a worker starts. For a definition from the project's `.pi/agents/` this also needs `allowProjectOverrides` in personal settings. With that flag on, a project's `agentDefinitionModel` replaces the personal one, `allowBanned` included. When the exception lets a worker run, its agent-model record gets `banListException: true`, its item result gets `banListException: true`, and its line is marked `(ban-list exception)`. The guard and the router extension do not stop such a worker. Under `"route"`, a `true` value has no effect and warns once per session. Every other path still refuses a banned model: the tier map drops its rungs, and the guard refuses a tool call that names it |
-| `subagents.explorationBudget` | Exploratory calls the orchestrator's own session may make per user prompt before the next is denied (see Exploration budget above). A positive integer, default 3. Read at the session's start and at each user prompt |
+| `subagents.explorationNudge` | Exploratory calls the orchestrator's own session makes per user prompt before each further one's result carries the exploration nudge (see Exploration nudge above). A positive integer, default 3. Read at the session's start and at each user prompt. Without it, the old key `subagents.explorationBudget` is read in its place |
 | `subagents.gateLevel` | How strictly the quality gate treats each tier: `low`, `medium`, `high` or `max`, default `medium` (see Gate level above). `/pi-orchestrator gate <level>` replaces it for one session. Read each time the gate level is needed; a malformed value keeps the default, and the failure is logged once to stderr |
 | `subagents.allowProjectOverrides` | Personal settings only, default `false`. Lets a project's `.pi/settings.json` set every `orchestrator.subagents` key except this one. A project key replaces the personal value whole: a project's `agentDefinitionModel` replaces the personal object, it is not merged into it. Without the flag every project `orchestrator.subagents` key is ignored; with it, a project value for the flag itself is ignored. Each ignored key is logged once to stderr, as `pi-orchestrator subagents: ignored project settings key <key>`, the way the guard logs ignored ban-list keys |
 
 ## Settings
 
-pi-orchestrator settings live under the `orchestrator` key in personal settings, `${PI_CODING_AGENT_DIR:-~/.pi/agent}/settings.json`. The guard and the router extension read them at session start, so a change to their keys needs a new session. The subagents extension reads `orchestrator.subagents`, the subagent ban list and the agent definitions on every call, `orchestrator.subagents.explorationBudget` at the session's start and at each user prompt, and `orchestrator.subagents.gateLevel` each time the gate level is needed.
+pi-orchestrator settings live under the `orchestrator` key in personal settings, `${PI_CODING_AGENT_DIR:-~/.pi/agent}/settings.json`. The guard and the router extension read them at session start, so a change to their keys needs a new session. The subagents extension reads `orchestrator.subagents`, the subagent ban list and the agent definitions on every call, `orchestrator.subagents.explorationNudge` at the session's start and at each user prompt, and `orchestrator.subagents.gateLevel` each time the gate level is needed.
 
 ```json
 {
@@ -499,7 +497,7 @@ Decision records keep the first 200 characters of the task text, with credential
   { "packages": [{ "source": "git:github.com/egonm12/pi-orchestrator", "extensions": ["!src/router/extension.ts"] }] }
   ```
 
-  Use `!src/guard/extension.ts` to keep the router and drop the guard, or `!src/subagents/extension.ts` to drop only the built-in `subagents` tool, and with it the orchestrator protocol, the exploration budget, `/pi-orchestrator budget`, the gate level and `/pi-orchestrator gate`, `subagents_verdict` and the commit block on unjudged edits, and keep routing for other subagent extensions.
+  Use `!src/guard/extension.ts` to keep the router and drop the guard, or `!src/subagents/extension.ts` to drop only the built-in `subagents` tool, and with it the orchestrator protocol, the exploration nudge, the gate level and `/pi-orchestrator gate`, `subagents_verdict` and the commit block on unjudged edits, and keep routing for other subagent extensions.
 - **Everything, for one run**: `pi --no-extensions`.
 - **Uninstall**: `pi remove git:github.com/egonm12/pi-orchestrator`.
 

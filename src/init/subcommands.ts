@@ -6,7 +6,7 @@ import { INIT_COMMAND } from "./setup.ts";
 // that is not listed, prints the usage with every subcommand.
 //
 // Each pi-orchestrator extension adds its own subcommands (the router `init`,
-// the subagents extension `budget`), and any of them may be switched off.
+// the subagents extension `gate`), and any of them may be switched off.
 // pi would name a second `/pi-orchestrator` `/pi-orchestrator:2`, so exactly
 // one extension registers the command: the first to load hosts it, and the
 // others join it on the session's event bus. pi gives each session's

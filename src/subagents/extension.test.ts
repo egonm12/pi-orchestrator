@@ -222,7 +222,7 @@ function loadSubagents(workerExtensions: readonly InlineExtension[]): LoadedSuba
     on(event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) { handlers.set(event, [...handlers.get(event) ?? [], handler]); },
     sendMessage(message: SentMessage["message"], options: SentMessage["options"]) { messages.push({ message, options }); },
     getActiveTools: () => [...ORCHESTRATOR_TOOLS],
-    // As pi gives each session's extensions one bus: the gate and budget subcommands join one command.
+    // As pi gives each session's extensions one bus, on which pi-orchestrator's subcommands join one command.
     events: createEventBus(),
   } as unknown as ExtensionAPI);
   const emit = async (event: { type: string; reason?: string }, ctx: ExtensionContext) => {
@@ -2719,12 +2719,14 @@ test("no worker gets the protocol: not a routed worker, not one that delegates, 
   } finally { h.cleanup(); }
 });
 
-// The exploration budget (ADR 0005), in the orchestrator's real pi session:
-// the model's tool calls go through pi's tool_call hooks, the owner's
-// `/pi-orchestrator budget off` through pi's command handling.
+// The exploration nudge (ADR 0013), in the orchestrator's real pi session:
+// the model's tool calls go through pi's tool_call and tool_result hooks, and
+// the model sees what pi hands it as each call's result.
 
 const READ: ScriptedReply = { toolCall: { name: "read", arguments: { path: "README.md" } } };
-const BUDGET_DENIED = "pi-orchestrator: 3 exploratory calls this prompt. Hand the rest of the research to a worker with `subagents`.";
+/** The exploration nudge after `count` exploratory calls in one user prompt. */
+const nudge = (count: number) => `${count} exploratory calls this prompt: consider handing the rest to a worker.`;
+const NUDGE = /\d+ exploratory calls? this prompt: consider handing the rest to a worker\.$/;
 
 /** A scripted provider whose orchestrator follows `plan`, one reply per request, then says done; other sessions follow `worker`. */
 function plannedAnthropic(worker: (request: ScriptedRequest) => ScriptedReply = () => ({ text: "leaf done" })) {
@@ -2734,37 +2736,42 @@ function plannedAnthropic(worker: (request: ScriptedRequest) => ScriptedReply = 
   return { ...provider, plan, setOrchestrator: (id: string) => { orchestratorId = id; } };
 }
 
-/** The tool results of `session`'s messages from `from` on: the tool and, for a refused call, its reason. */
+/** The tool results of `session`'s messages from `from` on: the tool and, for a
+ *  refused call, its reason, or for one that ran, the exploration nudge its result ends with, if any. */
 function toolOutcomes(session: { readonly messages: readonly unknown[] }, from = 0): string[] {
   return (session.messages.slice(from) as { role: string; toolName?: string; isError?: boolean; content?: { type: string; text?: string }[] }[])
     .filter((message) => message.role === "toolResult")
-    .map((message) => message.isError ? `${message.toolName} refused: ${message.content?.map((part) => part.text ?? "").join("")}` : `${message.toolName} ok`);
+    .map((message) => {
+      const text = message.content?.map((part) => part.text ?? "").join("\n") ?? "";
+      const nudged = text.match(NUDGE)?.[0];
+      if (message.isError) return `${message.toolName} refused: ${text}`;
+      return `${message.toolName} ok${nudged === undefined ? "" : ` · ${nudged}`}`;
+    });
 }
 
-test("the orchestrator's 4th exploratory call in one user prompt is denied, actions are not counted, and the next prompt starts again", async () => {
+test("past the explorationNudge setting the orchestrator's exploratory calls still run and their results carry the nudge with the count; actions are not counted", async () => {
   const h = harness();
   try {
     writeFileSync(join(h.projectDir, "README.md"), "# Project\n");
-    writeFileSync(join(h.projectDir, "index.js"), "export const x = 1;\n");
     const provider = plannedAnthropic();
     const session = await orchestratorSession(h, provider.extension, [provider.extension]);
     try {
       provider.setOrchestrator(session.sessionId);
-      provider.plan.push(READ, { toolCall: { name: "write", arguments: { path: "notes.md", content: "x\n" } } },
-        { toolCall: { name: "bash", arguments: { command: "node --check index.js" } } }, READ,
-        { toolCall: { name: "bash", arguments: { command: "echo hi > out.txt" } } }, READ);
+      provider.plan.push(READ, { toolCall: { name: "write", arguments: { path: "notes.md", content: "x\n" } } }, READ, READ, READ, READ);
       await session.prompt("Look around");
-      assert.deepEqual(toolOutcomes(session), ["read ok", "write ok", "bash ok", "read ok", "bash ok", `read refused: ${BUDGET_DENIED}`]);
-      const second = session.messages.length;
-      provider.plan.push(READ, READ, READ, READ);
-      await session.prompt("Look again");
-      assert.deepEqual(toolOutcomes(session, second), ["read ok", "read ok", "read ok", `read refused: ${BUDGET_DENIED}`]);
+      assert.deepEqual(toolOutcomes(session), ["read ok", "write ok", "read ok", "read ok", `read ok · ${nudge(4)}`, `read ok · ${nudge(5)}`]);
     } finally { session.dispose(); }
+    // The model got the file and, after it, the nudge.
+    const seen = provider.requests.at(-1)!.toolResults;
+    assert.equal(seen.length, 6);
+    assert.ok(seen[4]!.text.includes("# Project") && seen[4]!.text.endsWith(nudge(4)), seen[4]!.text);
+    assert.equal(seen[4]!.isError, false);
+    assert.ok(!seen.slice(0, 4).some((result) => NUDGE.test(result.text)), JSON.stringify(seen));
   } finally { h.cleanup(); }
 });
 
-test("the threshold is the owner's explorationBudget setting, and the protocol names it and the owner's gate level", async () => {
-  const h = harness({ orchestrator: { routing: ROUTING, subagents: { explorationBudget: 1, gateLevel: "high" } } });
+test("the nudge starts after the owner's explorationNudge setting, and the protocol names it and the owner's gate level", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { explorationNudge: 1, gateLevel: "high" } } });
   try {
     writeFileSync(join(h.projectDir, "README.md"), "# Project\n");
     const provider = plannedAnthropic();
@@ -2773,26 +2780,65 @@ test("the threshold is the owner's explorationBudget setting, and the protocol n
       provider.setOrchestrator(session.sessionId);
       provider.plan.push(READ, READ);
       await session.prompt("Look around");
-      assert.deepEqual(toolOutcomes(session), ["read ok",
-        "read refused: pi-orchestrator: 1 exploratory call this prompt. Hand the rest of the research to a worker with `subagents`."]);
+      assert.deepEqual(toolOutcomes(session), ["read ok", `read ok · ${nudge(2)}`]);
     } finally { session.dispose(); }
     assert.equal(provider.requests.length, 3);
     for (const request of provider.requests) {
       assert.ok(request.systemPrompt.includes(orchestratorProtocol(1, "high")), request.systemPrompt);
-      assert.match(request.systemPrompt, /1 exploratory call per user prompt/);
+      assert.match(request.systemPrompt, /After 1 exploratory call in one user prompt/);
+      assert.doesNotMatch(request.systemPrompt, /exploration budget|exploratory call is denied|lift the budget/);
       assert.match(request.systemPrompt, /Your gate level is high\./);
     }
   } finally { h.cleanup(); }
 });
 
-test("workers, forked workers and a pi-subagents child's session are never budgeted", async () => {
+test("a new user prompt starts the count again; a prompt an extension sends and a run a message starts count on", async () => {
+  const h = harness();
+  try {
+    writeFileSync(join(h.projectDir, "README.md"), "# Project\n");
+    // A command that starts a run with a message, as a background call's completion notice does.
+    const owner: InlineExtension = { name: "owner", factory: (pi) => {
+      pi.registerCommand("notice", { description: "A message starts a run", handler: async () => {
+        pi.sendMessage({ customType: "test-notice", content: "A worker finished", display: true }, { triggerTurn: true });
+      } });
+    } };
+    const provider = plannedAnthropic();
+    const session = await orchestratorSession(h, provider.extension, [provider.extension], [owner]);
+    try {
+      provider.setOrchestrator(session.sessionId);
+      provider.plan.push(READ, READ, READ, READ);
+      await session.prompt("Look around");
+      assert.deepEqual(toolOutcomes(session), ["read ok", "read ok", "read ok", `read ok · ${nudge(4)}`]);
+
+      // A user message an extension sends is not a user prompt.
+      let from = session.messages.length;
+      provider.plan.push(READ);
+      await session.sendUserMessage("Look on");
+      assert.deepEqual(toolOutcomes(session, from), [`read ok · ${nudge(5)}`]);
+
+      // Nor is a run a message starts.
+      from = session.messages.length;
+      provider.plan.push(READ);
+      await session.prompt("/notice");
+      await session.waitForIdle();
+      assert.deepEqual(toolOutcomes(session, from), [`read ok · ${nudge(6)}`]);
+
+      from = session.messages.length;
+      provider.plan.push(READ, READ, READ, READ);
+      await session.prompt("Look again");
+      assert.deepEqual(toolOutcomes(session, from), ["read ok", "read ok", "read ok", `read ok · ${nudge(4)}`]);
+    } finally { session.dispose(); }
+  } finally { h.cleanup(); }
+});
+
+test("workers, forked workers and a pi-subagents child's session are never nudged", async () => {
   const h = harness();
   try {
     writeFileSync(join(h.projectDir, "README.md"), "# Project\n");
     writeAgentDefinition(join(h.agentDir, "agents"), "lead.md", { name: "lead", description: "Delegates", tools: "read, subagents" }, "Split the work.");
-    // Each worker reads five times, then reports how many of its reads were refused.
+    // Each worker reads five times, then reports how many of its reads were refused or nudged.
     const provider = plannedAnthropic((request) => request.toolResults.length < 5 ? READ
-      : { text: `refused ${request.toolResults.filter((result) => result.isError).length}` });
+      : { text: `refused ${request.toolResults.filter((result) => result.isError).length}, nudged ${request.toolResults.filter((result) => NUDGE.test(result.text)).length}` });
     const session = await orchestratorSession(h, provider.extension, installedWithSubagents(provider.extension, 1));
     let results: readonly SubagentResult[] = [];
     try {
@@ -2804,7 +2850,7 @@ test("workers, forked workers and a pi-subagents child's session are never budge
       const toolResult = session.messages.find((message) => message.role === "toolResult") as { details?: SubagentsDetails } | undefined;
       results = toolResult?.details?.results ?? [];
     } finally { session.dispose(); }
-    assert.deepEqual(results.map((result) => [result.status, result.finalText]), Array(3).fill(["completed", "refused 0"]), JSON.stringify(results));
+    assert.deepEqual(results.map((result) => [result.status, result.finalText]), Array(3).fill(["completed", "refused 0, nudged 0"]), JSON.stringify(results));
   } finally { h.cleanup(); }
 
   const child = harness();
@@ -2825,74 +2871,15 @@ test("workers, forked workers and a pi-subagents child's session are never budge
   }
 });
 
-test("/pi-orchestrator budget off lifts the budget for the running prompt, or for the next user prompt when idle", async () => {
-  const h = harness();
-  try {
-    writeFileSync(join(h.projectDir, "README.md"), "# Project\n");
-    // The owner's side: a tool the model calls to have the owner type a command
-    // mid-prompt, and a command that starts a run with a message, as a
-    // background call's completion notice does.
-    let typeCommand: (text: string) => Promise<void> = async () => {};
-    const owner: InlineExtension = { name: "owner", factory: (pi) => {
-      pi.registerTool({
-        name: "owner_types", label: "Owner types", description: "The owner types a command.",
-        parameters: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } as unknown as Tool["parameters"],
-        async execute(_id, params) { await typeCommand((params as { text: string }).text); return { content: [], details: undefined }; },
-      });
-      pi.registerCommand("notice", { description: "A message starts a run", handler: async () => {
-        pi.sendMessage({ customType: "test-notice", content: "A worker finished", display: true }, { triggerTurn: true });
-      } });
-    } };
-    const provider = plannedAnthropic();
-    const session = await orchestratorSession(h, provider.extension, [provider.extension], [routerExtension(), owner]);
-    typeCommand = (text) => session.prompt(text);
-    try {
-      provider.setOrchestrator(session.sessionId);
-      const commands = session.extensionRunner.getRegisteredCommands().map((command) => command.invocationName);
-      assert.deepEqual(commands.filter((name) => name.startsWith("pi-orchestrator")), ["pi-orchestrator"], "the router and the subagents extension share one command");
-
-      // While the prompt runs: the rest of this prompt is lifted.
-      provider.plan.push(READ, READ, READ, READ, { toolCall: { name: "owner_types", arguments: { text: "/pi-orchestrator budget off" } } }, READ, READ);
-      await session.prompt("Look around");
-      assert.deepEqual(toolOutcomes(session), ["read ok", "read ok", "read ok", `read refused: ${BUDGET_DENIED}`, "owner_types ok", "read ok", "read ok"]);
-
-      // The next user prompt has the budget again.
-      let from = session.messages.length;
-      provider.plan.push(READ, READ, READ, READ);
-      await session.prompt("Look again");
-      assert.deepEqual(toolOutcomes(session, from), ["read ok", "read ok", "read ok", `read refused: ${BUDGET_DENIED}`]);
-
-      // While idle: the next user prompt is lifted, not a run a message starts before it.
-      await session.prompt("/pi-orchestrator budget off");
-      from = session.messages.length;
-      provider.plan.push(READ);
-      await session.prompt("/notice");
-      await session.waitForIdle();
-      assert.deepEqual(toolOutcomes(session, from), [`read refused: ${BUDGET_DENIED}`], "a message-started run counts on from the last prompt");
-      from = session.messages.length;
-      provider.plan.push(READ, READ, READ, READ);
-      await session.prompt("Look once more");
-      assert.deepEqual(toolOutcomes(session, from), ["read ok", "read ok", "read ok", "read ok"]);
-      from = session.messages.length;
-      provider.plan.push(READ, READ, READ, READ);
-      await session.prompt("And again");
-      assert.deepEqual(toolOutcomes(session, from), ["read ok", "read ok", "read ok", `read refused: ${BUDGET_DENIED}`]);
-    } finally { session.dispose(); }
-  } finally { h.cleanup(); }
-});
-
-test("/pi-orchestrator budget takes only off, and tells the owner which prompt it lifts", async () => {
+test("/pi-orchestrator has no budget subcommand", async () => {
   const h = harness();
   try {
     const subagents = loadSubagents([]);
     const main = orchestrator(h);
     await subagents.startSession(main.ctx);
-    const at = (idle: boolean) => ({ ...main.ctx, isIdle: () => idle }) as ExtensionContext;
-    for (const args of ["budget", "budget on", "budget off now"]) {
-      assert.deepEqual(await subagents.runCommand("pi-orchestrator", args, at(true)), ["usage: /pi-orchestrator budget off"], args);
-    }
-    assert.deepEqual(await subagents.runCommand("pi-orchestrator", "budget off", at(false)), ["pi-orchestrator: exploration budget off for the rest of this prompt."]);
-    assert.deepEqual(await subagents.runCommand("pi-orchestrator", "budget off", at(true)), ["pi-orchestrator: exploration budget off for the next prompt."]);
+    const [shown = ""] = await subagents.runCommand("pi-orchestrator", "budget off", main.ctx);
+    assert.match(shown, /^pi-orchestrator: unknown subcommand 'budget'\./);
+    assert.ok(shown.includes("  gate: ") && !shown.includes("  budget: "), shown);
   } finally { h.cleanup(); }
 });
 

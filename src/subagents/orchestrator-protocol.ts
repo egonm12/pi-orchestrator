@@ -3,7 +3,7 @@ import { isOrchestratorSession } from "./orchestrator-session.ts";
 import { tiersByGateAction, type GateAction, type GateLevel } from "./quality-gate.ts";
 
 // The orchestrator protocol: how the orchestrator's own session delegates and
-// judges (ADR 0005, ADR 0010, ADR 0011). It is a named section of the system prompt,
+// judges (ADR 0010, ADR 0011, ADR 0013). It is a named section of the system prompt,
 // added when each user prompt starts its agent loop, so pi keeps it through
 // the loop's turns and puts it back after a compaction. A run a message starts
 // without a user prompt (sendMessage with triggerTurn) skips before_agent_start:
@@ -40,9 +40,9 @@ function gateLevelParagraph(level: GateLevel): string {
 }
 
 // One entry per rule, in the order the orchestrator reads them. The exploration
-// budget's entry names the owner's threshold (exploration-budget.ts), and the
+// nudge's entry names the owner's threshold (exploration-nudge.ts), and the
 // gate level's entry the level in force (gate-level.ts).
-const paragraphs = (explorationBudget: number, gateLevel: GateLevel): readonly string[] => [
+const paragraphs = (explorationNudge: number, gateLevel: GateLevel): readonly string[] => [
   "You are the orchestrator. You own clarification, task decomposition, delegation, synthesis and acceptance. " +
     "Your context window is the scarce resource: keep conclusions in it, not file dumps.",
   "Delegate exploration and substantial work to workers with the `subagents` tool. Delegate when you expect more than two " +
@@ -52,10 +52,11 @@ const paragraphs = (explorationBudget: number, gateLevel: GateLevel): readonly s
     "with `subagents_status`, and steer it or answer the question in its Report with `subagents_message`.",
   "Keep small known actions yourself: a single lookup, a small edit you can already see, a build or test run, a commit, " +
     "or a decision only you can make.",
-  `Your exploration budget is ${explorationBudget} exploratory call${explorationBudget === 1 ? "" : "s"} per user prompt: reads, searches, listings, ` +
-    "diffs, web lookups, ctx and MCP calls, and any bash command that is not a build, test run or commit. Checking a worker's " +
-    "Result counts too. Edits, builds, test runs, commits and the subagents tools never count. The next exploratory call is " +
-    "denied: hand the rest of the research to a worker with `subagents` instead of trying another way. Only the user can lift the budget.",
+  `After ${explorationNudge} exploratory call${explorationNudge === 1 ? "" : "s"} in one user prompt, the result of each further one ends ` +
+    "with an exploration nudge that counts your exploratory calls so far. Exploratory calls are reads, searches, listings, diffs, web " +
+    "lookups, ctx and MCP calls, and any bash command that is not a build, test run or commit. Checking a worker's Result counts too. " +
+    "Edits, builds, test runs, commits and the subagents tools never count. No call is denied: a quick lookup, or a check of what a " +
+    "worker changed, is yours to make. When the nudge appears, hand the rest of the research to a worker with `subagents`.",
   "A worker's Result is evidence, not a verdict. Check it before you act on it: does every claim carry file:line evidence, " +
     "does it say what it could not verify, does anything contradict what you already know? Do not build on a claim without " +
     "evidence: check that claim yourself, or resume the worker with the `subagents` tool and ask for it.",
@@ -88,16 +89,16 @@ const paragraphs = (explorationBudget: number, gateLevel: GateLevel): readonly s
     "and do not work around the limit by starting a new worker.",
 ];
 
-/** The protocol text, as the orchestrator's system prompt carries it, for
- *  `explorationBudget` exploratory calls per user prompt at the gate level `gateLevel`. */
-export function orchestratorProtocol(explorationBudget: number, gateLevel: GateLevel): string {
-  return `# Orchestrator protocol\n\n${paragraphs(explorationBudget, gateLevel).join("\n\n")}`;
+/** The protocol text, as the orchestrator's system prompt carries it, for an
+ *  exploration nudge after `explorationNudge` exploratory calls per user prompt, at the gate level `gateLevel`. */
+export function orchestratorProtocol(explorationNudge: number, gateLevel: GateLevel): string {
+  return `# Orchestrator protocol\n\n${paragraphs(explorationNudge, gateLevel).join("\n\n")}`;
 }
 
 /** Part of a `before_agent_start` handler: adds the protocol to this prompt's
  *  system prompt in the orchestrator's own session, and leaves any other session's alone. */
 export function addOrchestratorProtocol(event: Pick<BeforeAgentStartEvent, "systemPromptOptions">,
-  ctx: Pick<ExtensionContext, "sessionManager">, explorationBudget: number, gateLevel: GateLevel): void {
+  ctx: Pick<ExtensionContext, "sessionManager">, explorationNudge: number, gateLevel: GateLevel): void {
   if (!isOrchestratorSession(ctx)) return;
-  event.systemPromptOptions.sections[ORCHESTRATOR_PROTOCOL_SECTION] = orchestratorProtocol(explorationBudget, gateLevel);
+  event.systemPromptOptions.sections[ORCHESTRATOR_PROTOCOL_SECTION] = orchestratorProtocol(explorationNudge, gateLevel);
 }

@@ -24,7 +24,7 @@ import { isWorkerSession } from "./worker-sessions.ts";
 import { isOrchestratorSession } from "./orchestrator-session.ts";
 import { addOrchestratorProtocol } from "./orchestrator-protocol.ts";
 import { registerCommitGate } from "./commit-gate.ts";
-import { registerExplorationBudget } from "./exploration-budget.ts";
+import { registerExplorationNudge } from "./exploration-nudge.ts";
 import { registerSubagentsVerdictTool } from "./verdict.ts";
 import { registerGateLevel } from "./gate-level.ts";
 import { reviewerPrompt, reviewTarget, servedOnRung, type ReviewTarget } from "./review.ts";
@@ -666,13 +666,13 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
     // compaction or a queued continuation keeps the orchestrator running.
     pi.on("agent_start", (_event, ctx) => { if (!isWorkerSession(ctx)) workerBoard().setOrchestratorState("running"); });
     pi.on("agent_settled", (_event, ctx) => { if (!isWorkerSession(ctx)) workerBoard().setOrchestratorState("idle"); });
-    // The exploration budget holds the orchestrator to delegating research (exploration-budget.ts).
-    const explorationBudget = registerExplorationBudget(pi, logOnce);
+    // The exploration nudge reminds the orchestrator to delegate research (exploration-nudge.ts).
+    const explorationNudge = registerExplorationNudge(pi, logOnce);
     // Unjudged edits hold back the orchestrator's git commit and git push, and a turn end names them (commit-gate.ts).
     registerCommitGate(pi, logOnce, gateLevels);
     // The orchestrator protocol joins the orchestrator's system prompt as each user prompt starts its agent loop.
     pi.on("before_agent_start", (event, ctx) => {
-      if (isOrchestratorSession(ctx)) addOrchestratorProtocol(event, ctx, explorationBudget.threshold, gateLevels.inForce(ctx).level);
+      if (isOrchestratorSession(ctx)) addOrchestratorProtocol(event, ctx, explorationNudge.threshold, gateLevels.inForce(ctx).level);
     });
   };
 }

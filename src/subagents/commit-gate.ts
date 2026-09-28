@@ -29,7 +29,7 @@ import { isRunningWorkerSession } from "./worker-sessions.ts";
 // and once more at the first turn end after each user prompt, so a notice
 // earlier in the context does not repeat on every turn.
 //
-// Like the exploration budget, the gate binds only the orchestrator's own
+// Like the exploration nudge, the gate binds only the orchestrator's own
 // session: a worker, a forked worker or a pi-subagents child loads this
 // extension too, and commits unhindered.
 

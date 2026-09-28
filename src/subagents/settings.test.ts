@@ -4,7 +4,7 @@ import { subagentsSettingsFromSettings } from "./settings.ts";
 
 test("without personal settings the defaults apply and allowProjectOverrides is off", () => {
   assert.deepEqual(subagentsSettingsFromSettings({}), {
-    settings: { maxParallel: 4, maxBackgroundWorkers: 8, agentDefinitionModel: { use: "route", allowBanned: false }, explorationBudget: 3, gateLevel: "medium" },
+    settings: { maxParallel: 4, maxBackgroundWorkers: 8, agentDefinitionModel: { use: "route", allowBanned: false }, explorationNudge: 3, gateLevel: "medium" },
     allowProjectOverrides: false,
     ignoredProjectKeys: [],
   });
@@ -14,7 +14,7 @@ test("with allowProjectOverrides a project key replaces the personal value and t
   const personal = { orchestrator: { subagents: { allowProjectOverrides: true, maxParallel: 3, agentDefinitionModel: { use: "preserve" } } } };
   const project = { orchestrator: { subagents: { maxParallel: 6, allowProjectOverrides: false } } };
   assert.deepEqual(subagentsSettingsFromSettings(personal, project), {
-    settings: { maxParallel: 6, maxBackgroundWorkers: 8, agentDefinitionModel: { use: "preserve", allowBanned: false }, explorationBudget: 3, gateLevel: "medium" },
+    settings: { maxParallel: 6, maxBackgroundWorkers: 8, agentDefinitionModel: { use: "preserve", allowBanned: false }, explorationNudge: 3, gateLevel: "medium" },
     allowProjectOverrides: true,
     ignoredProjectKeys: ["orchestrator.subagents.allowProjectOverrides"],
   });
@@ -53,13 +53,24 @@ test("maxBackgroundWorkers defaults to 8, takes a positive integer, and a projec
   }
 });
 
-test("explorationBudget defaults to 3, takes a positive integer, and a project may replace it only with allowProjectOverrides", () => {
-  assert.equal(subagentsSettingsFromSettings({ orchestrator: { subagents: { explorationBudget: 5 } } }).settings.explorationBudget, 5);
-  const project = { orchestrator: { subagents: { explorationBudget: 20 } } };
-  assert.equal(subagentsSettingsFromSettings({}, project).settings.explorationBudget, 3);
-  assert.deepEqual(subagentsSettingsFromSettings({}, project).ignoredProjectKeys, ["orchestrator.subagents.explorationBudget"]);
-  assert.equal(subagentsSettingsFromSettings({ orchestrator: { subagents: { allowProjectOverrides: true } } }, project).settings.explorationBudget, 20);
+test("explorationNudge defaults to 3, takes a positive integer, and a project may replace it only with allowProjectOverrides", () => {
+  assert.equal(subagentsSettingsFromSettings({ orchestrator: { subagents: { explorationNudge: 5 } } }).settings.explorationNudge, 5);
+  const project = { orchestrator: { subagents: { explorationNudge: 20 } } };
+  assert.equal(subagentsSettingsFromSettings({}, project).settings.explorationNudge, 3);
+  assert.deepEqual(subagentsSettingsFromSettings({}, project).ignoredProjectKeys, ["orchestrator.subagents.explorationNudge"]);
+  assert.equal(subagentsSettingsFromSettings({ orchestrator: { subagents: { allowProjectOverrides: true } } }, project).settings.explorationNudge, 20);
   for (const value of [0, 2.5, "3", -1]) {
+    assert.throws(() => subagentsSettingsFromSettings({ orchestrator: { subagents: { explorationNudge: value } } }), /explorationNudge must be a positive integer/);
+  }
+});
+
+test("the old explorationBudget key sets explorationNudge when the new key is absent, and the new key wins when both are set", () => {
+  assert.equal(subagentsSettingsFromSettings({ orchestrator: { subagents: { explorationBudget: 5 } } }).settings.explorationNudge, 5);
+  assert.equal(subagentsSettingsFromSettings({ orchestrator: { subagents: { explorationBudget: 5, explorationNudge: 2 } } }).settings.explorationNudge, 2);
+  const project = { orchestrator: { subagents: { explorationBudget: 20 } } };
+  assert.equal(subagentsSettingsFromSettings({ orchestrator: { subagents: { allowProjectOverrides: true } } }, project).settings.explorationNudge, 20);
+  assert.deepEqual(subagentsSettingsFromSettings({}, project).ignoredProjectKeys, ["orchestrator.subagents.explorationBudget"]);
+  for (const value of [0, 2.5, "3"]) {
     assert.throws(() => subagentsSettingsFromSettings({ orchestrator: { subagents: { explorationBudget: value } } }), /explorationBudget must be a positive integer/);
   }
 });

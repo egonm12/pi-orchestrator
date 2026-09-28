@@ -1,12 +1,13 @@
 ---
 # pi-orchestrator-2uc7
 title: Exploration nudge instead of refusal
-status: todo
+status: completed
 type: task
+priority: normal
 tags:
     - ready-for-agent
 created_at: 2026-09-28T14:30:23Z
-updated_at: 2026-09-28T14:30:23Z
+updated_at: 2026-09-28T15:37:46Z
 parent: pi-orchestrator-cml8
 ---
 
@@ -20,14 +21,24 @@ Exploratory calls by the orchestrator are never denied. The same counting as tod
 
 ## Acceptance criteria
 
-- [ ] Exploratory calls beyond the setting succeed and their result carries the nudge with the call count
-- [ ] A new user prompt resets the count; an extension-sourced prompt does not
-- [ ] Workers are never nudged
-- [ ] `explorationNudge` setting with default 3; old `explorationBudget` key used when the new one is absent (unit test)
-- [ ] `/pi-orchestrator budget` subcommand removed
-- [ ] Protocol text describes the nudge, not a refusal
-- [ ] Tests use the real-session seam (`orchestratorSession` with a scripted fake provider)
+- [x] Exploratory calls beyond the setting succeed and their result carries the nudge with the call count
+- [x] A new user prompt resets the count; an extension-sourced prompt does not
+- [x] Workers are never nudged
+- [x] `explorationNudge` setting with default 3; old `explorationBudget` key used when the new one is absent (unit test)
+- [x] `/pi-orchestrator budget` subcommand removed
+- [x] Protocol text describes the nudge, not a refusal
+- [x] Tests use the real-session seam (`orchestratorSession` with a scripted fake provider)
 
 ## Blocked by
 
 None, can start immediately.
+
+
+## Summary of changes
+
+- `src/subagents/exploration-nudge.ts` replaces `exploration-budget.ts`. The same counting (read-only and unrecognised calls per user prompt, reset at a user prompt whose source is not `extension`, only the orchestrator's own session) is done in `tool_call`, and never blocks. In `tool_result`, each counted call past the setting gets a text part appended to its result: `<n> exploratory calls this prompt: consider handing the rest to a worker.`
+- `/pi-orchestrator budget` is removed; `/pi-orchestrator gate` stays.
+- Settings: `orchestrator.subagents.explorationNudge`, a positive integer, default 3. When it is absent, the old `explorationBudget` key is read, and a bad value is named by the key it came from.
+- The protocol's exploration paragraph now describes the nudge and says no call is denied. The gate paragraph and the protocol's delivery are unchanged (tickets 02 and 03).
+- Tests: the budget tests in `extension.test.ts` are reworked at the real-session seam (`orchestratorSession` with a scripted fake provider): calls past the setting succeed and carry the nudge with the count, the setting and the protocol text, a new user prompt resets while `sendUserMessage` and a `sendMessage` run with `triggerTurn` count on, workers, forked workers and a pi-subagents child are never nudged, and `budget` is an unknown subcommand. The class-level `exploration-budget.test.ts` is removed. `settings.test.ts` covers the new key and the old one.
+- README describes the exploration nudge and the new settings key. CONTEXT.md already defined the exploration nudge.
