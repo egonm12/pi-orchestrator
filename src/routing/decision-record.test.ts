@@ -25,10 +25,12 @@ import {
   decisionRecordPath,
   FREE_TEXT_LIMIT,
   readRoutingRecords,
+  readRoutingRecordsJudging,
   readUsableRoutingRecordEntries,
   readUsableRoutingRecords,
   RoutingRecordError,
   TASK_TEXT_PREFIX_LIMIT,
+  UnreadableDelegationRecordError,
   validateRoutingRecord,
   writeDecisionRecord,
   type DecisionRecord,
@@ -314,6 +316,48 @@ test("every record type the extension writes reads back; the usable reader skips
     assert.match(skipped[3]!.error.message, /^routing record 2026-09-25\.jsonl:13: field '\(record\)' is not valid JSON/);
     assert.deepEqual(readUsableRoutingRecords(dir), entries.map((entry) => entry.record));
     assert.deepEqual(readUsableRoutingRecordEntries(join(dir, "none")), { entries: [], skipped: [] }, "a folder that does not exist holds no records");
+  } finally { cleanup(); }
+});
+
+test("a reader judging delegations refuses a line it cannot validate that belongs to one of them, and skips the lines of others", () => {
+  // pi-orchestrator-zb6t review: a verdict must not be judged without one of its delegation's records.
+  const { dir, cleanup } = tempDir();
+  try {
+    const at = NOW;
+    const edit = (delegationId: string, nested?: string) =>
+      buildEditRecord({ delegationId, at, orchestratorSession: "session-1", tool: "write", ...(nested === undefined ? {} : { nestedDelegationId: nested }) });
+    appendRoutingRecord(dir, edit("judged"));
+    appendRoutingRecord(dir, edit("reviewer"));
+    const path = decisionRecordPath(dir, NOW);
+    const unreadable = (record: object) => JSON.stringify({ ...record, schemaVersion: "decision-record/4" });
+    const others = [unreadable(edit("other")), '{"recordType":"edit","delegationId":"oth'];
+    appendFileSync(path, `${others.join("\n")}\n`);
+
+    const read = readRoutingRecordsJudging(dir, ["judged", "reviewer"]);
+    assert.deepEqual(read.records.map((record) => record.delegationId), ["judged", "reviewer"]);
+    assert.deepEqual(read.skipped.map((line) => [line.file, line.line, line.text]), [["2026-09-25.jsonl", 3, others[0]], ["2026-09-25.jsonl", 4, others[1]]],
+      "the lines of other delegations are skipped, and named");
+
+    const refused = (lines: string[], ids: string[], id: string, line: number) => {
+      const { dir: own, cleanup: done } = tempDir();
+      try {
+        appendRoutingRecord(own, edit("judged"));
+        appendFileSync(decisionRecordPath(own, NOW), `${lines.join("\n")}\n`);
+        assert.throws(() => readRoutingRecordsJudging(own, ids), (error: unknown) => {
+          assert.ok(error instanceof UnreadableDelegationRecordError, String(error));
+          assert.deepEqual([error.delegationId, error.file, error.line], [id, "2026-09-25.jsonl", line]);
+          assert.equal(error.message, `routing record 2026-09-25.jsonl:${line} of delegation ${id} cannot be read ` +
+            `(field '${error.recordError.field}' ${error.recordError.problem}); it may come from newer code than this session has loaded, so /reload may be needed`);
+          return true;
+        }, JSON.stringify(lines));
+      } finally { done(); }
+    };
+    // Its delegationId, its nestedDelegationId, or the id anywhere in a line that is not valid JSON.
+    refused([unreadable(edit("judged"))], ["judged"], "judged", 2);
+    refused([unreadable(edit("reviewer"))], ["judged", "reviewer"], "reviewer", 2);
+    refused([unreadable(edit("parent", "judged"))], ["judged"], "judged", 2);
+    refused([others[1]!, '{"recordType":"decision","delegationId":"judged","sch'], ["judged"], "judged", 3);
+    refused([JSON.stringify({ recordType: "failover", delegationId: "x", note: "after judged" })], ["judged"], "judged", 2);
   } finally { cleanup(); }
 });
 

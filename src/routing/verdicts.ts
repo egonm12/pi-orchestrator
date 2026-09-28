@@ -16,7 +16,9 @@
 //      its reason on, whether the verdict rests on a same-rung review, and any
 //      gate level raise it made. A retry's effort-ladder record is its link to
 //      the failed attempt: the verdict attaches to it only when the retry has
-//      no decision record, as with routing off.
+//      no decision record, as with routing off. A line of the delegation
+//      that cannot be read refuses the verdict (UnreadableDelegationRecordError):
+//      the record it would attach to may be the one missing.
 //   3. Learning data. A verdict attached to a decision that chose a rung is
 //      also recorded in ticket 08's observation ledger as a
 //      `verified-task-outcome`: taskType is the classifier's kind of work,
@@ -40,7 +42,7 @@ import {
   appendRoutingRecord,
   DECISION_RECORD_SCHEMA_VERSION,
   isRoutedDecision,
-  readUsableRoutingRecordEntries,
+  readRoutingRecordsJudging,
   type AgentModelRecord,
   type EditRecord,
   type ForkRecord,
@@ -105,8 +107,9 @@ function isDecisionOfSomeKind(record: RoutingRecord): record is RoutedDecisionRe
 
 export function attachVerdict(input: AttachVerdictInput): AttachVerdictOutcome {
   const timestamp = (input.at ?? new Date()).toISOString();
-  // Lines this reader cannot validate are skipped, not fatal (pi-orchestrator-zb6t).
-  const entries = readUsableRoutingRecordEntries(input.recordDir).entries.filter((entry) => entry.record.delegationId === input.delegationId);
+  // Lines of other delegations this reader cannot validate are skipped; one of
+  // this delegation's throws, as the verdict cannot be judged without it (pi-orchestrator-zb6t).
+  const entries = readRoutingRecordsJudging(input.recordDir, [input.delegationId]).entries.filter((entry) => entry.record.delegationId === input.delegationId);
   // An effort-ladder record stands in only for a retry without a decision
   // record, and an edit record only when the delegation has no decision at all.
   const latest = entries.filter((entry) => isDecisionOfSomeKind(entry.record) && entry.record.recordType !== "effort-ladder").at(-1) ??

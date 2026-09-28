@@ -3047,13 +3047,40 @@ test("subagents_verdict records a verdict past an effort-ladder record and a lin
       timestamp: new Date().toISOString(), previousDecisionId: "01a0e824-0000-4000-8000-000000000001", step: "unplaced", mode: "live",
       detail: "its rung openai-codex/gpt-6-sol:high has no position in the elevated tier of the tier map", taskTextPrefix: "Retry of delegation", agentRole: "unknown" };
     appendFileSync(join(recordDir, day), `${JSON.stringify(ladder)}\n${JSON.stringify({ ...ladder, step: "sideways" })}\n{"recordType":"fail\n`);
+    const lines = readFileSync(join(recordDir, day), "utf8").trimEnd().split("\n").length;
     assert.equal(await recordVerdict(subagents, main.ctx, { delegationId: id, verdict: "accept", reason: "checked notes.md:1" }),
-      `Recorded accept on delegation ${id}.`);
+      `Recorded accept on delegation ${id}. Skipped 2 routing record lines of other delegations that this session cannot read ` +
+      `(${day}:${lines - 1}, ${day}:${lines}); /reload may be needed.`);
     assert.match(await recordVerdict(subagents, main.ctx, { delegationId: id, verdict: "request_changes", reason: "notes.md lacks a heading" }),
       new RegExp(`^Recorded request_changes on delegation ${id}\\. It replaces the earlier accept\\. The effort ladder cannot place it`));
     const { entries, skipped } = readUsableRoutingRecordEntries(recordDir);
     assert.deepEqual(entries.flatMap(({ record }) => record.recordType === "verdict" ? [[record.delegationId, record.verdict]] : []), [[id, "accept"], [id, "request_changes"]]);
     assert.deepEqual(skipped.map((line) => [line.file, line.error.field]), [[day, "step"], [day, "(record)"]], "the unplaced ladder record is read, the other two are skipped");
+  } finally { h.cleanup(); }
+});
+
+test("subagents_verdict records a verdict beside the reported line: an unplaced effort-ladder record without kindOfWork that retries the judged delegation", async () => {
+  // pi-orchestrator-zb6t: 2026-09-28.jsonl:107 as it was written, with the judged delegation's id as the one it retries.
+  const line107 = '{"recordType":"effort-ladder","schemaVersion":"decision-record/3","cause":"effort-ladder","delegationId":"bfa81cd8-489b-446a-97ec-3d0f7fa281e7",' +
+    '"timestamp":"2026-09-28T13:36:41.308Z","previousDecisionId":"01a0e824-041a-7117-8a16-1e255bab01b4","step":"unplaced","mode":"live",' +
+    '"detail":"its rung openai-codex/gpt-6-sol:high has no position in the elevated tier of the tier map",' +
+    '"taskTextPrefix":"Retry of delegation 01a0e824-041a-7117-8a16-1e255bab01b4, whose changes were requested. Do its task again and address every point ' +
+    'of the feedback. Its changes are still in the working tree unless the ","agentRole":"unknown"}';
+  const h = routedHarness();
+  try {
+    const provider = scriptedAnthropic(runningScript);
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    const { worker } = await callSubagents(subagents.tool(), main.ctx, runTask("write", { path: "notes.md", content: "x\n" }));
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    const id = worker.sessionId!;
+    const recordDir = join(h.stateDir, "routing");
+    const decision = readRoutingRecords(recordDir).find((record) => record.recordType === "decision" && record.delegationId === id)!;
+    const ladder = JSON.parse(line107) as Record<string, unknown>;
+    assert.equal("kindOfWork" in ladder, false);
+    appendFileSync(join(recordDir, `${decision.timestamp.slice(0, 10)}.jsonl`), `${line107.replaceAll("01a0e824-041a-7117-8a16-1e255bab01b4", id)}\n`);
+    assert.equal(await recordVerdict(subagents, main.ctx, { delegationId: id, verdict: "accept", reason: "checked notes.md:1" }), `Recorded accept on delegation ${id}.`);
+    assert.deepEqual(readUsableRoutingRecordEntries(recordDir).skipped, [], "the ladder record reads");
   } finally { h.cleanup(); }
 });
 

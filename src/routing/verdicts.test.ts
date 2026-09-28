@@ -14,6 +14,8 @@ import {
 } from "../fixtures/routing-decision.ts";
 import {
   readRoutingRecords,
+  readUsableRoutingRecords,
+  UnreadableDelegationRecordError,
   validateRoutingRecord,
   writeDecisionRecord,
   type DecisionRecordInput,
@@ -141,6 +143,25 @@ test("a verdict is attached past an effort-ladder record, a record shape the rea
     if (onRetry.status !== "attached") return;
     assert.equal(onRetry.decision.recordType, "effort-ladder");
     assert.deepEqual(verifiedOutcomes(f.ledger).map((o) => o.instance), ["attempt-1"], "a ladder record teaches the router nothing");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("a verdict is refused, and nothing recorded, when a line of its own delegation cannot be read", async () => {
+  const f = folder();
+  try {
+    const decided = await decide(f.records);
+    const newer = JSON.stringify({ ...decided.record, schemaVersion: "decision-record/4" });
+    appendFileSync(decided.path, `${newer}\n`);
+    assert.throws(() => attachVerdict({ recordDir: f.records, delegationId: "attempt-1", verdict: "accept", at: REVIEWED_AT, refreshStatePath: f.ledger }),
+      (error: unknown) => {
+        assert.ok(error instanceof UnreadableDelegationRecordError, String(error));
+        assert.match(error.message, /^routing record 2026-09-25\.jsonl:2 of delegation attempt-1 cannot be read \(field 'schemaVersion' .*\/reload may be needed$/);
+        return true;
+      });
+    assert.deepEqual(readUsableRoutingRecords(f.records).map((record) => record.recordType), ["decision"], "no verdict was appended");
+    assert.equal(existsSync(f.ledger), false, "and no observation recorded");
   } finally {
     f.cleanup();
   }

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -8,7 +8,7 @@ import { buildCatalog } from "../catalog/model-catalog.ts";
 import { emptyRefreshState } from "../catalog/refresh-lifecycle.ts";
 import { resetBanLists } from "../policy/ban-lists.ts";
 import { authorizeRecipient, emptyAuthorization, grantOwnerApproval, saveAuthorization } from "../recipients/authorization.ts";
-import { readRoutingRecords, type DecisionRecord } from "../routing/decision-record.ts";
+import { readRoutingRecords, readUsableRoutingRecords, type DecisionRecord } from "../routing/decision-record.ts";
 import { autoStream } from "../router/auto-stream.ts";
 import { createRouterExtension } from "../router/extension.ts";
 import { createSubagentsExtension, type SubagentResult, type SubagentsDetails } from "./extension.ts";
@@ -301,6 +301,83 @@ test("a review started before the delegation's latest edit, or one that failed, 
     // The reviewer's system prompt names the later task too.
     const prompt = provider.requests.find((request) => request.sessionId === again.sessionId)!.systemPrompt;
     assert.ok(prompt.includes(`<later-instruction>\n${runTask("write", { path: "notes.md", content: "# Notes\nmore\n" })}\n</later-instruction>`), prompt);
+  } finally { h.cleanup(); }
+});
+
+/** Rewrites the last line of the routing log whose record `matches` as a newer schema version would write it, one
+ *  this reader cannot validate; returns its `<file>:<line>`. */
+function makeUnreadable(h: Harness, matches: (record: Record<string, unknown>) => boolean): string {
+  const dir = join(h.stateDir, "routing");
+  for (const file of readdirSync(dir).filter((name) => name.endsWith(".jsonl")).sort().reverse()) {
+    const lines = readFileSync(join(dir, file), "utf8").split("\n");
+    const index = lines.map((line) => line.trim() !== "" && matches(JSON.parse(line) as Record<string, unknown>)).lastIndexOf(true);
+    if (index === -1) continue;
+    lines[index] = JSON.stringify({ ...JSON.parse(lines[index]!), schemaVersion: "decision-record/4" });
+    writeFileSync(join(dir, file), lines.join("\n"));
+    return `${file}:${index + 1}`;
+  }
+  assert.fail("no routing record matches");
+}
+
+const unreadableRefusal = (id: string, location: string, of = id) => new RegExp(`^subagents_verdict: the verdict on delegation ${id} is refused: ` +
+  `routing record ${location.replace(".", "\\.")} of delegation ${of} cannot be read \\(field 'schemaVersion' .*\\); ` +
+  "it may come from newer code than this session has loaded, so /reload may be needed$");
+
+const verdictsOn = (h: Harness, id: string) => readUsableRoutingRecords(join(h.stateDir, "routing"))
+  .filter((record) => record.recordType === "verdict" && record.delegationId === id).length;
+
+test("at the low gate level a critical delegation whose decision line cannot be read is refused a verdict, with or without a reviewer, never taken as elevated", async () => {
+  // pi-orchestrator-zb6t review: without its decision a delegation has no tier, is gated as elevated, and at low
+  // an elevated delegation takes a spot check, so a critical one would pass with no reviewer.
+  const h = harness({ routing: ROUTING, subagents: { gateLevel: "low" } });
+  try {
+    const provider = anthropic();
+    const tools = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h);
+    const implementer = await one(tools, ctx, { task: `[critical] ${WRITE_NOTES}` });
+    const id = implementer.sessionId!;
+    const reviewer = await one(tools, ctx, { task: "Check it", review: id });
+    assert.equal(reviewer.status, "completed", JSON.stringify(reviewer));
+    const location = makeUnreadable(h, (record) => record.recordType === "decision" && record.delegationId === id);
+    assert.match(await verdict(tools, ctx, { delegationId: id, verdict: "accept", reason: "checked" }), unreadableRefusal(id, location));
+    assert.match(await verdict(tools, ctx, { delegationId: id, verdict: "accept", reason: "checked", reviewer: reviewer.sessionId }), unreadableRefusal(id, location));
+    assert.equal(verdictsOn(h, id), 0, "no verdict was recorded");
+  } finally { h.cleanup(); }
+});
+
+test("a verdict is refused when the delegation's latest edit line cannot be read, so a review started before that edit cannot pass", async () => {
+  // pi-orchestrator-zb6t review: a skipped newer edit record would let a review started before it pass.
+  const h = harness();
+  try {
+    const provider = anthropic();
+    const tools = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h);
+    const implementer = await one(tools, ctx, { task: `[elevated] ${WRITE_NOTES}` });
+    const id = implementer.sessionId!;
+    const reviewer = await one(tools, ctx, { task: "Check it", review: id });
+    assert.equal(reviewer.status, "completed", JSON.stringify(reviewer));
+    const resumed = await one(tools, ctx, { resume: id, task: runTask("write", { path: "notes.md", content: "# Notes\nmore\n" }) });
+    assert.equal(resumed.edited, true, JSON.stringify(resumed));
+    const edit = makeUnreadable(h, (record) => record.recordType === "edit" && record.delegationId === id);
+    const judged = { delegationId: id, verdict: "accept", reason: "checked", reviewer: reviewer.sessionId };
+    assert.match(await verdict(tools, ctx, judged), unreadableRefusal(id, edit));
+    assert.equal(verdictsOn(h, id), 0, "no verdict was recorded");
+  } finally { h.cleanup(); }
+});
+
+test("a verdict is refused when its reviewer's decision line cannot be read", async () => {
+  const h = harness();
+  try {
+    const provider = anthropic();
+    const tools = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h);
+    const id = (await one(tools, ctx, { task: `[elevated] ${WRITE_NOTES}` })).sessionId!;
+    const reviewer = await one(tools, ctx, { task: "Check it", review: id });
+    assert.equal(reviewer.status, "completed", JSON.stringify(reviewer));
+    const decision = makeUnreadable(h, (record) => record.recordType === "decision" && record.delegationId === reviewer.sessionId);
+    assert.match(await verdict(tools, ctx, { delegationId: id, verdict: "accept", reason: "checked", reviewer: reviewer.sessionId }),
+      unreadableRefusal(id, decision, reviewer.sessionId));
+    assert.equal(verdictsOn(h, id), 0, "no verdict was recorded");
   } finally { h.cleanup(); }
 });
 

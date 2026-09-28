@@ -1038,6 +1038,8 @@ export interface RoutingRecordEntry {
 export interface SkippedRoutingRecordLine {
   readonly file: string;
   readonly line: number;
+  /** The line as it stands in the file. */
+  readonly text: string;
   readonly error: RoutingRecordError;
 }
 
@@ -1062,14 +1064,14 @@ function walkRecordFolder(dir: string, reader: RecordFolderReader, invalid: (ski
       try {
         parsed = JSON.parse(text);
       } catch (error) {
-        invalid({ file, line, error: new RoutingRecordError("(record)", `is not valid JSON (${(error as Error).message})`, location) });
+        invalid({ file, line, text, error: new RoutingRecordError("(record)", `is not valid JSON (${(error as Error).message})`, location) });
         return;
       }
       try {
         entries.push({ file, line, record: validateRoutingRecord(parsed) });
       } catch (error) {
         if (!(error instanceof RoutingRecordError)) throw error;
-        invalid({ file, line, error: new RoutingRecordError(error.field, error.problem, location) });
+        invalid({ file, line, text, error: new RoutingRecordError(error.field, error.problem, location) });
       }
     });
   }
@@ -1103,6 +1105,57 @@ export function readUsableRoutingRecordEntries(dir: string, reader: RecordFolder
 /** The folder's valid records, skipping every invalid line (`readUsableRoutingRecordEntries`). */
 export function readUsableRoutingRecords(dir: string, reader?: RecordFolderReader): RoutingRecord[] {
   return readUsableRoutingRecordEntries(dir, reader).entries.map((entry) => entry.record);
+}
+
+/** A line this reader cannot validate that belongs to a delegation being
+ *  judged. It may have been written by newer code than this session loaded. */
+export class UnreadableDelegationRecordError extends Error {
+  readonly delegationId: string;
+  readonly file: string;
+  readonly line: number;
+  readonly recordError: RoutingRecordError;
+  constructor(delegationId: string, skipped: SkippedRoutingRecordLine) {
+    super(`routing record ${skipped.file}:${skipped.line} of delegation ${delegationId} cannot be read ` +
+      `(field '${skipped.error.field}' ${skipped.error.problem}); it may come from newer code than this session has loaded, so /reload may be needed`);
+    this.name = "UnreadableDelegationRecordError";
+    this.delegationId = delegationId;
+    this.file = skipped.file;
+    this.line = skipped.line;
+    this.recordError = skipped.error;
+  }
+}
+
+/** The delegation of `ids` a skipped line belongs to: the one its
+ *  delegationId or nestedDelegationId names, else the first whose id the raw
+ *  line contains; `undefined` when it belongs to none of them. */
+function ownerOfSkippedLine(skipped: SkippedRoutingRecordLine, ids: readonly string[]): string | undefined {
+  let parsed: unknown;
+  try { parsed = JSON.parse(skipped.text); } catch { parsed = undefined; }
+  if (isObject(parsed)) {
+    const named = ids.find((id) => parsed.delegationId === id || parsed.nestedDelegationId === id);
+    if (named !== undefined) return named;
+  }
+  return ids.find((id) => skipped.text.includes(id));
+}
+
+export interface JudgedRoutingRecords extends UsableRoutingRecordEntries {
+  readonly records: RoutingRecord[];
+}
+
+/** The folder's records for a reader that judges the delegations `ids` (a
+ *  verdict: the judged delegation and its reviewer). It fails closed: a line it
+ *  cannot validate that belongs to one of them throws
+ *  `UnreadableDelegationRecordError`, since judging without that record could
+ *  let a verdict through that the record would refuse (a critical decision
+ *  read as none, a later edit missed). Lines of other delegations are skipped
+ *  and returned, as `readUsableRoutingRecordEntries` does (pi-orchestrator-zb6t). */
+export function readRoutingRecordsJudging(dir: string, ids: readonly string[], reader?: RecordFolderReader): JudgedRoutingRecords {
+  const { entries, skipped } = readUsableRoutingRecordEntries(dir, reader);
+  for (const line of skipped) {
+    const owner = ownerOfSkippedLine(line, ids);
+    if (owner !== undefined) throw new UnreadableDelegationRecordError(owner, line);
+  }
+  return { entries, skipped, records: entries.map((entry) => entry.record) };
 }
 
 export function readRoutingRecords(dir: string, reader?: RecordFolderReader): RoutingRecord[] {

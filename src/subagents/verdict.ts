@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { readUsableRoutingRecords, VERDICTS, type Verdict } from "../routing/decision-record.ts";
+import { readRoutingRecordsJudging, UnreadableDelegationRecordError, VERDICTS, type SkippedRoutingRecordLine, type Verdict } from "../routing/decision-record.ts";
 import type { GateLevelRaise } from "../routing/decision-record.ts";
 import { attachVerdict } from "../routing/verdicts.ts";
 import { stateDir } from "../router/extension.ts";
@@ -27,8 +27,11 @@ import { planRetry, planText, retrySetup } from "./retry.ts";
 // held to the raised level, and its record names the raise. A request_changes
 // reply names the effort ladder's next rung for a retry (./retry.ts), or says
 // the ladder cannot place the delegation, or why no retry may start. It reads
-// the record folder past lines it cannot validate (pi-orchestrator-zb6t): one
-// foreign or torn line must not block every verdict.
+// the record folder past lines of other delegations it cannot validate, and
+// names them in its reply, so one foreign or torn line does not block every
+// verdict; a line of the judged delegation or its reviewer that it cannot
+// validate refuses the verdict, which cannot be judged without it
+// (pi-orchestrator-zb6t).
 
 export const SUBAGENTS_VERDICT_TOOL = "subagents_verdict";
 
@@ -84,7 +87,11 @@ function raiseProblem(from: GateLevel, level: GateLevel): string | undefined {
 
 /** What a retry of `id` would do now, with `feedback` as its task, as a request_changes reply says it. */
 function nextClimb(ctx: Parameters<typeof retrySetup>[0], id: string, feedback: string, recordDir: string): string {
-  const records = readUsableRoutingRecords(recordDir);
+  let records;
+  try { records = readRoutingRecordsJudging(recordDir, [id]).records; } catch (error) {
+    if (!(error instanceof UnreadableDelegationRecordError)) throw error;
+    return `No retry can be planned: ${error.message}.`;
+  }
   let task: string;
   try { task = retrySetup(ctx, id, feedback, records).task; } catch (error) {
     const message = (error as Error).message;
@@ -93,6 +100,15 @@ function nextClimb(ctx: Parameters<typeof retrySetup>[0], id: string, feedback: 
   const plan = planRetry(ctx.sessionManager.getSessionId(), id, records, task, new Date());
   if (plan.kind === "refused") return `A retry is refused: ${plan.why}.`;
   return `${planText(plan)} To retry, start a subagents item whose retry is ${id} and whose task is your feedback.`;
+}
+
+/** The reply's note on the lines of other delegations this session cannot read, or "" when there are none. */
+function skippedNote(skipped: readonly SkippedRoutingRecordLine[]): string {
+  if (skipped.length === 0) return "";
+  const shown = skipped.slice(0, 3).map((line) => `${line.file}:${line.line}`).join(", ");
+  const more = skipped.length > 3 ? ` and ${skipped.length - 3} more` : "";
+  return ` Skipped ${skipped.length} routing record line${skipped.length === 1 ? "" : "s"} of other delegations that this session cannot read ` +
+    `(${shown}${more}); /reload may be needed.`;
 }
 
 /** Registers `subagents_verdict` for the orchestrator's session. */
@@ -124,7 +140,13 @@ export function registerSubagentsVerdictTool(pi: ExtensionAPI, gateLevels: GateL
       if (!isOrchestratorSession(ctx)) throw refusal("only the orchestrator records verdicts");
       const { delegationId: id, verdict, reason, reviewer, raise } = verdictInput(params);
       const recordDir = join(stateDir(), "routing");
-      const records = readUsableRoutingRecords(recordDir);
+      const failClosed = <T>(read: () => T): T => {
+        try { return read(); } catch (error) {
+          if (!(error instanceof UnreadableDelegationRecordError)) throw error;
+          throw refusal(`the verdict on delegation ${id} is refused: ${error.message}`);
+        }
+      };
+      const { records, skipped } = failClosed(() => readRoutingRecordsJudging(recordDir, reviewer === undefined ? [id] : [id, reviewer]));
       const checked = editingDelegationProblem(ctx, records, id);
       if (checked.problem !== undefined) throw refusal(problemText(id, checked.problem));
       const { edits } = checked;
@@ -147,13 +169,13 @@ export function registerSubagentsVerdictTool(pi: ExtensionAPI, gateLevels: GateL
         }
       }
       const gateLevelRaise: GateLevelRaise | undefined = raise === undefined ? undefined : { from: inForce, to: raise.level, reason: raise.reason };
-      attachVerdict({ recordDir, delegationId: id, verdict, reason, sameRungReview, ...(gateLevelRaise === undefined ? {} : { gateLevelRaise }),
-        refreshStatePath: join(stateDir(), "refresh-state.json") });
+      failClosed(() => attachVerdict({ recordDir, delegationId: id, verdict, reason, sameRungReview, ...(gateLevelRaise === undefined ? {} : { gateLevelRaise }),
+        refreshStatePath: join(stateDir(), "refresh-state.json") }));
       const replaced = edits.verdict === undefined ? "" : ` It replaces the earlier ${edits.verdict}.`;
       const reviewed = reviewer === undefined ? "" : `, reviewed by delegation ${reviewer}${sameRungReview ? " on the delegation's own rung (a same-rung review)" : ""}`;
       const raised = gateLevelRaise === undefined ? "" : `, with its gate level raised from ${gateLevelRaise.from} to ${gateLevelRaise.to}`;
       const next = verdict === "request_changes" ? ` ${nextClimb(ctx, id, reason, recordDir)}` : "";
-      return { content: [{ type: "text", text: `Recorded ${verdict} on delegation ${id}${reviewed}${raised}.${replaced}${next}` }], details: undefined };
+      return { content: [{ type: "text", text: `Recorded ${verdict} on delegation ${id}${reviewed}${raised}.${replaced}${next}${skippedNote(skipped)}` }], details: undefined };
     },
   });
 }
