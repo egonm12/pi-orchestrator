@@ -2770,6 +2770,42 @@ test("past the explorationNudge setting the orchestrator's exploratory calls sti
   } finally { h.cleanup(); }
 });
 
+test("only read-only and unrecognised bash calls count toward the exploration nudge", async () => {
+  const h = harness();
+  try {
+    writeFileSync(join(h.projectDir, "README.md"), "# Project\\n");
+    writeFileSync(join(h.projectDir, "counter.test.js"), 'import test from "node:test"; import assert from "node:assert/strict"; test("counter test", () => assert.equal(1, 1));\\n');
+    execFileSync("git", ["init", "-q"], { cwd: h.projectDir });
+    execFileSync("git", ["config", "user.name", "Pi test"], { cwd: h.projectDir });
+    execFileSync("git", ["config", "user.email", "pi-test@example.invalid"], { cwd: h.projectDir });
+
+    const provider = plannedAnthropic();
+    const session = await orchestratorSession(h, provider.extension, installedWithSubagents(provider.extension, 1));
+    try {
+      provider.setOrchestrator(session.sessionId);
+      provider.plan.push(
+        READ,
+        { toolCall: { name: "bash", arguments: { command: "node --test" } } },
+        { toolCall: { name: "bash", arguments: { command: "git commit --allow-empty -m 'nudge counter test'" } } },
+        { toolCall: { name: "subagents", arguments: { items: [{ task: "Finish the no-op task" }] } } },
+        { toolCall: { name: "bash", arguments: { command: "git show --stat --oneline HEAD" } } },
+        { toolCall: { name: "bash", arguments: { command: 'echo "$(printf ok)"' } } },
+        READ,
+      );
+      await session.prompt("Check the project");
+      assert.deepEqual(toolOutcomes(session), [
+        "read ok",
+        "bash ok",
+        "bash ok",
+        "subagents ok",
+        "bash ok",
+        "bash ok",
+        `read ok · ${nudge(4)}`,
+      ]);
+    } finally { session.dispose(); }
+  } finally { h.cleanup(); }
+});
+
 test("the nudge starts after the owner's explorationNudge setting, and the protocol names it and the owner's gate level", async () => {
   const h = harness({ orchestrator: { routing: ROUTING, subagents: { explorationNudge: 1, gateLevel: "high" } } });
   try {
