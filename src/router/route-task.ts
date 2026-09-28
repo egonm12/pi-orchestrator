@@ -3,10 +3,11 @@ import type { ModelInfo } from "../models/model-info.ts";
 import type { BanLists } from "../policy/ban-lists.ts";
 import { classifyTier, type ClassifierModelCall, type LoadedClassifierChain } from "../routing/tier-classifier.ts";
 import type { ResolvedTierMap } from "../routing/tier-map.ts";
-import { failedHardFilter, routeForcedRung, routeTier, type ConstraintRung, type RouterEvidence, type RoutingConstraints } from "../routing/tier-router.ts";
+import { failedHardFilter, routeForcedRung, routeTier, type ConstraintRung, type ProviderUsage, type RouterEvidence, type RoutingConstraints } from "../routing/tier-router.ts";
 import { nextRungAfterFailure, type FailedDecision, type LadderDecision } from "../routing/effort-ladder.ts";
 import { isAtLeastTier } from "../routing/classifier.ts";
-import { deriveProviderUsage, type RoutingEvidenceSource } from "./evidence.ts";
+import { deriveProviderUsage, type RoutingEvidence, type RoutingEvidenceSource } from "./evidence.ts";
+import { readUsageObservations, usageLimits } from "./usage-observations.ts";
 import type { RoutingMode } from "../routing/decision-record.ts";
 
 export interface ActiveRouter {
@@ -18,6 +19,8 @@ export interface ActiveRouter {
   readonly evidence: RoutingEvidenceSource;
   readonly owner: TaskAllowanceOwner;
   readonly recordDir: string;
+  /** The usage store, shared by all the owner's sessions and projects. */
+  readonly usagePath: string;
   readonly installedModels: readonly ModelInfo[];
 }
 
@@ -37,11 +40,21 @@ function namedPaths(taskText: string): string[] {
   return paths;
 }
 
-function hardFilterEvidence(router: ActiveRouter, taskText: string, at: Date, evidence: ReturnType<RoutingEvidenceSource>,
+/** Each provider's limit at `at`, from ticket 08's observations and the usage
+ *  store, read now. Out of usage wins over throttled. */
+function providerUsageAt(router: ActiveRouter, evidence: RoutingEvidence, at: Date): Record<string, ProviderUsage> {
+  const usage = deriveProviderUsage(evidence, at);
+  for (const [provider, limit] of Object.entries(usageLimits(readUsageObservations(router.usagePath), at))) {
+    if (usage[provider]?.state !== "out-of-usage" || limit.state === "out-of-usage") usage[provider] = limit;
+  }
+  return usage;
+}
+
+function hardFilterEvidence(router: ActiveRouter, taskText: string, at: Date, evidence: RoutingEvidence,
   constraints: RoutingConstraints): RouterEvidence {
   const estimatedPromptTokens = Buffer.byteLength(taskText, "utf8");
   return {
-    providerUsage: deriveProviderUsage(evidence, at), catalog: evidence.catalog, estimatedPromptTokens,
+    providerUsage: providerUsageAt(router, evidence, at), catalog: evidence.catalog, estimatedPromptTokens,
     allowance: allowanceConstraint(router.owner, evidence.catalog, { role: "subtask", maxInputTokens: estimatedPromptTokens }),
     authorization: evidence.authorization, banLists: router.banLists,
     ...(constraints.excludedRung === undefined ? {} : { excludedRung: constraints.excludedRung }),
@@ -55,7 +68,8 @@ export function recordedRungPassesHardFilters(router: ActiveRouter, rung: Constr
 
 /** Classify, then route under the worker's routing constraints: a minimum
  *  tier raises the tier routing starts at, an excluded rung is removed in
- *  every tier, and a forced rung replaces the tier choice. */
+ *  every tier, and a forced rung replaces the tier choice. Also returns the
+ *  provider usage the hard filters read. */
 export async function routeTask(router: ActiveRouter, taskText: string, agentRole: string, at: Date, constraints: RoutingConstraints = {}) {
   const evidence = router.evidence();
   const classification = await classifyTier(
@@ -66,7 +80,7 @@ export async function routeTask(router: ActiveRouter, taskText: string, agentRol
   const { minimumTier, forcedRung } = constraints;
   const tier = minimumTier === undefined || isAtLeastTier(classification.tier, minimumTier) ? classification.tier : minimumTier;
   const route = forcedRung === undefined ? routeTier({ tier, tierMap: router.tierMap, evidence: filters }) : routeForcedRung(forcedRung, filters);
-  return { classification, route };
+  return { classification, route, providerUsage: filters.providerUsage };
 }
 
 /** The effort ladder's next rung after `failed` (ADR 0010), through the same

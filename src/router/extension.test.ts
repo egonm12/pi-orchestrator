@@ -179,13 +179,15 @@ function classifierAnswer(tier: string): string {
   return JSON.stringify({ tier, risk: { level: "none", reasons: [] }, ambiguity: "clear", complexity: "low", kindOfWork: "implement", why: `session classifier says ${tier}` });
 }
 
-async function loadAutoProvider(h: Harness, registry: SessionModelRegistry, deps: Partial<RouterDependencies> = {}): Promise<AutoStream> {
-  return loadAutoProviderWith(h, registry, { classifierCall: () => answering("mechanical").call, ...deps });
+async function loadAutoProvider(h: Harness, registry: SessionModelRegistry, deps: Partial<RouterDependencies> = {},
+  session: { readonly cwd?: string } = {}): Promise<AutoStream> {
+  return loadAutoProviderWith(h, registry, { classifierCall: () => answering("mechanical").call, ...deps }, session);
 }
 
 /** The router extension as pi loads it, with the classifier call it would use
  *  in pi unless `deps` replaces it: the in-session call over the registry. */
-async function loadAutoProviderWith(h: Harness, registry: SessionModelRegistry, deps: Partial<RouterDependencies>): Promise<AutoStream> {
+async function loadAutoProviderWith(h: Harness, registry: SessionModelRegistry, deps: Partial<RouterDependencies>,
+  session: { readonly cwd?: string } = {}): Promise<AutoStream> {
   let provider: ProviderConfigInput | undefined;
   const handlers = piHandlers();
   const createIsolatedRouterExtension = await isolatedRouterExtension();
@@ -194,7 +196,7 @@ async function loadAutoProviderWith(h: Harness, registry: SessionModelRegistry, 
     on(event: string, handler: Handler) { handlers.on(event, handler); },
   } as unknown as ExtensionAPI);
   await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, {
-    cwd: h.projectDir, hasUI: false, model: SESSION_MODEL, modelRegistry: registry, thinkingLevel: "medium",
+    cwd: session.cwd ?? h.projectDir, hasUI: false, model: SESSION_MODEL, modelRegistry: registry, thinkingLevel: "medium",
     sessionManager: { getSessionId: () => "parent" },
   });
   assert.equal(provider?.models?.[0]?.id, "auto");
@@ -1534,4 +1536,164 @@ test("a worker whose fallback would be the rung its constraints exclude fails wi
       } finally { clearOther(); }
     } finally { clear(); h.cleanup(); }
   }
+});
+
+// ---------------------------------------------------------------------------
+// Usage observations (PRD cml8, "Usage observations" and "Signals"): a
+// worker's usage-limit or rate-limit error marks the provider of its rung in
+// the usage store in the state folder, and every later routing, from any
+// session or project, reads it before the hard filters.
+// ---------------------------------------------------------------------------
+
+const CODEX_FIRST = { ...TEST_TIERS, mechanical: ["openai-codex/gpt-6-luna:low", `${HAIKU}:low`] };
+const CODEX_USAGE_LIMIT = "You have hit your ChatGPT usage limit (plus plan). Try again in ~42 min.";
+
+/** The rungs a registry forwarded to, as `provider/model:effort`. */
+function forwardedRungs(registry: ReturnType<typeof fakeSessionRegistry>): string[] {
+  return registry.calls.map((call) => `${call.model.provider}/${call.model.id}:${call.options?.reasoning}`);
+}
+
+/** The removed rungs of `delegationId`'s decision, with reason and detail. */
+function removedRungs(h: Harness, delegationId: string): [string, string, string][] {
+  const record = h.records().find((entry) => entry.delegationId === delegationId);
+  assert.ok(record?.recordType === "decision", `a decision for ${delegationId}`);
+  return record.route.removed.map((removed) => [removed.rung, removed.reason, removed.detail]);
+}
+
+test("a Codex usage-limit error marks openai-codex exhausted until the stated reset, and the next routing from another session and project avoids it", async () => {
+  const h = harness({ ...LIVE, tiers: CODEX_FIRST });
+  try {
+    const failing = fakeSessionRegistry([{ events: errorEvents(CODEX_USAGE_LIMIT) }]);
+    const failed = await autoEvents(await loadAutoProvider(h, failing), FIX_README, "limited-worker");
+    assert.deepEqual(forwardedRungs(failing), ["openai-codex/gpt-6-luna:low"]);
+    const final = failed.at(-1);
+    assert.ok(final?.type === "error");
+    assert.equal(final.error.errorMessage, CODEX_USAGE_LIMIT, "the worker still gets the provider's error");
+
+    const otherProject = join(h.projectDir, "..", "other-project");
+    mkdirSync(otherProject);
+    const next = fakeSessionRegistry([{ events: answerEvents("ok") }]);
+    await autoEvents(await loadAutoProvider(h, next, {}, { cwd: otherProject }), FIX_README, "next-worker");
+    assert.deepEqual(forwardedRungs(next), [`${HAIKU}:low`]);
+    const [removed] = removedRungs(h, "next-worker");
+    assert.deepEqual(removed?.slice(0, 2), ["openai-codex/gpt-6-luna:low", "provider out of usage"]);
+    assert.match(removed?.[2] ?? "", /exhausted until 2026-09-26T12:42:00\.000Z/);
+
+    const afterReset = fakeSessionRegistry([{ events: answerEvents("ok") }]);
+    await autoEvents(await loadAutoProvider(h, afterReset, { now: () => new Date("2026-09-26T12:42:00.000Z") }), FIX_README, "after-reset-worker");
+    assert.deepEqual(forwardedRungs(afterReset), ["openai-codex/gpt-6-luna:low"]);
+  } finally { h.cleanup(); }
+});
+
+const LIMIT_ERROR_CASES = [
+  { label: "a Codex usage limit without a reset", tiers: CODEX_FIRST, error: "You have hit your ChatGPT usage limit (pro plan).",
+    limited: "openai-codex/gpt-6-luna:low", other: `${HAIKU}:low`, reason: "provider out of usage", holdsUntil: "2026-09-26T17:00:00.000Z" },
+  // pi-ai prefixes a WebSocket error event with "Codex error: "; the message after it is a stand-in until the live check captures one.
+  { label: "a Codex usage limit on the WebSocket path", tiers: CODEX_FIRST, error: "Codex error: The usage limit has been reached",
+    limited: "openai-codex/gpt-6-luna:low", other: `${HAIKU}:low`, reason: "provider out of usage", holdsUntil: "2026-09-26T17:00:00.000Z" },
+  { label: "Anthropic out of extra usage", tiers: TEST_TIERS, error: "You're out of extra usage.",
+    limited: `${HAIKU}:low`, other: "openai-codex/gpt-6-luna:low", reason: "provider out of usage", holdsUntil: "2026-09-26T17:00:00.000Z" },
+  { label: "an Anthropic 429 rate limit", tiers: TEST_TIERS,
+    error: '429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed the rate limit"}}',
+    limited: `${HAIKU}:low`, other: "openai-codex/gpt-6-luna:low", reason: "provider throttled", holdsUntil: "2026-09-26T12:05:00.000Z" },
+  // A stand-in text too: pi-ai turns a Codex HTTP 429 into the usage-limit text above.
+  { label: "a rate limit that says when to try again", tiers: CODEX_FIRST, error: "Codex error: Rate limit reached. Please try again in 20s.",
+    limited: "openai-codex/gpt-6-luna:low", other: `${HAIKU}:low`, reason: "provider throttled", holdsUntil: "2026-09-26T12:00:20.000Z" },
+] as const;
+
+for (const { label, tiers, error, limited, other, reason, holdsUntil } of LIMIT_ERROR_CASES) {
+  test(`${label} keeps the provider out of routing until ${holdsUntil}`, async () => {
+    const h = harness({ ...LIVE, tiers });
+    try {
+      const failing = fakeSessionRegistry([{ events: errorEvents(error) }]);
+      await autoEvents(await loadAutoProvider(h, failing), FIX_README, "limited-worker");
+      assert.deepEqual(forwardedRungs(failing), [limited]);
+
+      const justBefore = new Date(Date.parse(holdsUntil) - 1_000);
+      const avoided = fakeSessionRegistry([{ events: answerEvents("ok") }]);
+      await autoEvents(await loadAutoProvider(h, avoided, { now: () => justBefore }), FIX_README, "before-worker");
+      assert.deepEqual(forwardedRungs(avoided), [other]);
+      assert.deepEqual(removedRungs(h, "before-worker").map(([rung, why]) => [rung, why]), [[limited, reason]]);
+      assert.match(removedRungs(h, "before-worker")[0]?.[2] ?? "", new RegExp(`until ${holdsUntil.replaceAll(".", "\\.")}`));
+
+      const back = fakeSessionRegistry([{ events: answerEvents("ok") }]);
+      await autoEvents(await loadAutoProvider(h, back, { now: () => new Date(holdsUntil) }), FIX_README, "after-worker");
+      assert.deepEqual(forwardedRungs(back), [limited]);
+    } finally { h.cleanup(); }
+  });
+}
+
+test("an error that is no limit leaves the provider in routing", async () => {
+  const h = harness(LIVE);
+  try {
+    const failing = fakeSessionRegistry([{ events: errorEvents('400 {"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long"}}') }]);
+    await autoEvents(await loadAutoProvider(h, failing), FIX_README, "failed-worker");
+    const next = fakeSessionRegistry([{ events: answerEvents("ok") }]);
+    await autoEvents(await loadAutoProvider(h, next), FIX_README, "next-worker");
+    assert.deepEqual(forwardedRungs(next), [`${HAIKU}:low`]);
+    assert.deepEqual(removedRungs(h, "next-worker"), []);
+  } finally { h.cleanup(); }
+});
+
+/** A project folder next to the harness project whose settings replace the mechanical tier. */
+function projectWithMechanicalTier(h: Harness, name: string, rungs: readonly string[]): string {
+  const dir = join(h.projectDir, "..", name);
+  mkdirSync(join(dir, ".pi"), { recursive: true });
+  writeFileSync(join(dir, ".pi", "settings.json"), JSON.stringify({ orchestrator: { routing: { tiers: { mechanical: rungs } } } }));
+  return dir;
+}
+
+const BOTH_EXHAUSTED = "anthropic: exhausted until 2026-09-26T17:00:00.000Z (no reset stated), from a limit error at 2026-09-26T12:00:00.000Z; " +
+  "openai-codex: exhausted until 2026-09-26T12:42:00.000Z, from a limit error at 2026-09-26T12:00:00.000Z";
+
+/** Two sessions in two projects hit a usage limit at once, each on its own provider. */
+async function exhaustBothProviders(h: Harness): Promise<void> {
+  const codex = fakeSessionRegistry([{ events: errorEvents(CODEX_USAGE_LIMIT) }]);
+  const anthropic = fakeSessionRegistry([{ events: errorEvents("You're out of extra usage.") }]);
+  const codexStream = await loadAutoProvider(h, codex, {}, { cwd: projectWithMechanicalTier(h, "codex-project", ["openai-codex/gpt-6-luna:low"]) });
+  const anthropicStream = await loadAutoProvider(h, anthropic, {}, { cwd: projectWithMechanicalTier(h, "anthropic-project", [`${HAIKU}:low`]) });
+  await Promise.all([autoEvents(codexStream, FIX_README, "codex-worker"), autoEvents(anthropicStream, FIX_README, "anthropic-worker")]);
+  assert.deepEqual([...forwardedRungs(codex), ...forwardedRungs(anthropic)], ["openai-codex/gpt-6-luna:low", `${HAIKU}:low`]);
+}
+
+test("with every provider exhausted a worker is refused with the reset times, and nothing is forwarded or recorded for it", async () => {
+  const h = harness(LIVE);
+  try {
+    await exhaustBothProviders(h);
+    const nothing = fakeSessionRegistry([]);
+    const refused = await autoEvents(await loadAutoProvider(h, nothing), FIX_README, "refused-worker");
+    const final = refused.at(-1);
+    assert.ok(final?.type === "error");
+    assert.equal(final.error.errorMessage, "routing refused this worker, and its fallback, the orchestrator session model " +
+      `anthropic/claude-haiku-4-5:medium, is on anthropic, which is out of usage. Usage limits: ${BOTH_EXHAUSTED}. No request was sent to any provider.`);
+    assert.equal(nothing.calls.length, 0);
+    assert.equal(h.records().some((record) => record.delegationId === "refused-worker"), false);
+  } finally { h.cleanup(); }
+});
+
+test("after a refusal the session-model fallback runs only while its provider is not exhausted", async () => {
+  const codexOnly = { mechanical: ["openai-codex/gpt-6-luna:low"], standard: ["openai-codex/gpt-6-sol:medium"],
+    elevated: ["openai-codex/gpt-6-sol:high"], critical: ["openai-codex/gpt-6-sol:xhigh"] };
+  const h = harness({ ...LIVE, tiers: codexOnly });
+  try {
+    await autoEvents(await loadAutoProvider(h, fakeSessionRegistry([{ events: errorEvents(CODEX_USAGE_LIMIT) }])), FIX_README, "codex-worker");
+
+    const fallback = fakeSessionRegistry([{ events: answerEvents("ok") }]);
+    assert.equal((await autoEvents(await loadAutoProvider(h, fallback), FIX_README, "fallback-worker")).at(-1)?.type, "done");
+    assert.deepEqual(forwardedRungs(fallback), [`${HAIKU}:medium`], "the anthropic session model still has usage");
+    const record = h.records().find((entry) => entry.delegationId === "fallback-worker");
+    assert.ok(record?.recordType === "decision" && record.route.outcome === "refused");
+    assert.deepEqual([...new Set(record.route.removed.map((removed) => removed.reason))], ["provider out of usage"]);
+    assert.equal(record.ranOn, `${HAIKU}:medium`);
+
+    const nothing = fakeSessionRegistry([]);
+    const stream = await loadAutoProvider(h, nothing);
+    process.env.PI_ORCHESTRATOR_SESSION_MODEL = "openai-codex/gpt-6-sol:medium";
+    const final = (await autoEvents(stream, FIX_README, "skipped-fallback-worker")).at(-1);
+    assert.ok(final?.type === "error");
+    assert.equal(final.error.errorMessage, "routing refused this worker, and its fallback, the orchestrator session model openai-codex/gpt-6-sol:medium, " +
+      "is on openai-codex, which is out of usage. Usage limits: openai-codex: exhausted until 2026-09-26T12:42:00.000Z, " +
+      "from a limit error at 2026-09-26T12:00:00.000Z. No request was sent to any provider.");
+    assert.equal(nothing.calls.length, 0);
+  } finally { h.cleanup(); }
 });

@@ -33,8 +33,9 @@ import type { ResolvedTierMap, TierRung } from "./tier-map.ts";
 
 export type ProviderUsageState = "out-of-usage" | "throttled";
 
-/** What ticket 08's observations say about one provider right now. A
- *  provider with no entry has no known limit, which removes nothing. */
+/** What ticket 08's observations and the usage store say about one provider
+ *  right now. A provider with no entry has no known limit, which removes
+ *  nothing. */
 export interface ProviderUsage {
   readonly state: ProviderUsageState;
   readonly detail?: string;

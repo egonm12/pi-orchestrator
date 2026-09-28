@@ -9,7 +9,10 @@ import { recordedRungPassesHardFilters, routeTask, type ActiveRouter } from "./r
 import { parentDelegationOf, reviewedDelegationOf } from "../subagents/worker-sessions.ts";
 import { publishServedRung, type RungEscalation } from "./served-rungs.ts";
 import type { RiskTier } from "../routing/classifier.ts";
-import type { RoutingConstraints } from "../routing/tier-router.ts";
+import type { ProviderUsage, RoutingConstraints } from "../routing/tier-router.ts";
+import { providerOf } from "../recipients/authorized-delegation.ts";
+import { limitErrorObservation } from "./limit-errors.ts";
+import { recordUsageObservation } from "./usage-observations.ts";
 
 type ProviderConfig = NonNullable<Parameters<ExtensionAPI["registerProvider"]>[1]>;
 
@@ -93,25 +96,53 @@ function sessionPin(banLists: BanLists): { model: string; effort: string } {
   return { model: baseModel, effort: thinkingSuffix.slice(1) };
 }
 
-/** Whether a fallback onto a worker's excluded rung is refused: only when a
- *  live route refused. In shadow mode and with routing off (not enabled, or
- *  switched off by an error) no other rung can be chosen, so a reviewer runs
- *  on the reviewed delegation's rung with its fresh context, a same-rung
- *  review (ADR 0010, owner decision 2026-09-28). */
+/** Whether the fallback is checked: only when a live route refused. Then a
+ *  fallback onto a worker's excluded rung is refused, and so is one whose
+ *  provider is out of usage. In shadow mode and with routing off (not
+ *  enabled, or switched off by an error) no other rung can be chosen, so a
+ *  reviewer runs on the reviewed delegation's rung with its fresh context, a
+ *  same-rung review (ADR 0010, owner decision 2026-09-28). */
 type ExcludedFallback = "refused" | "allowed";
 
+/** Each limited provider with what limits it, in provider order. */
+function usageLimitsText(providerUsage: Readonly<Record<string, ProviderUsage>>): string {
+  return Object.keys(providerUsage).sort().map((provider) => {
+    const usage = providerUsage[provider]!;
+    return `${provider}: ${usage.detail ?? (usage.state === "out-of-usage" ? "out of usage" : "throttled")}`;
+  }).join("; ");
+}
+
 /** The session model a worker falls back to when routing is off, refuses or
- *  runs in shadow mode. After a live refusal a worker whose routing
- *  constraints exclude that rung, a reviewer on the reviewed delegation's rung
- *  (ADR 0010), fails with the reason instead of running. */
-function fallbackPin(banLists: BanLists, constraints: RoutingConstraints | undefined, excludedFallback: ExcludedFallback): Pin {
+ *  runs in shadow mode. After a live refusal a worker fails with the reason
+ *  instead of running when its routing constraints exclude that rung, a
+ *  reviewer on the reviewed delegation's rung (ADR 0010), or when the
+ *  session model's provider is out of usage in `providerUsage`. */
+function fallbackPin(banLists: BanLists, constraints: RoutingConstraints | undefined, excludedFallback: ExcludedFallback,
+  providerUsage: Readonly<Record<string, ProviderUsage>> = {}): Pin {
   const pin = sessionPin(banLists);
+  if (excludedFallback === "allowed") return pin;
   const excluded = constraints?.excludedRung;
-  if (excludedFallback === "refused" && excluded?.model === pin.model && excluded.effort === pin.effort) {
+  if (excluded?.model === pin.model && excluded.effort === pin.effort) {
     throw new SessionModelError(`no other rung is left: this worker would fall back to the orchestrator session model ${pin.model}:${pin.effort}, ` +
       "which its routing constraints exclude");
   }
+  const provider = providerOf(pin.model);
+  if (providerUsage[provider]?.state === "out-of-usage") {
+    throw new SessionModelError(`routing refused this worker, and its fallback, the orchestrator session model ${pin.model}:${pin.effort}, ` +
+      `is on ${provider}, which is out of usage. Usage limits: ${usageLimitsText(providerUsage)}. No request was sent to any provider.`);
+  }
   return pin;
+}
+
+/** Records the usage observation a rung's error text gives for the rung's
+ *  provider, in the usage store every later routing reads. Nothing is
+ *  recorded with routing off, or for an error that is no limit. */
+function recordLimitError(deps: AutoProviderDependencies, provider: string, text: string | undefined): void {
+  const router = deps.disabled() ? undefined : deps.router();
+  if (router === undefined || text === undefined) return;
+  const observation = limitErrorObservation(text, deps.now());
+  if (observation === undefined) return;
+  try { recordUsageObservation(router.usagePath, provider, observation); } catch (error) { deps.disable(error); }
 }
 
 export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConfig {
@@ -149,9 +180,9 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
                   recordedRungPassesHardFilters(router, latest.route.rung, taskText, at, constraints)) {
                   pin = { model: latest.route.rung.model, effort: latest.route.rung.effort, ...escalationOf(latest.route) };
                 } else {
-                  const { classification, route } = await routeTask(router, taskText, agentRole, at, constraints);
+                  const { classification, route, providerUsage } = await routeTask(router, taskText, agentRole, at, constraints);
                   pin = router.mode === "shadow" ? fallbackPin(router.banLists, constraints, "allowed")
-                    : !route.ok ? fallbackPin(router.banLists, constraints, "refused")
+                    : !route.ok ? fallbackPin(router.banLists, constraints, "refused", providerUsage)
                     : { model: route.rung.model, effort: route.rung.effort, ...escalationOf(route) };
                   const ranOn = `${pin.model}:${pin.effort}`;
                   const parentDelegationId = parentDelegationOf(sessionId);
@@ -186,6 +217,8 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
           const reasoning = streamReasoning(rung, pin.effort);
           const inner = registry.streamSimple(rung, inward, { ...rest, ...(reasoning === undefined ? {} : { reasoning }) });
           for await (const event of inner) {
+            // Recorded before the worker sees the error, so a delegation started on it routes elsewhere.
+            if (event.type === "error" && event.reason === "error") recordLimitError(deps, rung.provider, event.error.errorMessage);
             const label = <T extends { provider: string; model: string; api: string }>(message: T): T =>
               ({ ...message, provider: model.provider, model: model.id, api: model.api });
             push({ ...event, ...("partial" in event && event.partial ? { partial: label(event.partial) } : {}),

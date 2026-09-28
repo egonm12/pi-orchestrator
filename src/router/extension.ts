@@ -20,6 +20,7 @@ import { runInit } from "../init/command.ts";
 import { setupNotice, setupStatus } from "../init/setup.ts";
 import { registerSubcommands, type Subcommand } from "../init/subcommands.ts";
 import { stateFolderEvidence, type EvidenceSetup, type RoutingEvidenceSource } from "./evidence.ts";
+import { usageObservationsPath } from "./usage-observations.ts";
 import { isOrchestratorSession } from "../subagents/orchestrator-session.ts";
 import { publishOrchestratorRouter } from "./orchestrator-router.ts";
 
@@ -139,6 +140,7 @@ function startRouting(ctx: ExtensionContext, deps: RouterDependencies): ActiveRo
     evidence: deps.evidence({ stateDir: folder, installedModelIds: installedModels.map((model) => model.fullId) }),
     owner: new TaskAllowanceOwner(newTaskLedger({ taskId: `router-session:${sessionId}` })),
     recordDir: join(folder, "routing"),
+    usagePath: usageObservationsPath(folder),
     installedModels,
   };
 }

@@ -463,9 +463,16 @@ pi-orchestrator can set routing constraints for one worker, by its session id, b
 
 The classifier still runs, so the decision record keeps the tier and why, and its `constraints` field names the constraint. Constraints never lift a hard filter.
 
+The usage limits come from usage observations, which the router extension reads from `usage-observations.json` in the state folder on every routing, so every session and project sees them. When a worker's rung fails with a limit error, the router extension records an observation for the rung's provider before the worker gets the error:
+
+- A usage-limit error, such as Codex's `You have hit your ChatGPT usage limit (plus plan). Try again in ~42 min.` or Anthropic's `You're out of extra usage.`, marks the provider exhausted until the reset the text states, or for 5 hours when it states none: the usage window of the Claude and Codex subscriptions.
+- A rate-limit error, such as Anthropic's `429 {"type":"error","error":{"type":"rate_limit_error",...}}`, marks the provider throttled until the time the text states, or for 5 minutes when it states none: long enough to spare the next few delegations, short enough that a per-minute limit doesn't keep the provider out for long.
+
+An exhausted provider's rungs are removed with the reason `provider out of usage`, a throttled provider's with `provider throttled`, and the removal's detail names when the limit lifts. With routing not enabled, or switched off by an error, nothing is recorded.
+
 The worker keeps the chosen rung as its pin across later requests and compaction. In live mode, a resumed worker can restore its pin from the decision record if the rung still passes the hard filters and the record was made under the same routing constraints. The auto model declares the largest context window in the tier map; an overflow on the pinned rung lets pi compact and retry on that rung. A compaction summary has a new session id and is classified separately. The classifier runs in the worker's process through its session model registry, without an extra `pi` process.
 
-In live mode the worker runs on the chosen rung. In shadow mode the router extension records the shadow decision, but the worker runs on the orchestrator's session model. A routing refusal, disabled routing or an internal routing failure also runs the worker on that model. The router extension sets `PI_ORCHESTRATOR_SESSION_MODEL` from the orchestrator's session model, including for a background worker at delegation time. If that variable is missing or names a model on the subagent ban list, the auto model request fails with a reason instead. A worker started on a real model is not routed; the guard still enforces the subagent ban list.
+In live mode the worker runs on the chosen rung. In shadow mode the router extension records the shadow decision, but the worker runs on the orchestrator's session model. A routing refusal, disabled routing or an internal routing failure also runs the worker on that model. After a live refusal, if that model's provider is exhausted, the worker fails instead, before any request is sent, with a reason naming every limited provider and when its limit lifts; no decision record is written for it. The router extension sets `PI_ORCHESTRATOR_SESSION_MODEL` from the orchestrator's session model, including for a background worker at delegation time. If that variable is missing or names a model on the subagent ban list, the auto model request fails with a reason instead. A worker started on a real model is not routed; the guard still enforces the subagent ban list.
 
 The orchestrator's main thread stays on the model picked in `/model`. Selecting `orchestrator/auto` there restores the previous model and warns; a saved `orchestrator/auto` default is also put back to the previous model. Without a previous model, it only warns, and the saved default stays unchanged. Only workers should run on the auto model.
 
@@ -479,6 +486,7 @@ Runtime state lives in `${PI_CODING_AGENT_DIR:-~/.pi/agent}/pi-orchestrator/`, o
 | `routing/*.jsonl` | One decision record per classified worker session (delegation id), fork and agent-model records, effort-ladder links for retries, verdicts, and the edit records and gate requirements of editing delegations, one file per day | Created on the first record |
 | `model-catalog.json` | Prices, context windows and usage headroom | Built from installed models and a pinned models.dev snapshot |
 | `refresh-state.json` | Throttling observations | No throttle |
+| `usage-observations.json` | The latest usage observation per provider: state, percentage left and reset time when known, when it was observed, and whether it came from an error or response headers. Shared by all sessions and projects; a write holds `usage-observations.json.lock` for a moment | No limit known |
 
 Decision records keep the first 200 characters of the task text, with credential-shaped text redacted. The redaction is best effort.
 

@@ -135,8 +135,12 @@ A verdict whose delegation id matches no decision record. Kept and counted, neve
 A rule that removes rungs before the tier choice and that no preference can override: the subagent ban list, the allowed-model list, usage limits, context window, task budget and approved recipients.
 
 **Usage observation**:
-The latest known state of one provider's usage for the owner's account: available, low, exhausted or throttled, with the percentage left and the reset time when known. Learned from limit errors and response headers, shared by all the owner's sessions and projects. An exhausted provider is removed by a hard filter.
+The latest known state of one provider's usage for the owner's account: available, low, exhausted or throttled, with the percentage left and the reset time when known. Learned from limit errors and response headers, shared by all the owner's sessions and projects. An exhausted or throttled provider is removed by a hard filter until its limit lifts.
 _Avoid_: Quota, headroom (alone), balance
+
+**Limit error**:
+A rung's error whose text says the provider refused for usage: a usage limit (the account's allowance is used up until a reset), which makes the provider exhausted, or a rate limit (too many requests for now), which makes it throttled. Each holds until the reset the text states, or for a set time when it states none.
+_Avoid_: Quota error, 429 (alone: Codex also reports a usage limit as a 429)
 
 **Escalation**:
 Moving a task to the next higher tier because the hard filters removed every rung of its current tier. Only ever upward, one tier at a time; an emptied critical tier is a refusal, not a move down.
