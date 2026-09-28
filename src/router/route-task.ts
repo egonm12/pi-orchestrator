@@ -10,30 +10,30 @@ import { deriveProviderUsage, type RoutingEvidence, type RoutingEvidenceSource }
 import { readUsageObservations, usageLimits } from "./usage-observations.ts";
 import { readUsableRoutingRecords, type RoutingMode } from "../routing/decision-record.ts";
 import { providerOf } from "../recipients/authorized-delegation.ts";
-import { pendingRoutingChoiceCounts } from "./routing-choice-reservations.ts";
+import { pendingRoutingChoices } from "./routing-choice-reservations.ts";
 
 const BALANCING_WINDOW_MS = 5 * 60 * 60 * 1000;
 
 /** Live decisions count rungs that started a request. Pending reservations
  * count choices in flight before their first event. Shadow and refusals did
- * not pin the recommendation. Both stores are shared across projects and
+ * not pin the recommendation. A delegation counts once, for the provider of
+ * its latest pin: after a failover that is the rung it ran on, not the rung
+ * that refused its first request. Both stores are shared across projects and
  * sessions; the in-process queue makes a fan-out's choices sequential. */
 function pinnedProviderCounts(dir: string, at: Date): Readonly<Record<string, number>> {
-  const counts: Record<string, number> = {};
-  const seen = new Set<string>();
+  const pinned = new Map<string, string>();
   for (const record of readUsableRoutingRecords(dir)) {
     if (record.recordType !== "decision" || record.mode !== "live" || record.route.outcome !== "chosen") continue;
     const timestamp = Date.parse(record.timestamp);
-    if (timestamp < at.getTime() - BALANCING_WINDOW_MS || timestamp > at.getTime() || seen.has(record.delegationId)) continue;
-    const pinned = `${record.route.rung.model}:${record.route.rung.effort}`;
-    if (record.ranOn !== pinned && !(record.ranOn === undefined && record.schemaVersion === "decision-record/2")) continue;
-    seen.add(record.delegationId);
-    const provider = providerOf(record.route.rung.model);
-    counts[provider] = (counts[provider] ?? 0) + 1;
+    if (timestamp < at.getTime() - BALANCING_WINDOW_MS || timestamp > at.getTime()) continue;
+    const rung = `${record.route.rung.model}:${record.route.rung.effort}`;
+    if (record.ranOn !== rung && !(record.ranOn === undefined && record.schemaVersion === "decision-record/2")) continue;
+    pinned.set(record.delegationId, providerOf(record.route.rung.model));
   }
-  for (const [provider, pending] of Object.entries(pendingRoutingChoiceCounts(dir, at, seen))) {
-    counts[provider] = (counts[provider] ?? 0) + pending;
-  }
+  // A choice in flight is newer than any decision its delegation committed.
+  for (const [delegationId, provider] of pendingRoutingChoices(dir, at)) pinned.set(delegationId, provider);
+  const counts: Record<string, number> = {};
+  for (const provider of pinned.values()) counts[provider] = (counts[provider] ?? 0) + 1;
   return counts;
 }
 

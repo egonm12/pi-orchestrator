@@ -18,6 +18,7 @@ import {
   buildAgentModelRecord,
   buildEditRecord,
   buildEffortLadderRecord,
+  buildFailoverRecord,
   buildForkRecord,
   buildGateRequirementRecord,
   buildUnplacedLadderRecord,
@@ -303,18 +304,20 @@ test("every record type the extension writes reads back; the usable reader skips
       buildGateRequirementRecord({ delegationId: "retry-2", at, gateLevel: "medium", gateAction: "spot-check" }),
       { ...common, delegationId: "retry-2", verdict: "accept", decisionFile: "2026-09-25.jsonl", reason: "checked" },
       { ...common, recordType: "orphaned-verdict", delegationId: "nobody", verdict: "request_changes" },
+      buildFailoverRecord({ delegationId: "attempt-live-1", at, refusedAttempt: { timestamp: at.toISOString(), rung: "openai-codex/gpt-6-sol:high" },
+        limit: "exhausted", detail: "You have hit your ChatGPT usage limit (plus plan).", rung: `${SONNET}:medium` }),
     ];
     for (const record of written.slice(1)) appendRoutingRecord(dir, record);
     const path = decisionRecordPath(dir, NOW);
     const readable = readRoutingRecords(dir);
     assert.deepEqual(readable.map((record) => record.recordType),
-      ["decision", "effort-ladder", "effort-ladder", "fork", "agent-model", "edit", "gate-requirement", "verdict", "orphaned-verdict"]);
+      ["decision", "effort-ladder", "effort-ladder", "fork", "agent-model", "edit", "gate-requirement", "verdict", "orphaned-verdict", "failover"]);
 
     // What an older reader cannot validate: a newer ladder step, a record type it does not know, a newer schema version, a torn line.
     const unplaced = written[2]!;
     appendFileSync(path, [
       JSON.stringify({ ...unplaced, step: "sideways" }),
-      JSON.stringify({ ...unplaced, recordType: "failover" }),
+      JSON.stringify({ ...unplaced, recordType: "usage-header" }),
       JSON.stringify({ ...unplaced, schemaVersion: "decision-record/4" }),
       '{"recordType":"verdict","schemaVer',
     ].join("\n") + "\n");
@@ -322,15 +325,15 @@ test("every record type the extension writes reads back; the usable reader skips
 
     assert.throws(() => readRoutingRecords(dir), (error: unknown) => {
       assert.ok(error instanceof RoutingRecordError, String(error));
-      assert.equal(error.message, "routing record 2026-09-25.jsonl:10: field 'step' must be one of effort, same-tier, next-tier, unplaced; got \"sideways\"");
+      assert.equal(error.message, "routing record 2026-09-25.jsonl:11: field 'step' must be one of effort, same-tier, next-tier, unplaced; got \"sideways\"");
       return true;
     });
     const { entries, skipped } = readUsableRoutingRecordEntries(dir);
     assert.deepEqual(entries.map((entry) => [entry.line, entry.record.recordType]),
-      [...readable.map((record, index) => [index + 1, record.recordType]), [14, "edit"]], "every valid line, the one after the bad ones too");
+      [...readable.map((record, index) => [index + 1, record.recordType]), [15, "edit"]], "every valid line, the one after the bad ones too");
     assert.deepEqual(skipped.map((line) => [line.file, line.line, line.error.field]),
-      [["2026-09-25.jsonl", 10, "step"], ["2026-09-25.jsonl", 11, "recordType"], ["2026-09-25.jsonl", 12, "schemaVersion"], ["2026-09-25.jsonl", 13, "(record)"]]);
-    assert.match(skipped[3]!.error.message, /^routing record 2026-09-25\.jsonl:13: field '\(record\)' is not valid JSON/);
+      [["2026-09-25.jsonl", 11, "step"], ["2026-09-25.jsonl", 12, "recordType"], ["2026-09-25.jsonl", 13, "schemaVersion"], ["2026-09-25.jsonl", 14, "(record)"]]);
+    assert.match(skipped[3]!.error.message, /^routing record 2026-09-25\.jsonl:14: field '\(record\)' is not valid JSON/);
     assert.deepEqual(readUsableRoutingRecords(dir), entries.map((entry) => entry.record));
     assert.deepEqual(readUsableRoutingRecordEntries(join(dir, "none")), { entries: [], skipped: [] }, "a folder that does not exist holds no records");
   } finally { cleanup(); }
@@ -506,6 +509,27 @@ test("a placed climb names its routing mode, live or shadow, never off; an unpla
     assert.throws(() => validateRoutingRecord({ ...unplaced, detail: " " }), /field 'detail'/);
     assert.throws(() => validateRoutingRecord({ ...unplaced, schemaVersion: "decision-record/2" }), /unplaced effort-ladder records/);
     assert.throws(() => validateRoutingRecord({ ...unplaced, previousDecisionId: "attempt-3" }), /must name a different attempt/);
+  } finally { cleanup(); }
+});
+
+test("a failover record links to the refused attempt by its timestamp and rung, names the rung it moved to, and keeps its error text safe", async () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    const refusedAttempt = { timestamp: NOW.toISOString(), rung: "openai-codex/gpt-6-luna:low" };
+    const failover = buildFailoverRecord({ delegationId: "worker-1", at: NOW, refusedAttempt, limit: "exhausted",
+      resetsAt: "2026-09-25T10:12:00.000Z", detail: `usage limit ${"x".repeat(FREE_TEXT_LIMIT)} api_key=abc123`, rung: `${SONNET}:medium` });
+    assert.equal(failover.detail.length, FREE_TEXT_LIMIT);
+    appendRoutingRecord(dir, failover);
+    const [read] = readRoutingRecords(dir);
+    assert.ok(read?.recordType === "failover");
+    assert.deepEqual([read.refusedAttempt, read.limit, read.resetsAt, read.rung], [refusedAttempt, "exhausted", "2026-09-25T10:12:00.000Z", `${SONNET}:medium`]);
+    const throttled = buildFailoverRecord({ delegationId: "worker-2", at: NOW, refusedAttempt, limit: "throttled", detail: "429 rate limit", rung: `${SONNET}:medium` });
+    assert.equal("resetsAt" in throttled, false);
+    assert.throws(() => validateRoutingRecord({ ...failover, limit: "low" }), /field 'limit' must be one of exhausted, throttled/);
+    assert.throws(() => validateRoutingRecord({ ...failover, refusedAttempt: { rung: refusedAttempt.rung } }), /field 'refusedAttempt.timestamp' is missing/);
+    assert.throws(() => validateRoutingRecord({ ...failover, rung: refusedAttempt.rung }), /field 'rung' must name a different rung/);
+    assert.throws(() => validateRoutingRecord({ ...failover, resetsAt: "soon" }), /field 'resetsAt' must be an ISO-8601 time/);
+    assert.throws(() => validateRoutingRecord({ ...failover, schemaVersion: "decision-record/2" }), /unsupported for failover records/);
   } finally { cleanup(); }
 });
 

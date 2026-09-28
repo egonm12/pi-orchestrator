@@ -1,6 +1,8 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { mkdirSync } from "node:fs";
-import { appendRoutingRecord, buildDecisionRecord, madeUnderConstraints, readRoutingRecords, RoutingRecordError, type DecisionRecord } from "../routing/decision-record.ts";
+import { appendRoutingRecord, buildDecisionRecord, buildFailoverRecord, madeUnderConstraints, readRoutingRecords, RoutingRecordError,
+  type DecisionRecord, type FailoverRecord } from "../routing/decision-record.ts";
+import type { TierClassification } from "../routing/tier-classifier.ts";
 import { splitKnownThinkingSuffix } from "../models/model-info.ts";
 import { subagentBanListEntry, type BanLists } from "../policy/ban-lists.ts";
 import { streamReasoning } from "../routing/session-classifier-call.ts";
@@ -15,7 +17,7 @@ import type { RiskTier } from "../routing/classifier.ts";
 import type { ProviderUsage, RoutingConstraints } from "../routing/tier-router.ts";
 import { providerOf } from "../recipients/authorized-delegation.ts";
 import { limitErrorObservation } from "./limit-errors.ts";
-import { recordUsageObservation } from "./usage-observations.ts";
+import { recordUsageObservation, type UsageObservation } from "./usage-observations.ts";
 
 type ProviderConfig = NonNullable<Parameters<ExtensionAPI["registerProvider"]>[1]>;
 
@@ -51,6 +53,18 @@ export interface AutoProviderDependencies {
 
 /** A pin and, when its routing decision escalated, the tiers it moved between. */
 type ServedPin = Pin & { readonly escalation?: RungEscalation };
+
+/** What a worker's first request was routed with, kept so a limit error
+ *  before any output can route it again (PRD cml8, "Failover"), and the
+ *  providers it was refused by so far. */
+interface FailoverContext {
+  readonly router: ActiveRouter;
+  readonly taskText: string;
+  readonly agentRole: string;
+  readonly classification: TierClassification;
+  readonly constraints: RoutingConstraints | undefined;
+  readonly refusedProviders: Set<string>;
+}
 
 function escalationOf(route: { readonly startedAtTier: RiskTier; readonly tier: RiskTier }): { escalation?: RungEscalation } {
   return route.startedAtTier === route.tier ? {} : { escalation: { from: route.startedAtTier, to: route.tier } };
@@ -171,7 +185,9 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
         let wasPinned = false;
         let probeRung: string | undefined;
         let pendingDecision: DecisionRecord | undefined;
+        let pendingFailover: FailoverRecord | undefined;
         let pendingRecordDir: string | undefined;
+        let failover: FailoverContext | undefined;
         try {
           if (!sessionId) throw new Error("auto model request has no sessionId");
           const registry = deps.registry();
@@ -252,6 +268,9 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
                       reserveRoutingChoice(router.recordDir, sessionId, providerOf(pin.model), at);
                       pendingDecision = decision;
                       pendingRecordDir = router.recordDir;
+                      // Only a new live choice can fail over: its request is
+                      // the worker's first, and routing picked its rung.
+                      failover = { router, taskText, agentRole, classification, constraints, refusedProviders: new Set() };
                     } else appendRoutingRecord(router.recordDir, decision);
                   }
                 } catch (error) {
@@ -267,53 +286,128 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
             }
           }
           if (!pin) throw new Error("auto model could not pin a rung");
-          probeRung = `${pin.model}:${pin.effort}`;
-          const { rung, inner } = request ?? beginRequest(pin);
-          const iterator = inner[Symbol.asyncIterator]();
-          // Calling next() starts a lazy model request. A synchronous stream
-          // factory is not evidence that a provider request was attempted.
-          const first = await iterator.next();
-          // Any first event shows the request was attempted on the rung, a
-          // provider's error reply included (an overflow keeps its pin). Known
-          // limit: pi-ai reports its own setup failures (an unconfigured
-          // provider) as an error event of the same shape, so those count too.
-          // The registry lookup and the authorization filter run first, which
-          // keeps that case rare. First-request limit errors are ticket 09's.
-          const accepted = !first.done;
-          if (pendingRecordDir) {
-            const dir = pendingRecordDir;
-            try {
-              await withRoutingChoice(dir, async () => {
-                if (accepted && pendingDecision) appendRoutingRecord(dir, pendingDecision);
-                releaseRoutingChoice(dir, sessionId);
-                pendingRecordDir = undefined;
-                pendingDecision = undefined;
-              });
-            } catch (error) {
-              deps.disable(error);
-              // Nobody will read the started request once the worker fails.
-              await iterator.return?.();
-              throw error;
-            }
-            // A worker whose request was never accepted keeps no pin, so the
-            // decision it did not record cannot be restored on a later request.
-            if (!accepted) pins.delete(sessionId);
+
+          /** Pins the worker again after its first request on `refused`
+           *  answered with `limit` before any output: routes the task once
+           *  more, now that the usage store holds the refused provider's
+           *  observation, and starts the request on the chosen rung. Its
+           *  decision and the failover record linking it to `refusedDecision`
+           *  are held until that request's first event, like a first choice.
+           *  `undefined` when routing has no other provider's rung left. */
+          async function failOver(context: FailoverContext, refused: ServedPin, refusedDecision: DecisionRecord,
+            limit: UsageObservation, errorText: string): Promise<{ pin: ServedPin } & ReturnType<typeof beginRequest> | undefined> {
+            const { router, taskText, agentRole, classification, constraints, refusedProviders } = context;
+            try { recordUsageObservation(router.usagePath, providerOf(refused.model), limit); }
+            catch (error) { deps.disable(error); return undefined; }
+            refusedProviders.add(providerOf(refused.model));
+            return withRoutingChoice(router.recordDir, async () => {
+              const at = deps.now();
+              let route: ReturnType<typeof routeTask>["route"];
+              try { ({ route } = routeTask(router, taskText, classification, at, constraints)); }
+              catch (error) { deps.disable(error); return undefined; }
+              if (!route.ok || refusedProviders.has(providerOf(route.rung.model))) return undefined;
+              const next: ServedPin = { model: route.rung.model, effort: route.rung.effort, ...escalationOf(route) };
+              const ranOn = `${next.model}:${next.effort}`;
+              const parentDelegationId = parentDelegationOf(sessionId!);
+              const reviewedDelegationId = reviewedDelegationOf(sessionId!);
+              const decision = buildDecisionRecord({ delegationId: sessionId!, at, taskText, agentRole, classification, tierMap: router.tierMap,
+                route, ranOn, mode: "live", ...(parentDelegationId === undefined ? {} : { parentDelegationId }),
+                ...(constraints === undefined ? {} : { constraints }), ...(reviewedDelegationId === undefined ? {} : { reviewedDelegationId }) });
+              const record = buildFailoverRecord({ delegationId: sessionId!, at,
+                refusedAttempt: { timestamp: refusedDecision.timestamp, rung: `${refused.model}:${refused.effort}` },
+                limit: limit.state === "exhausted" ? "exhausted" : "throttled", ...(limit.resetsAt === undefined ? {} : { resetsAt: limit.resetsAt }),
+                detail: errorText, rung: ranOn });
+              // Should the new request not start, a later request routes again
+              // instead of reusing the refused pin.
+              pins.delete(sessionId!);
+              const started = beginRequest(next);
+              reserveRoutingChoice(router.recordDir, sessionId!, providerOf(next.model), at);
+              pendingDecision = decision;
+              pendingFailover = record;
+              pendingRecordDir = router.recordDir;
+              pins.set(sessionId!, next);
+              return { pin: next, ...started };
+            });
           }
-          // The worker board shows the rung, which the relabelled replies below
-          // never name. It reads the tier from the decision, so publish only
-          // after the decision is persisted.
-          if (!first.done) publishServedRung({ delegationId: sessionId, model: pin.model, effort: pin.effort, ...(pin.escalation ? { escalation: pin.escalation } : {}) });
-          const forward = (event: Awaited<ReturnType<typeof iterator.next>> extends IteratorResult<infer E> ? E : never) => {
-            // Recorded before the worker sees the error, so later delegations route elsewhere.
-            if (event.type === "error" && event.reason === "error") recordLimitError(deps, rung.provider, event.error.errorMessage);
-            const label = <T extends { provider: string; model: string; api: string }>(message: T): T =>
-              ({ ...message, provider: model.provider, model: model.id, api: model.api });
-            push({ ...event, ...("partial" in event && event.partial ? { partial: label(event.partial) } : {}),
-              ...("message" in event && event.message ? { message: label(event.message) } : {}),
-              ...("error" in event && event.error ? { error: label(event.error) } : {}) } as Parameters<typeof push>[0]);
-          };
-          if (!first.done) forward(first.value);
-          for (let next = first.done ? first : await iterator.next(); !next.done; next = await iterator.next()) forward(next.value);
+
+          let attempt = { pin, ...(request ?? beginRequest(pin)) };
+          for (;;) {
+            probeRung = `${attempt.pin.model}:${attempt.pin.effort}`;
+            const iterator = attempt.inner[Symbol.asyncIterator]();
+            type Event = Awaited<ReturnType<typeof iterator.next>> extends IteratorResult<infer E> ? E : never;
+            // Calling next() starts a lazy model request. A synchronous stream
+            // factory is not evidence that a provider request was attempted.
+            let first = await iterator.next();
+            // Any first event shows the request was attempted on the rung, a
+            // provider's error reply included (an overflow keeps its pin). Known
+            // limit: pi-ai reports its own setup failures (an unconfigured
+            // provider) as an error event of the same shape, so those count too.
+            // The registry lookup and the authorization filter run first, which
+            // keeps that case rare.
+            const accepted = !first.done;
+            const committed = accepted ? pendingDecision : undefined;
+            if (pendingRecordDir) {
+              const dir = pendingRecordDir;
+              try {
+                await withRoutingChoice(dir, async () => {
+                  if (accepted && pendingFailover) appendRoutingRecord(dir, pendingFailover);
+                  if (accepted && pendingDecision) appendRoutingRecord(dir, pendingDecision);
+                  releaseRoutingChoice(dir, sessionId);
+                  pendingRecordDir = undefined;
+                  pendingDecision = undefined;
+                  pendingFailover = undefined;
+                });
+              } catch (error) {
+                deps.disable(error);
+                // Nobody will read the started request once the worker fails.
+                await iterator.return?.();
+                throw error;
+              }
+              // A worker whose request was never accepted keeps no pin, so the
+              // decision it did not record cannot be restored on a later request.
+              if (!accepted) pins.delete(sessionId);
+            }
+            // The worker board shows the rung, which the relabelled replies below
+            // never name. It reads the tier from the decision, so publish only
+            // after the decision is persisted. A failover publishes its new rung.
+            const { pin: served, rung } = attempt;
+            if (accepted) publishServedRung({ delegationId: sessionId, model: served.model, effort: served.effort, ...(served.escalation ? { escalation: served.escalation } : {}) });
+            // A start event carries no output yet, so it is held until the
+            // rung shows whether it answers or refuses: a failover must not
+            // leave the worker a second start.
+            const held: Event[] = [];
+            while (!first.done && first.value.type === "start") {
+              held.push(first.value);
+              first = await iterator.next();
+            }
+            // A limit error before any output on a new live choice fails over.
+            // Any other error, and a limit later in the run, fails the worker.
+            const refusal = failover && committed && !deps.disabled() && !first.done && first.value.type === "error" &&
+              first.value.reason === "error" && first.value.error.errorMessage !== undefined
+              ? { text: first.value.error.errorMessage, limit: limitErrorObservation(first.value.error.errorMessage, deps.now()) } : undefined;
+            if (failover && committed && refusal?.limit) {
+              const next = await failOver(failover, attempt.pin, committed, refusal.limit, refusal.text);
+              if (next) {
+                await iterator.return?.();
+                attempt = next;
+                continue;
+              }
+            }
+            // A refusal that could not fail over already recorded its observation.
+            const observed = refusal?.limit !== undefined;
+            const forward = (event: Event) => {
+              // Recorded before the worker sees the error, so later delegations route elsewhere.
+              if (event.type === "error" && event.reason === "error" && !(observed && event === first.value)) recordLimitError(deps, rung.provider, event.error.errorMessage);
+              const label = <T extends { provider: string; model: string; api: string }>(message: T): T =>
+                ({ ...message, provider: model.provider, model: model.id, api: model.api });
+              push({ ...event, ...("partial" in event && event.partial ? { partial: label(event.partial) } : {}),
+                ...("message" in event && event.message ? { message: label(event.message) } : {}),
+                ...("error" in event && event.error ? { error: label(event.error) } : {}) } as Parameters<typeof push>[0]);
+            };
+            for (const event of held) forward(event);
+            for (let next = first; !next.done; next = await iterator.next()) forward(next.value);
+            break;
+          }
         } catch (error) {
           // A lazy request that fails during preparation must not leave a
           // choice behind. The lock protects cancellation from a new choice.

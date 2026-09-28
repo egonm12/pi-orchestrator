@@ -36,17 +36,18 @@ function alive(pid: number): boolean {
   catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
 }
 
-/** Read-only counts for choices in flight. A dead process or a reservation
- * outside the rolling window cannot steer new delegations. Decisions are
- * counted separately, so exclude ids whose decision has been committed. */
-export function pendingRoutingChoiceCounts(recordDir: string, at: Date, committed: ReadonlySet<string>): Readonly<Record<string, number>> {
+/** Read-only: the provider of each choice in flight, by delegation id. A dead
+ * process or a reservation outside the rolling window cannot steer new
+ * delegations. A delegation with a committed decision can still have one: a
+ * failover's new choice, pending until its request's first event. */
+export function pendingRoutingChoices(recordDir: string, at: Date): ReadonlyMap<string, string> {
   let names: string[];
   try { names = readdirSync(folder(recordDir)).filter((name) => name.endsWith(".json")); }
   catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return new Map();
     throw error;
   }
-  const counts: Record<string, number> = {};
+  const pending = new Map<string, string>();
   for (const name of names) {
     try {
       const entry: unknown = JSON.parse(readFileSync(join(folder(recordDir), name), "utf8"));
@@ -55,8 +56,8 @@ export function pendingRoutingChoiceCounts(recordDir: string, at: Date, committe
       const timestamp = Date.parse(candidate.at);
       if (typeof candidate.delegationId !== "string" || typeof candidate.provider !== "string" || !Number.isInteger(candidate.pid) ||
         !Number.isFinite(timestamp) || timestamp < at.getTime() - WINDOW_MS || timestamp > at.getTime() ||
-        committed.has(candidate.delegationId) || !alive(candidate.pid)) continue;
-      counts[candidate.provider] = (counts[candidate.provider] ?? 0) + 1;
+        !alive(candidate.pid)) continue;
+      pending.set(candidate.delegationId, candidate.provider);
     } catch (error) {
       // A torn or older-format reservation is not evidence that a provider
       // started work. Skip it as the decision-record reader skips bad lines;
@@ -64,5 +65,5 @@ export function pendingRoutingChoiceCounts(recordDir: string, at: Date, committe
       if (!(error instanceof SyntaxError) && (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
   }
-  return counts;
+  return pending;
 }

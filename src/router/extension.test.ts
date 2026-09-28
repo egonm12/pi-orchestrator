@@ -17,6 +17,7 @@ import { resetBanLists } from "../policy/ban-lists.ts";
 import { authorizeRecipient, emptyAuthorization, grantOwnerApproval, type RecipientAuthorization } from "../recipients/authorization.ts";
 import { readRoutingRecords, writeDecisionRecord, type RoutingRecord } from "../routing/decision-record.ts";
 import { fixtureClassification, fixtureRoute, fixtureTierMap } from "../fixtures/routing-decision.ts";
+import { buildRoutingReport } from "../routing/routing-report.ts";
 import { answerEvents, errorEvents, fakeSessionRegistry, assistantMessage } from "../fixtures/session-model-registry.ts";
 import { SettingsManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { TestContext as ExtensionContext } from "../fixtures/extension-context.ts";
@@ -1806,6 +1807,12 @@ test("a worker whose fallback would be the rung its constraints exclude fails wi
 const CODEX_FIRST = { ...TEST_TIERS, mechanical: ["openai-codex/gpt-6-luna:low", `${HAIKU}:low`] };
 const CODEX_USAGE_LIMIT = "You have hit your ChatGPT usage limit (plus plan). Try again in ~42 min.";
 
+/** A rung that answers with some output and then fails with `errorMessage`:
+ *  a limit later in the run, which fails the worker instead of failing over. */
+function midRunErrorEvents(errorMessage: string) {
+  return [{ type: "start" }, { type: "text_delta", delta: "working" }, ...errorEvents(errorMessage)] as const;
+}
+
 /** The rungs a registry forwarded to, as `provider/model:effort`. */
 function forwardedRungs(registry: ReturnType<typeof fakeSessionRegistry>): string[] {
   return registry.calls.map((call) => `${call.model.provider}/${call.model.id}:${call.options?.reasoning}`);
@@ -1821,7 +1828,7 @@ function removedRungs(h: Harness, delegationId: string): [string, string, string
 test("a Codex usage-limit error marks openai-codex exhausted until the stated reset, and the next routing from another session and project avoids it", async () => {
   const h = harness({ ...LIVE, tiers: CODEX_FIRST });
   try {
-    const failing = fakeSessionRegistry([{ events: errorEvents(CODEX_USAGE_LIMIT) }]);
+    const failing = fakeSessionRegistry([{ events: midRunErrorEvents(CODEX_USAGE_LIMIT) }]);
     const failed = await autoEvents(await loadAutoProvider(h, failing), FIX_README, "limited-worker");
     assert.deepEqual(forwardedRungs(failing), ["openai-codex/gpt-6-luna:low"]);
     const final = failed.at(-1);
@@ -1863,9 +1870,10 @@ for (const { label, tiers, error, limited, other, reason, holdsUntil } of LIMIT_
   test(`${label} keeps the provider out of routing until ${holdsUntil}`, async () => {
     const h = harness({ ...LIVE, tiers });
     try {
-      const failing = fakeSessionRegistry([{ events: errorEvents(error) }]);
-      await autoEvents(await loadAutoProvider(h, failing), FIX_README, "limited-worker");
-      assert.deepEqual(forwardedRungs(failing), [limited]);
+      // On the first request, before any output: the worker fails over.
+      const failing = fakeSessionRegistry([{ events: errorEvents(error) }, { events: answerEvents("failed over") }]);
+      assert.equal((await autoEvents(await loadAutoProvider(h, failing), FIX_README, "limited-worker")).at(-1)?.type, "done");
+      assert.deepEqual(forwardedRungs(failing), [limited, other]);
 
       const justBefore = new Date(Date.parse(holdsUntil) - 1_000);
       const avoided = fakeSessionRegistry([{ events: answerEvents("ok") }]);
@@ -1906,8 +1914,8 @@ const BOTH_EXHAUSTED = "anthropic: exhausted until 2026-09-26T17:00:00.000Z (no 
 
 /** Two sessions in two projects hit a usage limit at once, each on its own provider. */
 async function exhaustBothProviders(h: Harness): Promise<void> {
-  const codex = fakeSessionRegistry([{ events: errorEvents(CODEX_USAGE_LIMIT) }]);
-  const anthropic = fakeSessionRegistry([{ events: errorEvents("You're out of extra usage.") }]);
+  const codex = fakeSessionRegistry([{ events: midRunErrorEvents(CODEX_USAGE_LIMIT) }]);
+  const anthropic = fakeSessionRegistry([{ events: midRunErrorEvents("You're out of extra usage.") }]);
   const codexStream = await loadAutoProvider(h, codex, {}, { cwd: projectWithMechanicalTier(h, "codex-project", ["openai-codex/gpt-6-luna:low"]) });
   const anthropicStream = await loadAutoProvider(h, anthropic, {}, { cwd: projectWithMechanicalTier(h, "anthropic-project", [`${HAIKU}:low`]) });
   await Promise.all([autoEvents(codexStream, FIX_README, "codex-worker"), autoEvents(anthropicStream, FIX_README, "anthropic-worker")]);
@@ -1953,5 +1961,138 @@ test("after a refusal the session-model fallback runs only while its provider is
       "is on openai-codex, which is out of usage. Usage limits: openai-codex: exhausted until 2026-09-26T12:42:00.000Z, " +
       "from a limit error at 2026-09-26T12:00:00.000Z. No request was sent to any provider.");
     assert.equal(nothing.calls.length, 0);
+  } finally { h.cleanup(); }
+});
+
+// ---------------------------------------------------------------------------
+// Failover on the first request (PRD cml8, "Failover"): a limit error on a
+// worker's first request, before the rung produced anything, pins the worker
+// again to the next surviving rung, on another provider. A limit later in the
+// run fails the worker. Both record a usage observation.
+// ---------------------------------------------------------------------------
+
+/** The records of `delegationId`, in file order. */
+function recordsOf(h: Harness, delegationId: string): RoutingRecord[] {
+  return h.records().filter((record) => record.delegationId === delegationId);
+}
+
+test("a first request answered with a usage-limit error pins the worker again to the other provider, records the failover linked to the refused attempt, and later routing avoids the provider", async () => {
+  const h = harness({ ...LIVE, tiers: CODEX_FIRST });
+  try {
+    const registry = fakeSessionRegistry([{ events: errorEvents(CODEX_USAGE_LIMIT) }, { events: answerEvents("done on haiku") },
+      { events: answerEvents("second turn") }]);
+    const stream = await loadAutoProvider(h, registry);
+    const events = await autoEvents(stream, FIX_README, "failover-worker");
+    assert.deepEqual(forwardedRungs(registry), ["openai-codex/gpt-6-luna:low", `${HAIKU}:low`]);
+    assert.deepEqual(events.map((event) => event.type), ["start", "thinking_delta", "text_delta", "done"], "the worker sees one answer and no error");
+    const final = events.at(-1);
+    assert.ok(final?.type === "done");
+    assert.deepEqual([final.message.provider, final.message.model], ["orchestrator", "auto"]);
+
+    const [refused, failover, chosen, ...rest] = recordsOf(h, "failover-worker");
+    assert.deepEqual(rest, []);
+    assert.ok(refused?.recordType === "decision" && refused.route.outcome === "chosen");
+    assert.equal(refused.route.rung.rung, "openai-codex/gpt-6-luna:low", "the refused attempt's decision names the rung it tried");
+    assert.equal(refused.ranOn, "openai-codex/gpt-6-luna:low");
+    assert.ok(failover?.recordType === "failover");
+    assert.deepEqual(failover.refusedAttempt, { timestamp: refused.timestamp, rung: "openai-codex/gpt-6-luna:low" });
+    assert.equal(failover.limit, "exhausted");
+    assert.equal(failover.resetsAt, "2026-09-26T12:42:00.000Z");
+    assert.equal(failover.detail, CODEX_USAGE_LIMIT);
+    assert.equal(failover.rung, `${HAIKU}:low`);
+    assert.ok(chosen?.recordType === "decision" && chosen.route.outcome === "chosen");
+    assert.equal(chosen.route.rung.rung, `${HAIKU}:low`);
+    assert.equal(chosen.ranOn, `${HAIKU}:low`);
+    assert.deepEqual(chosen.route.removed.map((removed) => [removed.rung, removed.reason]), [["openai-codex/gpt-6-luna:low", "provider out of usage"]]);
+    // The routing report reads the failover and counts one delegation, on the rung it ran on.
+    const report = buildRoutingReport(join(h.stateDir, "routing"));
+    assert.equal(report.totals.decisions, 1);
+    assert.deepEqual(report.rows.map((row) => [row.tier, row.rung, row.decisions]), [["mechanical", `${HAIKU}:low`, 1]]);
+
+    // Later requests of the same worker stay on the rung it failed over to.
+    await autoEvents(stream, [...FIX_README, assistantMessage({ content: [{ type: "text", text: "done on haiku" }] }), { role: "user", content: "and more", timestamp: 1 }], "failover-worker");
+    assert.deepEqual(forwardedRungs(registry).at(-1), `${HAIKU}:low`);
+
+    // The exhausted observation steers the next routing, from another session.
+    const next = fakeSessionRegistry([{ events: answerEvents("ok") }]);
+    await autoEvents(await loadAutoProvider(h, next), FIX_README, "next-worker");
+    assert.deepEqual(forwardedRungs(next), [`${HAIKU}:low`]);
+    const [removed] = removedRungs(h, "next-worker");
+    assert.deepEqual(removed?.slice(0, 2), ["openai-codex/gpt-6-luna:low", "provider out of usage"]);
+    assert.match(removed?.[2] ?? "", /exhausted until 2026-09-26T12:42:00\.000Z/);
+  } finally { h.cleanup(); }
+});
+
+test("a first request that starts and then hits a rate limit fails over without a second start, and balancing counts the delegation on the provider it ran on", async () => {
+  const h = harness({ ...LIVE, tiers: CODEX_FIRST });
+  try {
+    const throttled = "Codex error: Rate limit reached. Please try again in 20s.";
+    const registry = fakeSessionRegistry([{ events: [{ type: "start" }, ...errorEvents(throttled)] }, { events: answerEvents("done on haiku") }]);
+    const events = await autoEvents(await loadAutoProvider(h, registry), FIX_README, "throttled-worker");
+    assert.deepEqual(forwardedRungs(registry), ["openai-codex/gpt-6-luna:low", `${HAIKU}:low`]);
+    assert.deepEqual(events.map((event) => event.type), ["start", "thinking_delta", "text_delta", "done"]);
+    const failover = recordsOf(h, "throttled-worker").find((record) => record.recordType === "failover");
+    assert.ok(failover?.recordType === "failover");
+    assert.deepEqual([failover.limit, failover.resetsAt, failover.rung], ["throttled", "2026-09-26T12:00:20.000Z", `${HAIKU}:low`]);
+
+    // Once the throttle lifts, both providers survive: the failed-over
+    // delegation counts for anthropic, where it ran, so codex is chosen.
+    const next = fakeSessionRegistry([{ events: answerEvents("ok") }]);
+    await autoEvents(await loadAutoProvider(h, next, { now: () => new Date("2026-09-26T12:00:20.000Z") }), FIX_README, "after-throttle-worker");
+    assert.deepEqual(forwardedRungs(next), ["openai-codex/gpt-6-luna:low"]);
+    const [record] = recordsOf(h, "after-throttle-worker");
+    assert.ok(record?.recordType === "decision" && record.route.outcome === "chosen");
+    assert.deepEqual(record.route.providerCounts, { "openai-codex": 0, anthropic: 1 });
+  } finally { h.cleanup(); }
+});
+
+test("a limit after the rung's first output, or on a later request, fails the worker without failing over and still records the observation", async () => {
+  const h = harness({ ...LIVE, tiers: CODEX_FIRST });
+  try {
+    // After output on the first request.
+    const midStream = fakeSessionRegistry([{ events: midRunErrorEvents(CODEX_USAGE_LIMIT) }, { events: answerEvents("never") }]);
+    const events = await autoEvents(await loadAutoProvider(h, midStream), FIX_README, "mid-stream-worker");
+    assert.deepEqual(forwardedRungs(midStream), ["openai-codex/gpt-6-luna:low"]);
+    assert.deepEqual(events.map((event) => event.type), ["start", "text_delta", "error"], "the output is forwarded once, then the error");
+    const final = events.at(-1);
+    assert.ok(final?.type === "error");
+    assert.equal(final.error.errorMessage, CODEX_USAGE_LIMIT);
+    assert.deepEqual(recordsOf(h, "mid-stream-worker").map((record) => record.recordType), ["decision"]);
+
+    // On a later request of a pinned worker.
+    const later = fakeSessionRegistry([{ events: answerEvents("first turn") }, { events: errorEvents("You're out of extra usage.") }, { events: answerEvents("never") }]);
+    const stream = await loadAutoProvider(h, later);
+    assert.equal((await autoEvents(stream, FIX_README, "later-worker")).at(-1)?.type, "done");
+    const second = await autoEvents(stream, [...FIX_README, assistantMessage({ content: [{ type: "text", text: "first turn" }] }), { role: "user", content: "go on", timestamp: 1 }], "later-worker");
+    assert.deepEqual(forwardedRungs(later), [`${HAIKU}:low`, `${HAIKU}:low`], "the second request stays on the pinned rung");
+    assert.deepEqual(second.map((event) => event.type), ["error"]);
+    assert.deepEqual(recordsOf(h, "later-worker").map((record) => record.recordType), ["decision"]);
+
+    // Both limits are observations the next routing reads: with both
+    // providers exhausted it is refused before any request.
+    const next = fakeSessionRegistry([]);
+    const refused = (await autoEvents(await loadAutoProvider(h, next), FIX_README, "next-worker")).at(-1);
+    assert.ok(refused?.type === "error");
+    assert.match(refused.error.errorMessage ?? "", /Usage limits: anthropic: exhausted until .*; openai-codex: exhausted until 2026-09-26T12:42:00\.000Z/);
+    assert.equal(next.calls.length, 0);
+  } finally { h.cleanup(); }
+});
+
+test("a first-request limit with no other provider's rung left fails the worker with the limit error and records no failover", async () => {
+  const codexOnly = { mechanical: ["openai-codex/gpt-6-luna:low", "openai-codex/gpt-6-sol:medium"], standard: ["openai-codex/gpt-6-sol:medium"],
+    elevated: ["openai-codex/gpt-6-sol:high"], critical: ["openai-codex/gpt-6-sol:xhigh"] };
+  const h = harness({ ...LIVE, tiers: codexOnly });
+  try {
+    const registry = fakeSessionRegistry([{ events: errorEvents(CODEX_USAGE_LIMIT) }, { events: answerEvents("never") }]);
+    const events = await autoEvents(await loadAutoProvider(h, registry), FIX_README, "stuck-worker");
+    assert.deepEqual(forwardedRungs(registry), ["openai-codex/gpt-6-luna:low"], "the same provider's next rung is not tried");
+    assert.deepEqual(events.map((event) => event.type), ["error"]);
+    const final = events.at(-1);
+    assert.ok(final?.type === "error");
+    assert.equal(final.error.errorMessage, CODEX_USAGE_LIMIT);
+    const records = recordsOf(h, "stuck-worker");
+    assert.deepEqual(records.map((record) => record.recordType), ["decision"]);
+    assert.ok(records[0]?.recordType === "decision");
+    assert.equal(records[0].ranOn, "openai-codex/gpt-6-luna:low");
   } finally { h.cleanup(); }
 });

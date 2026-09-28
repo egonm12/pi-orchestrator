@@ -167,5 +167,9 @@ The virtual model `orchestrator/auto` that workers run on. Each request to it go
 _Avoid_: Smart router, proxy model, auto-routing model
 
 **Pin**:
-The rung a worker keeps for all of its requests, chosen at its first request. A forked worker's pin is the orchestrator's session rung at the delegating call. It holds through compaction and ends with the worker.
+The rung a worker keeps for all of its requests, chosen at its first request. A failover on that first request is the one way it moves. A forked worker's pin is the orchestrator's session rung at the delegating call. It holds through compaction and ends with the worker.
 _Avoid_: Session affinity, sticky model
+
+**Failover**:
+Pinning a worker again when its first request fails on a limit error before the rung produced anything: the worker is routed once more, now that the limit error's usage observation removes that provider, and runs on the next surviving rung, on another provider. The worker sees only the new rung's answer. A limit later in the run fails the worker, and so does a limit with no other provider's rung left. The decision record keeps the refused attempt's decision, a failover record linked to it by its time and rung, and the decision for the rung the worker moved to.
+_Avoid_: Retry (that is the effort ladder's new delegation), fallback (the session model after a refusal)

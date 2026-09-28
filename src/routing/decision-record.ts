@@ -27,7 +27,9 @@
 // Every record is validated on write and on read: a missing or unknown field,
 // at the top level or inside the classification, tier map or route, fails
 // with the field named. The auto provider (../router/auto-provider.ts) writes
-// one decision record per worker's first request.
+// one decision record per worker's first request, and when that request fails
+// over (PRD cml8, "Failover") a failover record and a decision record for the
+// rung it moved to.
 //
 // This module imports no other harness module at run time except the tier
 // list, so the report CLI that reads records loads nothing else.
@@ -416,9 +418,31 @@ export interface GateRequirementRecord extends RecordCommon {
   readonly gateAction: GateAction;
 }
 
+/** The limit a failover moved a worker away from: a usage limit (exhausted)
+ *  or a rate limit (throttled). */
+export const FAILOVER_LIMITS = ["exhausted", "throttled"] as const;
+
+/** A failover on a worker's first request (PRD cml8, "Failover"): the rung
+ *  of the refused attempt answered with a limit error before it produced
+ *  anything, and the worker was pinned again to `rung`. Written with the
+ *  delegation's next decision record, which says what the worker ran on;
+ *  `refusedAttempt` names the decision record of the refused attempt (same
+ *  delegation id) by its timestamp and rung. */
+export interface FailoverRecord extends RecordCommon {
+  readonly recordType: "failover";
+  readonly refusedAttempt: { readonly timestamp: string; readonly rung: string };
+  readonly limit: (typeof FAILOVER_LIMITS)[number];
+  /** When the limit lifts, if the error stated it. */
+  readonly resetsAt?: string;
+  /** The refused rung's error text. */
+  readonly detail: string;
+  /** The rung the worker was pinned to again, `provider/model:effort`. */
+  readonly rung: string;
+}
+
 export type RoutedDecisionRecord = DecisionRecord | EffortLadderRecord;
 export type RoutingRecord = RoutedDecisionRecord | ForkRecord | AgentModelRecord | ExplicitModelRecord | VerdictRecord | OrphanedVerdictRecord | EditRecord |
-  GateRequirementRecord;
+  GateRequirementRecord | FailoverRecord;
 
 /** A routed decision for the routing report. Forks accept verdicts but are not routed. */
 export function isRoutedDecision(record: RoutingRecord): record is RoutedDecisionRecord {
@@ -642,7 +666,7 @@ export function validateRoutingRecord(value: unknown): RoutingRecord {
   if (!isObject(value)) throw new RoutingRecordError("(record)", `must be a JSON object; got ${JSON.stringify(value)}`);
   checkSchemaVersion(value);
   const recordType = oneOf(value, "recordType", "",
-    ["decision", "effort-ladder", "agent-model", "fork", "explicit", "verdict", "orphaned-verdict", "edit", "gate-requirement"] as const);
+    ["decision", "effort-ladder", "agent-model", "fork", "explicit", "verdict", "orphaned-verdict", "edit", "gate-requirement", "failover"] as const);
   if (value.schemaVersion === DECISION_RECORD_SCHEMA_VERSION && recordType === "explicit") {
     throw new RoutingRecordError("schemaVersion", `is unsupported for ${recordType} records`);
   }
@@ -746,6 +770,23 @@ export function validateRoutingRecord(value: unknown): RoutingRecord {
     checkCommon(value);
     oneOf(value, "gateLevel", "", GATE_LEVELS);
     oneOf(value, "gateAction", "", GATE_ACTIONS);
+  } else if (recordType === "failover") {
+    if (value.schemaVersion !== DECISION_RECORD_SCHEMA_VERSION) throw new RoutingRecordError("schemaVersion", `is unsupported for ${recordType} records`);
+    checkKeys(value, "", [...COMMON_KEYS, "refusedAttempt", "limit", "detail", "rung"], ["resetsAt"]);
+    checkCommon(value);
+    const refused = objectAt(value, "refusedAttempt", "");
+    checkKeys(refused, "refusedAttempt", ["timestamp", "rung"]);
+    const refusedAt = stringAt(refused, "timestamp", "refusedAttempt", { nonBlank: true });
+    if (Number.isNaN(Date.parse(refusedAt))) throw new RoutingRecordError("refusedAttempt.timestamp", `must be an ISO-8601 time; got ${JSON.stringify(refusedAt)}`);
+    stringAt(refused, "rung", "refusedAttempt", { nonBlank: true });
+    oneOf(value, "limit", "", FAILOVER_LIMITS);
+    if (value.resetsAt !== undefined) {
+      const resetsAt = stringAt(value, "resetsAt", "", { nonBlank: true });
+      if (Number.isNaN(Date.parse(resetsAt))) throw new RoutingRecordError("resetsAt", `must be an ISO-8601 time; got ${JSON.stringify(resetsAt)}`);
+    }
+    stringAt(value, "detail", "", { nonBlank: true });
+    stringAt(value, "rung", "", { nonBlank: true });
+    if (value.rung === refused.rung) throw new RoutingRecordError("rung", "must name a different rung than the refused attempt");
   } else {
     checkKeys(value, "", [...COMMON_KEYS, "verdict"]);
     checkCommon(value);
@@ -971,6 +1012,24 @@ export function buildGateRequirementRecord(input: {
     recordType: "gate-requirement", schemaVersion: DECISION_RECORD_SCHEMA_VERSION,
     delegationId: input.delegationId, timestamp: (input.at ?? new Date()).toISOString(),
     gateLevel: input.gateLevel, gateAction: input.gateAction,
+  });
+}
+
+export function buildFailoverRecord(input: {
+  readonly delegationId: string;
+  readonly at: Date;
+  readonly refusedAttempt: { readonly timestamp: string; readonly rung: string };
+  readonly limit: FailoverRecord["limit"];
+  readonly resetsAt?: string;
+  readonly detail: string;
+  readonly rung: string;
+}): FailoverRecord {
+  return checkedRecord({
+    recordType: "failover", schemaVersion: DECISION_RECORD_SCHEMA_VERSION,
+    delegationId: input.delegationId, timestamp: input.at.toISOString(),
+    refusedAttempt: { timestamp: input.refusedAttempt.timestamp, rung: input.refusedAttempt.rung },
+    limit: input.limit, ...(input.resetsAt === undefined ? {} : { resetsAt: input.resetsAt }),
+    detail: input.detail, rung: input.rung,
   });
 }
 
