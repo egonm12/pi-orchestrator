@@ -70,7 +70,7 @@ test(`live guard handles six tool calls in one Haiku session (live route: ${MODE
     if (available.status !== "available") return t.skip(`live route ${MODEL} unavailable`);
     const plainCommand = `pi -p hi --no-session --model anthropic/claude-haiku-4-5 -e ${liveAuthExtensionPath()!}`;
     const prompt = `Perform these six independent tool calls, in order. A blocked call is expected; continue to the next call regardless. Do not invent results.\n` +
-      `1. write path ${join(agent.dir, "denied.txt")} content NO.\n` +
+      `1. write path ${join(agent.dir, "allowed.txt")} content YES.\n` +
       `2. subagent agent worker, task say hello, model anthropic/claude-fable-5, context fresh.\n` +
       `3. bash command pi -ne -p hi.\n` +
       `4. bash command echo 'pi -ne'.\n` +
@@ -82,7 +82,7 @@ test(`live guard handles six tool calls in one Haiku session (live route: ${MODE
     if (/"message":"[^"]*(?:usage|quota|rate limit|credit)[^"]*"/i.test(run.output)) return t.skip(`live provider refused: ${run.output.slice(-300)}`);
     assert.equal(run.status, 0, run.output.slice(-1500));
     assert.match(run.output, new RegExp(`${GUARD_PREFIX} loaded`));
-    assert.equal(existsSync(join(agent.dir, "denied.txt")), false);
+    assert.equal(existsSync(join(agent.dir, "allowed.txt")), true);
     const events = run.output.split("\n").filter((line) => line.startsWith("{")).flatMap((line) => {
       try { return [JSON.parse(line) as { type: string; toolCallId?: string; toolName?: string; args?: { command?: string }; result?: { content?: { text?: string }[] }; isError?: boolean }]; }
       catch { return []; }
@@ -94,7 +94,7 @@ test(`live guard handles six tool calls in one Haiku session (live route: ${MODE
       assert.ok(end, `missing ${name} result ${command ?? ""}`);
       return { error: end.isError, text: end.result?.content?.map((item) => item.text ?? "").join("\n") ?? "" };
     };
-    assert.match(completed("write").text, /cannot modify the agent directory/);
+    assert.equal(completed("write").error, false);
     assert.match(completed("subagent").text, /prohibited model: anthropic\/claude-fable-5/);
     assert.match(completed("bash", "pi -ne -p hi").text, /nested pi with extensions disabled/);
     const echo = completed("bash", "echo 'pi -ne'");
