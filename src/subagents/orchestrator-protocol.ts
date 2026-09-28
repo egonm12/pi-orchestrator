@@ -1,16 +1,30 @@
-import type { BeforeAgentStartEvent, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { BeforeAgentStartEvent, BeforeAgentStartEventResult, ContextEventResult, ContextWithSystemEvent, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { isOrchestratorSession } from "./orchestrator-session.ts";
 import { tiersByGateAction, type GateAction, type GateLevel } from "./quality-gate.ts";
 
 // The orchestrator protocol: how the orchestrator's own session delegates and
-// judges (ADR 0010, ADR 0011, ADR 0013). It is a named section of the system prompt,
-// added when each user prompt starts its agent loop, so pi keeps it through
-// the loop's turns and puts it back after a compaction. A run a message starts
-// without a user prompt (sendMessage with triggerTurn) skips before_agent_start:
-// pi drops the section from its second turn on. Only the orchestrator's
-// session gets it: a worker, a forked worker (whose copied conversation may
-// carry the orchestrator's section; pi removes it from the fork's prompt) and
-// a pi-subagents child do not.
+// judges (ADR 0010, ADR 0011, ADR 0013). It must be in the system prompt of
+// every request of every orchestrator run. Two hooks put it there:
+// - before_agent_start, when a prompt (typed, a skill, a template) starts a
+//   run: the protocol becomes a named section, which pi records in the
+//   transcript and keeps through the run's turns and after a compaction. When
+//   an extension loaded earlier forced the whole prompt (returned systemPrompt,
+//   as pi-claude-rules does), the provider gets that forced text instead of the
+//   sections, so the protocol is appended to it.
+// - context_with_system, before each request: a run a message starts
+//   (sendMessage with triggerTurn: completion notices, worker reports and
+//   questions, gate reminders) skips before_agent_start, and pi 0.87.1 builds
+//   its turns from the base prompt, so its second turn removes the section,
+//   and a later such run starts without it. When the request's replayed prompt
+//   lacks the current protocol, the request, not the transcript, gets a section
+//   patch after its last system message.
+// pi exposes no supported way to add a section to the base prompt (tool
+// guidelines render only without a custom SYSTEM.md, as bullets, and reach
+// workers that have the subagents tool), and sending wake-ups as user messages
+// would put words in the owner's mouth; see bean pi-orchestrator-6yxt.
+// Only the orchestrator's session gets it: a worker, a forked worker (whose
+// copied conversation may carry the orchestrator's section; pi removes it from
+// the fork's prompt) and a pi-subagents child do not.
 
 /** The protocol's section name in the system prompt. */
 export const ORCHESTRATOR_PROTOCOL_SECTION = "orchestrator_protocol";
@@ -96,10 +110,53 @@ export function orchestratorProtocol(explorationNudge: number, gateLevel: GateLe
   return `# Orchestrator protocol\n\n${paragraphs(explorationNudge, gateLevel).join("\n\n")}`;
 }
 
-/** Part of a `before_agent_start` handler: adds the protocol to this prompt's
- *  system prompt in the orchestrator's own session, and leaves any other session's alone. */
+/** The protocol as a section of a system message, delimited as pi renders a named section. */
+function protocolSection(protocol: string): string {
+  return `<${ORCHESTRATOR_PROTOCOL_SECTION}>\n${protocol}\n</${ORCHESTRATOR_PROTOCOL_SECTION}>`;
+}
+
+/** A `before_agent_start` handler: adds the protocol to this prompt's system
+ *  prompt in the orchestrator's own session, and leaves any other session's
+ *  alone. Returns the forced prompt with the protocol appended when an earlier
+ *  handler forced one without it. */
 export function addOrchestratorProtocol(event: Pick<BeforeAgentStartEvent, "systemPromptOptions">,
-  ctx: Pick<ExtensionContext, "sessionManager">, explorationNudge: number, gateLevel: GateLevel): void {
-  if (!isOrchestratorSession(ctx)) return;
-  event.systemPromptOptions.sections[ORCHESTRATOR_PROTOCOL_SECTION] = orchestratorProtocol(explorationNudge, gateLevel);
+  ctx: Pick<ExtensionContext, "sessionManager">, explorationNudge: number, gateLevel: GateLevel): BeforeAgentStartEventResult | undefined {
+  if (!isOrchestratorSession(ctx)) return undefined;
+  const protocol = orchestratorProtocol(explorationNudge, gateLevel);
+  event.systemPromptOptions.sections[ORCHESTRATOR_PROTOCOL_SECTION] = protocol;
+  const forced = event.systemPromptOptions.forceSystemPrompt;
+  if (forced === undefined || forced.includes(protocol)) return undefined;
+  return { systemPrompt: `${forced}\n\n${protocolSection(protocol)}` };
+}
+
+/** A transcript message as far as the protocol reads it. */
+interface PromptMessage {
+  readonly role: string;
+  readonly sections?: Readonly<Record<string, string | null>>;
+  readonly timestamp?: number;
+}
+
+/** A `context_with_system` handler: in the orchestrator's own session, gives a
+ *  request whose replayed system prompt lacks the current protocol a section
+ *  patch right after its last system message, so the prefix before it stays
+ *  stable across the run's requests. Leaves a request without any system
+ *  message alone: pi sent it no prompt, and the protocol alone is not one. */
+export function keepOrchestratorProtocol(event: Pick<ContextWithSystemEvent, "messages">,
+  ctx: Pick<ExtensionContext, "sessionManager">, explorationNudge: number, gateLevel: GateLevel): ContextEventResult | undefined {
+  if (!isOrchestratorSession(ctx)) return undefined;
+  const messages = event.messages as readonly PromptMessage[];
+  let lastSystem = -1;
+  let current: string | null | undefined;
+  messages.forEach((message, index) => {
+    if (message.role !== "system") return;
+    lastSystem = index;
+    const section = message.sections?.[ORCHESTRATOR_PROTOCOL_SECTION];
+    if (section !== undefined) current = section;
+  });
+  const protocol = orchestratorProtocol(explorationNudge, gateLevel);
+  if (lastSystem < 0 || (typeof current === "string" && current.includes(protocol))) return undefined;
+  // The last system message's timestamp, not the clock's: the same request prefix on every request of the run.
+  const patch = { role: "system", content: "", sections: { [ORCHESTRATOR_PROTOCOL_SECTION]: protocolSection(protocol) },
+    timestamp: messages[lastSystem]!.timestamp ?? 0 };
+  return { messages: [...event.messages.slice(0, lastSystem + 1), patch as never, ...event.messages.slice(lastSystem + 1)] };
 }

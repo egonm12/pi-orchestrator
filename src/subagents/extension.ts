@@ -22,7 +22,7 @@ import { findWorker, pickWorker, workerListing } from "./worker-picker.ts";
 import { openTranscript } from "./transcript-view.ts";
 import { isWorkerSession } from "./worker-sessions.ts";
 import { isOrchestratorSession } from "./orchestrator-session.ts";
-import { addOrchestratorProtocol } from "./orchestrator-protocol.ts";
+import { addOrchestratorProtocol, keepOrchestratorProtocol } from "./orchestrator-protocol.ts";
 import { registerCommitGate } from "./commit-gate.ts";
 import { registerExplorationNudge } from "./exploration-nudge.ts";
 import { registerSubagentsVerdictTool } from "./verdict.ts";
@@ -692,10 +692,13 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
     const explorationNudge = registerExplorationNudge(pi, logOnce);
     // Unjudged edits hold back the orchestrator's git commit and git push, and a turn end names them (commit-gate.ts).
     registerCommitGate(pi, logOnce, gateLevels);
-    // The orchestrator protocol joins the orchestrator's system prompt as each user prompt starts its agent loop.
-    pi.on("before_agent_start", (event, ctx) => {
-      if (isOrchestratorSession(ctx)) addOrchestratorProtocol(event, ctx, explorationNudge.threshold, gateLevels.inForce(ctx).level);
-    });
+    // The orchestrator protocol is in the system prompt of every request of every orchestrator run: added as a
+    // prompt starts its run, and put back into any request whose prompt lost it, as in a run a message started
+    // (orchestrator-protocol.ts).
+    pi.on("before_agent_start", (event, ctx) =>
+      isOrchestratorSession(ctx) ? addOrchestratorProtocol(event, ctx, explorationNudge.threshold, gateLevels.inForce(ctx).level) : undefined);
+    pi.on("context_with_system", (event, ctx) =>
+      isOrchestratorSession(ctx) ? keepOrchestratorProtocol(event, ctx, explorationNudge.threshold, gateLevels.inForce(ctx).level) : undefined);
   };
 }
 

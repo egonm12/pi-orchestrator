@@ -1446,8 +1446,8 @@ interface ScriptedRequest {
   /** The tool results in the request's context, in order. */
   readonly toolResults: readonly { readonly text: string; readonly isError: boolean }[];
   readonly userMessages: readonly string[];
-  /** The system prompt's sections as the model has them at this request: every
-   *  system message's sections applied in order, a removed one dropped. */
+  /** The system prompt as the model has it at this request: every system
+   *  message's text (a forced prompt), then its sections applied in order, a removed one dropped. */
   readonly systemPrompt: string;
 }
 
@@ -1466,8 +1466,12 @@ function scriptedAnthropic(script: (request: ScriptedRequest) => ScriptedReply, 
     streamSimple(model, context, options) {
       const tools = new Set<string>();
       const sections = new Map<string, string>();
+      const forced: string[] = [];
+      const text = (content: string | readonly { type: string; text?: string }[]) =>
+        typeof content === "string" ? content : content.map((part) => part.type === "text" ? part.text ?? "" : "").join("");
       for (const message of context.messages) {
         if (message.role !== "system") continue;
+        if (text(message.content).length > 0) forced.push(text(message.content));
         for (const tool of message.toolsRemoved ?? []) tools.delete(tool.name);
         for (const tool of message.toolsAdded ?? []) tools.add(tool.name);
         for (const [name, section] of Object.entries(message.sections ?? {})) {
@@ -1475,14 +1479,12 @@ function scriptedAnthropic(script: (request: ScriptedRequest) => ScriptedReply, 
           else sections.set(name, section);
         }
       }
-      const text = (content: string | readonly { type: string; text?: string }[]) =>
-        typeof content === "string" ? content : content.map((part) => part.type === "text" ? part.text ?? "" : "").join("");
       const firstUser = context.messages.find((message) => message.role === "user");
       const request: ScriptedRequest = {
         sessionId: options?.sessionId, task: firstUser ? text(firstUser.content) : "", tools: [...tools],
         toolResults: context.messages.flatMap((message) => message.role === "toolResult" ? [{ text: text(message.content), isError: message.isError }] : []),
         userMessages: context.messages.flatMap((message) => message.role === "user" ? [text(message.content)] : []),
-        systemPrompt: [...sections.values()].join("\n\n"),
+        systemPrompt: [...forced, ...sections.values()].join("\n\n"),
       };
       requests.push(request);
       const reply = script(request);
@@ -2727,6 +2729,86 @@ test("the orchestrator's session has the protocol in its system prompt on every 
     const turns = provider.requests.filter((request) => request.tools.length > 0);
     assert.equal(turns.length, 4, "two turns per prompt");
     for (const turn of turns) assert.ok(turn.systemPrompt.includes(orchestratorProtocol(3, "medium")), turn.systemPrompt);
+  } finally { h.cleanup(); }
+});
+
+/** Resolves once `ready` holds, polling; fails after `timeoutMs`. */
+async function until(ready: () => boolean, what: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!ready()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+test("a completion notice that wakes the idle orchestrator runs with the protocol on every turn, after its tool call too", async () => {
+  const h = harness();
+  try {
+    writeFileSync(join(h.projectDir, "README.md"), "# Project\n");
+    // The background worker sleeps first, so its notice arrives after the orchestrator's run has settled.
+    const provider = plannedAnthropic((request) => request.tools.includes("bash") && request.toolResults.length === 0
+      ? { toolCall: { name: "bash", arguments: { command: "sleep 0.5" } } } : { text: "leaf done" });
+    const session = await orchestratorSession(h, provider.extension, installedWithSubagents(provider.extension, 0));
+    const orchestratorRequests = () => provider.requests.filter((request) => request.sessionId === session.sessionId);
+    try {
+      provider.setOrchestrator(session.sessionId);
+      provider.plan.push({ toolCall: { name: "subagents", arguments: { items: [{ task: "Find the config file" }], background: true } } },
+        { text: "started" }, READ, { text: "judged" });
+      await session.prompt("Start a background worker");
+      assert.equal(orchestratorRequests().length, 2, "the prompt's run settled before the notice");
+      await until(() => orchestratorRequests().length === 4 && session.isIdle, "the run the notice started");
+    } finally { session.dispose(); }
+    const woken = orchestratorRequests().slice(2);
+    const notice = woken[0]!.userMessages.find((text) => text.includes("Background subagents call"));
+    assert.ok(notice?.includes("leaf done"), `the worker ran and finished: ${notice}`);
+    assert.equal(woken[1]!.toolResults.length, woken[0]!.toolResults.length + 1, "the second turn follows the read");
+    for (const request of woken) assert.ok(request.systemPrompt.includes(orchestratorProtocol(3, "medium")), request.systemPrompt);
+  } finally { h.cleanup(); }
+});
+
+test("a worker's question sent with triggerTurn wakes the idle orchestrator with the protocol on every turn", async () => {
+  const h = harness();
+  try {
+    writeFileSync(join(h.projectDir, "README.md"), "# Project\n");
+    let api: ExtensionAPI | undefined;
+    const waker: InlineExtension = { name: "waker", factory: (pi) => { api = pi; } };
+    const provider = plannedAnthropic();
+    const session = await orchestratorSession(h, provider.extension, [provider.extension], [waker]);
+    try {
+      provider.setOrchestrator(session.sessionId);
+      provider.plan.push({ text: "ready" }, READ, { text: "answered" });
+      await session.prompt("Wait for questions");
+      // As report.ts sends a worker's question.
+      await api!.sendMessage({ customType: "worker-question", content: "A worker asks: which config?", display: true }, { triggerTurn: true, deliverAs: "steer" });
+      await until(() => provider.requests.length === 3 && session.isIdle, "the woken run");
+    } finally { session.dispose(); }
+    const woken = provider.requests.slice(1);
+    assert.ok(woken[0]!.userMessages.some((text) => text.includes("which config?")), JSON.stringify(woken[0]!.userMessages));
+    for (const request of woken) assert.ok(request.systemPrompt.includes(orchestratorProtocol(3, "medium")), request.systemPrompt);
+  } finally { h.cleanup(); }
+});
+
+test("a typed skill prompt keeps the protocol when an extension loaded earlier forces the whole system prompt", async () => {
+  const h = harness();
+  try {
+    writeFileSync(join(h.projectDir, "README.md"), "# Project\n");
+    mkdirSync(join(h.agentDir, "skills", "survey"), { recursive: true });
+    writeFileSync(join(h.agentDir, "skills", "survey", "SKILL.md"), "---\nname: survey\ndescription: Survey the project\n---\n\nRead the README first.\n");
+    // Like pi-claude-rules: returns the prompt it was handed plus its own section, which forces that text for the run.
+    const forcing: InlineExtension = { name: "forcing-rules", factory: (pi) => { pi.on("before_agent_start", (event) => ({ systemPrompt: `${event.systemPrompt}\n\n## Project rules` })); } };
+    const provider = plannedAnthropic();
+    const session = await orchestratorSession(h, provider.extension, [provider.extension], [forcing]);
+    try {
+      provider.setOrchestrator(session.sessionId);
+      provider.plan.push(READ, { text: "surveyed" });
+      await session.prompt("/skill:survey the project");
+    } finally { session.dispose(); }
+    assert.equal(provider.requests.length, 2);
+    assert.ok(provider.requests[0]!.userMessages[0]!.includes("Read the README first."), "the skill was expanded");
+    for (const request of provider.requests) {
+      assert.ok(request.systemPrompt.includes("## Project rules"), "the forced prompt is what the model got");
+      assert.ok(request.systemPrompt.includes(orchestratorProtocol(3, "medium")), request.systemPrompt);
+    }
   } finally { h.cleanup(); }
 });
 

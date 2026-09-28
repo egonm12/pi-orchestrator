@@ -5,6 +5,10 @@
 **Orchestrator**:
 The role the main session takes. It owns clarification, task decomposition, delegation, synthesis and acceptance. It hands exploration and substantial work to workers and keeps only small known actions, such as a single lookup, a small edit or a commit.
 
+**Orchestrator protocol**:
+The rules the orchestrator follows to delegate and judge, carried in its system prompt. It is on every request of every orchestrator run: a run a prompt starts (typed, a skill or a template) and a run a message starts, such as a completion notice, a worker's report or question, or a gate reminder. Workers never get it.
+_Avoid_: Orchestrator prompt, system rules
+
 **Worker**:
 An agent the orchestrator hands one bounded piece of investigation, implementation or verification work to. It reports to the orchestrator, never to the user.
 _Avoid_: Execution agent, subagent (that is the tool that starts workers, not the role)
