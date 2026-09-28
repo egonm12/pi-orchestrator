@@ -482,6 +482,51 @@ test("a reviewer's editing calls are denied with the reason, its reads, searches
   } finally { h.cleanup(); }
 });
 
+/** An earlier tool_call hook that rewrites a bash command in place, as the
+ *  pi-claude-hooks package does with the `rtk hook claude` PreToolUse hook:
+ *  each rewrite below is what rtk 0.49.0 answered for that command. */
+function rtkHook(rewrites: Readonly<Record<string, string>>): InlineExtension {
+  return {
+    name: "fake-rtk-hook",
+    factory: (pi) => { pi.on("tool_call", (event) => {
+      const input = event.input as { command?: unknown };
+      if (event.toolName === "bash" && typeof input.command === "string") input.command = rewrites[input.command] ?? input.command;
+    }); },
+  };
+}
+
+test("a reviewer's git inspection, counts and beans reads run when an earlier hook routes them through rtk, and its commit is still denied", async () => {
+  const h = harness();
+  try {
+    const dir = h.projectDir;
+    const rewrites = {
+      [`git -C ${dir} show --stat e0abfd7`]: `rtk git -C ${dir} show --stat e0abfd7`,
+      [`cd ${dir} && git show --stat 5d29fa3 && git status --short`]: `cd ${dir} && rtk git show --stat 5d29fa3 && rtk git status --short`,
+      [`wc -l ${dir}/notes.md`]: `rtk wc -l ${dir}/notes.md`,
+      ["git commit -m x"]: "rtk git commit -m x",
+    };
+    const provider = anthropic();
+    const tools = loadSubagents([routerExtension(), provider.extension, rtkHook(rewrites)]);
+    const ctx = orchestrator(h);
+    const implementer = await one(tools, ctx, { task: `[elevated] ${WRITE_NOTES}` });
+    const id = implementer.sessionId!;
+    // The tool calls a reviewer made on 2026-09-28, with the shape pi gave them.
+    const calls = [
+      [runTask("bash", { command: `git -C ${dir} show --stat e0abfd7`, timeout: 60 }), false],
+      [runTask("bash", { command: `cd ${dir} && git show --stat 5d29fa3 && git status --short`, timeout: 30 }), false],
+      [runTask("bash", { command: `wc -l ${dir}/notes.md`, timeout: 10 }), false],
+      [runTask("bash", { command: `cd ${dir} && beans prime | head -50`, timeout: 30 }), false],
+      [runTask("bash", { command: "git commit -m x", timeout: 30 }), true],
+    ] as const;
+    for (const [task, denied] of calls) {
+      const reviewer = await one(tools, ctx, { task, review: id });
+      assert.equal(reviewer.status, "completed", JSON.stringify(reviewer));
+      assert.equal(reviewer.edited, undefined, task);
+      assert.equal(readFileSync(reviewer.sessionFile!, "utf8").includes(REVIEWER_EDIT_DENIED), denied, task);
+    }
+  } finally { h.cleanup(); }
+});
+
 test("a review item is refused, without starting a worker, with fork or resume, from a worker, and for a delegation that is unknown or did not edit", async () => {
   const h = harness();
   try {

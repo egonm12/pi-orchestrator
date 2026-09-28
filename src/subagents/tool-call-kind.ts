@@ -214,8 +214,27 @@ function commandWords(words: readonly string[]): readonly string[] {
     if (ASSIGNMENT.test(first) || PREFIXES.has(first)) { rest = others; continue; }
     if (first === "env" && others.length > 0) { rest = afterOptions(others); continue; }
     if (first === "timeout") { rest = afterOptions(others, ["-s", "--signal", "-k", "--kill-after"]).slice(1); continue; }
+    if (basename(first) === "rtk") { rest = rtkCommand(others); continue; }
     return rest;
   }
+}
+
+/** rtk subcommands that stand for a command of another name. */
+const RTK_ALIASES: Readonly<Record<string, string>> = { read: "cat", lint: "eslint" };
+/** rtk subcommands that run the command after them. */
+const RTK_RUNNERS = new Set(["err", "test", "summary", "proxy"]);
+
+/** The command rtk runs, from the words after `rtk`. rtk filters a command's
+ *  output, and its PreToolUse hook, which pi-claude-hooks runs as a tool_call
+ *  hook, rewrites a call's input in place, so `git show` can arrive here as
+ *  `rtk git show` and `head -5 x` as `rtk read x --max-lines 5`. Any other
+ *  subcommand, such as `init` or `run`, is read as a command of that name,
+ *  which nothing here knows. */
+function rtkCommand(args: readonly string[]): readonly string[] {
+  const [subcommand, ...rest] = afterOptions(args);
+  if (subcommand === undefined) return [];
+  if (RTK_RUNNERS.has(subcommand)) return afterOptions(rest);
+  return [RTK_ALIASES[subcommand] ?? subcommand, ...rest];
 }
 
 /** `args` from the first word that is not an option; `withValue` names options whose value follows them. */
@@ -254,6 +273,9 @@ const READ_ONLY_COMMANDS: Readonly<Record<string, readonly string[]>> = {
   fd: ["-x", "-X", "--exec", "--exec-batch"],
 };
 
+/** beans subcommands that only print the issue tracker's guide or its beans; the others change `.beans`. */
+const BEANS_READS = new Set(["prime", "show", "list"]);
+
 /** Build and test tools that build, test or check as they are. */
 const BUILD_TEST_COMMANDS = new Set(["tsc", "vitest", "jest", "mocha", "ava", "pytest", "py.test", "tox", "nox", "mypy", "pyright",
   "eslint", "shellcheck", "make", "gmake", "ninja", "rspec"]);
@@ -280,6 +302,7 @@ function commandKind(words: readonly string[]): CommandKind {
   const name = basename(first);
   if (name === "git") return gitKind(args);
   if (name === "find") return findKind(args);
+  if (name === "beans") return BEANS_READS.has(positional(args)[0] ?? "") ? "read-only" : "unrecognised";
   if (name === "xargs") return commandKind(afterOptions(args, XARGS_OPTIONS_WITH_VALUE));
   if (name === "sed") return args.some((arg) => /^-[^-]*i/.test(arg) || arg.startsWith("--in-place")) ? "unrecognised" : "read-only";
   if (name === "tee") return positional(args).every((arg) => HARMLESS_TARGETS.has(arg)) ? "read-only" : "unrecognised";

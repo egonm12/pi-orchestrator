@@ -153,6 +153,42 @@ test("each tool is classified by its name, and bash by its command", () => {
   assert.deepEqual(kinds([["bash", {}], ["bash", undefined], ["powershell", { command: "Get-ChildItem" }]]), ["unrecognised", "unrecognised", "unrecognised"]);
 });
 
+test("beans prime, show and list are read-only; any other beans command is unrecognised", () => {
+  assertBash("read-only", ["beans prime", "beans prime 2>&1 | head -60", "beans show --json pi-orchestrator-9xq7", "beans list --json --ready -t bug"]);
+  assertBash("unrecognised", ["beans update x -s completed", "beans create 'Title' -t bug", "beans archive", "beans"]);
+});
+
+test("a command rtk runs, as its hook rewrites it, has the kind of the command it runs", () => {
+  // Each is what `rtk hook claude` (rtk 0.49.0) rewrote the command in the comment to.
+  assertBash("read-only", [
+    "rtk git -C /repo show --stat e0abfd7", // git -C /repo show --stat e0abfd7
+    "cd /repo && rtk git show --stat 5d29fa3 && rtk git status --short", // cd /repo && git show ... && git status --short
+    "rtk git status --short 2>&1", // git status --short 2>&1
+    "rtk rg -n foo /repo", // rg -n foo /repo
+    "rtk grep -rn x .", // grep -rn x .
+    "rtk wc -l src/subagents/retry.ts", // wc -l src/subagents/retry.ts
+    "rtk ls -la", // ls -la
+    "rtk find . -name x", // find . -name x
+    "rtk read x --max-lines 5", // head -5 x
+    "rtk read x --tail-lines 5", // tail -n 5 x
+    "rtk diff a b", // diff a b
+  ]);
+  assertBash("build-test", [
+    "rtk tsc --noEmit", // npx tsc --noEmit
+    "rtk vitest", // npx vitest run
+    "rtk cargo test", // cargo test
+    "rtk pytest", // pytest
+    "rtk lint src", // npx eslint src
+    "rtk test cargo test",
+    "rtk err npm test",
+  ]);
+  assertBash("version-control", ["rtk git commit -m x", "rtk git push", "rtk proxy git push"]);
+  assertBash("unrecognised", ["rtk run 'rm -rf dist'", "rtk init", "rtk config --create", "rtk lint --fix src", "rtk find . -delete", "rtk ls > out.txt"]);
+  // The commit gate reads the git subcommand through rtk too.
+  assert.deepEqual(gitSubcommands("rtk git commit -m x"), ["commit"]);
+  assert.deepEqual(gitSubcommands("cd /repo && rtk git add -A && rtk git push"), ["add", "push"]);
+});
+
 test("gitSubcommands names the subcommand of each git command, after git's own options, in chains and pipes", () => {
   const cases: readonly [string, readonly string[] | undefined][] = [
     ["git commit -m wip", ["commit"]],

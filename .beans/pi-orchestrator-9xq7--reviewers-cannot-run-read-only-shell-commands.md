@@ -1,13 +1,13 @@
 ---
 # pi-orchestrator-9xq7
 title: Reviewers cannot run read-only shell commands
-status: todo
+status: completed
 type: bug
 priority: normal
 tags:
     - ready-for-agent
 created_at: 2026-09-28T14:55:30Z
-updated_at: 2026-09-28T14:56:06Z
+updated_at: 2026-09-28T15:10:07Z
 ---
 
 ## Problem
@@ -27,6 +27,27 @@ A reviewer can run read-only and verifying commands (git show, git status, git d
 
 ## Todo
 
-- [ ] Reproduce with the exact tool calls a real reviewer session made (Bash, ctx_execute with language shell, ctx_execute_file)
-- [ ] Find why each is classified as editing
-- [ ] Failing test first, then fix
+- [x] Reproduce with the exact tool calls a real reviewer session made (Bash, ctx_execute with language shell, ctx_execute_file)
+- [x] Find why each is classified as editing
+- [x] Failing test first, then fix
+
+
+## Findings
+
+- The three reviewer sessions (subagents/01a0e857-..., files 01a0e877-8c43, 01a0e877-8c4c and 01a0e885-00bb) sent every shell call as tool `bash` with input `{ command, timeout }`, for example `{"command": "git -C <repo> show --stat e0abfd7", "timeout": 60}`. Every `bash`, `ctx_execute` and `ctx_execute_file` result was the denial; `read` calls ran.
+- Root cause: the pi-claude-hooks package runs Claude Code's PreToolUse hooks as a `tool_call` hook, and ~/.claude/settings.json has `rtk hook claude` for Bash. That hook rewrites `event.input.command` in place (pi lets a `tool_call` handler mutate the input, and later handlers see the change): `git -C x show --stat e0abfd7` becomes `rtk git -C x show --stat e0abfd7`, `wc -l f` becomes `rtk wc -l f`, `npx tsc --noEmit` becomes `rtk tsc --noEmit`. The reviewer guard (READ_ONLY_REVIEWER, src/subagents/editing.ts) then saw `rtk ...`, which classifyToolCall called unrecognised, so editing, so denied. Checked with `rtk hook claude` (rtk 0.49.0) and classifyToolCall on its output.
+- `beans prime` is not rewritten by rtk, but classifyToolCall called it unrecognised, so it was denied too.
+- context-mode's pi `tool_call` hook only blocks inline HTTP calls and does not change the input, so it was not the cause.
+- The same rewrite hid `rtk git commit` from the commit gate (gitSubcommands returned `[]`), and made every worker that ran `rtk git status` or similar an editing delegation.
+
+## Decisions
+
+- `beans prime`, `beans show` and `beans list` are read-only in the classifier; every other beans command stays unrecognised, since create, update, archive and the rest change `.beans`. That also means a worker that only runs those three is not an editing delegation, which is correct: they write nothing.
+- `ctx_execute` and `ctx_execute_file` stay denied for reviewers and stay editing for workers. They run code in any language (the transcripts show JavaScript with `require('fs')`), and ADR 0010 counts them as editing by owner decision. Classifying only `language: shell` with the bash reader would be possible, but it would change ADR 0010's editing rule and is not needed now that `bash` works for reviewers.
+
+## Summary of changes
+
+- src/subagents/tool-call-kind.ts: the bash reader treats `rtk` as a wrapper. `rtk <tool> ...` has the kind of `<tool> ...`, `rtk read` is read as `cat` and `rtk lint` as `eslint`, `rtk err`, `test`, `summary` and `proxy` take the command after them, and any other rtk subcommand (`init`, `config`, `run`) stays unrecognised. Because the wrapper sits in `commandWords`, the commit gate's `gitSubcommands` sees `rtk git commit` as `commit` too. `beans prime`, `show` and `list` are read-only.
+- src/subagents/review.test.ts: a reviewer test with a fake hook that rewrites `bash` input in place as rtk does, replaying the transcript's calls (`git -C <dir> show --stat e0abfd7`, `cd <dir> && git show ... && git status --short`, `wc -l`, `cd <dir> && beans prime | head -50`); they run, and `git commit -m x` rewritten to `rtk git commit -m x` is still denied. It failed before the fix on the `git show` call.
+- src/subagents/tool-call-kind.test.ts: classifier tests for the rtk forms rtk's hook produces, for rtk commands that stay unrecognised or version-control, for `gitSubcommands` through rtk, and for beans.
+- README.md: the exploration budget section says how beans and rtk commands are read.
