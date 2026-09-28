@@ -5,7 +5,7 @@ status: in-progress
 type: epic
 priority: normal
 created_at: 2026-09-27T21:45:45Z
-updated_at: 2026-09-28T09:24:58Z
+updated_at: 2026-09-28T13:46:46Z
 ---
 
 Design session (split-plan 'orchestrator enforcement', ADR 0005). Keeps the main session in the orchestrator role.
@@ -98,3 +98,7 @@ Rejected: jeyq's redundant vu2o edge (it uses vu2o directly, kept); kokv's stale
 - ctx_batch_execute counts as editing when one of its commands would.
 - Final verification runs on a clean worktree of the last commit; failures from another session's uncommitted widget work are reported separately.
 All but the last are folded into ir82; l8af counts same-rung reviews apart. ADR 0010 and CONTEXT.md (Same-rung review) updated.
+
+
+## Owner decision (2026-09-28): ADR 0013 is leading
+ADR 0013 supersedes ADR 0005 and amends ADR 0010: the exploration budget becomes an exploration nudge and the commit/push block becomes a notice, and an editing delegation is defined by working-tree comparison. ir82's ctx_batch_execute criterion is superseded. Open: whether the rework of jeyq, kokv and mw81 and the changes to mxmz and l8af belong in this epic.

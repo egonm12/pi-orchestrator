@@ -1,13 +1,13 @@
 ---
 # pi-orchestrator-ir82
 title: Changes requested retries on the next effort-ladder rung
-status: in-progress
+status: completed
 type: feature
 priority: normal
 tags:
     - ready-for-agent
 created_at: 2026-09-27T22:07:20Z
-updated_at: 2026-09-28T12:53:13Z
+updated_at: 2026-09-28T13:47:32Z
 parent: pi-orchestrator-3p1z
 blocked_by:
     - pi-orchestrator-kokv
@@ -52,7 +52,7 @@ Reviewer fixes on top of 247s, and two small additions:
 - [x] Reviewer runs on the same rung in shadow mode and with routing off; the verdict records a same-rung review
 - [x] A reviewer's editing calls are denied; its reads, searches, builds and tests run
 - [x] In shadow mode a retry runs on the session model and its effort-ladder record names the would-be rung; with routing off it runs on the session model with an unplaced record and no rung; the limit holds
-- [ ] ctx_batch_execute counts as editing when one of its commands would
+- [x] ~~ctx_batch_execute counts as editing when one of its commands would~~ Superseded: ADR 0013 is leading (owner, 2026-09-28), and an editing delegation is defined by working-tree comparison, not by tool calls
 
 ## Summary of Changes
 
