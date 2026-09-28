@@ -18,7 +18,7 @@ A worker's final reply to the orchestrator: what it confirmed with evidence, wha
 _Avoid_: Report (that is a background worker's message), answer, output
 
 **Quality gate**:
-The orchestrator's duty to judge every implementation result before using it, by its own spot check or an independent reviewer, and to record that judgement as a verdict.
+The orchestrator's duty to judge every implementation result before using it, by its own spot check or an independent reviewer, and to record that judgement as a verdict. It reminds, never blocks: commit and push go through and name the delegations still waiting for a verdict.
 _Avoid_: Review gate, report gate
 
 **Gate level**:
@@ -48,8 +48,16 @@ One handing of one piece of work from the orchestrator to a worker. Each attempt
 _Avoid_: Dispatch, spawn
 
 **Editing delegation**:
-A delegation whose worker, or a worker it started, changed files or ran something that may have: anything beyond reading, searching, building and testing. It needs a verdict; a research delegation is checked but gets none.
+A delegation whose worker, or a worker it started, changed files in the working tree, as a comparison of the tree before and after the worker shows. When workers run at the same time, a change counts for every worker that was running when it happened. Running commands alone does not make it one. Where there is no repository to compare, anything beyond reading, searching, building and testing counts. It needs a verdict; a research delegation is checked but gets none.
 _Avoid_: Implementation delegation (the kind of work is the classifier's, editing is what the worker did)
+
+**Exploration nudge**:
+A reminder added to the result of each exploratory call the orchestrator makes beyond a set number in one user prompt, suggesting it hand the rest to a worker. Guidance, never a denial.
+_Avoid_: Exploration budget (the earlier hard limit), call limit
+
+**Label**:
+A short text the orchestrator gives one delegation to say what it is for, such as `research: budget code`. Shown wherever the worker is listed, falling back to its agent definition and then to `worker`. A reviewer is always shown as `reviewer`.
+_Avoid_: Role (that is the orchestrator/worker split), title, name
 
 **Routing policy**:
 Rules selecting the rung for a task from the tier map, according to task risk, ambiguity, complexity and kind of work, with correctness prioritized over speed and cost. The execution role is the orchestrator's choice, not the router's.
@@ -63,7 +71,7 @@ An experimental routing recommendation recorded for evaluation but not controlli
 ## Watching workers
 
 **Worker widget**:
-The list below the editor, in Claude Code's agent list style: `main`, the orchestrator's own agent, then one row per worker on the board with its agent name, its activity or last status, and its elapsed time and tokens. The /subagents picker and the transcript view's nested workers use the same rows.
+The list below the editor, in Claude Code's agent list style: `main`, the orchestrator's own agent, then one row per worker on the board with its label, its tier and rung, its activity or last status, and its elapsed time and tokens. The /subagents picker and the transcript view's nested workers use the same rows.
 _Avoid_: Status line, subagent list
 
 **Activity**:
@@ -85,7 +93,11 @@ One model at one effort level, written `provider/model:effort`. The unit the rou
 _Avoid_: Model (alone), deployment
 
 **Tier map**:
-The owner's ordered list of rungs per tier. A project may override it. Initial routing chooses listed rungs; the effort ladder may raise a listed model to its next supported effort.
+The owner's list of rungs per tier. A project may override it. Initial routing chooses listed rungs; the effort ladder may raise a listed model to its next supported effort. Each tier has a tier order.
+
+**Tier order**:
+How a tier picks among the rungs that survive the hard filters. *Balanced* (the default): the rung whose provider started the fewest delegations in the last 5 hours, across all the owner's sessions and projects, with list order breaking ties. *Ordered*: the first survivor in the list.
+_Avoid_: Load balancing, round-robin, priority
 _Avoid_: Model list, pool
 
 **Effort**:
@@ -121,6 +133,10 @@ A verdict whose delegation id matches no decision record. Kept and counted, neve
 
 **Hard filter**:
 A rule that removes rungs before the tier choice and that no preference can override: the subagent ban list, the allowed-model list, usage limits, context window, task budget and approved recipients.
+
+**Usage observation**:
+The latest known state of one provider's usage for the owner's account: available, low, exhausted or throttled, with the percentage left and the reset time when known. Learned from limit errors and response headers, shared by all the owner's sessions and projects. An exhausted provider is removed by a hard filter.
+_Avoid_: Quota, headroom (alone), balance
 
 **Escalation**:
 Moving a task to the next higher tier because the hard filters removed every rung of its current tier. Only ever upward, one tier at a time; an emptied critical tier is a refusal, not a move down.
