@@ -5,7 +5,7 @@ status: in-progress
 type: epic
 priority: normal
 created_at: 2026-09-27T21:45:45Z
-updated_at: 2026-09-28T08:40:24Z
+updated_at: 2026-09-28T09:24:58Z
 ---
 
 Design session (split-plan 'orchestrator enforcement', ADR 0005). Keeps the main session in the orchestrator role.
@@ -89,3 +89,12 @@ Rejected: jeyq's redundant vu2o edge (it uses vu2o directly, kept); kokv's stale
 
 
 - Open for the owner (from kokv): should ctx_batch_execute in a worker count as editing, like ctx_execute?
+
+
+## Owner decisions after 247s (2026-09-28)
+- Same-rung review in shadow mode and with routing off (reviewers run on the implementer's rung with a fresh context, recorded as such).
+- Reviewers cannot edit.
+- Retries in shadow/off run on the session model; the effort-ladder record names the would-be rung; limit holds.
+- ctx_batch_execute counts as editing when one of its commands would.
+- Final verification runs on a clean worktree of the last commit; failures from another session's uncommitted widget work are reported separately.
+All but the last are folded into ir82; l8af counts same-rung reviews apart. ADR 0010 and CONTEXT.md (Same-rung review) updated.

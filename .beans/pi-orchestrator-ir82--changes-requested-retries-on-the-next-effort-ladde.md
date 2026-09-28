@@ -7,7 +7,7 @@ priority: normal
 tags:
     - ready-for-agent
 created_at: 2026-09-27T22:07:20Z
-updated_at: 2026-09-27T22:52:02Z
+updated_at: 2026-09-28T09:24:58Z
 parent: pi-orchestrator-3p1z
 blocked_by:
     - pi-orchestrator-kokv
@@ -40,3 +40,16 @@ ADR 0010. When subagents_verdict records request_changes, its reply names the ne
 ## Notes from uezs
 - setRoutingConstraints(id, { forcedRung: { rung, tier } }) pins a forced rung or refuses it (code no_authorized_candidate) when it fails a hard filter. Nothing calls it yet; WorkerSetup needs a field.
 - A forced rung writes a normal decision record carrying constraints, not an effort-ladder record. This ticket must write the effort-ladder record (buildEffortLadderRecord) linked to the failed attempt and reconcile the two.
+
+
+## Owner decisions (2026-09-28), folded into this ticket
+Reviewer fixes on top of 247s, and two small additions:
+- Same-rung review (Q1): when routing cannot choose a rung other than the implementer's (shadow mode, routing off), a reviewer runs on the same rung instead of failing, with a fresh context. The verdict it backs is recorded as a same-rung review (a field on the verdict or reviewer decision record), and subagents_verdict accepts it. Replaces 247s's fail-with-a-reason fallback for reviewers in shadow mode and with routing off.
+- Reviewers cannot edit (Q2): in a reviewer's session, editing tool calls (the editing rule in src/subagents/editing.ts) are denied with a reason; reading, searching, building and testing stay allowed. A reviewer never becomes an editing delegation.
+- Retries in shadow mode and with routing off (Q3): a retry runs on the session model like any worker; its effort-ladder record names the rung it would have used; the two-climb limit still applies.
+- ctx_batch_execute (Q4): in a worker's session it counts as editing when any of its commands, classified with the bash classifier, is neither read-only nor build/test.
+
+- [ ] Reviewer runs on the same rung in shadow mode and with routing off; the verdict records a same-rung review
+- [ ] A reviewer's editing calls are denied; its reads, searches, builds and tests run
+- [ ] In shadow mode and with routing off a retry runs on the session model, its effort-ladder record names the would-be rung, and the limit holds
+- [ ] ctx_batch_execute counts as editing when one of its commands would

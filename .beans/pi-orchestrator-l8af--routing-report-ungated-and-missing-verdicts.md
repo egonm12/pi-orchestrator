@@ -7,7 +7,7 @@ priority: normal
 tags:
     - ready-for-agent
 created_at: 2026-09-27T21:58:41Z
-updated_at: 2026-09-27T22:18:26Z
+updated_at: 2026-09-28T09:24:58Z
 parent: pi-orchestrator-3p1z
 blocked_by:
     - pi-orchestrator-mxmz
@@ -26,6 +26,7 @@ ADR 0010, 0011. An editing delegation whose gate action was none is recorded as 
 - [ ] Ungated delegations appear in the decision record and the report's ungated count
 - [ ] A required verdict with no verdict record counts as missing; recording the verdict later removes it
 - [ ] Neither creates a learning observation
+- [ ] Verdicts backed by a same-rung review are counted apart (owner decision 2026-09-28)
 - [ ] The verdict-reviewer agent and structured-output verdict reading are removed, with their tests
 - [ ] Tests
 
