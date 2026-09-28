@@ -1901,6 +1901,55 @@ test("an error that is no limit leaves the provider in routing", async () => {
   } finally { h.cleanup(); }
 });
 
+/** A folder where the usage store should be: every usage-store write fails. */
+function blockUsageStore(h: Harness): void {
+  mkdirSync(join(h.stateDir, "usage-observations.json", "in-the-way"), { recursive: true });
+}
+
+test("a usage observation the store cannot save warns once, keeps routing on, and this process still avoids the provider", async () => {
+  const h = harness({ ...LIVE, tiers: CODEX_FIRST });
+  try {
+    blockUsageStore(h);
+    const registry = fakeSessionRegistry([{ events: midRunErrorEvents(CODEX_USAGE_LIMIT) }, { events: midRunErrorEvents(CODEX_USAGE_LIMIT) },
+      { events: answerEvents("ok") }]);
+    const stderr = await stderrOf(async () => {
+      const stream = await loadAutoProvider(h, registry);
+      const failed = (await autoEvents(stream, FIX_README, "limited-worker")).at(-1);
+      assert.ok(failed?.type === "error");
+      assert.equal(failed.error.errorMessage, CODEX_USAGE_LIMIT, "the worker still gets the provider's error");
+      // The pinned worker's next request hits the limit again: a second failed write, no second line.
+      await autoEvents(stream, [...FIX_README, { role: "user", content: "try again", timestamp: 1 }], "limited-worker");
+      await autoEvents(stream, FIX_README, "next-worker");
+    });
+    const lines = stderr.split("\n").filter(Boolean);
+    assert.equal(lines.length, 1, stderr);
+    assert.equal(lines[0]!.replace(/: [A-Z]+: .*?\. Routing/, ": <error>. Routing"),
+      "pi-orchestrator router warning: could not save the usage observation for openai-codex (exhausted until 2026-09-26T12:42:00.000Z) " +
+      `in ${join(h.stateDir, "usage-observations.json")}: <error>. Routing in this process still avoids openai-codex; ` +
+      "other sessions don't see it until a later write succeeds.");
+    assert.deepEqual(forwardedRungs(registry), ["openai-codex/gpt-6-luna:low", "openai-codex/gpt-6-luna:low", `${HAIKU}:low`],
+      "the unsaved observation still removes openai-codex from the next routing");
+    const record = h.records().find((entry) => entry.delegationId === "next-worker");
+    assert.ok(record?.recordType === "decision" && record.mode === "live" && record.route.outcome === "chosen", "routing stays on");
+    assert.deepEqual(removedRungs(h, "next-worker").map(([rung, why]) => [rung, why]), [["openai-codex/gpt-6-luna:low", "provider out of usage"]]);
+  } finally { h.cleanup(); }
+});
+
+test("a first-request limit whose observation the store cannot save still fails over", async () => {
+  const h = harness({ ...LIVE, tiers: CODEX_FIRST });
+  try {
+    blockUsageStore(h);
+    const registry = fakeSessionRegistry([{ events: errorEvents(CODEX_USAGE_LIMIT) }, { events: answerEvents("done on haiku") }]);
+    let events: Awaited<ReturnType<typeof autoEvents>> = [];
+    const stderr = await stderrOf(async () => { events = await autoEvents(await loadAutoProvider(h, registry), FIX_README, "failover-worker"); });
+    assert.deepEqual(forwardedRungs(registry), ["openai-codex/gpt-6-luna:low", `${HAIKU}:low`]);
+    assert.equal(events.at(-1)?.type, "done");
+    assert.deepEqual(recordsOf(h, "failover-worker").map((record) => record.recordType), ["decision", "failover", "decision"]);
+    assert.match(stderr, /^pi-orchestrator router warning: could not save the usage observation for openai-codex /);
+    assert.doesNotMatch(stderr, /router disabled/);
+  } finally { h.cleanup(); }
+});
+
 /** A project folder next to the harness project whose settings replace the mechanical tier. */
 function projectWithMechanicalTier(h: Harness, name: string, rungs: readonly string[]): string {
   const dir = join(h.projectDir, "..", name);
@@ -1931,7 +1980,7 @@ test("with every provider exhausted a worker is refused with the reset times, an
     const final = refused.at(-1);
     assert.ok(final?.type === "error");
     assert.equal(final.error.errorMessage, "routing refused this worker, and its fallback, the orchestrator session model " +
-      `anthropic/claude-haiku-4-5:medium, is on anthropic, which is out of usage. Usage limits: ${BOTH_EXHAUSTED}. No request was sent to any provider.`);
+      `anthropic/claude-haiku-4-5:medium, is on anthropic, which is out of usage. Usage limits: ${BOTH_EXHAUSTED}. No worker request was sent.`);
     assert.equal(nothing.calls.length, 0);
     assert.equal(h.records().some((record) => record.delegationId === "refused-worker"), false);
   } finally { h.cleanup(); }
@@ -1959,7 +2008,7 @@ test("after a refusal the session-model fallback runs only while its provider is
     assert.ok(final?.type === "error");
     assert.equal(final.error.errorMessage, "routing refused this worker, and its fallback, the orchestrator session model openai-codex/gpt-6-sol:medium, " +
       "is on openai-codex, which is out of usage. Usage limits: openai-codex: exhausted until 2026-09-26T12:42:00.000Z, " +
-      "from a limit error at 2026-09-26T12:00:00.000Z. No request was sent to any provider.");
+      "from a limit error at 2026-09-26T12:00:00.000Z. No worker request was sent.");
     assert.equal(nothing.calls.length, 0);
   } finally { h.cleanup(); }
 });

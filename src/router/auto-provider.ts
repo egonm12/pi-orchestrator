@@ -17,7 +17,7 @@ import type { RiskTier } from "../routing/classifier.ts";
 import type { ProviderUsage, RoutingConstraints } from "../routing/tier-router.ts";
 import { providerOf } from "../recipients/authorized-delegation.ts";
 import { limitErrorObservation } from "./limit-errors.ts";
-import { recordUsageObservation, type UsageObservation } from "./usage-observations.ts";
+import { limitLiftsAt, recordUsageObservation, type UsageObservation } from "./usage-observations.ts";
 
 type ProviderConfig = NonNullable<Parameters<ExtensionAPI["registerProvider"]>[1]>;
 
@@ -49,6 +49,8 @@ export interface AutoProviderDependencies {
   readonly banLists: () => BanLists;
   readonly disabled: () => boolean;
   readonly disable: (error: unknown) => void;
+  /** Prints `message` once per process for `key`, leaving routing on. */
+  readonly warn: (key: string, message: string) => void;
 }
 
 /** A pin and, when its routing decision escalated, the tiers it moved between. */
@@ -155,20 +157,33 @@ function fallbackPin(banLists: BanLists, constraints: RoutingConstraints | undef
   const provider = providerOf(pin.model);
   if (providerUsage[provider]?.state === "out-of-usage") {
     throw new SessionModelError(`routing refused this worker, and its fallback, the orchestrator session model ${pin.model}:${pin.effort}, ` +
-      `is on ${provider}, which is out of usage. Usage limits: ${usageLimitsText(providerUsage)}. No request was sent to any provider.`);
+      `is on ${provider}, which is out of usage. Usage limits: ${usageLimitsText(providerUsage)}. No worker request was sent.`);
   }
   return pin;
 }
 
+/** Records `observation` for `provider` in the usage store every later
+ *  routing reads. A write that fails warns and leaves routing on: this
+ *  process keeps the observation and goes on reading it (usage-observations.ts),
+ *  so a failed write never routes this process's workers to a provider it saw
+ *  limited. Other processes see it once a later write succeeds. */
+async function saveObservation(deps: AutoProviderDependencies, router: ActiveRouter, provider: string, observation: UsageObservation): Promise<void> {
+  try { await recordUsageObservation(router.usagePath, provider, observation); } catch (error) {
+    const until = limitLiftsAt(observation);
+    const reason = (error instanceof Error ? error.message : String(error)).split(/\r?\n/, 1)[0];
+    deps.warn(`usage-store:${router.usagePath}:${provider}`, `could not save the usage observation for ${provider} ` +
+      `(${observation.state}${until === undefined ? "" : ` until ${new Date(until).toISOString()}`}) in ${router.usagePath}: ${reason}. ` +
+      `Routing in this process still ${until === undefined ? "reads it" : `avoids ${provider}`}; other sessions don't see it until a later write succeeds.`);
+  }
+}
+
 /** Records the usage observation a rung's error text gives for the rung's
- *  provider, in the usage store every later routing reads. Nothing is
- *  recorded with routing off, or for an error that is no limit. */
-function recordLimitError(deps: AutoProviderDependencies, provider: string, text: string | undefined): void {
+ *  provider. Nothing is recorded with routing off, or for an error that is no limit. */
+async function recordLimitError(deps: AutoProviderDependencies, provider: string, text: string | undefined): Promise<void> {
   const router = deps.disabled() ? undefined : deps.router();
   if (router === undefined || text === undefined) return;
   const observation = limitErrorObservation(text, deps.now());
-  if (observation === undefined) return;
-  try { recordUsageObservation(router.usagePath, provider, observation); } catch (error) { deps.disable(error); }
+  if (observation !== undefined) await saveObservation(deps, router, provider, observation);
 }
 
 export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConfig {
@@ -297,8 +312,7 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
           async function failOver(context: FailoverContext, refused: ServedPin, refusedDecision: DecisionRecord,
             limit: UsageObservation, errorText: string): Promise<{ pin: ServedPin } & ReturnType<typeof beginRequest> | undefined> {
             const { router, taskText, agentRole, classification, constraints, refusedProviders } = context;
-            try { recordUsageObservation(router.usagePath, providerOf(refused.model), limit); }
-            catch (error) { deps.disable(error); return undefined; }
+            await saveObservation(deps, router, providerOf(refused.model), limit);
             refusedProviders.add(providerOf(refused.model));
             return withRoutingChoice(router.recordDir, async () => {
               const at = deps.now();
@@ -395,17 +409,17 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
             }
             // A refusal that could not fail over already recorded its observation.
             const observed = refusal?.limit !== undefined;
-            const forward = (event: Event) => {
+            const forward = async (event: Event) => {
               // Recorded before the worker sees the error, so later delegations route elsewhere.
-              if (event.type === "error" && event.reason === "error" && !(observed && event === first.value)) recordLimitError(deps, rung.provider, event.error.errorMessage);
+              if (event.type === "error" && event.reason === "error" && !(observed && event === first.value)) await recordLimitError(deps, rung.provider, event.error.errorMessage);
               const label = <T extends { provider: string; model: string; api: string }>(message: T): T =>
                 ({ ...message, provider: model.provider, model: model.id, api: model.api });
               push({ ...event, ...("partial" in event && event.partial ? { partial: label(event.partial) } : {}),
                 ...("message" in event && event.message ? { message: label(event.message) } : {}),
                 ...("error" in event && event.error ? { error: label(event.error) } : {}) } as Parameters<typeof push>[0]);
             };
-            for (const event of held) forward(event);
-            for (let next = first; !next.done; next = await iterator.next()) forward(next.value);
+            for (const event of held) await forward(event);
+            for (let next = first; !next.done; next = await iterator.next()) await forward(next.value);
             break;
           }
         } catch (error) {

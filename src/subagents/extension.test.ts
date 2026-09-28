@@ -2822,9 +2822,11 @@ test("a typed skill prompt keeps the protocol when an extension loaded earlier f
 const USAGE_NOON = new Date(2026, 8, 29, 12, 0);
 const atLocal = (hours: number, minutes = 0) => new Date(2026, 8, 29, hours, minutes).toISOString();
 
-/** Records `observation` for `provider` in the harness's usage store. */
+/** Records `observation` for `provider` in the harness's usage store. This
+ *  process reads it at once, so scripted provider replies can call it without
+ *  waiting; a failed write surfaces as an unhandled rejection. */
 function observe(h: Harness, provider: string, observation: UsageObservation): void {
-  recordUsageObservation(usageObservationsPath(h.stateDir), provider, observation);
+  void recordUsageObservation(usageObservationsPath(h.stateDir), provider, observation);
 }
 
 const occurrences = (text: string, part: string) => text.split(part).length - 1;

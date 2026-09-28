@@ -36,7 +36,10 @@ export const ROUTER_DISABLED_PREFIX = "pi-orchestrator router disabled:";
 /** pi loads each extension with a fresh module copy (jiti moduleCache: false),
  *  so the once-per-process disabled line is kept on the process's global object. */
 export const DISABLED_LINE_REPORTED = Symbol.for("pi-orchestrator.router.disabled-line-reported");
-type ProcessGlobal = typeof globalThis & { [DISABLED_LINE_REPORTED]?: boolean };
+export const ROUTER_WARNING_PREFIX = "pi-orchestrator router warning:";
+/** The keys of the warnings this process printed, each once, like the disabled line. */
+const WARNINGS_REPORTED = Symbol.for("pi-orchestrator.router.warnings-reported");
+type ProcessGlobal = typeof globalThis & { [DISABLED_LINE_REPORTED]?: boolean; [WARNINGS_REPORTED]?: Set<string> };
 
 /** The state folder when `PI_ORCHESTRATOR_STATE_DIR` is not set: under the agent
  *  directory, never inside the package checkout. */
@@ -161,6 +164,12 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
       banLists: () => active?.banLists ?? loadBanListsOrDefaults().banLists,
       disabled: () => disabled,
       disable: (error) => disable(error),
+      warn: (key, message) => {
+        const reported = (globalThis as ProcessGlobal)[WARNINGS_REPORTED] ??= new Set();
+        if (reported.has(key)) return;
+        reported.add(key);
+        process.stderr.write(`${ROUTER_WARNING_PREFIX} ${message}\n`);
+      },
     });
     if (typeof pi.registerProvider === "function") pi.registerProvider("orchestrator", autoConfig);
     refuseAutoModelForMainThread(pi);
