@@ -1,8 +1,8 @@
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { readRoutingRecords } from "../routing/decision-record.ts";
+import { readRoutingRecords, VERDICTS, type Verdict } from "../routing/decision-record.ts";
 import type { GateLevelRaise } from "../routing/decision-record.ts";
-import { attachVerdict, REVIEW_VERDICTS, type ReviewVerdict } from "../routing/verdicts.ts";
+import { attachVerdict } from "../routing/verdicts.ts";
 import { stateDir } from "../router/extension.ts";
 import type { GateLevels } from "./gate-level.ts";
 import { isOrchestratorSession } from "./orchestrator-session.ts";
@@ -33,7 +33,7 @@ export const SUBAGENTS_VERDICT_TOOL = "subagents_verdict";
 /** The tool's input. */
 interface VerdictInput {
   readonly delegationId: string;
-  readonly verdict: ReviewVerdict;
+  readonly verdict: Verdict;
   readonly reason: string;
   /** The reviewer delegation whose Result the verdict rests on. */
   readonly reviewer?: string;
@@ -45,7 +45,7 @@ const USAGE = `${SUBAGENTS_VERDICT_TOOL} requires a delegationId, a verdict of a
 
 function verdictInput(params: unknown): VerdictInput {
   const { delegationId, verdict, reason, reviewer, gateLevel, gateLevelReason } = (params ?? {}) as Record<string, unknown>;
-  if (typeof delegationId !== "string" || delegationId.trim() === "" || !REVIEW_VERDICTS.includes(verdict as ReviewVerdict) ||
+  if (typeof delegationId !== "string" || delegationId.trim() === "" || !VERDICTS.includes(verdict as Verdict) ||
     typeof reason !== "string" || reason.trim() === "") throw new Error(USAGE);
   if (reviewer !== undefined && (typeof reviewer !== "string" || reviewer.trim() === "")) {
     throw new Error(`${SUBAGENTS_VERDICT_TOOL}: a reviewer, when given, is the review delegation's id`);
@@ -56,7 +56,7 @@ function verdictInput(params: unknown): VerdictInput {
   if ((gateLevel === undefined) !== (gateLevelReason === undefined) || (gateLevelReason !== undefined && (typeof gateLevelReason !== "string" || gateLevelReason.trim() === ""))) {
     throw new Error(`${SUBAGENTS_VERDICT_TOOL}: a raised gateLevel needs a gateLevelReason saying why, and a gateLevelReason needs a gateLevel`);
   }
-  return { delegationId: delegationId.trim(), verdict: verdict as ReviewVerdict, reason: reason.trim(),
+  return { delegationId: delegationId.trim(), verdict: verdict as Verdict, reason: reason.trim(),
     ...(reviewer === undefined ? {} : { reviewer: reviewer.trim() }),
     ...(gateLevel === undefined ? {} : { raise: { level: gateLevel, reason: (gateLevelReason as string).trim() } }) };
 }
@@ -108,7 +108,7 @@ export function registerSubagentsVerdictTool(pi: ExtensionAPI, gateLevels: GateL
       type: "object",
       properties: {
         delegationId: { type: "string", description: "The editing delegation's id, as its Result names it." },
-        verdict: { type: "string", enum: [...REVIEW_VERDICTS], description: "accept, or request_changes when the work falls short." },
+        verdict: { type: "string", enum: [...VERDICTS], description: "accept, or request_changes when the work falls short." },
         reason: { type: "string", description: "What you checked and what you found." },
         reviewer: { type: "string", description: "Optional: the delegation id of the completed review (a subagents item with review) this verdict rests on." },
         gateLevel: { type: "string", enum: [...GATE_LEVELS], description: "Optional: a gate level above the one in force, for this delegation only." },

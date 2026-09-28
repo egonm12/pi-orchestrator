@@ -1,37 +1,34 @@
-// Ticket 25: review verdicts (stories 30 to 32).
+// Ticket 25: review verdicts (stories 31 and 32).
 //
-//   1. Reading. The reviewer agent (./verdict-reviewer.md) declares
-//      pi-subagents' `outputSchema` with a required `verdict` enum. pi-subagents
-//      validates the child's `structured_output` call against it and hands the
-//      value to the parent as the result's `structuredOutput`.
-//      `verdictFromReviewResult` reads that field and nothing else: a result
-//      without it, or with a value outside the enum, is `missing`. Prose is
-//      never parsed.
+//   1. Recording. The orchestrator records every verdict itself, whoever did
+//      the checking (ADR 0010), with `subagents_verdict`
+//      (../subagents/verdict.ts): `accept` or `request_changes`, and nothing
+//      else. A verdict the gate required and nobody recorded is a missing
+//      verdict, which the routing report derives (./routing-report.ts); it is
+//      never recorded as a verdict.
 //   2. Attaching. `attachVerdict` looks the delegation id up in the
 //      record folder. A known id appends a `verdict` record linked to the
 //      delegation's decision: its routing decision, its fork or agent-model
 //      record, or, for an editing delegation the router did not route (routing
 //      off, or switched off by an error), its edit record. An unknown id
 //      appends an `orphaned-verdict` record. Both go into the day file of the
-//      verdict's own timestamp. The orchestrator's `subagents_verdict`
-//      (../subagents/verdict.ts) passes its reason on, whether the verdict
-//      rests on a same-rung review, and any gate level raise it made. A
-//      retry's effort-ladder record is its link to the failed attempt: the
-//      verdict attaches to it only when the retry has no decision record, as
-//      with routing off.
-//   3. Learning data. An `accept` or `request_changes` attached to a decision
-//      that chose a rung is also recorded in ticket 08's observation ledger as
-//      a `verified-task-outcome`: taskType is the classifier's kind of work,
+//      verdict's own timestamp. The orchestrator's `subagents_verdict` passes
+//      its reason on, whether the verdict rests on a same-rung review, and any
+//      gate level raise it made. A retry's effort-ladder record is its link to
+//      the failed attempt: the verdict attaches to it only when the retry has
+//      no decision record, as with routing off.
+//   3. Learning data. A verdict attached to a decision that chose a rung is
+//      also recorded in ticket 08's observation ledger as a
+//      `verified-task-outcome`: taskType is the classifier's kind of work,
 //      instance is the delegation id, so a second attach replaces rather than
 //      adds (the ledger dedupes on model, taskType and instance). The model is
 //      the one that ran the work: the chosen rung's model in live mode, the
 //      hand-picked model in shadow mode (owner decision, 2026-09-25), with the
-//      router's rung in the note. `missing`, an orphan, a refused decision
-//      and a delegation the router did not route record no observation.
+//      router's rung in the note. An orphan, a refused decision and a
+//      delegation the router did not route record no observation, and neither
+//      does an ungated delegation or a missing verdict.
 
-import { copyFileSync, existsSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { existsSync } from "node:fs";
 import {
   emptyRefreshState,
   loadRefreshState,
@@ -52,50 +49,6 @@ import {
   type RoutingRecord,
   type Verdict,
 } from "./decision-record.ts";
-
-export const REVIEW_VERDICTS = ["accept", "request_changes"] as const;
-export type ReviewVerdict = (typeof REVIEW_VERDICTS)[number];
-
-/** The schema `verdict-reviewer.md` declares in its frontmatter. A test checks
- *  the two are equal. */
-export const VERDICT_OUTPUT_SCHEMA = {
-  type: "object",
-  properties: {
-    verdict: { type: "string", enum: [...REVIEW_VERDICTS] },
-    summary: { type: "string" },
-  },
-  required: ["verdict"],
-  additionalProperties: false,
-} as const;
-
-export const VERDICT_REVIEWER_AGENT = "verdict-reviewer";
-
-const VERDICT_REVIEWER_SOURCE = fileURLToPath(new URL("./verdict-reviewer.md", import.meta.url));
-
-/** Copy the reviewer definition into `<agentDir>/agents/`, where pi-subagents
- *  discovers user agents. For throwaway agent dirs only; returns the path. */
-export function installVerdictReviewer(agentDir: string): string {
-  const agents = join(agentDir, "agents");
-  mkdirSync(agents, { recursive: true });
-  const target = join(agents, `${VERDICT_REVIEWER_AGENT}.md`);
-  copyFileSync(VERDICT_REVIEWER_SOURCE, target);
-  return target;
-}
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/** The verdict in a pi-subagents review result (`SingleResult`, or anything
- *  with its `structuredOutput` field). Only `structuredOutput.verdict` is
- *  read; every other field, prose included, is ignored. */
-export function verdictFromReviewResult(result: unknown): Verdict {
-  if (!isObject(result)) return "missing";
-  const structured = result.structuredOutput;
-  if (!isObject(structured)) return "missing";
-  const verdict = structured.verdict;
-  return REVIEW_VERDICTS.includes(verdict as ReviewVerdict) ? (verdict as ReviewVerdict) : "missing";
-}
 
 export interface AttachVerdictInput {
   readonly recordDir: string;
@@ -122,14 +75,14 @@ export type AttachVerdictOutcome =
       readonly status: "attached";
       readonly recordPath: string;
       readonly decision: VerdictTarget;
-      /** Absent for `missing` and for a refused decision. */
+      /** Absent for a refused decision and a delegation the router did not route. */
       readonly observation?: CapabilityObservation;
     }
   | { readonly status: "orphaned"; readonly recordPath: string };
 
 /** The observation a verdict yields, or `undefined` when it yields none. */
 function observationFor(decision: RoutedDecisionRecord, verdict: Verdict, observedAt: string): CapabilityObservation | undefined {
-  if (decision.recordType === "effort-ladder" || verdict === "missing" || decision.route.outcome !== "chosen") return undefined;
+  if (decision.recordType === "effort-ladder" || decision.route.outcome !== "chosen") return undefined;
   const { rung } = decision.route;
   const model = decision.mode === "shadow" ? decision.handPickedModel : rung.model;
   if (model === undefined) return undefined;

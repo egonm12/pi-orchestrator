@@ -18,6 +18,7 @@ import {
   buildAgentModelRecord,
   buildEditRecord,
   buildEffortLadderRecord,
+  buildGateRequirementRecord,
   buildUnplacedLadderRecord,
   DECISION_RECORD_SCHEMA_VERSION,
   decisionRecordPath,
@@ -294,6 +295,35 @@ test("an edit record names its orchestrator session and tool, and a worker's own
     assert.throws(() => validateRoutingRecord({ ...own, nestedDelegationId: "worker-1" }), /field 'nestedDelegationId' must name a different delegation/);
     assert.throws(() => validateRoutingRecord({ ...own, schemaVersion: "decision-record/2" }), /field 'schemaVersion'/);
   } finally { cleanup(); }
+});
+
+test("a gate requirement record names the gate level in force and the gate action at it, and nothing else", async () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    const ungated = buildGateRequirementRecord({ delegationId: "worker-1", at: NOW, gateLevel: "low", gateAction: "none" });
+    const reviewer = buildGateRequirementRecord({ delegationId: "worker-2", at: NOW, gateLevel: "medium", gateAction: "reviewer" });
+    appendRoutingRecord(dir, ungated);
+    appendRoutingRecord(dir, reviewer);
+    assert.deepEqual(readRoutingRecords(dir), [
+      { recordType: "gate-requirement", schemaVersion: "decision-record/3", delegationId: "worker-1", timestamp: NOW.toISOString(), gateLevel: "low", gateAction: "none" },
+      { recordType: "gate-requirement", schemaVersion: "decision-record/3", delegationId: "worker-2", timestamp: NOW.toISOString(), gateLevel: "medium", gateAction: "reviewer" },
+    ]);
+    assert.equal(validateRoutingRecord({ ...ungated, gateAction: "spot-check" }).recordType, "gate-requirement");
+    assert.throws(() => validateRoutingRecord({ ...ungated, gateAction: "spot check" }), /field 'gateAction' must be one of none, spot-check, reviewer/);
+    assert.throws(() => validateRoutingRecord({ ...ungated, gateLevel: "strict" }), /field 'gateLevel' must be one of low, medium, high, max/);
+    const { gateLevel: _level, ...withoutLevel } = ungated;
+    assert.throws(() => validateRoutingRecord(withoutLevel), /field 'gateLevel' is missing/);
+    assert.throws(() => validateRoutingRecord({ ...ungated, tier: "standard" }), /field 'tier' is not a known field/);
+    assert.throws(() => validateRoutingRecord({ ...ungated, schemaVersion: "decision-record/2" }), /field 'schemaVersion' is unsupported for gate-requirement records/);
+  } finally { cleanup(); }
+});
+
+test("a verdict is accept or request_changes: missing is no recorded verdict", () => {
+  const verdict = { recordType: "verdict", schemaVersion: DECISION_RECORD_SCHEMA_VERSION, delegationId: "worker-1", timestamp: NOW.toISOString(),
+    verdict: "missing", decisionFile: "2026-09-25.jsonl" };
+  assert.throws(() => validateRoutingRecord(verdict), /field 'verdict' must be one of accept, request_changes; got "missing"/);
+  assert.throws(() => validateRoutingRecord({ recordType: "orphaned-verdict", schemaVersion: DECISION_RECORD_SCHEMA_VERSION, delegationId: "worker-1",
+    timestamp: NOW.toISOString(), verdict: "missing" }), /field 'verdict' must be one of accept, request_changes/);
 });
 
 test("a verdict's reason is optional, must not be blank, and has credentials redacted and its length bounded like other free text", async () => {

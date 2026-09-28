@@ -1,6 +1,15 @@
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { RISK_TIERS, type RiskTier } from "../routing/classifier.ts";
-import { GATE_LEVELS, type GateLevel, type RoutingRecord } from "../routing/decision-record.ts";
+import {
+  appendRoutingRecord,
+  buildGateRequirementRecord,
+  GATE_LEVELS,
+  readRoutingRecords,
+  type GateAction,
+  type GateLevel,
+  type GateRequirementRecord,
+  type RoutingRecord,
+} from "../routing/decision-record.ts";
 import type { ConstraintRung } from "../routing/tier-router.ts";
 import { splitKnownThinkingSuffix } from "../models/model-info.ts";
 import { delegationEdits, type DelegationEdits } from "./editing.ts";
@@ -16,13 +25,12 @@ import { workerSessionDir } from "./worker.ts";
 // The gate action is the one place that says whether a delegation needs a
 // verdict and whether it needs a reviewer: the commit gate
 // (./commit-gate.ts), subagents_verdict, an editing delegation's Result and
-// the orchestrator protocol all read it.
+// the orchestrator protocol all read it. When a run of an editing delegation
+// ends, its gate action at the gate level then in force is recorded as its
+// gate requirement, from which the routing report counts ungated delegations
+// and missing verdicts (ADR 0013).
 
-export { GATE_LEVELS, type GateLevel } from "../routing/decision-record.ts";
-
-/** CONTEXT.md, Gate action: no verdict, the orchestrator's spot check, or an independent reviewer. */
-export const GATE_ACTIONS = ["none", "spot-check", "reviewer"] as const;
-export type GateAction = (typeof GATE_ACTIONS)[number];
+export { GATE_ACTIONS, GATE_LEVELS, type GateAction, type GateLevel } from "../routing/decision-record.ts";
 
 /** ADR 0011's table: the gate action per tier and gate level. Critical needs
  *  a reviewer at every level, so low never means "gate nothing". */
@@ -53,6 +61,17 @@ export function gateAction(tier: RiskTier | undefined, level: GateLevel): GateAc
 export function tiersByGateAction(level: GateLevel): Readonly<Record<GateAction, readonly RiskTier[]>> {
   const tiers = (action: GateAction) => RISK_TIERS.filter((tier) => GATE_TABLE[tier][level] === action);
   return { none: tiers("none"), "spot-check": tiers("spot-check"), reviewer: tiers("reviewer") };
+}
+
+/** Records the gate requirement of `delegationId`, whose run edited and has
+ *  just ended: its gate action at `level`, the gate level in force now, read
+ *  from its tier in the record folder `recordDir`. A resume that edits again
+ *  records a fresh one. It is no verdict and teaches the router nothing. */
+export function recordGateRequirement(recordDir: string, delegationId: string, level: GateLevel, at?: Date): GateRequirementRecord {
+  const { tier } = delegationRouting(readRoutingRecords(recordDir), delegationId);
+  const record = buildGateRequirementRecord({ delegationId, gateLevel: level, gateAction: gateAction(tier, level), ...(at === undefined ? {} : { at }) });
+  appendRoutingRecord(recordDir, record);
+  return record;
 }
 
 /** A delegation's tier and the rung it ran on, as its records name them. */

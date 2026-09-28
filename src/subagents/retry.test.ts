@@ -411,7 +411,7 @@ test("with routing off a retry is unplaced: it runs on the session model, its la
     // The retries' verdicts attach to their ladder records, as unrouted delegations the report counts.
     const report = buildRoutingReport(join(h.stateDir, "routing"));
     assert.equal(report.orphanedVerdicts, 0);
-    assert.deepEqual(report.unroutedVerdicts, { accept: 0, request_changes: 3, missing: 0 });
+    assert.deepEqual(report.unrouted, { verdicts: { accept: 0, request_changes: 3 }, sameRungVerdicts: { accept: 0, request_changes: 0 }, ungated: 0, missing: 0 });
     assert.equal(report.ladders.length, 2);
   } finally { await o.shutdown(); h.cleanup(); }
 });

@@ -29,7 +29,7 @@ import { registerSubagentsVerdictTool } from "./verdict.ts";
 import { registerGateLevel } from "./gate-level.ts";
 import { reviewerPrompt, reviewTarget, servedOnRung, type ReviewTarget } from "./review.ts";
 import { retrySetup, startRetry, type RetrySetup, type StartedRetry } from "./retry.ts";
-import { delegationRouting, gateAction, type GateLevel } from "./quality-gate.ts";
+import { delegationRouting, gateAction, recordGateRequirement, type GateLevel } from "./quality-gate.ts";
 import { readRoutingRecords, type RoutingRecord } from "../routing/decision-record.ts";
 import { stateDir } from "../router/extension.ts";
 
@@ -373,6 +373,13 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
           board.asking(delegationId, true);
           try { return await question(delegationId, text, questionSignal); } finally { board.asking(delegationId, false); }
         } };
+        // An editing run's gate requirement, at the gate level in force as it ends (quality-gate.ts). A worker's
+        // own call leaves it to the delegation its workers' edits count for.
+        const recordRequirement = (worker: WorkerResult) => {
+          if (worker.edited !== true || parentDelegationId !== undefined) return;
+          try { recordGateRequirement(join(stateDir(), "routing"), worker.sessionId, gateLevels.inForce(ctx).level); }
+          catch (error) { logOnce(`could not record delegation ${worker.sessionId}'s gate requirement: ${error instanceof Error ? error.message : String(error)}`); }
+        };
         let next = 0;
         const runQueue = async () => {
           while (next < items.length) {
@@ -403,6 +410,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
                   onTool: (tool) => showProgress(index, { ...item, status: "running", ...(tool === undefined ? {} : { tool }) }),
                   ...(backgroundCall === undefined ? {} : { onMessageReady: (receive) => backgroundCalls.registerWorker(backgroundCall.delegationIds[index]!, receive) }),
                 });
+                recordRequirement(worker);
                 saveWorkerOutcome(worker.sessionFile, worker.status);
                 results[index] = { ...item, ...worker, finalText: cutText(worker.finalText, worker.sessionFile) };
               } catch (error) {
@@ -515,6 +523,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               onTool: (tool) => showProgress(index, { ...item, ...workerModel, status: "running", ...(tool === undefined ? {} : { tool }) }),
               ...(backgroundCall === undefined ? {} : { onMessageReady: (receive) => backgroundCalls.registerWorker(backgroundCall.delegationIds[index]!, receive) }),
             });
+            recordRequirement(worker);
             // A resumed reviewer is not routed again, so its saved instructions carry the review prompt for it.
             // A review that ran on the reviewed delegation's rung is a same-rung review (review.ts).
             const agentName = definition === undefined ? {} : { agent: definition.name };

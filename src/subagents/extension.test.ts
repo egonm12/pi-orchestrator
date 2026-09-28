@@ -340,7 +340,7 @@ test("a completed worker resumes its saved session with the same delegation and 
     attachVerdict({ recordDir, delegationId: first.worker.sessionId, verdict: "request_changes", refreshStatePath });
     attachVerdict({ recordDir, delegationId: first.worker.sessionId, verdict: "accept", refreshStatePath });
     assert.equal(buildRoutingReport(recordDir).totals.decisions, 1);
-    assert.deepEqual(buildRoutingReport(recordDir).totals.verdicts, { accept: 1, request_changes: 0, missing: 0 });
+    assert.deepEqual(buildRoutingReport(recordDir).totals.verdicts, { accept: 1, request_changes: 0 });
   } finally { h.cleanup(); }
 });
 
@@ -2930,6 +2930,18 @@ function editRecords(h: Harness) {
   return readRoutingRecords(join(h.stateDir, "routing")).flatMap((record) => record.recordType === "edit" ? [record] : []);
 }
 
+/** Each gate requirement record as [delegation id, gate level, gate action], in file order. */
+function gateRequirements(h: Harness): [string, string, string][] {
+  return readRoutingRecords(join(h.stateDir, "routing"))
+    .flatMap((record) => record.recordType === "gate-requirement" ? [[record.delegationId, record.gateLevel, record.gateAction] as [string, string, string]] : []);
+}
+
+/** The report's gate counts over every routed delegation. */
+function reportGate(h: Harness) {
+  const { verdicts, sameRungVerdicts, ungated, missing } = buildRoutingReport(join(h.stateDir, "routing")).totals;
+  return { verdicts, sameRungVerdicts, ungated, missing };
+}
+
 async function recordVerdict(subagents: LoadedSubagents, ctx: ExtensionContext, params: Record<string, unknown>): Promise<string> {
   const result = await subagents.tool("subagents_verdict").execute("verdict-call", params as never, undefined, undefined, ctx);
   return toolText(result);
@@ -3003,10 +3015,10 @@ test("subagents_verdict records accept and request_changes with a reason; the re
       `Recorded request_changes on delegation ${id}. The effort ladder cannot place it: routing is off, so no tier map is loaded to climb. ` +
       `A retry runs on the session model, climb 1 of 2. To retry, start a subagents item whose retry is ${id} and whose task is your feedback.`);
     const recordDir = join(h.stateDir, "routing");
-    assert.deepEqual(buildRoutingReport(recordDir).totals.verdicts, { accept: 0, request_changes: 1, missing: 0 });
+    assert.deepEqual(buildRoutingReport(recordDir).totals.verdicts, { accept: 0, request_changes: 1 });
     assert.equal(await recordVerdict(subagents, main.ctx, { delegationId: id, verdict: "accept", reason: "checked notes.md:1" }),
       `Recorded accept on delegation ${id}. It replaces the earlier request_changes.`);
-    assert.deepEqual(buildRoutingReport(recordDir).totals.verdicts, { accept: 1, request_changes: 0, missing: 0 });
+    assert.deepEqual(buildRoutingReport(recordDir).totals.verdicts, { accept: 1, request_changes: 0 });
     const records = readRoutingRecords(recordDir);
     const decision = records.find((record) => record.recordType === "decision");
     assert.ok(decision);
@@ -3083,6 +3095,8 @@ test("a worker's own worker's edits count for the delegation that started it, wh
     assert.equal(provider.requests.some((request) => request.sessionId === nestedId), true, "the nested worker made the edit");
     assert.equal(await refusal(subagents, main.ctx, { delegationId: nestedId, verdict: "accept", reason: "checked" }),
       `subagents_verdict: delegation ${nestedId} is a worker's own worker; its edits count for delegation ${worker.sessionId}, so record the verdict there`);
+    // Only the lead's delegation has a gate requirement, recorded as it ended.
+    assert.deepEqual(gateRequirements(h), [[worker.sessionId, "medium", "spot-check"]]);
     assert.equal(await recordVerdict(subagents, main.ctx, { delegationId: worker.sessionId!, verdict: "accept", reason: "checked notes.md" }),
       `Recorded accept on delegation ${worker.sessionId}.`);
   } finally { h.cleanup(); }
@@ -3108,10 +3122,28 @@ test("a resumed delegation's edits belong to it, and its verdict attaches to its
     assert.equal(worker.edited, true);
     assert.ok(toolText(resumed).includes(EDITED_LINE));
     assert.deepEqual(editRecords(h).map((record) => record.delegationId), [id]);
+    // The research run recorded no gate requirement; the editing resume did, as it ended.
+    assert.deepEqual(gateRequirements(h), [[id, "medium", "spot-check"]]);
+    const none = { accept: 0, request_changes: 0 };
+    assert.deepEqual(reportGate(h), { verdicts: none, sameRungVerdicts: none, ungated: 0, missing: 1 });
     assert.equal(await recordVerdict(subagents, main.ctx, { delegationId: id, verdict: "accept", reason: "checked notes.md" }), `Recorded accept on delegation ${id}.`);
     assert.deepEqual(buildRoutingReport(join(h.stateDir, "routing")).totals, {
-      decisions: 1, verdicts: { accept: 1, request_changes: 0, missing: 0 }, shadowDecisions: 0, shadowAgreements: 0,
+      decisions: 1, verdicts: { accept: 1, request_changes: 0 }, sameRungVerdicts: none, ungated: 0, missing: 0,
+      shadowDecisions: 0, shadowAgreements: 0,
     });
+    // A resume that only reads records nothing; one that edits again records a fresh requirement, and its verdict is missing again.
+    const resume = async (callId: string, task: string) => {
+      const result = await subagents.tool().execute(callId, { items: [{ resume: id, task }] } as never, undefined, undefined, main.ctx);
+      assert.equal((result.details as SubagentsDetails).results[0]!.status, "completed", toolText(result));
+    };
+    await resume("call-3", runTask("read", { path: "README.md" }));
+    assert.deepEqual(gateRequirements(h), [[id, "medium", "spot-check"]]);
+    assert.deepEqual(reportGate(h).missing, 0);
+    await resume("call-4", runTask("write", { path: "more.md", content: "y\n" }));
+    assert.deepEqual(gateRequirements(h), [[id, "medium", "spot-check"], [id, "medium", "spot-check"]]);
+    assert.deepEqual(reportGate(h), { verdicts: { accept: 1, request_changes: 0 }, sameRungVerdicts: none, ungated: 0, missing: 1 });
+    await recordVerdict(subagents, main.ctx, { delegationId: id, verdict: "accept", reason: "checked more.md" });
+    assert.deepEqual(reportGate(h).missing, 0);
   } finally { h.cleanup(); }
 });
 
@@ -3147,10 +3179,11 @@ test("a verdict on a fork, an agent's named model or an unrouted worker attaches
         `To retry, start a subagents item whose retry is ${id} and whose task is your feedback.`);
       const records = readRoutingRecords(join(h.stateDir, "routing"));
       // The reviewer's decision carries the router's fixed clock, so it may sit in another day file.
-      assert.deepEqual(records.map((record) => record.recordType).sort(), (kind === "unrouted" ? ["edit", "verdict"] : [kind, "edit", "decision", "verdict"]).sort(), kind);
+      assert.deepEqual(records.map((record) => record.recordType).sort(), (kind === "unrouted" ? ["edit", "gate-requirement", "verdict"] : [kind, "edit", "gate-requirement", "decision", "verdict"]).sort(), kind);
       const report = buildRoutingReport(join(h.stateDir, "routing"));
       assert.equal(report.orphanedVerdicts, 0, kind);
-      assert.deepEqual(report.unroutedVerdicts, { accept: 0, request_changes: 1, missing: 0 }, kind);
+      // Gated as elevated, it needed a reviewer, and got one: nothing is missing.
+      assert.deepEqual(report.unrouted, { verdicts: { accept: 0, request_changes: 1 }, sameRungVerdicts: { accept: 0, request_changes: 0 }, ungated: 0, missing: 0 }, kind);
     } finally { h.cleanup(); }
   }
 });
@@ -3295,6 +3328,10 @@ test("/pi-orchestrator gate sets the session's gate level: an ungated delegation
     assert.equal(worker.edited, true, JSON.stringify(worker));
     assert.ok(toolText(result).includes("At the low gate level a mechanical delegation needs no verdict: it is ungated."), toolText(result));
     assert.equal(await subagents.toolCall("bash", { command: "git commit -m x" }, main.ctx), undefined, "an ungated delegation holds back no commit");
+    // Its gate requirement, at the level in force as it ended, makes it ungated in the decision record and the report.
+    assert.deepEqual(gateRequirements(h), [[worker.sessionId, "low", "none"]]);
+    const none = { accept: 0, request_changes: 0 };
+    assert.deepEqual(reportGate(h), { verdicts: none, sameRungVerdicts: none, ungated: 1, missing: 0 });
     await subagents.agentEvent("turn_end", main.ctx);
     assert.deepEqual(subagents.messages.filter(({ message }) => message.customType === "subagents-unjudged"), [], "nor is it named at the turn end");
     // Back at medium it needs the orchestrator's spot check, and waits for it.
@@ -3303,6 +3340,9 @@ test("/pi-orchestrator gate sets the session's gate level: an ungated delegation
     assert.ok(denied?.reason.includes(`waits for your verdict: delegation ${worker.sessionId}.`), JSON.stringify(denied));
     await subagents.agentEvent("turn_end", main.ctx);
     assert.equal(subagents.messages.filter(({ message }) => message.customType === "subagents-unjudged").length, 1);
+    // The report keeps the requirement recorded as the delegation ended, and neither ungated nor missing is a learning observation.
+    assert.deepEqual(reportGate(h), { verdicts: none, sameRungVerdicts: none, ungated: 1, missing: 0 });
+    assert.equal(existsSync(join(h.stateDir, "refresh-state.json")), false, "no observation was recorded");
     // Another session starts from the settings' level.
     const other = orchestrator(h);
     assert.deepEqual(await subagents.runCommand("pi-orchestrator", "gate", other.ctx), [`pi-orchestrator: gate level medium, from settings.\n${usage}`]);

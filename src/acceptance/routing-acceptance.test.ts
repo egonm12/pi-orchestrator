@@ -18,6 +18,9 @@ import { authorizeRecipient, emptyAuthorization, grantOwnerApproval, saveAuthori
 import { ROUTER_DISABLED_PREFIX, ROUTER_PREFIX } from "../router/extension.ts";
 import type { RiskTier } from "../routing/classifier.ts";
 import {
+  appendRoutingRecord,
+  buildEditRecord,
+  buildGateRequirementRecord,
   readRoutingRecords,
   writeDecisionRecord,
   type DecisionRecord,
@@ -171,6 +174,8 @@ interface ExpectedReportRow {
   readonly rung: string | null;
   readonly decisions: number;
   readonly verdicts: readonly Verdict[];
+  /** Editing delegations whose required verdict was never recorded; none when absent. */
+  readonly missing?: number;
   readonly shadowDecisions: number;
   readonly shadowAgreements: number;
 }
@@ -180,7 +185,9 @@ function expectedCounts(row: Omit<ExpectedReportRow, "tier" | "rung">): string {
   const agreement = row.shadowDecisions === 0
     ? "n/a (no shadow decisions)"
     : `${row.shadowAgreements} of ${row.shadowDecisions} (${Math.round((row.shadowAgreements / row.shadowDecisions) * 100)}%)`;
-  return `decisions ${row.decisions}, accept ${count("accept")}, request_changes ${count("request_changes")}, missing ${count("missing")}, shadow agreement ${agreement}`;
+  // No verdict here rests on a same-rung review, and no delegation is ungated.
+  return `decisions ${row.decisions}, accept ${count("accept")}, request_changes ${count("request_changes")}, same-rung accept 0, same-rung request_changes 0, ` +
+    `ungated 0, missing ${row.missing ?? 0}, shadow agreement ${agreement}`;
 }
 
 /** The report the test expects, written from its own list of rows in the
@@ -189,6 +196,7 @@ function expectedReport(folder: string, rows: readonly ExpectedReportRow[], orph
   const total = {
     decisions: rows.reduce((sum, row) => sum + row.decisions, 0),
     verdicts: rows.flatMap((row) => row.verdicts),
+    missing: rows.reduce((sum, row) => sum + (row.missing ?? 0), 0),
     shadowDecisions: rows.reduce((sum, row) => sum + row.shadowDecisions, 0),
     shadowAgreements: rows.reduce((sum, row) => sum + row.shadowAgreements, 0),
   };
@@ -197,8 +205,8 @@ function expectedReport(folder: string, rows: readonly ExpectedReportRow[], orph
     ...rows.map((row) => `tier ${row.tier}, ${row.rung === null ? "refused" : `rung ${row.rung}`}: ${expectedCounts(row)}`),
     `all: ${expectedCounts(total)}`,
     `orphaned verdicts: ${orphanedVerdicts}`,
-    // Every verdict here is on a routed delegation.
-    "verdicts on unrouted delegations: accept 0, request_changes 0, missing 0",
+    // Every delegation here is routed.
+    "unrouted delegations: accept 0, request_changes 0, same-rung accept 0, same-rung request_changes 0, ungated 0, missing 0",
     "",
   ].join("\n");
 }
@@ -212,8 +220,9 @@ function runRoutingReport(folder: string): { status: number | null; stdout: stri
 
 // Seam 1 companion of checkbox 7: the report check above, against a folder
 // whose counts are known by construction. No pi. This is where a change to
-// the report's counting (verdicts once per delegation id, newest wins; orphans
-// once; explicit records nowhere; shadow agreement) is caught without spend.
+// the report's counting (verdicts once per delegation id, newest wins; missing
+// verdicts from gate requirements; orphans once; explicit records nowhere;
+// shadow agreement) is caught without spend.
 test("the gate's hand-computed report equals routing-report.ts over a folder with known counts", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-harness-acceptance-report-"));
   try {
@@ -249,13 +258,15 @@ test("the gate's hand-computed report equals routing-report.ts over a folder wit
     attach("m-live", "accept", later);
     attach("m-shadow-agrees", "request_changes", later);
     attach("m-shadow-agrees", "accept", latest);
-    attach("m-shadow-differs", "missing", later);
+    // An editing delegation the gate required a spot check of, never judged: a missing verdict.
+    appendRoutingRecord(records, buildEditRecord({ delegationId: "m-shadow-differs", orchestratorSession: "orchestrator-1", tool: "write", at: later }));
+    appendRoutingRecord(records, buildGateRequirementRecord({ delegationId: "m-shadow-differs", gateLevel: "medium", gateAction: "spot-check", at: later }));
     attach("e-refused", "request_changes", later);
     attach("no-such-attempt", "request_changes", later);
     attach("no-such-attempt", "accept", latest);
 
     const expected = expectedReport(records, [
-      { tier: "mechanical", rung: `${FIXTURE_HAIKU}:low`, decisions: 3, verdicts: ["accept", "accept", "missing"], shadowDecisions: 2, shadowAgreements: 1 },
+      { tier: "mechanical", rung: `${FIXTURE_HAIKU}:low`, decisions: 3, verdicts: ["accept", "accept"], missing: 1, shadowDecisions: 2, shadowAgreements: 1 },
       { tier: "standard", rung: "anthropic/claude-sonnet-5:medium", decisions: 1, verdicts: [], shadowDecisions: 0, shadowAgreements: 0 },
       { tier: "elevated", rung: null, decisions: 1, verdicts: ["request_changes"], shadowDecisions: 0, shadowAgreements: 0 },
     ], 1);

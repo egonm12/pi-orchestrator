@@ -3,9 +3,10 @@
 // One append-only JSON line per routing decision, one file per UTC day,
 // `<folder>/<YYYY-MM-DD>.jsonl`. The folder is injected; the harness default
 // is `src/state/routing` (git-ignored runtime state, like ticket 08's
-// refresh state). Verdicts attached later (./verdicts.ts) and the edit records
-// of editing delegations (../subagents/editing.ts) are further lines in the
-// same day files, so the folder holds every routing fact and nothing else.
+// refresh state). Verdicts attached later (./verdicts.ts), and the edit
+// records (../subagents/editing.ts) and gate requirements
+// (../subagents/quality-gate.ts) of editing delegations are further lines in
+// the same day files, so the folder holds every routing fact and nothing else.
 //
 // The writer copies each field it records by name from the values it is
 // given: ticket 23's classification, ticket 22's resolved tier map, ticket
@@ -161,14 +162,19 @@ export type LadderMode = (typeof LADDER_MODES)[number];
 /** A placed climb's step, as the effort ladder took it. */
 export const LADDER_STEPS = ["effort", "same-tier", "next-tier"] as const;
 
-/** The reviewer's verdict as recorded. `missing` is a review that returned no
- *  structured verdict; it is never guessed from prose. */
-export const VERDICTS = ["accept", "request_changes", "missing"] as const;
+/** The orchestrator's verdict as `subagents_verdict` records it. A verdict
+ *  the gate required and nobody recorded is a missing verdict, which the
+ *  routing report derives from gate requirement records; it is never a record. */
+export const VERDICTS = ["accept", "request_changes"] as const;
 export type Verdict = (typeof VERDICTS)[number];
 
 /** How strictly the quality gate treats each tier (ADR 0011), lowest first. */
 export const GATE_LEVELS = ["low", "medium", "high", "max"] as const;
 export type GateLevel = (typeof GATE_LEVELS)[number];
+
+/** CONTEXT.md, Gate action: no verdict, the orchestrator's spot check, or an independent reviewer. */
+export const GATE_ACTIONS = ["none", "spot-check", "reviewer"] as const;
+export type GateAction = (typeof GATE_ACTIONS)[number];
 
 /** The orchestrator's raise of the gate level for one delegation (ADR 0011):
  *  from the level in force to a higher one, with its reason. */
@@ -290,7 +296,7 @@ export interface VerdictRecord extends RecordCommon {
    *  when it has none of those, as a worker the router did not route. */
   readonly decisionFile: string;
   /** Why the orchestrator judged so (subagents_verdict); absent on verdicts
-   *  read from a reviewer's structured output. */
+   *  recorded without one, before subagents_verdict. */
   readonly reason?: string;
   /** The verdict rests on a same-rung review: its reviewer ran on the
    *  delegation's own rung, in shadow mode or with routing off (ADR 0010). */
@@ -395,8 +401,20 @@ export interface EditRecord extends RecordCommon {
   readonly nestedDelegationId?: string;
 }
 
+/** An editing delegation's gate requirement (ADR 0010, ADR 0011): written
+ *  when a run of it that edited ends, at the gate level then in force. A
+ *  resume that edits again writes another, and the latest counts. Gate action
+ *  none makes it an ungated delegation; any other, with no verdict after its
+ *  latest edit, a missing verdict. Neither teaches the router. */
+export interface GateRequirementRecord extends RecordCommon {
+  readonly recordType: "gate-requirement";
+  readonly gateLevel: GateLevel;
+  readonly gateAction: GateAction;
+}
+
 export type RoutedDecisionRecord = DecisionRecord | EffortLadderRecord;
-export type RoutingRecord = RoutedDecisionRecord | ForkRecord | AgentModelRecord | ExplicitModelRecord | VerdictRecord | OrphanedVerdictRecord | EditRecord;
+export type RoutingRecord = RoutedDecisionRecord | ForkRecord | AgentModelRecord | ExplicitModelRecord | VerdictRecord | OrphanedVerdictRecord | EditRecord |
+  GateRequirementRecord;
 
 /** A routed decision for the routing report. Forks accept verdicts but are not routed. */
 export function isRoutedDecision(record: RoutingRecord): record is RoutedDecisionRecord {
@@ -605,7 +623,8 @@ function checkCommon(record: Json): void {
 export function validateRoutingRecord(value: unknown): RoutingRecord {
   if (!isObject(value)) throw new RoutingRecordError("(record)", `must be a JSON object; got ${JSON.stringify(value)}`);
   checkSchemaVersion(value);
-  const recordType = oneOf(value, "recordType", "", ["decision", "effort-ladder", "agent-model", "fork", "explicit", "verdict", "orphaned-verdict", "edit"] as const);
+  const recordType = oneOf(value, "recordType", "",
+    ["decision", "effort-ladder", "agent-model", "fork", "explicit", "verdict", "orphaned-verdict", "edit", "gate-requirement"] as const);
   if (value.schemaVersion === DECISION_RECORD_SCHEMA_VERSION && recordType === "explicit") {
     throw new RoutingRecordError("schemaVersion", `is unsupported for ${recordType} records`);
   }
@@ -703,6 +722,12 @@ export function validateRoutingRecord(value: unknown): RoutingRecord {
       stringAt(value, "nestedDelegationId", "", { nonBlank: true });
       if (value.nestedDelegationId === value.delegationId) throw new RoutingRecordError("nestedDelegationId", "must name a different delegation");
     }
+  } else if (recordType === "gate-requirement") {
+    if (value.schemaVersion !== DECISION_RECORD_SCHEMA_VERSION) throw new RoutingRecordError("schemaVersion", `is unsupported for ${recordType} records`);
+    checkKeys(value, "", [...COMMON_KEYS, "gateLevel", "gateAction"]);
+    checkCommon(value);
+    oneOf(value, "gateLevel", "", GATE_LEVELS);
+    oneOf(value, "gateAction", "", GATE_ACTIONS);
   } else {
     checkKeys(value, "", [...COMMON_KEYS, "verdict"]);
     checkCommon(value);
@@ -913,6 +938,19 @@ export function buildEditRecord(input: {
     delegationId: input.delegationId, timestamp: (input.at ?? new Date()).toISOString(),
     orchestratorSession: input.orchestratorSession, tool: input.tool,
     ...(input.nestedDelegationId === undefined ? {} : { nestedDelegationId: input.nestedDelegationId }),
+  });
+}
+
+export function buildGateRequirementRecord(input: {
+  readonly delegationId: string;
+  readonly gateLevel: GateLevel;
+  readonly gateAction: GateAction;
+  readonly at?: Date;
+}): GateRequirementRecord {
+  return checkedRecord({
+    recordType: "gate-requirement", schemaVersion: DECISION_RECORD_SCHEMA_VERSION,
+    delegationId: input.delegationId, timestamp: (input.at ?? new Date()).toISOString(),
+    gateLevel: input.gateLevel, gateAction: input.gateAction,
   });
 }
 

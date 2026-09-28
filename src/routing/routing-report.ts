@@ -5,27 +5,37 @@
 //
 // Reads the record folder's day files and nothing else (no settings, no
 // ledger, no agent dir), and prints one line per tier and rung: decisions,
-// verdicts by kind, and the shadow agreement rate, then the totals, the
-// orphaned verdict count and the verdicts on unrouted delegations.
+// verdicts by kind, same-rung verdicts, ungated delegations, missing verdicts
+// and the shadow agreement rate, then the totals, the orphaned verdict count
+// and the same counts for unrouted delegations.
 //
 //   - A decision's row is the tier and rung it chose, or `<tier routing
 //     started at>, refused` when the router refused: the classified tier,
 //     unless a routing constraint raised it or forced a rung.
 //   - Verdicts count once per delegation id, the newest winning, as ticket 08's
 //     ledger does. A decision with no verdict yet counts in no verdict column.
+//     A verdict backed by a same-rung review (ADR 0010) counts in the same-rung
+//     columns instead of accept or request_changes.
+//   - Ungated and missing (ADR 0010, ADR 0011) come from each editing
+//     delegation's latest gate requirement record, written when a run of it
+//     that edited ends. Gate action none makes it ungated, whether or not it
+//     got a verdict anyway. Any other gate action with no verdict after the
+//     delegation's latest edit record is a missing verdict, so a verdict
+//     recorded later, after a resume say, removes it. Neither is a verdict or
+//     a learning observation, and each counts once per delegation id.
 //   - Shadow agreement: of the shadow decisions in the row, the share whose
 //     chosen rung's model equals the hand-picked model. A refused shadow
 //     decision chose no rung, so it does not agree.
 //   - Orphaned verdicts count once per delegation id.
-//   - A verdict on a delegation the router did not route (a forked worker, an
-//     agent definition's named model, a worker that ran with routing off) has
-//     no row: it counts in its own line, once per delegation id, the newest
-//     winning.
+//   - A delegation the router did not route (a forked worker, an agent
+//     definition's named model, a worker that ran with routing off) has no
+//     row: its verdict, ungated delegation or missing verdict counts in its own
+//     line, once per delegation id.
 //   - Edit records (ADR 0010) mark editing delegations; they are not counted.
 //   - An effort-ladder record is a retry's link to the attempt it climbs
 //     from (ADR 0010), not its routing decision: each is listed on its own
 //     line. The retry's row is its decision record's; a retry with routing
-//     off has none, so its verdict counts as one on an unrouted delegation.
+//     off has none, so it counts as an unrouted delegation.
 //   - Ticket 27's `explicit` records (a call that named its own model) are
 //     not routing decisions and are not counted.
 //
@@ -40,16 +50,30 @@ import {
   RoutingRecordError,
   type DecisionRecord,
   type EffortLadderRecord,
+  type GateRequirementRecord,
   type RecordFolderReader,
   type Verdict,
+  type VerdictRecord,
 } from "./decision-record.ts";
 
-export interface RoutingReportRow {
+/** What the quality gate left for a set of delegations. */
+export interface GateCounts {
+  /** Latest verdicts by kind, same-rung ones left out. */
+  readonly verdicts: Readonly<Record<Verdict, number>>;
+  /** Latest verdicts backed by a same-rung review, by kind. */
+  readonly sameRungVerdicts: Readonly<Record<Verdict, number>>;
+  /** Editing delegations whose latest gate requirement was gate action none. */
+  readonly ungated: number;
+  /** Editing delegations whose latest gate requirement needs a verdict that
+   *  was not recorded after their latest edit. */
+  readonly missing: number;
+}
+
+export interface RoutingReportRow extends GateCounts {
   readonly tier: RiskTier;
   /** The chosen rung, or `null` for the refused row. */
   readonly rung: string | null;
   readonly decisions: number;
-  readonly verdicts: Readonly<Record<Verdict, number>>;
   readonly shadowDecisions: number;
   readonly shadowAgreements: number;
 }
@@ -58,22 +82,32 @@ export interface RoutingReport {
   readonly rows: readonly RoutingReportRow[];
   readonly totals: Omit<RoutingReportRow, "tier" | "rung">;
   readonly orphanedVerdicts: number;
-  /** The latest verdict of each delegation without a routing decision, by kind. */
-  readonly unroutedVerdicts: Readonly<Record<Verdict, number>>;
+  /** The same counts for delegations without a routing decision. */
+  readonly unrouted: GateCounts;
   readonly ladders: readonly EffortLadderRecord[];
 }
 
-interface MutableRow {
+interface MutableGateCounts {
+  verdicts: Record<Verdict, number>;
+  sameRungVerdicts: Record<Verdict, number>;
+  ungated: number;
+  missing: number;
+}
+
+interface MutableRow extends MutableGateCounts {
   tier: RiskTier;
   rung: string | null;
   decisions: number;
-  verdicts: Record<Verdict, number>;
   shadowDecisions: number;
   shadowAgreements: number;
 }
 
+function emptyGateCounts(): MutableGateCounts {
+  return { verdicts: { accept: 0, request_changes: 0 }, sameRungVerdicts: { accept: 0, request_changes: 0 }, ungated: 0, missing: 0 };
+}
+
 function emptyCounts(): Omit<MutableRow, "tier" | "rung"> {
-  return { decisions: 0, verdicts: { accept: 0, request_changes: 0, missing: 0 }, shadowDecisions: 0, shadowAgreements: 0 };
+  return { decisions: 0, ...emptyGateCounts(), shadowDecisions: 0, shadowAgreements: 0 };
 }
 
 function rowKey(decision: DecisionRecord): { tier: RiskTier; rung: string | null } {
@@ -86,21 +120,46 @@ function agrees(decision: DecisionRecord): boolean {
   return decision.route.outcome === "chosen" && decision.route.rung.model === decision.handPickedModel;
 }
 
+/** One delegation's latest verdict and what its latest gate requirement left. */
+interface DelegationGate {
+  verdict?: VerdictRecord;
+  requirement?: GateRequirementRecord;
+  /** A verdict was recorded after the delegation's latest edit record. */
+  judgedSinceEdit: boolean;
+}
+
+function countGate(counts: MutableGateCounts, gate: DelegationGate | undefined): void {
+  if (gate === undefined) return;
+  if (gate.verdict !== undefined) (gate.verdict.sameRungReview ? counts.sameRungVerdicts : counts.verdicts)[gate.verdict.verdict] += 1;
+  if (gate.requirement?.gateAction === "none") counts.ungated += 1;
+  else if (gate.requirement !== undefined && !gate.judgedSinceEdit) counts.missing += 1;
+}
+
 export function buildRoutingReport(folder: string, reader?: RecordFolderReader): RoutingReport {
   const records = readRoutingRecords(folder, reader);
   const decisions = new Map<string, DecisionRecord>();
   const ladders: EffortLadderRecord[] = [];
-  const verdicts = new Map<string, Verdict>();
+  const gates = new Map<string, DelegationGate>();
+  const gateOf = (delegationId: string): DelegationGate => {
+    const gate = gates.get(delegationId) ?? { judgedSinceEdit: false };
+    gates.set(delegationId, gate);
+    return gate;
+  };
   const orphans = new Set<string>();
   for (const record of records) {
     if (record.recordType === "decision") decisions.set(record.delegationId, record);
     else if (record.recordType === "effort-ladder") ladders.push(record);
-    else if (record.recordType === "verdict") verdicts.set(record.delegationId, record.verdict);
+    else if (record.recordType === "verdict") {
+      const gate = gateOf(record.delegationId);
+      gate.verdict = record;
+      gate.judgedSinceEdit = true;
+    } else if (record.recordType === "edit") gateOf(record.delegationId).judgedSinceEdit = false;
+    else if (record.recordType === "gate-requirement") gateOf(record.delegationId).requirement = record;
     else if (record.recordType === "orphaned-verdict") orphans.add(record.delegationId);
     // An `explicit` record (ticket 27) routed nothing: no row, no orphan.
   }
-  const unroutedVerdicts: Record<Verdict, number> = { accept: 0, request_changes: 0, missing: 0 };
-  for (const [delegationId, verdict] of verdicts) if (!decisions.has(delegationId)) unroutedVerdicts[verdict] += 1;
+  const unrouted = emptyGateCounts();
+  for (const [delegationId, gate] of gates) if (!decisions.has(delegationId)) countGate(unrouted, gate);
 
   const rows = new Map<string, MutableRow>();
   const totals = emptyCounts();
@@ -109,10 +168,10 @@ export function buildRoutingReport(folder: string, reader?: RecordFolderReader):
     const key = `${tier}\u0000${rung ?? ""}`;
     const row = rows.get(key) ?? { tier, rung, ...emptyCounts() };
     rows.set(key, row);
-    const verdict = verdicts.get(decision.delegationId);
+    const gate = gates.get(decision.delegationId);
     for (const counts of [row, totals]) {
       counts.decisions += 1;
-      if (verdict !== undefined) counts.verdicts[verdict] += 1;
+      countGate(counts, gate);
       if (decision.mode === "shadow") {
         counts.shadowDecisions += 1;
         if (agrees(decision)) counts.shadowAgreements += 1;
@@ -127,7 +186,7 @@ export function buildRoutingReport(folder: string, reader?: RecordFolderReader):
     if (b.rung === null) return -1;
     return a.rung < b.rung ? -1 : a.rung > b.rung ? 1 : 0;
   });
-  return { rows: ordered, totals, orphanedVerdicts: orphans.size, unroutedVerdicts, ladders };
+  return { rows: ordered, totals, orphanedVerdicts: orphans.size, unrouted, ladders };
 }
 
 function agreement(shadowDecisions: number, shadowAgreements: number): string {
@@ -135,11 +194,16 @@ function agreement(shadowDecisions: number, shadowAgreements: number): string {
   return `${shadowAgreements} of ${shadowDecisions} (${Math.round((shadowAgreements / shadowDecisions) * 100)}%)`;
 }
 
-function counts(row: Omit<RoutingReportRow, "tier" | "rung">): string {
+function gateCounts(gate: GateCounts): string {
   return (
-    `decisions ${row.decisions}, accept ${row.verdicts.accept}, request_changes ${row.verdicts.request_changes}, ` +
-    `missing ${row.verdicts.missing}, shadow agreement ${agreement(row.shadowDecisions, row.shadowAgreements)}`
+    `accept ${gate.verdicts.accept}, request_changes ${gate.verdicts.request_changes}, ` +
+    `same-rung accept ${gate.sameRungVerdicts.accept}, same-rung request_changes ${gate.sameRungVerdicts.request_changes}, ` +
+    `ungated ${gate.ungated}, missing ${gate.missing}`
   );
+}
+
+function counts(row: Omit<RoutingReportRow, "tier" | "rung">): string {
+  return `decisions ${row.decisions}, ${gateCounts(row)}, shadow agreement ${agreement(row.shadowDecisions, row.shadowAgreements)}`;
 }
 
 export function renderRoutingReport(folder: string, report: RoutingReport): string {
@@ -149,8 +213,7 @@ export function renderRoutingReport(folder: string, report: RoutingReport): stri
   }
   lines.push(`all: ${counts(report.totals)}`);
   lines.push(`orphaned verdicts: ${report.orphanedVerdicts}`);
-  const unrouted = report.unroutedVerdicts;
-  lines.push(`verdicts on unrouted delegations: accept ${unrouted.accept}, request_changes ${unrouted.request_changes}, missing ${unrouted.missing}`);
+  lines.push(`unrouted delegations: ${gateCounts(report.unrouted)}`);
   for (const ladder of report.ladders) {
     const climb = ladder.step === "unplaced" ? `unplaced (${ladder.detail})` : `${ladder.step}; ${ladder.route.tier} ${ladder.route.rung.rung}`;
     lines.push(`effort ladder: ${ladder.previousDecisionId} -> ${ladder.delegationId}; ${climb}${ladder.mode === "live" ? "" : `; ${ladder.mode}`}`);

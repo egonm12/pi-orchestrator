@@ -145,7 +145,23 @@ A commit or push is found anywhere in the command: in a chain or a pipe (`npm te
 
 At the end of each orchestrator turn with delegations waiting, a notice names them the same way, and says that commit and push are denied until each has a verdict. It is sent like a worker's progress report: shown at once, read by the model at its next request, and never starting a turn, so it follows a final reply without holding it back. It repeats only when the waiting delegations change, and once at the first turn end of each user prompt. Workers, forked workers and sessions in a pi-subagents child process commit and push unhindered.
 
-The routing report, `node src/routing/routing-report.ts <state dir>/routing`, counts each delegation's latest verdict in its tier and rung's row. Verdicts on delegations without a routing decision (forks, agent-model workers and unrouted workers) have no row; they are counted on their own line, `verdicts on unrouted delegations: ...`.
+When a run of an editing delegation ends, the orchestrator's copy of the extension writes its gate requirement into the routing record folder: the delegation id, the gate level in force at that moment and the gate action at it (`none`, `spot-check` or `reviewer`). A resume that edits again writes a fresh one, and the latest counts; a run that did not edit writes none, and a worker's own worker leaves it to the delegation its edits count for. The requirement is written when the worker ends, not at pi's `session_shutdown`, which also fires for a reload, a resume, a new session and a fork.
+
+The routing report, `node src/routing/routing-report.ts <state dir>/routing`, counts per tier and rung, for each delegation once:
+
+- `accept` and `request_changes`: its latest verdict, unless that verdict rests on a same-rung review;
+- `same-rung accept` and `same-rung request_changes`: its latest verdict when that verdict rests on a same-rung review (see Reviewers below), counted apart from the others;
+- `ungated`: an editing delegation whose latest gate requirement is gate action none, whether or not it got a verdict anyway;
+- `missing`: an editing delegation whose latest gate requirement needs a verdict, and that has no verdict recorded after its latest edit record. A verdict recorded later, in a resumed orchestrator session say, takes it out of `missing`.
+
+Ungated delegations and missing verdicts are not verdicts, and neither is a learning observation. The report is where a skipped gate stays visible (ADR 0013). Delegations without a routing decision (forks, agent-model workers and unrouted workers) have no row; they are counted the same way on their own line, `unrouted delegations: ...`. For example:
+
+```text
+tier standard, rung anthropic/claude-sonnet-5:medium: decisions 3, accept 1, request_changes 0, same-rung accept 0, same-rung request_changes 1, ungated 1, missing 0, shadow agreement 1 of 2 (50%)
+unrouted delegations: accept 1, request_changes 0, same-rung accept 1, same-rung request_changes 0, ungated 1, missing 1
+```
+
+A verdict is only ever `accept` or `request_changes`, recorded by the orchestrator with `subagents_verdict`. Verdicts are never read from a reviewer's structured output, and the pi-subagents `verdict-reviewer` agent is no longer shipped.
 
 ### Gate level
 
@@ -178,7 +194,7 @@ A reviewer is a `subagents` item whose `review` is the delegation id and whose `
 
 The reviewed delegation must be a finished editing delegation of this orchestrator session; otherwise the item fails without starting a worker and names why (unknown, did not edit, still running, a worker's own worker, another session's). `review` excludes `fork` and `resume`, and a worker's own `subagents` call cannot start a reviewer. An `agent` gives the reviewer its instructions and tools, but its `model` and `thinking` are ignored: the reviewer is always routed.
 
-The reviewer is routed through the auto model with two routing constraints (see How routing decides below): a minimum tier, the delegation's tier or elevated for one without a tier, and an excluded rung, the rung the delegation ran on. The tier and rung come from the delegation's latest decision, fork or agent-model record; for a routed decision, the tier it routed at and the rung it ran on, which is the session model in shadow mode and on refusal. For a delegation without such a record, the rung is the one the worker board saw serve it; with neither, the item fails, since the reviewer could not be kept off that rung. In shadow mode and with routing off, the reviewer runs on the session model even when that is the implementer's rung. It still has a fresh context; its saved outcome and the verdict it backs mark it as a *same-rung review*. In live mode, if routing refuses and the session-model fallback would be the excluded rung, the review fails instead:
+The reviewer is routed through the auto model with two routing constraints (see How routing decides below): a minimum tier, the delegation's tier or elevated for one without a tier, and an excluded rung, the rung the delegation ran on. The tier and rung come from the delegation's latest decision, fork or agent-model record; for a routed decision, the tier it routed at and the rung it ran on, which is the session model in shadow mode and on refusal. For a delegation without such a record, the rung is the one the worker board saw serve it; with neither, the item fails, since the reviewer could not be kept off that rung. In shadow mode and with routing off, the reviewer runs on the session model even when that is the implementer's rung. It still has a fresh context; its saved outcome and the verdict it backs mark it as a *same-rung review*, which the routing report counts apart (see Verdicts above). In live mode, if routing refuses and the session-model fallback would be the excluded rung, the review fails instead:
 
 ```text
 no other rung is left: this worker would fall back to the orchestrator session model anthropic/claude-sonnet-4-5:high, which its routing constraints exclude
@@ -458,7 +474,7 @@ Runtime state lives in `${PI_CODING_AGENT_DIR:-~/.pi/agent}/pi-orchestrator/`, o
 | File | Contents | When absent |
 |------|----------|-------------|
 | `authorized-recipients.json` | Providers you approved as data recipients | No provider is approved, so every route refuses |
-| `routing/*.jsonl` | One decision record per classified worker session (delegation id), fork and agent-model records, effort-ladder links for retries, verdicts, and the edit records of editing delegations, one file per day | Created on the first record |
+| `routing/*.jsonl` | One decision record per classified worker session (delegation id), fork and agent-model records, effort-ladder links for retries, verdicts, and the edit records and gate requirements of editing delegations, one file per day | Created on the first record |
 | `model-catalog.json` | Prices, context windows and usage headroom | Built from installed models and a pinned models.dev snapshot |
 | `refresh-state.json` | Throttling observations | No throttle |
 

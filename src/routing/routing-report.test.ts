@@ -16,7 +16,18 @@ import {
   SONNET,
 } from "../fixtures/routing-decision.ts";
 import type { RiskTier } from "./classifier.ts";
-import { appendRoutingRecord, NODE_RECORD_FOLDER_READER, writeDecisionRecord, type DecisionRecordInput, type RecordFolderReader } from "./decision-record.ts";
+import {
+  appendRoutingRecord,
+  buildEditRecord,
+  buildGateRequirementRecord,
+  NODE_RECORD_FOLDER_READER,
+  writeDecisionRecord,
+  type DecisionRecordInput,
+  type GateAction,
+  type GateLevel,
+  type RecordFolderReader,
+  type Verdict,
+} from "./decision-record.ts";
 import { buildRoutingReport, renderRoutingReport } from "./routing-report.ts";
 import { attachVerdict } from "./verdicts.ts";
 
@@ -36,17 +47,29 @@ interface Known {
 /**
  * The known folder, over two days:
  *
- *   id   day  mode    classified  route                      hand-picked  verdict
- *   d1   1    live    standard    standard sonnet:medium     -            accept
- *   d2   1    shadow  standard    standard sonnet:medium     sonnet       request_changes
- *   d3   1    shadow  standard    standard sonnet:medium     opus         (none)
- *   d4   2    shadow  standard    elevated opus:high         opus         missing
- *   d5   2    live    mechanical  mechanical haiku:low       -            accept, then request_changes
- *   d6   2    shadow  elevated    refused                    opus         (none)
+ *   id   day  mode    classified  route                      hand-picked  gate (level: action)  verdict
+ *   d1   1    live    standard    standard sonnet:medium     -            medium: spot-check    accept
+ *   d2   1    shadow  standard    standard sonnet:medium     sonnet       medium: spot-check    request_changes, same-rung review
+ *   d3   1    shadow  standard    standard sonnet:medium     opus         low: none             (none)
+ *   d4   2    shadow  standard    elevated opus:high         opus         medium: reviewer      (none)
+ *   d5   2    live    mechanical  mechanical haiku:low       -            -                     accept, then request_changes
+ *   d6   2    shadow  elevated    refused                    opus         -                     (none)
+ *   u1   2    (no decision: unrouted)                                     medium: reviewer      (none)
+ *   u2   2    (no decision: unrouted)                                     low: none             accept
+ *   u3   2    (no decision: unrouted)                                     medium: reviewer      accept, same-rung review
  *   o1, o2    orphaned verdicts; o1 twice
  *
+ * Each gated delegation has an edit record before its gate requirement. d3
+ * and u2 are ungated, u2 with a verdict anyway; d4 and u1 are missing a verdict.
  * The second tier map holds only a Codex rung in standard, so d4 escalates.
  */
+/** An editing run of `delegationId` that ends at `at`: its edit record, then
+ *  its gate requirement, as the subagents runtime writes them. */
+function edited(records: string, delegationId: string, at: Date, gateLevel: GateLevel, gateAction: GateAction): void {
+  appendRoutingRecord(records, buildEditRecord({ delegationId, orchestratorSession: "orchestrator-1", tool: "write", at }));
+  appendRoutingRecord(records, buildGateRequirementRecord({ delegationId, gateLevel, gateAction, at }));
+}
+
 async function knownFolder(): Promise<Known> {
   // Canonical once: on macOS the default TMPDIR is under /var, a symlink to
   // /private/var, and Node's permission model checks a path as given. The CLI
@@ -98,13 +121,18 @@ async function knownFolder(): Promise<Known> {
   await decide("d4", day2, "standard", { mode: "shadow", handPickedModel: OPUS, tierMap: onlyCodexStandard, route: fixtureRoute("standard", onlyCodexStandard) });
   await decide("d5", day2, "mechanical", {});
   await decide("d6", day2, "elevated", { mode: "shadow", handPickedModel: OPUS, route: fixtureRefusal("elevated", tierMap) });
-  const attach = (delegationId: string, verdict: "accept" | "request_changes" | "missing", at: Date) =>
-    attachVerdict({ recordDir: records, delegationId, verdict, at, refreshStatePath: ledger });
+  const attach = (delegationId: string, verdict: Verdict, at: Date, sameRungReview?: true) =>
+    attachVerdict({ recordDir: records, delegationId, verdict, at, refreshStatePath: ledger, ...(sameRungReview ? { sameRungReview } : {}) });
+  for (const [delegationId, day, gateLevel, gateAction] of [
+    ["d1", day1, "medium", "spot-check"], ["d2", day1, "medium", "spot-check"], ["d3", day1, "low", "none"], ["d4", day2, "medium", "reviewer"],
+    ["u1", day2, "medium", "reviewer"], ["u2", day2, "low", "none"], ["u3", day2, "medium", "reviewer"],
+  ] as const) edited(records, delegationId, day, gateLevel, gateAction);
   attach("d1", "accept", later(day1));
-  attach("d2", "request_changes", later(day1));
-  attach("d4", "missing", later(day2));
+  attach("d2", "request_changes", later(day1), true);
   attach("d5", "accept", later(day2));
   attach("d5", "request_changes", later(later(day2)));
+  attach("u2", "accept", later(day2));
+  attach("u3", "accept", later(day2), true);
   attach("o1", "accept", later(day1));
   attach("o1", "accept", later(day2));
   attach("o2", "request_changes", later(day2));
@@ -116,18 +144,22 @@ async function knownFolder(): Promise<Known> {
 function expectedReport(folder: string): string {
   return [
     `routing report for ${folder}`,
-    "tier mechanical, rung anthropic/claude-haiku-4-5:low: decisions 1, accept 0, request_changes 1, missing 0, shadow agreement n/a (no shadow decisions)",
-    "tier standard, rung anthropic/claude-sonnet-5:medium: decisions 3, accept 1, request_changes 1, missing 0, shadow agreement 1 of 2 (50%)",
-    "tier elevated, rung anthropic/claude-opus-5:high: decisions 1, accept 0, request_changes 0, missing 1, shadow agreement 1 of 1 (100%)",
-    "tier elevated, refused: decisions 1, accept 0, request_changes 0, missing 0, shadow agreement 0 of 1 (0%)",
-    "all: decisions 6, accept 1, request_changes 2, missing 1, shadow agreement 2 of 4 (50%)",
+    "tier mechanical, rung anthropic/claude-haiku-4-5:low: decisions 1, accept 0, request_changes 1, same-rung accept 0, same-rung request_changes 0, " +
+      "ungated 0, missing 0, shadow agreement n/a (no shadow decisions)",
+    "tier standard, rung anthropic/claude-sonnet-5:medium: decisions 3, accept 1, request_changes 0, same-rung accept 0, same-rung request_changes 1, " +
+      "ungated 1, missing 0, shadow agreement 1 of 2 (50%)",
+    "tier elevated, rung anthropic/claude-opus-5:high: decisions 1, accept 0, request_changes 0, same-rung accept 0, same-rung request_changes 0, " +
+      "ungated 0, missing 1, shadow agreement 1 of 1 (100%)",
+    "tier elevated, refused: decisions 1, accept 0, request_changes 0, same-rung accept 0, same-rung request_changes 0, " +
+      "ungated 0, missing 0, shadow agreement 0 of 1 (0%)",
+    "all: decisions 6, accept 1, request_changes 1, same-rung accept 0, same-rung request_changes 1, ungated 1, missing 1, shadow agreement 2 of 4 (50%)",
     "orphaned verdicts: 2",
-    "verdicts on unrouted delegations: accept 0, request_changes 0, missing 0",
+    "unrouted delegations: accept 1, request_changes 0, same-rung accept 1, same-rung request_changes 0, ungated 1, missing 1",
     "",
   ].join("\n");
 }
 
-test("the report on a folder of known records prints decisions, verdicts by kind, orphans and shadow agreement per tier and rung", async () => {
+test("the report on a folder of known records prints decisions, verdicts by kind, same-rung verdicts, ungated, missing, orphans and shadow agreement per tier and rung", async () => {
   const known = await knownFolder();
   try {
     const run = spawnSync(process.execPath, [CLI, known.records], { encoding: "utf8", cwd: REPO, timeout: 30_000 });
@@ -138,6 +170,38 @@ test("the report on a folder of known records prints decisions, verdicts by kind
     assert.equal(renderRoutingReport(known.records, buildRoutingReport(known.records)), expectedReport(known.records));
   } finally {
     known.cleanup();
+  }
+});
+
+test("a missing verdict leaves the report once a verdict follows the latest edit, and a resume that edits again needs a fresh one", async () => {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), "pi-harness-routing-report-missing-")));
+  try {
+    const records = join(home, "routing");
+    const ledger = join(home, "refresh-state.json");
+    const at = (minute: number) => new Date(Date.UTC(2026, 8, 26, 9, minute));
+    const tierMap = fixtureTierMap();
+    const route = fixtureRoute("standard", tierMap);
+    writeDecisionRecord(records, { delegationId: "d1", at: at(0), mode: "live", taskText: "task d1", agentRole: "worker",
+      classification: await fixtureClassification("task d1", "standard"), tierMap, route, ranOn: route.ok ? route.rung.rung : HAIKU });
+    const gate = () => {
+      const { verdicts, sameRungVerdicts, ungated, missing } = buildRoutingReport(records).totals;
+      return { verdicts, sameRungVerdicts, ungated, missing };
+    };
+    const none = { accept: 0, request_changes: 0 };
+    edited(records, "d1", at(1), "medium", "spot-check");
+    assert.deepEqual(gate(), { verdicts: none, sameRungVerdicts: none, ungated: 0, missing: 1 });
+    attachVerdict({ recordDir: records, delegationId: "d1", verdict: "accept", at: at(2), refreshStatePath: ledger });
+    assert.deepEqual(gate(), { verdicts: { accept: 1, request_changes: 0 }, sameRungVerdicts: none, ungated: 0, missing: 0 });
+    // A resume edits again: the earlier verdict no longer covers it.
+    edited(records, "d1", at(3), "medium", "spot-check");
+    assert.deepEqual(gate(), { verdicts: { accept: 1, request_changes: 0 }, sameRungVerdicts: none, ungated: 0, missing: 1 });
+    attachVerdict({ recordDir: records, delegationId: "d1", verdict: "request_changes", at: at(4), refreshStatePath: ledger });
+    assert.deepEqual(gate(), { verdicts: { accept: 0, request_changes: 1 }, sameRungVerdicts: none, ungated: 0, missing: 0 });
+    // A resume at the low gate level: its fresh requirement makes it ungated, and nothing is missing.
+    edited(records, "d1", at(5), "low", "none");
+    assert.deepEqual(gate(), { verdicts: { accept: 0, request_changes: 1 }, sameRungVerdicts: none, ungated: 1, missing: 0 });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
   }
 });
 
