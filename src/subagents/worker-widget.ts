@@ -1,5 +1,4 @@
 import { truncateToVisualLines, type ExtensionUIContext, type Theme, type ThemeColor } from "@earendil-works/pi-coding-agent";
-import { shortTask } from "./render.ts";
 import { elapsedMs, type BoardWorker, type Activity, type WorkerBoardView, type WorkerModel, type WorkerState } from "./worker-board.ts";
 
 // The worker widget below the editor (epic a338, faal), drawn as Claude
@@ -69,24 +68,36 @@ export function widgetRows(workers: readonly BoardWorker[], now: number): Widget
 /** The label of a worker whose item names no agent definition, as the subagents tool shows it. */
 const NO_AGENT = "worker";
 
-/** A worker's agent name, `worker` without one, and `(fork)` for a fork. */
+/** A worker's name (CONTEXT.md, Label): its label, else its agent
+ *  definition, else `worker`, with `(fork)` for a fork. A reviewer is
+ *  `reviewer: <label>`, its label its own or the reviewed delegation's, which
+ *  the subagents extension gives it, and plain `reviewer` without one. */
 export function agentLabel(worker: Pick<BoardWorker, "label" | "agent" | "review" | "model">): string {
-  if (worker.review !== undefined) return "reviewer";
-  const label = oneLine(worker.label ?? "", "first") || worker.agent || NO_AGENT;
-  return `${label}${worker.model.kind === "fork" ? " (fork)" : ""}`;
+  const label = oneLine(worker.label ?? "", "first");
+  if (worker.review !== undefined) return label === "" ? "reviewer" : `reviewer: ${label}`;
+  return `${label || worker.agent || NO_AGENT}${worker.model.kind === "fork" ? " (fork)" : ""}`;
 }
 
-/** A worker's model and effort: a routed worker's latest rung, marked when its routing escalated. */
-function modelText(model: WorkerModel): string {
+/** A model as a row shows it: without its provider, and without the
+ *  `claude-` its model names repeat, so `anthropic/claude-opus-5-5` reads `opus-5-5`. */
+export function shortModel(model: string): string {
+  return model.slice(model.lastIndexOf("/") + 1).replace(/^claude-/, "");
+}
+
+/** A worker's model and effort: a routed worker's latest rung, marked when
+ *  its routing escalated. Rows show it short (shortModel); the transcript
+ *  view and the status snapshot show the full rung. */
+export function rungText(model: WorkerModel, form: "short" | "full" = "short"): string {
+  const name = (id: string) => form === "short" ? shortModel(id) : id;
   switch (model.kind) {
     case "routing": return "routing…";
     case "routed": {
       const latest = model.rungs.at(-1)!;
       const escalation = [...model.rungs].reverse().find((rung) => rung.escalation !== undefined)?.escalation;
-      return `${latest.model}:${latest.effort}${escalation === undefined ? "" : ` ↑${escalation.to}`}`;
+      return `${name(latest.model)}:${latest.effort}${escalation === undefined ? "" : ` ↑${escalation.to}`}`;
     }
     case "fork":
-    case "preserved": return model.effort === undefined ? model.model : `${model.model}:${model.effort}`;
+    case "preserved": return model.effort === undefined ? name(model.model) : `${name(model.model)}:${model.effort}`;
   }
 }
 
@@ -138,15 +149,19 @@ function nestIndent(depth: number): string {
   return depth === 0 ? "" : `${"  ".repeat(depth - 1)}└ `;
 }
 
-/** A worker's compact line, before it is fitted to the render width. */
-function rowParts(row: WidgetRow, now: number): { indent: string; parts: Part[] } {
+/** A worker's row before it is fitted (cml8, rm9t): its name, then its
+ *  tier, short rung, elapsed time once it started, and worker state, and
+ *  while it runs its activity in a word. A row that is not running ends with
+ *  its state: never with task text, and never with a failure's reason, which
+ *  the transcript view shows. */
+function rowParts(row: WidgetRow, now: number): { indent: string; name: string; details: Part[] } {
   const { worker } = row;
-  const parts: Part[] = [["accent", agentLabel(worker)], ...(worker.tier === undefined ? [] : [["dim", worker.tier] as Part]),
-    ["dim", modelText(worker.model)], [STATE_COLOR[worker.state], worker.state]];
+  const details: Part[] = [...(worker.tier === undefined ? [] : [["dim", worker.tier] as Part]), ["dim", rungText(worker.model)]];
   const elapsed = elapsedMs(worker, now);
-  if (elapsed !== undefined) parts.push(["dim", formatElapsed(elapsed)], ["dim", `${worker.turns} ${worker.turns === 1 ? "turn" : "turns"}`]);
-  parts.push(worker.activity === undefined ? ["dim", shortTask(worker.task)] : activityPart(worker.activity));
-  return { indent: nestIndent(row.depth), parts };
+  if (elapsed !== undefined) details.push(["dim", formatElapsed(elapsed)]);
+  details.push([STATE_COLOR[worker.state], worker.state]);
+  if (worker.state === "running" && worker.activity !== undefined && worker.activity.kind !== "failed") details.push(activityPart(worker.activity));
+  return { indent: nestIndent(row.depth), name: agentLabel(worker), details };
 }
 
 const SEPARATOR = " · ";
@@ -187,16 +202,22 @@ export function fitted(indent: string, parts: readonly Part[], theme: Theme, wid
   return fitLine(`${indent}${kept.map(([color, text]) => theme.fg(color, text)).join("")}`, width);
 }
 
-/** The compact worker lines at `now`, one per row with its agent, model,
- *  worker state, progress and activity, each at most `width` columns wide:
- *  the /subagents listing's, where there is no UI to pick in. */
+/** How many characters `parts` take joined with separators. */
+function joinedWidth(parts: readonly Part[]): number {
+  return parts.length === 0 ? 0 : partsWidth(parts) + SEPARATOR.length * (parts.length - 1);
+}
+
+/** The compact worker lines at `now`, one per row, each at most `width`
+ *  columns wide: the name, then the row's details after a separator. The
+ *  name takes the room the details leave and is shortened only when the row
+ *  does not fit; a row too narrow even for a short name cuts its details from
+ *  the end. The /subagents listing's, the status output's and the tool
+ *  result's, where there is no UI to pick in. */
 export function compactLines(rows: WidgetRows, now: number, theme: Theme, width: number): string[] {
   const lines = rows.rows.map((row) => {
-    const { indent, parts } = rowParts(row, now);
-    const mandatory = parts.slice(1, row.worker.tier === undefined ? 3 : 4);
-    const labelRoom = width - indent.length - partsWidth(mandatory) - SEPARATOR.length * mandatory.length;
-    return labelRoom < 2 ? fitted(indent, parts, theme, width)
-      : fitted(indent, [[parts[0]![0], cutText(parts[0]![1], labelRoom)], ...parts.slice(1)], theme, width);
+    const { indent, name, details } = rowParts(row, now);
+    const room = width - indent.length - joinedWidth(details) - SEPARATOR.length;
+    return fitted(indent, [["accent", cutText(name, Math.max(MIN_NAME_COLUMN, room))], ...details], theme, width);
   });
   if (rows.more > 0) lines.push(fitted("", [["muted", `+${rows.more} more`]], theme, width));
   return lines;
@@ -217,86 +238,55 @@ const SELECTED_DOT = "●";
 const DOT = "○";
 /** The cursor's columns, the dot and a space: where the names start. */
 const MARKS_WIDTH = 4;
-/** The name column at most; a narrower terminal gives it about a third of the row. */
-export const NAME_COLUMN = 20;
+/** A name is cut no shorter than this; a row too narrow for it cuts its details from the end instead. */
 const MIN_NAME_COLUMN = 6;
-/** The spaces after the name column, and at least before the stats. */
+/** The spaces between the name column and a row's details. */
 const NAME_GAP = 3;
-const STATS_GAP = 2;
 /** Less room than this leaves the middle text out, rather than a lone `…`. */
 const MIN_MIDDLE = 4;
 
 /** One row of an agent list (the widget's, the /subagents picker's and the
  *  transcript view's nested workers) before it is fitted: what leads the name
- *  (a nested worker's indent, a list number), the name, its activity or last
- *  status, and its stats, the fullest first. */
+ *  (a nested worker's indent, a list number), the name, and the row's details. */
 export interface AgentRow {
   readonly indent: string;
   readonly name: string;
-  readonly status: readonly Part[];
-  readonly stats: readonly string[];
-  /** Room reserved for tier, rung and state before shortening the name. */
-  readonly required?: number;
+  readonly details: readonly Part[];
 }
 
-const MAIN_ROW: AgentRow = { indent: "", name: MAIN_AGENT, status: [], stats: [] };
+const MAIN_ROW: AgentRow = { indent: "", name: MAIN_AGENT, details: [] };
 
-/** A worker's activity, or its task before its first activity and once it
- *  ended; a worker that is not running says its worker state first. */
-function statusParts(worker: BoardWorker): Part[] {
-  const text = worker.activity === undefined ? shortTask(worker.task) : activityPart(worker.activity)[1];
-  const parts: Part[] = worker.state === "running" ? [] : [[STATE_COLOR[worker.state], worker.state]];
-  if (text !== "") parts.push(["dim", text]);
-  return parts;
-}
-
-/** Once the worker started, `3m04s · ↓ 12.3k tokens` and, for a narrow
- *  terminal, `3m04s`: its elapsed time and, once its replies used any, their
- *  tokens, input, output and cache summed as the transcript view's header
- *  counts them. None before it starts. */
-function statsTexts(worker: BoardWorker, now: number): string[] {
-  const elapsed = elapsedMs(worker, now);
-  if (elapsed === undefined) return [];
-  const { total } = worker.tokens;
-  const time = formatElapsed(elapsed);
-  return total === 0 ? [time] : [`${time}${SEPARATOR}↓ ${formatTokens(total)} ${total === 1 ? "token" : "tokens"}`, time];
-}
-
-/** A worker's row in an agent list at `now`. */
+/** A worker's row in an agent list at `now`: the same row as its compact line. */
 export function agentRow(row: WidgetRow, now: number): AgentRow {
-  const worker = row.worker;
-  if (worker.tier !== undefined) {
-    const { parts } = rowParts(row, now);
-    return { indent: nestIndent(row.depth), name: agentLabel(worker), status: parts.slice(1), stats: [],
-      required: partsWidth(parts.slice(1, 4)) + SEPARATOR.length * 2 };
-  }
-  return { indent: nestIndent(row.depth), name: agentLabel(worker), status: statusParts(worker), stats: statsTexts(worker, now) };
+  return rowParts(row, now);
 }
 
-/** The name column at `width`: NAME_COLUMN, or about a third of a narrower row. */
-function nameColumn(width: number): number {
-  return Math.max(MIN_NAME_COLUMN, Math.min(NAME_COLUMN, Math.floor((width - MARKS_WIDTH) * 0.3)));
+/** The most columns `row`'s indent and name may take at `width`: the room
+ *  its details leave, at least MIN_NAME_COLUMN; any number without details. */
+function nameLimit(row: AgentRow, width: number): number {
+  if (row.details.length === 0) return Number.POSITIVE_INFINITY;
+  return Math.max(MIN_NAME_COLUMN, width - MARKS_WIDTH - NAME_GAP - joinedWidth(row.details));
 }
 
-/** `row` fitted to `width`: its marks, its name cut to `column` and padded
- *  to it, its status cut to the room the stats leave, and the fullest of its
- *  stats that fits after the name against the right edge, none when none fits. */
+/** The columns `row`'s indent and name take at `width`: all they need when
+ *  the row fits, else their limit. */
+function nameRoom(row: AgentRow, width: number): number {
+  return Math.min(row.indent.length + row.name.length, nameLimit(row, width));
+}
+
+/** `row` fitted to `width`: its marks, its name cut to its room and padded
+ *  to `column`, then its details, cut from the end when even the shortest
+ *  name leaves them too little room. */
 function agentLine(row: AgentRow, selected: boolean, column: number, theme: Theme, width: number): string {
   const marks = selected ? theme.fg("accent", `${CURSOR}${SELECTED_DOT}`) : `${NO_CURSOR}${theme.fg("dim", DOT)}`;
-  const nameWidth = row.required === undefined ? column : Math.max(MIN_NAME_COLUMN, Math.min(column, width - MARKS_WIDTH - NAME_GAP - row.required));
+  const nameWidth = Math.min(column, nameLimit(row, width));
   const name = cutText(row.name, Math.max(1, nameWidth - row.indent.length));
   let line = `${marks} ${theme.fg("dim", row.indent)}${selected ? theme.fg("accent", theme.bold(name)) : theme.fg("muted", name)}`;
-  let used = MARKS_WIDTH + row.indent.length + name.length;
-  const rest = width - MARKS_WIDTH - nameWidth;
-  const stats = row.stats.find((text) => rest >= STATS_GAP + text.length) ?? "";
-  const room = rest - NAME_GAP - (stats === "" ? 0 : STATS_GAP + stats.length);
-  const status = room >= MIN_MIDDLE ? cutParts(row.status, room).filter(([, text]) => text !== "") : [];
-  if (status.length > 0) {
-    const start = MARKS_WIDTH + nameWidth + NAME_GAP;
-    line += `${" ".repeat(Math.max(1, start - used))}${status.map(([color, text]) => theme.fg(color, text)).join("")}`;
-    used = Math.max(used + 1, start) + partsWidth(status);
-  }
-  if (stats !== "") line += `${" ".repeat(Math.max(1, width - used - stats.length))}${theme.fg("dim", stats)}`;
+  const used = MARKS_WIDTH + row.indent.length + name.length;
+  const start = MARKS_WIDTH + nameWidth + NAME_GAP;
+  const room = width - start;
+  const details = room >= MIN_MIDDLE ? cutParts(row.details, room).filter(([, text]) => text !== "") : [];
+  if (details.length > 0) line += `${" ".repeat(Math.max(1, start - used))}${details.map(([color, text]) => theme.fg(color, text)).join("")}`;
   return fitLine(line, width);
 }
 
@@ -310,11 +300,12 @@ export function hintLine(hint: string, theme: Theme, width: number): string {
   return fitLine(`${NO_CURSOR}${theme.fg("dim", hint)}`, width);
 }
 
-/** An agent list's rows, one line each at most `width` columns wide, with
- *  one name column: the `selected` one with the cursor and a filled dot,
- *  every other one indented with a hollow dot. */
+/** An agent list's rows, one line each at most `width` columns wide: the
+ *  `selected` one with the cursor and a filled dot, every other one with a
+ *  hollow dot. The names share one column, as wide as the widest name its
+ *  row has room for, so the details line up while the rows fit. */
 export function agentLines(rows: readonly AgentRow[], selected: number | undefined, theme: Theme, width: number): string[] {
-  const column = nameColumn(width);
+  const column = Math.max(0, ...rows.map((row) => nameRoom(row, width)));
   return rows.map((row, index) => agentLine(row, index === selected, column, theme, width));
 }
 

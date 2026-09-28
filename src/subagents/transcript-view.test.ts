@@ -274,8 +274,8 @@ test("left and right switch to the previous or next worker in the board's order,
   assert.equal(shownWorker(view), "lead · running · worker 1 of 4");
   const text = view.text();
   assert.equal(text[text.findIndex((line) => NESTED_ROW.test(line)) - 1], NESTED_HINT, "a hint with the keys the list takes, above it");
-  assert.match(nestedLines(view)[0]!, /^❯ ● └ worker {15}Nested work +\d+s$/, "its nested workers as the worker widget's agent list, the first selected");
-  assert.match(nestedLines(view)[1]!, /^  ○ └ worker {15}Second nested +\d+s$/);
+  assert.match(nestedLines(view)[0]!, /^❯ ● └ worker   routing… · \d+s · running$/, "its nested workers as the worker widget's agent list, the first selected");
+  assert.match(nestedLines(view)[1]!, /^  ○ └ worker   routing… · \d+s · running$/);
   assert.ok(view.text().at(-1)!.includes("↑↓ Enter nested worker"));
 
   view.press(KEY.right);
@@ -299,7 +299,7 @@ test("left and right switch to the previous or next worker in the board's order,
   assert.equal(shownWorker(view), "worker · running · worker 3 of 4", "Enter without nested workers does nothing");
 });
 
-test("the nested workers' stats sit against the right edge, and a narrow terminal cuts the status first, then the tokens, then the elapsed time, never past the width", async () => {
+test("the nested workers' names share a column while their rows fit; a narrow terminal shortens the name first, then cuts the details from the end, never past the width", async () => {
   const time = clock();
   const board = new WorkerBoard({ now: time.now });
   running(board, "Lead the work", "lead-1", { agent: "lead" });
@@ -311,16 +311,15 @@ test("the nested workers' stats sit against the right edge, and a narrow termina
   void openTranscript(view.ui, board, board.workers()[0]!.id, { now: time.now });
 
   assert.deepEqual(nestedLines(view, 100), [
-    "❯ ● └ orchestrator:veri…   Weighing Entra state-parameter guidance             8m08s · ↓ 133k tokens",
-    "  ○ └ tester               Check the tests                                                     8m08s",
+    "❯ ● └ orchestrator:verifying-work   routing… · 8m08s · running",
+    "  ○ └ tester                        routing… · 8m08s · running",
   ]);
-  for (const line of nestedLines(view, 100)) assert.equal(line.length, 100, `the stats end at the right edge: ${line}`);
   assert.deepEqual(nestedLines(view, 50), [
-    "❯ ● └ orchestrat…   Weighi…  8m08s · ↓ 133k tokens",
-    "  ○ └ tester        Check the tests          8m08s",
-  ], "the status cut to the room the stats leave");
-  assert.equal(nestedLines(view, 30)[0], "❯ ● └ orch…   Weighing…  8m08s", "the elapsed time alone when the tokens do not fit");
-  assert.equal(nestedLines(view, 12)[0], "❯ ● └ orc…", "only the name when no stats fit");
+    "❯ ● └ orchestrator:v…   routing… · 8m08s · running",
+    "  ○ └ tester            routing… · 8m08s · running",
+  ], "the name takes the room the details leave");
+  assert.equal(nestedLines(view, 30)[0], "❯ ● └ orc…   routing… · 8m08s", "a short name, then the details cut from the end");
+  assert.equal(nestedLines(view, 12)[0], "❯ ● └ orc…", "only the name when no details fit");
   for (const width of [100, 72, 50, 40, 30, 20, 12, 8, 4, 1]) {
     for (const line of view.text(width)) assert.ok(line.length <= width, `${width}: ${line}`);
   }
@@ -677,15 +676,20 @@ test("in regular tuiMode the view prints its top once, the whole transcript, and
   assert.equal(view.closed, false);
 });
 
-test("the transcript's nested worker row shows its label, tier and rung", () => {
+test("the transcript's nested worker row is the widget's: label, tier, short rung, elapsed time and state, while the header keeps the full rung and turns", () => {
   const board = new WorkerBoard();
   running(board, "Lead", "lead-1");
-  running(board, "Check budget", "nested-1", { parentDelegationId: "lead-1", label: "budget code" });
+  const nested = running(board, "Check budget", "nested-1", { parentDelegationId: "lead-1", label: "budget code" });
   board.setTier("nested-1", "standard");
-  board.served({ delegationId: "nested-1", model: "anthropic/sonnet", effort: "high" });
+  board.served({ delegationId: "nested-1", model: "anthropic/claude-opus-5-5", effort: "xhigh" });
+  nested.fake.emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash" });
   const view = regularUI();
   void openTranscript(view.ui, board, board.workers()[0]!.id);
-  assert.match(view.text(160).find((line) => line.includes("budget code"))!, /budget code\s+standard · anthropic\/sonnet:high · running · \d+s · 0 turns · Check budget/);
+  assert.match(view.text(160).find((line) => NESTED_ROW.test(line))!, /^❯ ● └ budget code   standard · opus-5-5:xhigh · \d+s · running · bash$/);
+  view.press(KEY.enter);
+  const text = view.text(160);
+  assert.ok(text.some((line) => line.startsWith("anthropic/claude-opus-5-5:xhigh since ")), text.join("\n"));
+  assert.ok(text.some((line) => /^running · \d+s · 0 turns · /.test(line)), text.join("\n"));
   view.press(KEY.escape);
 });
 
@@ -693,7 +697,9 @@ test("in regular tuiMode the shown worker's nested workers are listed live above
   const board = new WorkerBoard();
   running(board, "Lead the work", "lead-1", { agent: "lead" });
   const feeds: WorkerFeed[] = [];
-  for (let item = 1; item <= 8; item++) feeds.push(running(board, `Nested ${item}`, `nested-${item}`, { parentDelegationId: "lead-1" }, [user(`Nested ${item}`), reply(`Reply ${item}`)]).feed);
+  for (let item = 1; item <= 8; item++) {
+    feeds.push(running(board, `Nested ${item}`, `nested-${item}`, { parentDelegationId: "lead-1", label: `nested ${item}` }, [user(`Nested ${item}`), reply(`Reply ${item}`)]).feed);
+  }
   const view = regularUI();
   void openTranscript(view.ui, board, board.workers()[0]!.id);
   const live = () => {
@@ -704,19 +710,19 @@ test("in regular tuiMode the shown worker's nested workers are listed live above
 
   assert.equal(view.text().filter((line) => NESTED_ROW.test(line)).length, 6, "at most 6 rows");
   assert.equal(view.text().filter((line) => line === NESTED_HINT).length, 1, "under one hint");
-  assert.match(live().nested[0]!, /^❯ ● └ worker +Nested 1 +\d+s$/, "right above the stats line, the first selected");
-  assert.match(live().nested[5]!, /^  ○ └ worker +Nested 6 +\d+s$/);
+  assert.match(live().nested[0]!, /^❯ ● └ nested 1   routing… · \d+s · running$/, "right above the stats line, the first selected");
+  assert.match(live().nested[5]!, /^  ○ └ nested 6   routing… · \d+s · running$/);
   assert.equal(live().rest.at(-1), "←→ worker · ↑↓ Enter nested worker · x stop · ctrl+o tool output · Esc back");
 
   view.press(KEY.down, KEY.down, KEY.down, KEY.down, KEY.down, KEY.down, KEY.down);
-  assert.match(live().nested[5]!, /^❯ ● └ worker +Nested 8 +\d+s$/, "scrolled to keep the selection in view");
-  assert.match(live().nested[0]!, /^  ○ └ worker +Nested 3 +\d+s$/);
+  assert.match(live().nested[5]!, /^❯ ● └ nested 8   routing… · \d+s · running$/, "scrolled to keep the selection in view");
+  assert.match(live().nested[0]!, /^  ○ └ nested 3   routing… · \d+s · running$/);
   view.press(KEY.up);
-  assert.match(live().nested[5]!, /^❯ ● └ worker +Nested 7 +\d+s$/, "the window moves with the selection, as the overlay's does");
+  assert.match(live().nested[5]!, /^❯ ● └ nested 7   routing… · \d+s · running$/, "the window moves with the selection, as the overlay's does");
 
   feeds[7]!.ended({ state: "completed" });
   view.press(KEY.down);
-  assert.match(live().nested[5]!, /^❯ ● └ worker +completed · Nested 8 +\d+s$/, "the list follows the board live");
+  assert.match(live().nested[5]!, /^❯ ● └ nested 8   routing… · \d+s · completed$/, "the list follows the board live");
   view.press(KEY.up);
   view.forced.length = 0;
   view.press(KEY.enter);

@@ -56,7 +56,7 @@ A reminder added to the result of each exploratory call the orchestrator makes b
 _Avoid_: Exploration budget (the earlier hard limit), call limit
 
 **Label**:
-A short text the orchestrator gives one delegation to say what it is for, such as `research: budget code`. Shown wherever the worker is listed, falling back to its agent definition and then to `worker`. A reviewer is always shown as `reviewer`.
+A short text the orchestrator gives one delegation to say what it is for, such as `research: budget code`. Shown wherever the worker is listed, falling back to its agent definition and then to `worker`. A retry keeps the label of the delegation it retries. A reviewer is shown as `reviewer: <label>`, with its own label or else the reviewed delegation's, and as plain `reviewer` when neither has one.
 _Avoid_: Role (that is the orchestrator/worker split), title, name
 
 **Routing policy**:
@@ -71,11 +71,11 @@ An experimental routing recommendation recorded for evaluation but not controlli
 ## Watching workers
 
 **Worker widget**:
-The list below the editor, in Claude Code's agent list style: `main`, the orchestrator's own agent, then one row per worker on the board with its label, its tier and rung, its activity or last status, and its elapsed time and tokens. The /subagents picker and the transcript view's nested workers use the same rows.
+The list below the editor, in Claude Code's agent list style: `main`, the orchestrator's own agent, then one row per worker on the board: label · tier · rung · elapsed time · worker state, and while the worker runs its activity. The rung is short, the model without its provider plus the effort (`opus-5-5:xhigh`); the transcript view and the status snapshot show the full rung. A row that is not running ends with its worker state, never with task text. The label takes the room the rest of the row leaves and is shortened only when the row does not fit. The /subagents picker, the transcript view's nested workers and the status output use the same rows.
 _Avoid_: Status line, subagent list
 
 **Activity**:
-What a worker is doing right now, in a word: `thinking…`, `writing…`, the name of the tool it runs, or why it failed. It changes by phase, never with each streamed piece of text.
+What a worker is doing right now, in a word: `thinking…`, `writing…`, the name of the tool it runs, or why it failed. It changes by phase, never with each streamed piece of text. A worker row shows it only while the worker runs; why a worker failed is in its transcript view.
 _Avoid_: Current action, live status
 
 **Transcript view**:

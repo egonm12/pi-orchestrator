@@ -426,7 +426,7 @@ test("a preserved agent model resumes without a second record and keeps its agen
     const resumedRow = workerBoard().workers().at(-1)!;
     assert.equal(resumedRow.agent, "reviewer", "the resumed run reads its saved agent definition");
     const plain = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as Theme;
-    assert.match(compactLines({ rows: workerRows([resumedRow]), more: 0 }, Date.now(), plain, 200)[0]!, /^reviewer · anthropic\/claude-haiku-4-5/);
+    assert.match(compactLines({ rows: workerRows([resumedRow]), more: 0 }, Date.now(), plain, 200)[0]!, /^reviewer · haiku-4-5:medium · \d+s · completed$/);
     assert.equal(readRoutingRecords(join(h.stateDir, "routing")).filter((record) => record.recordType === "agent-model").length, 1);
     assert.ok(provider.requests[1]!.systemText.includes("Review carefully."));
     assert.deepEqual(provider.requests.map((request) => request.tools), [["read", "report"], ["read", "report"]]);
@@ -449,7 +449,7 @@ test("a resumed named worker retains its saved label in the board and widget", a
     assert.equal(row.agent, "scout");
     assert.equal(row.label, "research: budget code");
     const plain = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as Theme;
-    assert.match(widgetLines(widgetRows([row], Date.now()), undefined, Date.now(), plain, 200)[3]!, /research: budget co…\s+mechanical · /);
+    assert.match(widgetLines(widgetRows([row], Date.now()), undefined, Date.now(), plain, 200)[3]!, /^  ○ research: budget code   mechanical · haiku-4-5:low · \d+s · completed$/);
   } finally { h.cleanup(); }
 });
 
@@ -2007,8 +2007,8 @@ test("subagents_status lists background calls, snapshots each item of a call, an
     const listing = await status({});
     assert.equal(listing.text, [
       "Background call call-1: 0/2 workers done",
-      `  ${runningId} · parser repair · mechanical · anthropic/claude-haiku-4-5:low · running · 0s · 1 turn · thinking…`,
-      `  ${queuedId} · worker · routing… · queued · Update the docs`,
+      `  ${runningId} · parser repair · mechanical · haiku-4-5:low · 0s · running · thinking…`,
+      `  ${queuedId} · worker · routing… · queued`,
     ].join("\n"));
 
     const call = await status({ id: "call-1" });
@@ -2021,7 +2021,8 @@ test("subagents_status lists background calls, snapshots each item of a call, an
     assert.ok(typeof running?.elapsedMs === "number" && running.elapsedMs >= 0, JSON.stringify(running));
     assert.ok(running?.sessionFile?.startsWith(join(main.sessionDir, "subagents", main.sessionId)), running?.sessionFile);
     assert.deepEqual(queued, { delegationId: queuedId, task: "Update the docs", state: "queued", turns: 0, lastLines: [] });
-    for (const shown of [`Worker ${runningId}: running: hold`, "Turns: 1", `Session file: ${running!.sessionFile}`, "  Found the bug.", `Worker ${queuedId}: queued`]) {
+    for (const shown of [`Worker ${runningId}: running: hold`, "Turns: 1", "Rung: anthropic/claude-haiku-4-5:low", `Session file: ${running!.sessionFile}`, "  Found the bug.",
+      `Worker ${queuedId}: queued`]) {
       assert.ok(call.text.includes(shown), `${shown} in:\n${call.text}`);
     }
     assert.doesNotMatch(call.text, /Agent:/, "the snapshot must not repeat a conflicting agent identity beside its board row");
@@ -2358,12 +2359,12 @@ test("the orchestrator's session shows its workers in the widget below the edito
     assert.equal(worker.status, "completed", JSON.stringify(worker));
 
     const running = (name: string, status: string) =>
-      new RegExp(`^  ○ ${name} {2,}mechanical · [^ ]+ · running · \\d+s · \\d+ turns? · ${status}$`);
+      new RegExp(`^  ○ ${name} {2,}mechanical · [^ ]+ · \\d+s · running · ${status}$`);
     const nestedShown = seen.find((lines) => lines.length === 5 && lines[2] === "❯ ● main" && running("└ worker", "\\S.*").test(lines[4]!));
     assert.ok(nestedShown, JSON.stringify(seen));
     // Its tool call follows its turn's start within the 1.5 s hold, so the lead still shows thinking.
     assert.match(nestedShown[3]!, running("coordinate config", "thinking…"));
-    assert.match(component!.render(200)[3]!, /^  ○ coordinate config {2,}mechanical · [^ ]+ · completed · /, "a finished worker lingers with its end state");
+    assert.match(component!.render(200)[3]!, /^  ○ coordinate config {2,}mechanical · [^ ]+ · \d+s · completed$/, "a finished worker lingers, its row ending with its end state");
     await subagents.shutdownSession(ctx);
     assert.equal(component, undefined, "the session's end removes the widget");
   } finally { h.cleanup(); }
@@ -2508,7 +2509,7 @@ test("/subagents with no arguments opens the picker of every worker when there i
     assert.equal(screen.opens, 1, "the picker opened, not the old background-only text notice");
     assert.ok(screen.lines().some((line) => line.includes("Workers of this session")), screen.lines().join("\n"));
     // A running worker's row shows its activity, not its task (CONTEXT.md, Activity).
-    assert.ok(screen.lines().some((line) => /^(?:❯ ●|  ○) \d+\. worker +mechanical · [^ ]+ · running · \d+s · 1 turn · thinking…$/.test(line)),  `every worker of the session, not only background calls:\n${screen.lines().join("\n")}`);
+    assert.ok(screen.lines().some((line) => /^(?:❯ ●|  ○) \d+\. worker +mechanical · [^ ]+ · \d+s · running · thinking…$/.test(line)),  `every worker of the session, not only background calls:\n${screen.lines().join("\n")}`);
     screen.press("\x1b");
     await opening;
     assert.equal(screen.opens, 1, "Esc left without opening a transcript next");
@@ -2517,7 +2518,7 @@ test("/subagents with no arguments opens the picker of every worker when there i
     const noUI = { notify: (text: string) => { shown.push(text); } };
     await subagents.runCommandWithUI("subagents", "", { ...ctx, hasUI: false, ui: noUI } as unknown as ExtensionContext);
     assert.equal(shown.length, 1);
-    assert.match(shown[0]!, /^\d+\. worker · mechanical · .* · running · \d+s · 1 turn · thinking…$/m, "the same full listing as text, where there is no UI to pick in");
+    assert.match(shown[0]!, /^\d+\. worker · mechanical · [^ ]+ · \d+s · running · thinking…$/m, "the same row as text, where there is no UI to pick in");
   } finally {
     for (const finish of pending) finish();
     h.cleanup();

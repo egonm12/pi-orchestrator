@@ -18,6 +18,7 @@ import { createSubagentsExtension, type SubagentResult, type SubagentsDetails } 
 import { orchestratorProtocol } from "./orchestrator-protocol.ts";
 import { readWorkerOutcome } from "./resume.ts";
 import { markWorkerSession } from "./worker-sessions.ts";
+import { workerBoard } from "./worker-board.ts";
 
 // Retries on the effort ladder (ADR 0010), as the orchestrator sees them:
 // subagents_verdict's request_changes reply, and the subagents tool with a
@@ -284,6 +285,23 @@ test("request_changes names the next rung; a retry runs there as a new delegatio
     const report = buildRoutingReport(join(h.stateDir, "routing"));
     assert.deepEqual(report.ladders.map((record) => [record.previousDecisionId, record.delegationId]), [[id, retryId], [retryId, second.sessionId]]);
     assert.equal(report.totals.decisions, 3);
+  } finally { await o.shutdown(); h.cleanup(); }
+});
+
+test("a retry keeps the failed attempt's label, on the board and in its saved outcome, so a retry of a retry keeps it too", async () => {
+  const h = harness();
+  const o = await orchestrator(h);
+  try {
+    const first = await one(o, { task: `[standard]\n${WRITE_NOTES}`, label: "notes file" });
+    await verdict(o, requestChanges(first.sessionId!));
+    const retry = await one(o, { retry: first.sessionId, task: ADD_HEADING });
+    assert.equal(retry.status, "completed", JSON.stringify(retry));
+    assert.equal(workerBoard().byDelegation(retry.sessionId!)?.label, "notes file");
+    assert.equal(readWorkerOutcome(retry.sessionFile!)?.label, "notes file");
+    await verdict(o, requestChanges(retry.sessionId!));
+    const second = await one(o, { retry: retry.sessionId, task: ADD_HEADING });
+    assert.equal(second.status, "completed", JSON.stringify(second));
+    assert.equal(workerBoard().byDelegation(second.sessionId!)?.label, "notes file");
   } finally { await o.shutdown(); h.cleanup(); }
 });
 

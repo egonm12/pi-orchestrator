@@ -25,10 +25,10 @@ test("the tool result renders a labelled worker from the board on one line", () 
   feed.started();
   feed.session({ sessionId: "budget-1", sessionFile: undefined, effort: "high", messages: () => [], subscribe: () => () => {} });
   board.setTier("budget-1", "standard");
-  board.served({ delegationId: "budget-1", model: "anthropic/sonnet", effort: "high" });
+  board.served({ delegationId: "budget-1", model: "anthropic/claude-opus-5-5", effort: "xhigh" });
   const result = { content: [{ type: "text", text: "" }], details: details({ task: "Check budget", status: "running", boardWorker: board.worker(feed.id) }) };
   const lines = renderSubagentsResult(result as never, { expanded: false } as never, PLAIN).render(120);
-  assert.match(lines[0]!, /^budget code · standard · anthropic\/sonnet:high · running · \d+s · 0 turns · Check budget$/);
+  assert.match(lines[0]!, /^budget code · standard · opus-5-5:xhigh · \d+s · running$/);
   assert.equal(lines.length, 1);
 });
 

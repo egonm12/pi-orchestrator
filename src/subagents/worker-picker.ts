@@ -40,8 +40,8 @@ function listNumber(index: number, count: number): string {
 }
 
 /** The board's workers as text, for a session without a UI to pick in: each
- *  worker's list number, then its compact worker line (with its model and
- *  turns, which the picker's rows leave out), nested workers indented. */
+ *  worker's list number, then its compact worker line, the same row the
+ *  picker shows, nested workers indented. */
 export function workerListing(workers: readonly BoardWorker[], now: number): string {
   return compactLines({ rows: workerRows(workers), more: 0 }, now, PLAIN, LISTING_WIDTH - numberWidth(workers.length) - 2)
     .map((line, index) => `${listNumber(index, workers.length)}${line}`.trimEnd()).join("\n");

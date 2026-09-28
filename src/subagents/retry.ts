@@ -180,18 +180,22 @@ export function retryTask(id: string, feedback: string, material: ReviewMaterial
 export interface RetrySetup {
   readonly task: string;
   readonly agent?: string;
+  /** The failed attempt's label, which the retry's worker row keeps (CONTEXT.md, Label). */
+  readonly label?: string;
 }
 
-/** The task and agent definition of a retry of `id` with `feedback`; throws
- *  when the failed attempt's task is not known. */
+/** The task, agent definition and label of a retry of `id` with `feedback`;
+ *  throws when the failed attempt's task is not known. */
 export function retrySetup(ctx: Pick<ExtensionContext, "cwd" | "sessionManager">, id: string, feedback: string,
   records: readonly RoutingRecord[]): RetrySetup {
   const material = delegationMaterial(ctx, id, records);
   if (material.tasks.length === 0) {
     throw new Error(`cannot retry delegation ${id}: its task is not known, as neither its saved session nor this session's worker board has it`);
   }
-  const agent = workerBoard().byDelegation(id)?.agent ?? (material.sessionFile === undefined ? undefined : readWorkerOutcome(material.sessionFile)?.agent);
-  return { task: retryTask(id, feedback, material), ...(agent === undefined ? {} : { agent }) };
+  const onBoard = workerBoard().byDelegation(id);
+  const saved = material.sessionFile === undefined ? undefined : readWorkerOutcome(material.sessionFile);
+  const agent = onBoard?.agent ?? saved?.agent, label = onBoard?.label ?? saved?.label;
+  return { task: retryTask(id, feedback, material), ...(agent === undefined ? {} : { agent }), ...(label === undefined ? {} : { label }) };
 }
 
 /** A retry that has started its climb. */

@@ -240,23 +240,44 @@ test("a review item is routed at or above the implementer's tier and never on it
   } finally { h.cleanup(); }
 });
 
-test("a resumed reviewer keeps reviewer identity on the real board and in its row", async () => {
+const PLAIN_THEME = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as never;
+
+/** The compact row of the board's latest worker, as the widget, picker and status show it. */
+const latestRow = () => compactLines({ rows: workerRows([workerBoard().workers().at(-1)!]), more: 0 }, Date.now(), PLAIN_THEME, 200)[0]!;
+
+test("a reviewer's row names it by the reviewed delegation's label, or by its own label when it has one", async () => {
+  const h = harness();
+  try {
+    const provider = anthropic();
+    const tools = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h);
+    const implementer = await one(tools, ctx, { task: `[elevated] ${WRITE_NOTES}`, label: "notes file" });
+    const reviewer = await one(tools, ctx, { task: "Check the notes", review: implementer.sessionId! });
+    assert.equal(reviewer.status, "completed", JSON.stringify(reviewer));
+    assert.match(latestRow(), /^reviewer: notes file · elevated · [^ ]+ · \d+s · completed$/, latestRow());
+    await one(tools, ctx, { task: "Check the heading", review: implementer.sessionId!, label: "heading check" });
+    assert.match(latestRow(), /^reviewer: heading check · /, latestRow());
+
+    const unlabelled = await one(tools, ctx, { task: `[elevated] ${WRITE_NOTES}` });
+    await one(tools, ctx, { task: "Check the notes", review: unlabelled.sessionId! });
+    assert.match(latestRow(), /^reviewer · elevated · /, "a reviewer of an unlabelled delegation without its own label is plain reviewer");
+  } finally { h.cleanup(); }
+});
+
+test("a resumed reviewer keeps reviewer identity and its label on the real board and in its row", async () => {
   const h = harness();
   try {
     const provider = anthropic();
     const tools = loadSubagents([routerExtension(), provider.extension]);
     const ctx = orchestrator(h);
     const implementer = await one(tools, ctx, { task: `[elevated] ${WRITE_NOTES}` });
-    const first = await one(tools, ctx, { task: "Check the notes", review: implementer.sessionId!, label: "wrong identity" });
+    const first = await one(tools, ctx, { task: "Check the notes", review: implementer.sessionId!, label: "notes check" });
     assert.equal(first.status, "completed", JSON.stringify(first));
     const resumed = await one(tools, ctx, { resume: first.sessionId!, task: "Check again" }, "resume-reviewer");
     assert.equal(resumed.status, "completed", JSON.stringify(resumed));
     const worker = workerBoard().workers().at(-1)!;
     assert.equal(worker.review, implementer.sessionId);
-    const plain = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as never;
-    const row = compactLines({ rows: workerRows([worker]), more: 0 }, Date.now(), plain, 200)[0]!;
-    assert.match(row, /^reviewer · elevated · [^ ]+ · completed · /, row);
-    assert.doesNotMatch(row, /wrong identity/);
+    assert.match(latestRow(), /^reviewer: notes check · elevated · [^ ]+ · \d+s · completed$/, latestRow());
   } finally { h.cleanup(); }
 });
 

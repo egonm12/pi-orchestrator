@@ -84,18 +84,24 @@ function session() {
 const HINT = "  ↑/↓ to select · Enter to open · Esc to cancel";
 /** Wide enough for the tags, which count as columns when a line is fitted. */
 const TAGGED_WIDTH = 200;
+/** A picker row: the marks, the list number and name padded to the list's `column`, then its details. */
+function pickerRow(selected: boolean, name: string, details: string, column: number): string {
+  return `${selected ? "❯ ●" : "  ○"} ${name.padEnd(column)}   ${details}`;
+}
 const TAGGED = { fg: (color: string, text: string) => text === "" ? "" : `<${color}>${text}</>`, bold: (text: string) => `**${text}**` } as unknown as Theme;
 
-test("the picker shows a labelled worker's tier and rung in one row", async () => {
+test("the picker shows a labelled worker's row as the widget does: label, tier, short rung, elapsed time, state and one-word activity", async () => {
   const { time, board } = session();
   const feed = board.add({ callId: "call-3", background: false, task: "Check budget", label: "budget code", model: { kind: "routed" } });
   feed.started();
-  feed.session(fakeSession("budget-1"));
+  const listeners = new Set<(event: AgentSessionEvent) => void>();
+  feed.session(fakeSession("budget-1", listeners));
   board.setTier("budget-1", "elevated");
-  board.served({ delegationId: "budget-1", model: "anthropic/sonnet", effort: "high" });
+  board.served({ delegationId: "budget-1", model: "anthropic/claude-opus-5-5", effort: "xhigh" });
+  for (const listener of listeners) listener({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash" } as unknown as AgentSessionEvent);
   const screen = fakeUI();
   const picked = pickWorker(screen.ui, board, { now: time.now });
-  assert.match(screen.lines(140)[7]!, /budget code\s+elevated · anthropic\/sonnet:high · running · 0s · 0 turns · Check budget/);
+  assert.equal(screen.lines(140)[7], pickerRow(false, "4. budget code", "elevated · opus-5-5:xhigh · 0s · running · bash", 14));
   screen.press(KEY.escape);
   await picked;
 });
@@ -113,20 +119,20 @@ test("the picker lists every worker of the session, finished ones included, as t
     "Workers of this session",
     HINT,
     "",
-    "❯ ● 1. lead            failed · the provider refused th…  0s",
-    "  ○ 2. └ tester        completed · Check the tests        0s",
-    "  ○ 3. worker          queued · Fix the typo",
+    pickerRow(true, "1. lead", "routing… · 0s · failed", 11),
+    pickerRow(false, "2. └ tester", "routing… · 0s · completed", 11),
+    pickerRow(false, "3. worker", "routing… · queued", 11),
     rule,
   ], "no main row: the orchestrator has no transcript to open");
   screen.press(KEY.down);
   assert.deepEqual(screen.lines().slice(4, 6), [
-    "  ○ 1. lead            failed · the provider refused th…  0s",
-    "❯ ● 2. └ tester        completed · Check the tests        0s",
+    pickerRow(false, "1. lead", "routing… · 0s · failed", 11),
+    pickerRow(true, "2. └ tester", "routing… · 0s · completed", 11),
   ], "the selected row has the cursor and the filled dot, every other one two spaces and a hollow dot");
   const renders = screen.renders;
   board.add({ callId: "call-3", background: false, task: "Arrives while picking", model: { kind: "routed" } });
   assert.ok(screen.renders > renders, "a board change redraws the picker");
-  assert.equal(screen.lines()[7], "  ○ 4. worker          queued · Arrives while picking");
+  assert.equal(screen.lines()[7], pickerRow(false, "4. worker", "routing… · queued", 11));
   screen.press("q", KEY.enter);
   assert.equal(await picked, nested!.id);
   assert.equal(screen.open, false);
@@ -139,11 +145,11 @@ test("the picker lists every worker of the session, finished ones included, as t
   }
 
   assert.equal(workerListing(board.workers(), time.now()), [
-    "1. lead · routing… · failed · 0s · 0 turns · the provider refused the request",
-    "2. └ tester · routing… · completed · 0s · 0 turns · Check the tests",
-    "3. worker · routing… · queued · Fix the typo",
-    "4. worker · routing… · queued · Arrives while picking",
-  ].join("\n"), "the list as text, where there is no UI to pick in, keeps each worker's model and turns");
+    "1. lead · routing… · 0s · failed",
+    "2. └ tester · routing… · 0s · completed",
+    "3. worker · routing… · queued",
+    "4. worker · routing… · queued",
+  ].join("\n"), "the list as text, where there is no UI to pick in, has the same rows");
   assert.ok(lead);
 });
 
@@ -161,12 +167,12 @@ test("the picker's selected row has the cursor, a filled dot and a bold accent n
   assert.deepEqual(rendered.slice(2, -1), [
     "  <dim>↑/↓ to select · Enter to open · Esc to cancel</>",
     "",
-    "<accent>❯ ●</> <dim>1. </><accent>**worker**</>              <muted>queued</><muted> · </><dim>Item 1</>",
-    "  <dim>○</> <dim>2. </><muted>worker</>              <muted>queued</><muted> · </><dim>Item 2</>",
+    "<accent>❯ ●</> <dim>1. </><accent>**worker**</>   <dim>routing…</><muted> · </><muted>queued</>",
+    "  <dim>○</> <dim>2. </><muted>worker</>   <dim>routing…</><muted> · </><muted>queued</>",
   ]);
 });
 
-test("the picker's stats sit against the right edge, and a narrow terminal cuts the status first, then the tokens, then the elapsed time, never past the width", async () => {
+test("in the picker a narrow terminal shortens the name first, then cuts the row's details from the end, never past the width", async () => {
   const time = clock();
   const board = new WorkerBoard({ now: time.now });
   const worker = board.add({ callId: "call", background: false, task: "Weighing Entra state-parameter guidance", agent: "orchestrator:verifying-work", model: { kind: "routed" } });
@@ -179,11 +185,11 @@ test("the picker's stats sit against the right edge, and a narrow terminal cuts 
   void pickWorker(screen.ui, board, { now: time.now });
 
   const row = (width: number) => screen.lines(width)[4];
-  assert.equal(row(100), "❯ ● 1. orchestrator:ver…   Weighing Entra state-parameter guidance             8m08s · ↓ 133k tokens");
-  assert.equal(screen.lines(100)[4]!.length, 100, "the stats end at the right edge");
-  assert.equal(row(50), "❯ ● 1. orchestra…   Weighi…  8m08s · ↓ 133k tokens", "the status cut to the room the stats leave");
-  assert.equal(row(30), "❯ ● 1. orc…   Weighing…  8m08s", "the elapsed time alone when the tokens do not fit");
-  assert.equal(row(12), "❯ ● 1. or…", "only the name when no stats fit");
+  assert.equal(row(100), "❯ ● 1. orchestrator:verifying-work   routing… · 8m08s · running", "a row that fits keeps its whole name");
+  assert.equal(row(50), "❯ ● 1. orchestrator:…   routing… · 8m08s · running", "the name takes the room the details leave");
+  assert.equal(screen.lines(50)[4]!.length, 50);
+  assert.equal(row(30), "❯ ● 1. or…   routing… · 8m08s", "a short name, then the details cut from the end");
+  assert.equal(row(12), "❯ ● 1. or…", "only the name when no details fit");
   for (const width of [100, 72, 60, 50, 40, 30, 20, 12, 8, 4, 1]) {
     for (const line of screen.lines(width)) assert.ok(line.length <= width, `${width}: ${line}`);
   }
@@ -198,11 +204,11 @@ test("a long list scrolls to keep the selected worker in view", async () => {
 
   const rows = () => screen.lines().slice(4, -1);
   assert.equal(rows().length, 10);
-  assert.equal(rows()[0], "❯ ●  1. worker         queued · Item 1");
+  assert.equal(rows()[0], "❯ ●  1. worker   routing… · queued");
   assert.equal(screen.lines()[2], `${HINT} · 1–10 of 12`);
   screen.press(...Array.from({ length: 11 }, () => KEY.down));
-  assert.equal(rows()[0], "  ○  3. worker         queued · Item 3");
-  assert.equal(rows()[9], "❯ ● 12. worker         queued · Item 12");
+  assert.equal(rows()[0], "  ○  3. worker   routing… · queued");
+  assert.equal(rows()[9], "❯ ● 12. worker   routing… · queued");
   assert.equal(screen.lines()[2], `${HINT} · 3–12 of 12`);
   screen.press(KEY.enter);
   assert.equal(await picked, board.workers()[11]!.id);

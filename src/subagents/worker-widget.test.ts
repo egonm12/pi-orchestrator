@@ -17,7 +17,7 @@ const PLAIN = { fg: (_color: string, text: string) => text, bold: (text: string)
 /** Tags each coloured piece with its colour and bold text with `**`, to check the styling. */
 const TAGGED = { fg: (color: string, text: string) => text === "" ? "" : `<${color}>${text}</>`, bold: (text: string) => `**${text}**` } as unknown as Theme;
 const WIDE = 200;
-/** The width the widget's screen tests read it at: its stats sit against the right edge. */
+/** The width the widget's screen tests read it at. */
 const SCREEN = 72;
 /** The widget's first lines while the editor has the keyboard: the hint and a blank line. */
 const HINT_LINES = ["  ↑/↓ to select", ""];
@@ -30,11 +30,6 @@ const FIRST_ROW = HINT_LINES.length + 1;
 /** The widget's lines while the editor has the keyboard: the hint, main selected, then `rows`. */
 function unfocused(...rows: string[]): string[] {
   return [...HINT_LINES, "❯ ● main", ...rows];
-}
-
-/** A row whose `stats` end at the right edge of a `width` columns wide widget. */
-function right(left: string, stats: string, width = SCREEN): string {
-  return `${left.padEnd(width - stats.length)}${stats}`;
 }
 
 function clock(start = 1_000_000) {
@@ -68,20 +63,38 @@ function lines(board: WorkerBoard, now: number, width = WIDE, selected?: number,
   return widgetLines(widgetRows(board.workers(), now), selected, now, theme, width);
 }
 
-test("labelled routed workers show label, tier, rung, state, elapsed, turns and activity in widget and status", () => {
+/** An unselected agent list row: its name padded to the list's `column`, then its details. */
+function row(name: string, details: string, column: number): string {
+  return `  ○ ${name.padEnd(column)}   ${details}`;
+}
+
+test("a row reads label, tier, short rung, elapsed time and state, and a running worker's activity in one word, in the compact line and the widget alike", () => {
   const time = clock();
   const board = new WorkerBoard({ now: time.now });
   const feed = board.add({ callId: "call", background: false, task: "Check budget", agent: "scout", label: "research: budget code", model: { kind: "routed" } });
   feed.started();
-  feed.session(fakeSession("budget-1").session);
+  const session = fakeSession("budget-1");
+  feed.session(session.session);
   board.setTier("budget-1", "standard");
-  board.served({ delegationId: "budget-1", model: "anthropic/sonnet", effort: "high" });
+  board.served({ delegationId: "budget-1", model: "anthropic/claude-opus-5-5", effort: "xhigh" });
+  session.emit({ type: "turn_start" });
+  session.emit({ type: "turn_start" });
+  session.emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash" });
   time.advance(2_000);
-  assert.deepEqual(compact(board, time.now()), ["research: budget code · standard · anthropic/sonnet:high · running · 2s · 0 turns · Check budget"]);
-  assert.match(lines(board, time.now(), 200)[3]!, /research: budget co…\s+standard · anthropic\/sonnet:high · running · 2s · 0 turns · Check budget/);
+  const running = "standard · opus-5-5:xhigh · 2s · running · bash";
+  assert.deepEqual(compact(board, time.now()), [`research: budget code · ${running}`]);
+  assert.equal(lines(board, time.now())[FIRST_ROW], row("research: budget code", running, 21));
+
+  feed.ended({ state: "completed" });
+  const finished = "standard · opus-5-5:xhigh · 2s · completed";
+  assert.deepEqual(compact(board, time.now()), [`research: budget code · ${finished}`], "a finished row ends with its state");
+  assert.equal(lines(board, time.now())[FIRST_ROW], row("research: budget code", finished, 21));
+  for (const line of [...compact(board, time.now()), ...lines(board, time.now())]) {
+    assert.doesNotMatch(line, /turn|Check budget|anthropic/, "no turn count, no task text and no provider in a row");
+  }
 });
 
-test("each compact worker line, the /subagents listing's, shows its agent, model and effort, worker state, elapsed time, turns and activity, nested workers indented under their parent", () => {
+test("activity shows only while a worker runs; queued, asking, failed and finished rows end with their state; nested workers are indented under their parent", () => {
   const time = clock();
   const board = new WorkerBoard({ now: time.now });
   const lead = board.add({ callId: "call-1", background: false, task: "Lead the refactor", agent: "lead", model: { kind: "routed" } });
@@ -96,7 +109,6 @@ test("each compact worker line, the /subagents listing's, shows its agent, model
   lead.session(leadSession.session);
   board.served({ delegationId: "lead-1", model: "anthropic/claude-sonnet-4-5", effort: "high", escalation: { from: "standard", to: "elevated" } });
   leadSession.emit({ type: "turn_start" });
-  leadSession.emit({ type: "turn_start" });
   leadSession.emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "subagents" });
   const nested = board.add({ callId: "nested-call", background: false, task: "Check the tests", agent: "tester", parentDelegationId: "lead-1", model: { kind: "routed" } });
   nested.started();
@@ -107,7 +119,9 @@ test("each compact worker line, the /subagents listing's, shows its agent, model
   forkSession.emit({ type: "turn_start" });
   forkSession.emit(reply("Reading the diff.\n\nThe change looks   right so far."));
   preserved.started();
-  preserved.session(fakeSession("bg-1").session);
+  const preservedSession = fakeSession("bg-1");
+  preserved.session(preservedSession.session);
+  preservedSession.emit({ type: "tool_execution_start", toolCallId: "t2", toolName: "read" });
   board.asking("bg-1", true);
   fails.started();
   const failsSession = fakeSession("fails-1");
@@ -117,127 +131,121 @@ test("each compact worker line, the /subagents listing's, shows its agent, model
   fails.ended({ state: "failed", error: "The model call failed\nwith a 529" });
 
   assert.deepEqual(compact(board, time.now()), [
-    "lead · anthropic/claude-sonnet-4-5:high ↑elevated · running · 1m15s · 2 turns · subagents",
-    "└ tester · routing… · running · 1m15s · 0 turns · Check the tests",
-    "worker (fork) · anthropic/claude-opus-4-5:high · running · 1m15s · 1 turn · writing…",
-    "scout · openai/gpt-5:low · asking · 1m15s · 0 turns · Scout the config",
-    "worker · routing… · queued · Fix the typo",
-    "worker (fork) · anthropic/claude-opus-4-5:high · failed · 1m15s · 1 turn · The model call failed",
+    "lead · sonnet-4-5:high ↑elevated · 1m15s · running · subagents",
+    "└ tester · routing… · 1m15s · running",
+    "worker (fork) · opus-4-5:high · 1m15s · running · writing…",
+    "scout · gpt-5:low · 1m15s · asking",
+    "worker · routing… · queued",
+    "worker (fork) · opus-4-5:high · 1m15s · failed",
   ]);
   const rows = widgetRows(board.workers(), time.now()).rows;
   assert.deepEqual(rows.map((row) => [row.worker.id, row.depth]), [[lead.id, 0], [nested.id, 1], [fork.id, 0], [preserved.id, 0], [queued.id, 0], [fails.id, 0]],
     "each row knows its worker, so a later selection can open it");
 });
 
-test("reviewers ignore their labels and long labels stay on one line", () => {
+test("a reviewer reads reviewer: <label>, or reviewer without one; other names fall back from label to agent definition to worker, on one line", () => {
   const time = clock();
   const board = new WorkerBoard({ now: time.now });
-  board.add({ callId: "call", background: false, task: "Review", agent: "scout", label: "misleading label", review: "original", model: { kind: "routed" } });
+  board.add({ callId: "call", background: false, task: "Review", agent: "scout", label: "budget code", review: "original", model: { kind: "routed" } });
+  board.add({ callId: "call", background: false, task: "Review", agent: "scout", review: "unlabelled", model: { kind: "routed" } });
   board.add({ callId: "call", background: false, task: "Research", label: "a long description that should not wrap\nonto another line", model: { kind: "routed" } });
   board.add({ callId: "call", background: false, task: "Unlabelled", agent: "scout", model: { kind: "routed" } });
   board.add({ callId: "call", background: false, task: "No definition", model: { kind: "routed" } });
-  assert.deepEqual(compact(board, time.now()).map((line) => line.split(" · ")[0]), ["reviewer", "a long description that should not wrap", "scout", "worker"]);
-  const widget = lines(board, time.now(), 100);
-  assert.equal(widget.length, 7, "one line per worker");
-  assert.match(widget[4]!, /a long description…/);
+  assert.deepEqual(compact(board, time.now()).map((line) => line.split(" · ")[0]),
+    ["reviewer: budget code", "reviewer", "a long description that should not wrap", "scout", "worker"]);
+  const widget = lines(board, time.now());
+  assert.equal(widget.length, FIRST_ROW + 5, "one line per worker");
+  assert.equal(widget[FIRST_ROW], row("reviewer: budget code", "routing… · queued", 39));
   assert.ok(widget.every((line) => !line.includes("onto another line")));
 });
 
-test("a narrow row shortens its label before tier, rung and state in compact and widget views", () => {
+test("the label takes the room the rest of its row leaves and is shortened only when that row does not fit", () => {
   const time = clock();
   const board = new WorkerBoard({ now: time.now });
-  const feed = board.add({ callId: "call", background: false, task: "Check budget", label: "a very long research label that should yield to routing details", model: { kind: "routed" } });
+  const label = "a very long research label that should yield to routing details";
+  const feed = board.add({ callId: "call", background: false, task: "Check budget", label, model: { kind: "routed" } });
   feed.started();
   feed.session(fakeSession("narrow-1").session);
   board.setTier("narrow-1", "standard");
-  board.served({ delegationId: "narrow-1", model: "anthropic/sonnet", effort: "high" });
-  const width = 62;
-  const compactRow = compact(board, time.now(), width)[0]!;
-  const widgetRow = lines(board, time.now(), width)[3]!;
-  for (const row of [compactRow, widgetRow]) {
-    assert.ok(row.length <= width, row);
-    assert.match(row, /a very.*….*standard · anthropic\/sonnet:high · running/, row);
-  }
-  assert.equal(compact(board, time.now(), width).length, 1);
+  board.served({ delegationId: "narrow-1", model: "anthropic/claude-sonnet-4-5", effort: "high" });
+  board.add({ callId: "call", background: false, task: "Scout", agent: "scout", model: { kind: "routed" } });
+  const details = "standard · sonnet-4-5:high · 0s · running";
+
+  assert.deepEqual(compact(board, time.now()), [`${label} · ${details}`, "scout · routing… · queued"], "a wide row shows the whole label");
+  assert.deepEqual(lines(board, time.now()).slice(FIRST_ROW), [row(label, details, label.length), row("scout", "routing… · queued", label.length)]);
+
+  const width = 70;
+  const [compactRow, compactScout] = compact(board, time.now(), width);
+  assert.equal(compactRow, `a very long research labe… · ${details}`);
+  assert.equal(compactRow!.length, width, "the label takes all the room left");
+  assert.equal(compactScout, "scout · routing… · queued", "a row that fits keeps its whole label");
+  const widget = lines(board, time.now(), width).slice(FIRST_ROW);
+  assert.deepEqual(widget, [row("a very long research…", details, 22), row("scout", "routing… · queued", 22)]);
+  assert.equal(widget[0]!.length, width);
+  for (const line of [...compact(board, time.now(), 40), ...lines(board, time.now(), 40)]) assert.ok(line.length <= 40, line);
 });
 
-test("a compact worker line longer than the render width is cut with an ellipsis", () => {
+test("a compact line too narrow even for a short name cuts its details from the end, never showing task text", () => {
   const time = clock();
   const board = new WorkerBoard({ now: time.now });
   board.add({ callId: "call", background: false, task: "Find every place the config loader reads the environment", agent: "scout", model: { kind: "routed" } });
 
-  assert.deepEqual(compact(board, time.now(), 40), ["scout · routing… · queued · Find every…"]);
+  assert.deepEqual(compact(board, time.now(), 40), ["scout · routing… · queued"]);
   assert.deepEqual(compact(board, time.now(), 12), ["scout · rou…"]);
-  for (const line of compact(board, time.now(), 40)) assert.ok(line.length <= 40);
 });
 
-test("the widget is Claude Code's agent list: a hint, main first and selected, then each worker's name, its activity or last status, and its elapsed time and tokens against the right edge", () => {
+test("the widget is Claude Code's agent list: a hint, main first and selected, then each worker's name in one column and its row after it", () => {
   const time = clock();
   const board = new WorkerBoard({ now: time.now });
   const lead = board.add({ callId: "call-1", background: false, task: "Lead the refactor", agent: "lead", model: { kind: "routed" } });
   const fork = board.add({ callId: "call-1", background: false, task: "Review in context", model: { kind: "fork", model: "anthropic/claude-opus-4-5", effort: "high" } });
-  const scout = board.add({ callId: "call-2", background: true, task: "Scout the config", agent: "scout", delegationId: "bg-1", model: { kind: "routed" } });
   board.add({ callId: "call-2", background: true, task: "Fix the typo\nin README.md", delegationId: "bg-2", model: { kind: "routed" } });
-  const fails = board.add({ callId: "call-3", background: false, task: "Try the build", model: { kind: "routed" } });
 
   lead.started();
   const leadSession = fakeSession("lead-1");
   lead.session(leadSession.session);
-  leadSession.emit({ type: "turn_start" });
   leadSession.emit(usage(133_000));
   leadSession.emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "subagents" });
   const nested = board.add({ callId: "nested-call", background: false, task: "Check the tests", agent: "tester", parentDelegationId: "lead-1", model: { kind: "routed" } });
   nested.started();
   nested.session(fakeSession("nested-1").session);
   fork.started();
-  const forkSession = fakeSession("fork-1");
-  fork.session(forkSession.session);
-  forkSession.emit({ type: "turn_start" });
-  forkSession.emit(reply("Reading the diff."));
-  forkSession.emit(usage(1));
-  scout.started();
-  scout.session(fakeSession("bg-1").session);
-  board.asking("bg-1", true);
-  fails.started();
-  fails.session(fakeSession("fails-1").session);
+  fork.session(fakeSession("fork-1").session);
   time.advance(488_000);
-  fails.ended({ state: "failed", error: "The model call failed\nwith a 529" });
+  fork.ended({ state: "completed" });
 
   const shown = lines(board, time.now(), 100);
   assert.deepEqual(shown, [
     ...HINT_LINES,
     "❯ ● main",
-    "  ○ lead                   subagents                                           8m08s · ↓ 133k tokens",
-    "  ○ └ tester               Check the tests                                                     8m08s",
-    "  ○ worker (fork)          writing…                                                8m08s · ↓ 1 token",
-    "  ○ scout                  asking · Scout the config                                           8m08s",
-    "  ○ worker                 queued · Fix the typo",
-    "  ○ worker                 failed · The model call failed                                      8m08s",
+    row("lead", "routing… · 8m08s · running · subagents", 13),
+    row("└ tester", "routing… · 8m08s · running", 13),
+    row("worker (fork)", "opus-4-5:high · 8m08s · completed", 13),
+    row("worker", "routing… · queued", 13),
   ]);
-  for (const line of shown.filter((line) => / (8m08s|tokens?)$/.test(line))) {
-    assert.equal(line.length, 100, `the stats end at the right edge: ${line}`);
-  }
-  for (const line of shown.slice(3)) assert.match(line, /^.{24} {3}\S/, `every worker's status starts in column 27, after the name column: ${line}`);
+  for (const line of shown.slice(FIRST_ROW)) assert.match(line, /^.{17} {3}\S/, `every row's details start after the name column: ${line}`);
+  assert.ok(shown.every((line) => !/tokens?|Lead the refactor/.test(line)), "no tokens and no task text");
 });
 
 test("the selected row has the ❯ cursor, a filled dot and its name in bold accent; every other row two spaces, a hollow dot and a muted name", () => {
   const time = clock();
   const board = new WorkerBoard({ now: time.now });
   for (let item = 1; item <= 2; item++) board.add({ callId: "call", background: true, task: `Item ${item}`, delegationId: `bg-${item}`, model: { kind: "routed" } });
+  const details = "<dim>routing…</><muted> · </><muted>queued</>";
 
   assert.deepEqual(lines(board, time.now(), WIDE, undefined, TAGGED), [
     "  <dim>↑/↓ to select</>",
     "",
     "<accent>❯ ●</> <accent>**main**</>",
-    "  <dim>○</> <muted>worker</>                 <muted>queued</><muted> · </><dim>Item 1</>",
-    "  <dim>○</> <muted>worker</>                 <muted>queued</><muted> · </><dim>Item 2</>",
+    `  <dim>○</> <muted>worker</>   ${details}`,
+    `  <dim>○</> <muted>worker</>   ${details}`,
   ], "while the editor has the keyboard, main is selected");
   assert.deepEqual(lines(board, time.now(), WIDE, 1, TAGGED), [
     "  <dim>↑/↓ to select · Enter to open · Esc to go back</>",
     "",
     "  <dim>○</> <muted>main</>",
-    "  <dim>○</> <muted>worker</>                 <muted>queued</><muted> · </><dim>Item 1</>",
-    "<accent>❯ ●</> <accent>**worker**</>                 <muted>queued</><muted> · </><dim>Item 2</>",
+    `  <dim>○</> <muted>worker</>   ${details}`,
+    `<accent>❯ ●</> <accent>**worker**</>   ${details}`,
   ], "in the focused widget the selected worker has the cursor and the filled dot, and main a hollow one");
 });
 
@@ -249,12 +257,7 @@ test("the widget shows at most 6 worker rows below main, then \"+N more\" for th
   assert.deepEqual(lines(board, time.now()), [
     ...HINT_LINES,
     "❯ ● main",
-    "  ○ worker                 queued · Item 1",
-    "  ○ worker                 queued · Item 2",
-    "  ○ worker                 queued · Item 3",
-    "  ○ worker                 queued · Item 4",
-    "  ○ worker                 queued · Item 5",
-    "  ○ worker                 queued · Item 6",
+    ...Array.from({ length: 6 }, () => row("worker", "routing… · queued", 6)),
     "    +2 more",
   ]);
   assert.equal(widgetRows(board.workers(), time.now()).more, 2);
@@ -264,7 +267,7 @@ test("the widget shows at most 6 worker rows below main, then \"+N more\" for th
   assert.equal(lines(six, time.now()).length, 2 + 1 + 6, "exactly 6 workers need no \"+N more\" line");
 });
 
-test("a narrow terminal cuts a worker's status first so its stats still fit against the right edge, then keeps only the elapsed time, then no stats; a long name is cut to the name column", () => {
+test("a narrow terminal shortens the name first, keeping at least a few characters, then cuts the row's details from the end", () => {
   const time = clock();
   const board = new WorkerBoard({ now: time.now });
   const worker = board.add({ callId: "call", background: false, task: "Weighing Entra state-parameter guidance", agent: "orchestrator:verifying-work", model: { kind: "routed" } });
@@ -275,10 +278,10 @@ test("a narrow terminal cuts a worker's status first so its stats still fit agai
   time.advance(488_000);
 
   const rows = (width: number) => lines(board, time.now(), width).slice(HINT_LINES.length);
-  assert.deepEqual(rows(100), ["❯ ● main", "  ○ orchestrator:verify…   Weighing Entra state-parameter guidance             8m08s · ↓ 133k tokens"]);
-  assert.deepEqual(rows(50), ["❯ ● main", "  ○ orchestrator…   Weighi…  8m08s · ↓ 133k tokens"], "a third of the row for the name, the status cut to the room the stats leave");
-  assert.deepEqual(rows(30), ["❯ ● main", "  ○ orches…   Weighing…  8m08s"], "the elapsed time alone when the tokens do not fit");
-  assert.deepEqual(rows(12), ["❯ ● main", "  ○ orche…"], "only the name when no stats fit");
+  assert.deepEqual(rows(100), ["❯ ● main", "  ○ orchestrator:verifying-work   routing… · 8m08s · running"]);
+  assert.deepEqual(rows(50), ["❯ ● main", "  ○ orchestrator:ver…   routing… · 8m08s · running"], "the name takes the room the details leave");
+  assert.deepEqual(rows(30), ["❯ ● main", "  ○ orche…   routing… · 8m08s"], "a short name, then the details cut from the end");
+  assert.deepEqual(rows(12), ["❯ ● main", "  ○ orche…"], "only the name when no details fit");
   for (const width of [100, 72, 50, 40, 30, 20, 12, 8, 4, 1]) {
     for (const line of lines(board, time.now(), width)) assert.ok(line.length <= width, `${width}: ${line}`);
   }
@@ -363,35 +366,35 @@ test("a finished worker stays about 10 s with its end state, then drops out, and
 
   const first = board.add({ callId: "call", background: false, task: "First", model: { kind: "routed" } });
   const second = board.add({ callId: "call", background: false, task: "Second", model: { kind: "fork", model: "anthropic/claude-opus-4-5", effort: "high" } });
-  assert.deepEqual(screen.shown(), unfocused("  ○ worker                 queued · First", "  ○ worker (fork)          queued · Second"));
+  assert.deepEqual(screen.shown(), unfocused(row("worker", "routing… · queued", 13), row("worker (fork)", "opus-4-5:high · queued", 13)));
   assert.equal(screen.placements.at(-1), "belowEditor");
   first.started();
   second.started();
   time.advance(3_000);
   screen.tick();
-  assert.deepEqual(screen.shown(), unfocused(right("  ○ worker                 First", "3s"), right("  ○ worker (fork)          Second", "3s")),
+  assert.deepEqual(screen.shown(), unfocused(row("worker", "routing… · 3s · running", 13), row("worker (fork)", "opus-4-5:high · 3s · running", 13)),
     "the timer keeps the elapsed time current");
 
   first.ended({ state: "failed", error: "the provider refused the request" });
   time.advance(9_000);
   screen.tick();
-  assert.deepEqual(screen.shown(), unfocused(right("  ○ worker                 failed · the provider refused the request", "3s"),
-    right("  ○ worker (fork)          Second", "12s")));
+  assert.deepEqual(screen.shown(), unfocused(row("worker", "routing… · 3s · failed", 13),
+    row("worker (fork)", "opus-4-5:high · 12s · running", 13)), "a failed row ends with its state, not its error");
   time.advance(1_000);
   screen.tick();
-  assert.deepEqual(screen.shown(), unfocused(right("  ○ worker (fork)          Second", "13s")), "10 s after its end it drops out");
+  assert.deepEqual(screen.shown(), unfocused(row("worker (fork)", "opus-4-5:high · 13s · running", 13)), "10 s after its end it drops out");
 
   second.ended({ state: "completed" });
   time.advance(5_000);
   screen.tick();
-  assert.deepEqual(screen.shown(), unfocused(right("  ○ worker (fork)          completed · Second", "13s")));
+  assert.deepEqual(screen.shown(), unfocused(row("worker (fork)", "opus-4-5:high · 13s · completed", 13)));
   time.advance(5_000);
   screen.tick();
   assert.equal(screen.shown(), undefined, "with no worker left the widget disappears");
   assert.equal(screen.timers, 0, "and its timer stops");
 
   board.add({ callId: "call-2", background: true, task: "Third", delegationId: "bg-3", model: { kind: "routed" } });
-  assert.deepEqual(screen.shown(), unfocused("  ○ worker                 queued · Third"), "a new worker brings it back");
+  assert.deepEqual(screen.shown(), unfocused(row("worker", "routing… · queued", 6)), "a new worker brings it back");
   widget.stop();
   assert.equal(screen.shown(), undefined, "stopping removes the widget");
   assert.equal(screen.timers, 0);
@@ -406,12 +409,12 @@ test("a board change re-renders the shown widget at once, and a new orchestrator
   const screen = fakeUI();
   board.add({ callId: "call", background: true, task: "Already running", delegationId: "bg-1", model: { kind: "routed" } }).started();
   startWorkerWidget(screen.ui, board, { now: time.now, ...screen.timer });
-  assert.deepEqual(screen.shown(), unfocused(right("  ○ worker                 Already running", "0s")), "workers already on the board show when it starts");
+  assert.deepEqual(screen.shown(), unfocused(row("worker", "routing… · 0s · running", 6)), "workers already on the board show when it starts");
 
   const renders = screen.renders;
   board.asking("bg-1", true);
   assert.ok(screen.renders > renders, "the board's change signal asks pi to render");
-  assert.deepEqual(screen.shown(), unfocused(right("  ○ worker                 asking · Already running", "0s")));
+  assert.deepEqual(screen.shown(), unfocused(row("worker", "routing… · 0s · asking", 6)));
 
   board.startSession("session-2");
   assert.equal(screen.shown(), undefined);
@@ -440,23 +443,23 @@ test("the focused widget marks the selected worker, arrows move over its rows bu
   assert.deepEqual(screen.shown(), [
     ...FOCUS_HINT_LINES,
     "  ○ main",
-    "❯ ● worker                 queued · Item 1",
-    "  ○ worker                 queued · Item 2",
-    "  ○ worker                 queued · Item 3",
-    "  ○ worker                 queued · Item 4",
-    "  ○ worker                 queued · Item 5",
-    "  ○ worker                 queued · Item 6",
+    "❯ ● worker   routing… · queued",
+    row("worker", "routing… · queued", 6),
+    row("worker", "routing… · queued", 6),
+    row("worker", "routing… · queued", 6),
+    row("worker", "routing… · queued", 6),
+    row("worker", "routing… · queued", 6),
     "    +1 more",
   ], "the first worker is selected, main no longer");
   screen.press(KEY.down, KEY.down);
-  assert.equal(screen.shown()![FIRST_ROW + 2], "❯ ● worker                 queued · Item 3");
-  assert.equal(screen.shown()![FIRST_ROW], "  ○ worker                 queued · Item 1");
+  assert.equal(screen.shown()![FIRST_ROW + 2], "❯ ● worker   routing… · queued");
+  assert.equal(screen.shown()![FIRST_ROW], row("worker", "routing… · queued", 6));
   screen.press(...Array.from({ length: 9 }, () => KEY.down));
-  assert.equal(screen.shown()![FIRST_ROW + 5], "❯ ● worker                 queued · Item 6", "down stops at the last row, not on \"+N more\"");
+  assert.equal(screen.shown()![FIRST_ROW + 5], "❯ ● worker   routing… · queued", "down stops at the last row, not on \"+N more\"");
   screen.press(KEY.enter);
   assert.deepEqual(await chosen, { workerId: ids[5] });
   assert.equal(screen.focused, false, "Enter gives the keyboard back");
-  assert.deepEqual(screen.shown()!.slice(0, FIRST_ROW + 1), unfocused("  ○ worker                 queued · Item 1"), "and main is selected again");
+  assert.deepEqual(screen.shown()!.slice(0, FIRST_ROW + 1), unfocused(row("worker", "routing… · queued", 6)), "and main is selected again");
   assert.ok(!screen.shown()!.slice(FIRST_ROW).some((line) => line.startsWith("❯")), "no worker keeps the cursor");
 
   for (const leave of [KEY.escape, KEY.kittyEscape, KEY.ctrlC]) {
@@ -521,7 +524,7 @@ test("in the focused widget ↑ on the first row or Esc returns to the editor un
   assert.deepEqual(screen.editor.received, ["q"], "the key goes into the editor");
 
   focus = widget.focus(screen.ui, { select: ids[2] });
-  assert.equal(screen.shown()![FIRST_ROW + 2], "❯ ● worker                 queued · Item 3", "back from a transcript, that worker is selected");
+  assert.equal(screen.shown()![FIRST_ROW + 2], "❯ ● worker   routing… · queued", "back from a transcript, that worker is selected");
   screen.press(KEY.up, KEY.enter);
   assert.deepEqual(await focus, { workerId: ids[1] });
 });
@@ -539,10 +542,10 @@ test("focus on a hidden widget is refused; a selected worker that drops out pass
   first.started();
   const left = widget.focus(screen.ui);
   first.ended({ state: "completed" });
-  assert.equal(screen.shown()![FIRST_ROW], right("❯ ● worker                 completed · First", "0s"), "a finished worker lingers, still selected");
+  assert.equal(screen.shown()![FIRST_ROW], "❯ ● worker   routing… · 0s · completed", "a finished worker lingers, still selected");
   time.advance(10_000);
   screen.tick();
-  assert.deepEqual(screen.shown(), [...FOCUS_HINT_LINES, "  ○ main", "❯ ● worker                 queued · Second"], "the row in its place takes the mark");
+  assert.deepEqual(screen.shown(), [...FOCUS_HINT_LINES, "  ○ main", "❯ ● worker   routing… · queued"], "the row in its place takes the mark");
 
   board.startSession("another-session");
   assert.equal(screen.shown(), undefined);

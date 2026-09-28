@@ -327,6 +327,9 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
           if (!background) onUpdate?.({ content: [{ type: "text", text: `${done}/${items.length} workers done` }], details: update });
         };
         const board = workerBoard();
+        /** A delegation's label: on the board, else saved with its outcome. */
+        const delegationLabel = (id: string) => board.byDelegation(id)?.label ??
+          savedWorkerIdentity(id, { cwd: ctx.cwd, orchestratorSession: ctx.sessionManager })?.label;
         // The routing decision is persisted before the served rung reaches the board.
         // Resumes also learn their tier from the earlier delegation's record.
         const unsubscribeTier = board.subscribe((worker) => {
@@ -345,7 +348,9 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
           const retried = retrySetups[index] instanceof Error ? undefined : retrySetups[index];
           const saved = resume === undefined ? undefined : savedWorkerIdentity(resume, { cwd: ctx.cwd, orchestratorSession: ctx.sessionManager });
           const task = retried?.task ?? itemTask, agent = itemAgent ?? retried?.agent ?? saved?.agent;
-          const displayLabel = label ?? saved?.label, reviewedId = review ?? saved?.review?.delegationId;
+          const reviewedId = review ?? saved?.review?.delegationId;
+          // A retry keeps the failed attempt's label; a reviewer without its own takes the reviewed delegation's.
+          const displayLabel = label ?? retried?.label ?? saved?.label ?? (reviewedId === undefined ? undefined : delegationLabel(reviewedId));
           return board.add({ callId: toolCallId, background, task, ...(agent === undefined ? {} : { agent }), ...(displayLabel === undefined ? {} : { label: displayLabel }),
             ...(reviewedId === undefined ? {} : { review: reviewedId }),
             ...(delegationId === undefined ? {} : { delegationId }), ...(parentDelegationId === undefined ? {} : { parentDelegationId }),
@@ -544,7 +549,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
             // A resumed reviewer is not routed again, so its saved instructions carry the review prompt for it.
             // A review that ran on the reviewed delegation's rung is a same-rung review (review.ts).
             const agentName = definition === undefined ? {} : { agent: definition.name };
-            saveWorkerOutcome(worker.sessionFile, worker.status, reviewing === undefined ? { instructions: resolution.instructions, tools: resolution.tools, ...agentName, label: item.label } : {
+            saveWorkerOutcome(worker.sessionFile, worker.status, reviewing === undefined ? { instructions: resolution.instructions, tools: resolution.tools, ...agentName, label: item.label ?? retried?.label } : {
               instructions: [reviewing.prompt, ...(resolution.instructions === undefined ? [] : [resolution.instructions])].join("\n\n"),
               tools: resolution.tools, ...agentName, label: item.label, review: { delegationId: reviewing.delegationId, startedAt: reviewStartedAt,
                 ...(target !== undefined && servedOnRung(worker.sessionId, target.constraints.excludedRung) ? { sameRung: true as const } : {}) },

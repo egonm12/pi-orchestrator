@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { BackgroundCalls, CallSnapshot, CompletionNoticeDetails, WorkerSnapshot } from "./background.ts";
 import { workerBoard } from "./worker-board.ts";
-import { compactLines, workerRows } from "./worker-widget.ts";
+import { compactLines, rungText, workerRows } from "./worker-widget.ts";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 
 // The subagents_status tool (ADR 0008): the orchestrator's view of its
@@ -61,10 +61,16 @@ function boardRow(delegationId: string): string | undefined {
   return compactLines({ rows: workerRows([worker]), more: 0 }, Date.now(), PLAIN, 200)[0];
 }
 
+/** The full rung of a worker on the board, which its row shows short. */
+function fullRung(delegationId: string): string | undefined {
+  const worker = workerBoard().byDelegation(delegationId);
+  return worker === undefined ? undefined : rungText(worker.model, "full");
+}
+
 function snapshotText(calls: readonly CallSnapshot[]): string {
   return calls.map((call) => [`Background call ${call.callId}:`, ...call.workers.map((worker) => {
     const row = boardRow(worker.delegationId);
-    return row === undefined ? workerText(worker, false) : `${workerText(worker, true)}\n${row}`;
+    return row === undefined ? workerText(worker, false) : `${workerText(worker, true)}\nRung: ${fullRung(worker.delegationId)}\n${row}`;
   })].join("\n\n")).join("\n\n");
 }
 

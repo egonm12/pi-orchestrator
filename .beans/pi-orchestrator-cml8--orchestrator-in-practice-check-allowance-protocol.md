@@ -7,7 +7,7 @@ priority: normal
 tags:
     - ready-for-agent
 created_at: 2026-09-28T09:31:08Z
-updated_at: 2026-09-28T12:53:16Z
+updated_at: 2026-09-28T20:36:52Z
 ---
 
 ## Problem statement
@@ -26,7 +26,7 @@ Using pi-orchestrator in practice showed six problems:
 - **Exploration nudge instead of refusal (ADR 0013).** Exploratory calls are never denied. After a set number in one user prompt (setting `explorationNudge`, default 3), the result of each further exploratory call carries a short nudge, such as `4 exploratory calls this prompt: consider handing the rest to a worker.`
 - **A gate that reminds (ADR 0013).** Commit and push are never denied. Their result names the delegations still waiting for a verdict. The routing report keeps counting missing verdicts. Gate levels and gate actions (ADR 0011) are unchanged.
 - **Protocol on every run.** The orchestrator protocol is present on every run of the orchestrator, including runs started by `sendMessage` with `triggerTurn`. Also check live why the protocol can be missing after a typed skill prompt.
-- **Labels.** The orchestrator gives each delegation an optional short label, such as `research: budget code`. Worker rows show the label, falling back to the agent definition and then to `worker`. Reviewers are always shown as `reviewer`. Rows show the tier next to the rung.
+- **Labels.** The orchestrator gives each delegation an optional short label, such as `research: budget code`. Worker rows show the label, falling back to the agent definition and then to `worker`. A retry keeps the label of the delegation it retries. Reviewers are shown as `reviewer: <label>`, with their own label or the reviewed delegation's (rm9t). Rows show the tier next to the rung.
 - **Balanced tier order (ADR 0012).** By default a tier picks, among the rungs that survive the hard filters, the rung whose provider started the fewest delegations in the last 5 hours, across all the owner's sessions and projects. List order breaks ties. A tier can be set to *ordered* to keep "first survivor wins". A reviewer prefers a rung from a different provider than the implementer's.
 - **Editing detection from the working tree.** A delegation is editing when the working tree changed while its worker ran, or when the worker used `edit` or `write`. The old command rule applies only when there is no git repository.
 - **Usage and rate limits.** The router, not the classifier, checks usage before pinning a worker.
@@ -62,7 +62,7 @@ Using pi-orchestrator in practice showed six problems:
 21. As the orchestrator, I want to give each delegation a short label, so that the owner can see what each worker is for.
 22. As the owner, I want every worker row to show its label, so that I can tell parallel workers apart at a glance.
 23. As the owner, I want rows without a label to show the agent definition name, and rows with neither to show `worker`, so that the list never has an empty name.
-24. As the owner, I want reviewer workers always shown as `reviewer`, so that I can see which worker is checking another.
+24. As the owner, I want reviewer workers shown as `reviewer: <label>`, with the reviewer's own label or else the reviewed delegation's, so that I can see which worker is checking which. (Amended by rm9t: this was always `reviewer`.)
 25. As the owner, I want each row to show the tier next to the rung, so that I can see how much care the classifier gave the task.
 26. As the owner, I want the label shown the same way in the worker widget, the /subagents picker, the transcript view's nested workers and the status output, so that a worker has one name everywhere.
 27. As the owner, I want long labels shortened to fit the row, so that the list keeps one line per worker.
@@ -101,7 +101,7 @@ Using pi-orchestrator in practice showed six problems:
 - **Settings:** `orchestrator.subagents.explorationNudge`, a positive integer, default 3. The old `explorationBudget` key is read as its value when the new key is absent.
 - **Gate:** the commit and push denial is removed. A commit or push result gets a reminder naming the delegations waiting for a verdict. The verdict-reminder messages and the routing report's missing-verdict count stay.
 - **Orchestrator protocol:** its text drops the refusal and describes the nudge and the reminding gate. It must be in the system prompt of every orchestrator run, including runs started by `sendMessage` with `triggerTurn`. pi 0.87.1 clears the run options and falls back to the base system prompt for those runs. The fix makes the protocol reach them, for example by adding it to the base prompt through a supported hook or by starting follow-up runs through a path that fires `before_agent_start`. The implementer picks one that holds up across pi versions. Workers never get the protocol.
-- **Subagents tool schema:** each item gains an optional `label` (short text). The worker board keeps the label and the worker's tier. The row format for widget, picker, transcript view and status becomes label · tier · rung · state · elapsed · turns · activity, with the name falling back from label to agent definition to `worker`, and reviewers always `reviewer`.
+- **Subagents tool schema:** each item gains an optional `label` (short text). The worker board keeps the label and the worker's tier. The row format for widget, picker, transcript view and status becomes label · tier · rung · elapsed · state · activity (rm9t, replacing k2xj's label · tier · rung · state · elapsed · turns · activity). The rung is short, the model without its provider plus the effort (`opus-5-5:xhigh`); the transcript view and the status snapshot keep the full rung, and the transcript view the turn count. The activity shows only while a worker runs, as one word, so a finished row ends with its state and never with task text. The label takes the remaining width and is shortened only when the row does not fit. The name falls back from label to agent definition to `worker`; a retry keeps the original delegation's label, and a reviewer reads `reviewer: <label>`.
 - **Tier map settings:** each tier gains an optional order, `balanced` (default) or `ordered`. A project tier replaces the personal tier with the same name, including its order.
 - **Tier router:** balancing chooses among the survivors of one step, by delegations started per provider in the last 5 hours. The router extension reads the count from the global decision records under the owner's state directory, counting only rungs that were actually pinned. Rungs chosen earlier in the same call count as well, so a fan-out spreads. The effort ladder keeps its step order. The reviewer's constraint gains a provider to avoid, as a preference and not a hard filter.
 - **Decision record:** gains the provider counts behind a balanced choice, the tier order in force, and failover entries linked to the refused attempt.
