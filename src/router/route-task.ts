@@ -1,7 +1,7 @@
 import { allowanceConstraint, type TaskAllowanceOwner } from "../budget/task-allowance.ts";
 import type { ModelInfo } from "../models/model-info.ts";
 import type { BanLists } from "../policy/ban-lists.ts";
-import { classifyTier, type ClassifierModelCall, type LoadedClassifierChain } from "../routing/tier-classifier.ts";
+import { classifyTier, type ClassifierModelCall, type LoadedClassifierChain, type TierClassification } from "../routing/tier-classifier.ts";
 import type { ResolvedTierMap } from "../routing/tier-map.ts";
 import { failedHardFilter, routeForcedRung, routeTier, type ConstraintRung, type ProviderUsage, type RouterEvidence, type RoutingConstraints } from "../routing/tier-router.ts";
 import { nextRungAfterFailure, type FailedDecision, type LadderDecision } from "../routing/effort-ladder.ts";
@@ -88,16 +88,21 @@ export function recordedRungPassesHardFilters(router: ActiveRouter, rung: Constr
   return failedHardFilter(rung, hardFilterEvidence(router, taskText, at, router.evidence(), constraints)) === undefined;
 }
 
-/** Classify, then route under the worker's routing constraints: a minimum
- *  tier raises the tier routing starts at, an excluded rung is removed in
- *  every tier, and a forced rung replaces the tier choice. Also returns the
- *  provider usage the hard filters read. */
-export async function routeTask(router: ActiveRouter, taskText: string, agentRole: string, at: Date, constraints: RoutingConstraints = {}) {
+/** Classify the worker's task before taking the shared choice lock. */
+export async function classifyTask(router: ActiveRouter, taskText: string, agentRole: string): Promise<TierClassification> {
   const evidence = router.evidence();
-  const classification = await classifyTier(
+  return classifyTier(
     { task: taskText, role: agentRole, paths: namedPaths(taskText) },
     { chain: router.chain, callModel: router.callModel, allowance: { owner: router.owner, catalog: evidence.catalog } },
   );
+}
+
+/** Route under the worker's constraints after classification, while the
+ * shared choice lock is held. A minimum tier raises where routing starts,
+ * an excluded rung is removed in every tier, and a forced rung replaces the
+ * tier choice. The provider usage returned is what the hard filters read. */
+export function routeTask(router: ActiveRouter, taskText: string, classification: TierClassification, at: Date, constraints: RoutingConstraints = {}) {
+  const evidence = router.evidence();
   const filters = hardFilterEvidence(router, taskText, at, evidence, constraints);
   const { minimumTier, forcedRung } = constraints;
   const tier = minimumTier === undefined || isAtLeastTier(classification.tier, minimumTier) ? classification.tier : minimumTier;

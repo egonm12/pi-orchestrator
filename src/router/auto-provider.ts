@@ -1,11 +1,13 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { mkdirSync } from "node:fs";
 import { appendRoutingRecord, buildDecisionRecord, madeUnderConstraints, readRoutingRecords, RoutingRecordError, type DecisionRecord } from "../routing/decision-record.ts";
 import { splitKnownThinkingSuffix } from "../models/model-info.ts";
 import { subagentBanListEntry, type BanLists } from "../policy/ban-lists.ts";
 import { streamReasoning } from "../routing/session-classifier-call.ts";
 import { autoStream } from "./auto-stream.ts";
 import { ROUTER_PREFIX } from "./prefix.ts";
-import { recordedRungPassesHardFilters, routeTask, type ActiveRouter } from "./route-task.ts";
+import { classifyTask, recordedRungPassesHardFilters, routeTask, type ActiveRouter } from "./route-task.ts";
+import { withRoutingChoice } from "./routing-choice-lock.ts";
 import { parentDelegationOf, reviewedDelegationOf } from "../subagents/worker-sessions.ts";
 import { publishServedRung, type RungEscalation } from "./served-rungs.ts";
 import type { RiskTier } from "../routing/classifier.ts";
@@ -69,6 +71,14 @@ function latestDecision(dir: string, sessionId: string): DecisionRecord | undefi
   }
 }
 
+function canRestoreDecision(router: ActiveRouter, decision: DecisionRecord | undefined, sessionId: string,
+  constraints: RoutingConstraints | undefined, taskText: string, at: Date): boolean {
+  return decision?.mode === "live" && decision.delegationId === sessionId && decision.route.outcome === "chosen" &&
+    (decision.ranOn === undefined || decision.ranOn === `${decision.route.rung.model}:${decision.route.rung.effort}`) &&
+    madeUnderConstraints(decision, constraints) &&
+    recordedRungPassesHardFilters(router, decision.route.rung, taskText, at, constraints);
+}
+
 function firstTaskAndRole(context: Context): { taskText: string; agentRole: string } {
   const messages = context.messages;
   const first = messages.find((message) => message.role === "user");
@@ -83,6 +93,7 @@ function firstTaskAndRole(context: Context): { taskText: string; agentRole: stri
 }
 
 class SessionModelError extends Error {}
+class MissingRungError extends Error {}
 
 function sessionPin(banLists: BanLists): { model: string; effort: string } {
   const value = process.env.PI_ORCHESTRATOR_SESSION_MODEL;
@@ -147,14 +158,6 @@ function recordLimitError(deps: AutoProviderDependencies, provider: string, text
 
 export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConfig {
   const pins = new Map<string, ServedPin>();
-  // Classifiers can finish together in a fan-out. Keep reading counts, choosing
-  // and appending one pin in one turn before the next worker chooses.
-  let routingQueue: Promise<void> = Promise.resolve();
-  function serializeRouting(work: () => Promise<void>): Promise<void> {
-    const next = routingQueue.then(work, work);
-    routingQueue = next.catch(() => {});
-    return next;
-  }
   return {
     name: "Orchestrator auto", baseUrl: "http://localhost/unused", apiKey: "unused", api: "orchestrator-auto" as never,
     models: [{ id: "auto", name: "Orchestrator auto", reasoning: true, input: ["text", "image"],
@@ -170,26 +173,55 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
           if (!sessionId) throw new Error("auto model request has no sessionId");
           const registry = deps.registry();
           if (!registry) throw new Error("auto model has no session model registry");
+          function beginRequest(selected: ServedPin) {
+            const slash = selected.model.indexOf("/");
+            const rung = registry.find(selected.model.slice(0, slash), selected.model.slice(slash + 1));
+            if (!rung) throw new MissingRungError(`pinned rung ${selected.model} is missing from the session model registry`);
+            const { apiKey: _apiKey, headers: _headers, reasoning: _reasoning, ...rest } = options ?? {};
+            const inward = { ...context, messages: context.messages.map((message) =>
+              message.role === "assistant" && message.provider === model.provider && message.model === model.id
+                ? { ...message, provider: rung.provider, model: rung.id, api: rung.api } : message) };
+            const reasoning = streamReasoning(rung, selected.effort);
+            const inner = registry.streamSimple(rung, inward, { ...rest, ...(reasoning === undefined ? {} : { reasoning }) });
+            return { rung, inner };
+          }
+          let request: ReturnType<typeof beginRequest> | undefined;
+          let startingRequest = false;
           let pin: ServedPin | undefined = resumePins().get(sessionId) ?? pins.get(sessionId);
           wasPinned = pin !== undefined;
           if (!pin) {
-            await serializeRouting(async () => {
-              const router = deps.disabled() ? undefined : deps.router();
-              const constraints = routingConstraints().get(sessionId);
-              if (!router) pin = fallbackPin(deps.banLists(), constraints, "allowed");
-              else {
+            const router = deps.disabled() ? undefined : deps.router();
+            const constraints = routingConstraints().get(sessionId);
+            if (!router) pin = fallbackPin(deps.banLists(), constraints, "allowed");
+            else {
+              const { taskText, agentRole } = firstTaskAndRole(context);
+              // Classification may call a provider. Do it before taking the
+              // shared lock; only choice and reservation must be serialized.
+              let existing: DecisionRecord | undefined;
+              try { existing = router.mode === "live" ? latestDecision(router.recordDir, sessionId) : undefined; }
+              catch (error) {
+                deps.disable(error);
+                pin = fallbackPin(deps.banLists(), constraints, "allowed");
+              }
+              const at = deps.now();
+              const resumable = canRestoreDecision(router, existing, sessionId, constraints, taskText, at);
+              let classification;
+              if (!resumable && !pin) {
+                try { classification = await classifyTask(router, taskText, agentRole); }
+                catch (error) {
+                  deps.disable(error);
+                  pin = fallbackPin(deps.banLists(), constraints, "allowed");
+                }
+              }
+              if (existing || classification) await withRoutingChoice(router.recordDir, async () => {
                 try {
-                  const at = deps.now();
-                  const { taskText, agentRole } = firstTaskAndRole(context);
                   const latest = router.mode === "live" ? latestDecision(router.recordDir, sessionId) : undefined;
                   // A decision made under other constraints could restore a rung these exclude.
-                  if (latest?.mode === "live" && latest.route.outcome === "chosen" &&
-                    (latest.ranOn === undefined || latest.ranOn === `${latest.route.rung.model}:${latest.route.rung.effort}`) &&
-                    madeUnderConstraints(latest, constraints) &&
-                    recordedRungPassesHardFilters(router, latest.route.rung, taskText, at, constraints)) {
+                  if (canRestoreDecision(router, latest, sessionId, constraints, taskText, at) && latest?.route.outcome === "chosen") {
                     pin = { model: latest.route.rung.model, effort: latest.route.rung.effort, ...escalationOf(latest.route) };
                   } else {
-                    const { classification, route, providerUsage } = await routeTask(router, taskText, agentRole, at, constraints);
+                    classification ??= await classifyTask(router, taskText, agentRole);
+                    const { route, providerUsage } = routeTask(router, taskText, classification, at, constraints);
                     pin = router.mode === "shadow" ? fallbackPin(router.banLists, constraints, "allowed")
                       : !route.ok ? fallbackPin(router.banLists, constraints, "refused", providerUsage)
                       : { model: route.rung.model, effort: route.rung.effort, ...escalationOf(route) };
@@ -199,35 +231,35 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
                     const common = { delegationId: sessionId, at, taskText, agentRole, classification, tierMap: router.tierMap, route, ranOn,
                       ...(parentDelegationId === undefined ? {} : { parentDelegationId }), ...(constraints === undefined ? {} : { constraints }),
                       ...(reviewedDelegationId === undefined ? {} : { reviewedDelegationId }) };
-                    appendRoutingRecord(router.recordDir, buildDecisionRecord(router.mode === "shadow"
+                    const decision = buildDecisionRecord(router.mode === "shadow"
                       ? { ...common, mode: "shadow", handPickedModel: pin.model }
-                      : { ...common, mode: "live" }));
+                      : { ...common, mode: "live" });
+                    // Fail before starting a request if the record folder is
+                    // unavailable. A missing rung or failed request start then
+                    // leaves no chosen decision to inflate balancing counts.
+                    mkdirSync(router.recordDir, { recursive: true });
+                    startingRequest = true;
+                    request = beginRequest(pin);
+                    startingRequest = false;
+                    appendRoutingRecord(router.recordDir, decision);
                   }
                 } catch (error) {
                   // An unavailable or banned session model is a refusal, not a router bug.
-                  if (error instanceof SessionModelError) throw error;
+                  if (error instanceof SessionModelError || error instanceof MissingRungError || startingRequest) throw error;
                   deps.disable(error);
+                  if (request) throw error; // Never start a second request after a record write failure.
                   pin = fallbackPin(deps.banLists(), constraints, "allowed");
                 }
-              }
-              if (!pin) throw new Error("auto model could not pin a rung");
-              pins.set(sessionId, pin);
-            });
+                if (!pin) throw new Error("auto model could not pin a rung");
+                pins.set(sessionId, pin);
+              });
+            }
           }
           if (!pin) throw new Error("auto model could not pin a rung");
           probeRung = `${pin.model}:${pin.effort}`;
-          const slash = pin.model.indexOf("/");
-          const rung = registry.find(pin.model.slice(0, slash), pin.model.slice(slash + 1));
-          if (!rung) throw new Error(`pinned rung ${pin.model} is missing from the session model registry`);
+          const { rung, inner } = request ?? beginRequest(pin);
           // The worker board shows the rung, which the relabelled replies below never name.
           publishServedRung({ delegationId: sessionId, model: pin.model, effort: pin.effort, ...(pin.escalation ? { escalation: pin.escalation } : {}) });
-          // The rung sets the effort; a caller's thinking level never reaches it (ADR 0006).
-          const { apiKey: _apiKey, headers: _headers, reasoning: _reasoning, ...rest } = options ?? {};
-          const inward = { ...context, messages: context.messages.map((message) =>
-            message.role === "assistant" && message.provider === model.provider && message.model === model.id
-              ? { ...message, provider: rung.provider, model: rung.id, api: rung.api } : message) };
-          const reasoning = streamReasoning(rung, pin.effort);
-          const inner = registry.streamSimple(rung, inward, { ...rest, ...(reasoning === undefined ? {} : { reasoning }) });
           for await (const event of inner) {
             // Recorded before the worker sees the error, so a delegation started on it routes elsewhere.
             if (event.type === "error" && event.reason === "error") recordLimitError(deps, rung.provider, event.error.errorMessage);

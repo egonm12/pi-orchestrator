@@ -7,7 +7,7 @@ priority: normal
 tags:
     - ready-for-agent
 created_at: 2026-09-28T14:30:23Z
-updated_at: 2026-09-28T16:09:32Z
+updated_at: 2026-09-28T16:26:35Z
 parent: pi-orchestrator-cml8
 ---
 
@@ -37,3 +37,5 @@ None, can start immediately.
 ## Summary of changes
 
 Added balanced-by-default and ordered tier settings with project replacement of both rungs and order. The tier router chooses the least-used surviving provider from pinned global live decisions in the rolling five-hour window, including earlier fan-out pins; shadow recommendations do not count. Decisions record tier order and the counts behind balanced choices. Documented settings in README and covered map resolution, routing, records, rolling window, cross-session/project/tier usage, shadow exclusion and fan-out with focused tests. `npx tsc --noEmit` passed; `npm test` passed with 805 passing and 16 skipped.
+
+Follow-up fix: A state-folder choice lock now makes concurrent auto-provider instances classify independently, then choose and append decisions atomically across worker sessions and processes. A decision is appended only after the selected registry rung exists and its provider request starts; missing rungs and synchronous request-start failures do not inflate counts. Separate-provider fan-out and failed-start regressions were red first. The rolling five-hour, cross-session/project counts and shadow exclusion remain unchanged. `npx tsc --noEmit` passed; focused routing tests passed (180/180); `npm test` passed (814 passing, 16 skipped).

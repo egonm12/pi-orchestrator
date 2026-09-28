@@ -621,6 +621,75 @@ test("parallel fan-out pins distinct providers and the second record sees the fi
   } finally { h.cleanup(); }
 });
 
+test("parallel fan-out across separate worker providers reserves each choice in the shared state folder", async () => {
+  const h = harness(LIVE);
+  try {
+    let arrivals = 0;
+    let release!: () => void;
+    const together = new Promise<void>((resolve) => { release = resolve; });
+    const classifierCall = () => async () => {
+      if (++arrivals === 2) release();
+      await together;
+      return classifierAnswer("mechanical");
+    };
+    const firstRegistry = fakeSessionRegistry([{ events: answerEvents("one") }]);
+    const secondRegistry = fakeSessionRegistry([{ events: answerEvents("two") }]);
+    const [first, second] = await Promise.all([
+      loadAutoProvider(h, firstRegistry, { classifierCall }),
+      loadAutoProvider(h, secondRegistry, { classifierCall }),
+    ]);
+    const events = await Promise.all([
+      autoEvents(first, FIX_README, "separate-fanout-one"),
+      autoEvents(second, FIX_README, "separate-fanout-two"),
+    ]);
+    assert.deepEqual(events.map((stream) => stream.at(-1)?.type), ["done", "done"]);
+    assert.deepEqual([firstRegistry.calls[0]?.model.provider, secondRegistry.calls[0]?.model.provider].sort(), ["anthropic", "openai-codex"]);
+    const records = h.records().filter((record) => record.recordType === "decision");
+    assert.equal(records.length, 2);
+    assert.deepEqual(records.map((record) => record.route.outcome === "chosen" && record.route.providerCounts), [
+      { anthropic: 0, "openai-codex": 0 }, { anthropic: 1, "openai-codex": 0 },
+    ]);
+  } finally { h.cleanup(); }
+});
+
+test("a rung missing from the registry never counts as a pinned delegation", async () => {
+  const h = harness({ ...LIVE, tiers: { ...TEST_TIERS, mechanical: ["anthropic/claude-sonnet-5:low", "openai-codex/gpt-6-luna:low"] } });
+  try {
+    const missing = fakeSessionRegistry([]);
+    let unavailable = false;
+    const registry = { ...missing, find: (provider: string, id: string) =>
+      unavailable && id === "claude-sonnet-5" ? undefined : missing.find(provider, id) };
+    const first = await loadAutoProvider(h, registry, { classifierCall: () => answering("mechanical").call });
+    unavailable = true;
+    const failed = await autoEvents(first, FIX_README, "missing-rung-worker");
+    assert.equal(failed.at(-1)?.type, "error");
+    assert.equal(missing.calls.length, 0);
+    assert.deepEqual(h.records(), [], "a failed lookup made no provider request");
+
+    const restored = fakeSessionRegistry([{ events: answerEvents("ok") }]);
+    const second = await loadAutoProvider(h, restored);
+    assert.equal((await autoEvents(second, FIX_README, "after-missing-rung")).at(-1)?.type, "done");
+    assert.equal(restored.calls[0]?.model.provider, "anthropic", "a failed lookup cannot skew balancing");
+    const record = h.records().find((entry) => entry.delegationId === "after-missing-rung");
+    assert.ok(record?.recordType === "decision" && record.route.outcome === "chosen");
+    assert.deepEqual(record.route.providerCounts, { anthropic: 0, "openai-codex": 0 });
+  } finally { h.cleanup(); }
+});
+
+test("a provider request that fails to start does not reserve a balanced choice", async () => {
+  const h = harness(LIVE);
+  try {
+    const failedRegistry = fakeSessionRegistry([{ throws: "could not start request" }]);
+    const first = await loadAutoProvider(h, failedRegistry);
+    assert.equal((await autoEvents(first, FIX_README, "cannot-start")).at(-1)?.type, "error");
+    assert.deepEqual(h.records(), []);
+    const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
+    const second = await loadAutoProvider(h, registry);
+    assert.equal((await autoEvents(second, FIX_README, "after-cannot-start")).at(-1)?.type, "done");
+    assert.equal(registry.calls[0]?.model.provider, "anthropic");
+  } finally { h.cleanup(); }
+});
+
 test("when routing is not enabled the auto model runs on the session model without a record", async () => {
   const h = harness({ ...LIVE, enabled: false });
   try {
