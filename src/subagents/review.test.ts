@@ -495,7 +495,7 @@ function rtkHook(rewrites: Readonly<Record<string, string>>): InlineExtension {
   };
 }
 
-test("a reviewer's git inspection, counts and beans reads run when an earlier hook routes them through rtk, and its commit is still denied", async () => {
+test("a reviewer's git inspection, counts and beans reads run when an earlier hook routes them through rtk, and its commit and an rtk shell run are still denied", async () => {
   const h = harness();
   try {
     const dir = h.projectDir;
@@ -517,6 +517,8 @@ test("a reviewer's git inspection, counts and beans reads run when an earlier ho
       [runTask("bash", { command: `wc -l ${dir}/notes.md`, timeout: 10 }), false],
       [runTask("bash", { command: `cd ${dir} && beans prime | head -50`, timeout: 30 }), false],
       [runTask("bash", { command: "git commit -m x", timeout: 30 }), true],
+      // rtk summary runs `ls > notes.md` through sh -c: it writes.
+      [runTask("bash", { command: `cd ${dir} && rtk summary ls '>' notes.md`, timeout: 30 }), true],
     ] as const;
     for (const [task, denied] of calls) {
       const reviewer = await one(tools, ctx, { task, review: id });

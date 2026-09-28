@@ -214,26 +214,36 @@ function commandWords(words: readonly string[]): readonly string[] {
     if (ASSIGNMENT.test(first) || PREFIXES.has(first)) { rest = others; continue; }
     if (first === "env" && others.length > 0) { rest = afterOptions(others); continue; }
     if (first === "timeout") { rest = afterOptions(others, ["-s", "--signal", "-k", "--kill-after"]).slice(1); continue; }
-    if (basename(first) === "rtk") { rest = rtkCommand(others); continue; }
+    if (basename(first) === "rtk") {
+      const command = rtkCommand(others);
+      // Left as `rtk ...`, a command nothing here knows.
+      if (command === undefined) return rest;
+      rest = command;
+      continue;
+    }
     return rest;
   }
 }
 
 /** rtk subcommands that stand for a command of another name. */
 const RTK_ALIASES: Readonly<Record<string, string>> = { read: "cat", lint: "eslint" };
-/** rtk subcommands that run the command after them. */
-const RTK_RUNNERS = new Set(["err", "test", "summary", "proxy"]);
+/** rtk subcommands that run a command the reader cannot follow, as it cannot
+ *  follow `sh -c`: `err`, `test` and `summary` join their arguments with spaces
+ *  and run the result with `sh -c`, so a quoted `';'` or `'>'` is shell syntax
+ *  there; `proxy` splits a lone argument with spaces into a command and its
+ *  arguments. rtk's hook never rewrites a command to one of them. */
+const RTK_SHELL_RUNNERS = new Set(["err", "test", "summary", "proxy"]);
 
-/** The command rtk runs, from the words after `rtk`. rtk filters a command's
- *  output, and its PreToolUse hook, which pi-claude-hooks runs as a tool_call
- *  hook, rewrites a call's input in place, so `git show` can arrive here as
- *  `rtk git show` and `head -5 x` as `rtk read x --max-lines 5`. Any other
- *  subcommand, such as `init` or `run`, is read as a command of that name,
- *  which nothing here knows. */
-function rtkCommand(args: readonly string[]): readonly string[] {
+/** The command rtk runs, from the words after `rtk`, or `undefined` for one of
+ *  RTK_SHELL_RUNNERS. rtk filters a command's output, and its PreToolUse hook,
+ *  which pi-claude-hooks runs as a tool_call hook, rewrites a call's input in
+ *  place, so `git show` can arrive here as `rtk git show` and `head -5 x` as
+ *  `rtk read x --max-lines 5`. Any other subcommand, such as `init` or `run`,
+ *  is read as a command of that name, which nothing here knows. */
+function rtkCommand(args: readonly string[]): readonly string[] | undefined {
   const [subcommand, ...rest] = afterOptions(args);
   if (subcommand === undefined) return [];
-  if (RTK_RUNNERS.has(subcommand)) return afterOptions(rest);
+  if (RTK_SHELL_RUNNERS.has(subcommand)) return undefined;
   return [RTK_ALIASES[subcommand] ?? subcommand, ...rest];
 }
 
@@ -275,6 +285,8 @@ const READ_ONLY_COMMANDS: Readonly<Record<string, readonly string[]>> = {
 
 /** beans subcommands that only print the issue tracker's guide or its beans; the others change `.beans`. */
 const BEANS_READS = new Set(["prime", "show", "list"]);
+/** beans' global options whose value follows them, before its subcommand: `beans --beans-path <dir> show`. */
+const BEANS_OPTIONS_WITH_VALUE = ["--beans-path", "--config"];
 
 /** Build and test tools that build, test or check as they are. */
 const BUILD_TEST_COMMANDS = new Set(["tsc", "vitest", "jest", "mocha", "ava", "pytest", "py.test", "tox", "nox", "mypy", "pyright",
@@ -302,7 +314,7 @@ function commandKind(words: readonly string[]): CommandKind {
   const name = basename(first);
   if (name === "git") return gitKind(args);
   if (name === "find") return findKind(args);
-  if (name === "beans") return BEANS_READS.has(positional(args)[0] ?? "") ? "read-only" : "unrecognised";
+  if (name === "beans") return BEANS_READS.has(afterOptions(args, BEANS_OPTIONS_WITH_VALUE)[0] ?? "") ? "read-only" : "unrecognised";
   if (name === "xargs") return commandKind(afterOptions(args, XARGS_OPTIONS_WITH_VALUE));
   if (name === "sed") return args.some((arg) => /^-[^-]*i/.test(arg) || arg.startsWith("--in-place")) ? "unrecognised" : "read-only";
   if (name === "tee") return positional(args).every((arg) => HARMLESS_TARGETS.has(arg)) ? "read-only" : "unrecognised";

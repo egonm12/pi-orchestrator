@@ -158,6 +158,11 @@ test("beans prime, show and list are read-only; any other beans command is unrec
   assertBash("unrecognised", ["beans update x -s completed", "beans create 'Title' -t bug", "beans archive", "beans"]);
 });
 
+test("beans' global options and their values come before the subcommand that decides the kind", () => {
+  assertBash("read-only", ["beans --beans-path .beans show x", "beans --config .beans.yml list --json", "beans --beans-path=.beans prime"]);
+  assertBash("unrecognised", ["beans --beans-path show update x", "beans --config list update x -s completed"]);
+});
+
 test("a command rtk runs, as its hook rewrites it, has the kind of the command it runs", () => {
   // Each is what `rtk hook claude` (rtk 0.49.0) rewrote the command in the comment to.
   assertBash("read-only", [
@@ -179,14 +184,35 @@ test("a command rtk runs, as its hook rewrites it, has the kind of the command i
     "rtk cargo test", // cargo test
     "rtk pytest", // pytest
     "rtk lint src", // npx eslint src
-    "rtk test cargo test",
-    "rtk err npm test",
   ]);
-  assertBash("version-control", ["rtk git commit -m x", "rtk git push", "rtk proxy git push"]);
+  assertBash("version-control", ["rtk git commit -m x", "rtk git push"]);
   assertBash("unrecognised", ["rtk run 'rm -rf dist'", "rtk init", "rtk config --create", "rtk lint --fix src", "rtk find . -delete", "rtk ls > out.txt"]);
   // The commit gate reads the git subcommand through rtk too.
   assert.deepEqual(gitSubcommands("rtk git commit -m x"), ["commit"]);
   assert.deepEqual(gitSubcommands("cd /repo && rtk git add -A && rtk git push"), ["add", "push"]);
+});
+
+test("rtk err, test, summary and proxy run a command the reader cannot follow, so, like sh -c, they are unrecognised", () => {
+  // err, test and summary join their arguments with spaces and run the result
+  // with sh -c; proxy splits a lone argument with spaces into a command and its
+  // arguments. rtk's hook never rewrites a command to one of them.
+  assertBash("unrecognised", [
+    "rtk err cat x ';' rm -rf src",
+    "rtk summary ls '>' notes.md",
+    "rtk err cat '$(rm -rf src)'",
+    "rtk proxy 'rm -rf src/cat'",
+    "rtk test npm test '&&' git commit -am x",
+    "rtk err npm test",
+    "rtk test cargo test",
+    "rtk proxy git push",
+  ]);
+  // The commit gate sees through them no better than through sh -c.
+  const throughShell: readonly [string, string][] = [
+    ["rtk proxy git push", "sh -c 'git push'"],
+    ["rtk test npm test '&&' git commit -am x", "sh -c 'npm test && git commit -am x'"],
+    ["rtk err git commit -m x", "sh -c 'git commit -m x'"],
+  ];
+  for (const [command, shell] of throughShell) assert.deepEqual(gitSubcommands(command), gitSubcommands(shell), command);
 });
 
 test("gitSubcommands names the subcommand of each git command, after git's own options, in chains and pipes", () => {
