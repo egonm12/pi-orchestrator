@@ -1034,10 +1034,16 @@ export interface RoutingRecordEntry {
   readonly record: RoutingRecord;
 }
 
-/** Every record in the folder's day files, oldest file first, in file order.
- *  A folder that does not exist holds no records. Throws `RoutingRecordError`
- *  with `<file>:<line>` for the first invalid line. */
-export function readRoutingRecordEntries(dir: string, reader: RecordFolderReader = NODE_RECORD_FOLDER_READER): RoutingRecordEntry[] {
+/** A day file line that is not a valid record: its error names `<file>:<line>`. */
+export interface SkippedRoutingRecordLine {
+  readonly file: string;
+  readonly line: number;
+  readonly error: RoutingRecordError;
+}
+
+/** Each record in the folder's day files, oldest file first, in file order,
+ *  and each invalid line handed to `invalid`. */
+function walkRecordFolder(dir: string, reader: RecordFolderReader, invalid: (skipped: SkippedRoutingRecordLine) => void): RoutingRecordEntry[] {
   let names: readonly string[];
   try {
     names = reader.readdir(dir);
@@ -1050,24 +1056,53 @@ export function readRoutingRecordEntries(dir: string, reader: RecordFolderReader
     const lines = reader.readFile(join(dir, file)).split("\n");
     lines.forEach((text, index) => {
       if (text.trim().length === 0) return;
-      const location = `${file}:${index + 1}`;
+      const line = index + 1;
+      const location = `${file}:${line}`;
       let parsed: unknown;
       try {
         parsed = JSON.parse(text);
       } catch (error) {
-        throw new RoutingRecordError("(record)", `is not valid JSON (${(error as Error).message})`, location);
+        invalid({ file, line, error: new RoutingRecordError("(record)", `is not valid JSON (${(error as Error).message})`, location) });
+        return;
       }
       try {
-        entries.push({ file, line: index + 1, record: validateRoutingRecord(parsed) });
+        entries.push({ file, line, record: validateRoutingRecord(parsed) });
       } catch (error) {
-        if (error instanceof RoutingRecordError) {
-          throw new RoutingRecordError(error.field, error.problem, location);
-        }
-        throw error;
+        if (!(error instanceof RoutingRecordError)) throw error;
+        invalid({ file, line, error: new RoutingRecordError(error.field, error.problem, location) });
       }
     });
   }
   return entries;
+}
+
+/** Every record in the folder's day files, oldest file first, in file order.
+ *  A folder that does not exist holds no records. Throws `RoutingRecordError`
+ *  with `<file>:<line>` for the first invalid line. For the routing report,
+ *  which names a bad record rather than count around it. */
+export function readRoutingRecordEntries(dir: string, reader: RecordFolderReader = NODE_RECORD_FOLDER_READER): RoutingRecordEntry[] {
+  return walkRecordFolder(dir, reader, ({ error }) => { throw error; });
+}
+
+export interface UsableRoutingRecordEntries {
+  readonly entries: RoutingRecordEntry[];
+  readonly skipped: SkippedRoutingRecordLine[];
+}
+
+/** The folder's valid records, as `readRoutingRecordEntries` reads them, and
+ *  every invalid line skipped. Every pi process appends to the same folder, so
+ *  it can hold a record type or shape this reader does not know yet (one
+ *  written by a newer version of the extension), or a torn line; neither may
+ *  block a reader that only needs the records it knows (pi-orchestrator-zb6t). */
+export function readUsableRoutingRecordEntries(dir: string, reader: RecordFolderReader = NODE_RECORD_FOLDER_READER): UsableRoutingRecordEntries {
+  const skipped: SkippedRoutingRecordLine[] = [];
+  const entries = walkRecordFolder(dir, reader, (line) => { skipped.push(line); });
+  return { entries, skipped };
+}
+
+/** The folder's valid records, skipping every invalid line (`readUsableRoutingRecordEntries`). */
+export function readUsableRoutingRecords(dir: string, reader?: RecordFolderReader): RoutingRecord[] {
+  return readUsableRoutingRecordEntries(dir, reader).entries.map((entry) => entry.record);
 }
 
 export function readRoutingRecords(dir: string, reader?: RecordFolderReader): RoutingRecord[] {

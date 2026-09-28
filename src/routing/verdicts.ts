@@ -40,7 +40,7 @@ import {
   appendRoutingRecord,
   DECISION_RECORD_SCHEMA_VERSION,
   isRoutedDecision,
-  readRoutingRecordEntries,
+  readUsableRoutingRecordEntries,
   type AgentModelRecord,
   type EditRecord,
   type ForkRecord,
@@ -105,7 +105,8 @@ function isDecisionOfSomeKind(record: RoutingRecord): record is RoutedDecisionRe
 
 export function attachVerdict(input: AttachVerdictInput): AttachVerdictOutcome {
   const timestamp = (input.at ?? new Date()).toISOString();
-  const entries = readRoutingRecordEntries(input.recordDir).filter((entry) => entry.record.delegationId === input.delegationId);
+  // Lines this reader cannot validate are skipped, not fatal (pi-orchestrator-zb6t).
+  const entries = readUsableRoutingRecordEntries(input.recordDir).entries.filter((entry) => entry.record.delegationId === input.delegationId);
   // An effort-ladder record stands in only for a retry without a decision
   // record, and an edit record only when the delegation has no decision at all.
   const latest = entries.filter((entry) => isDecisionOfSomeKind(entry.record) && entry.record.recordType !== "effort-ladder").at(-1) ??

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -105,6 +105,42 @@ test("a verdict with a known delegation id is attached to that decision and one 
       assert.equal(validateRoutingRecord({ ...record, schemaVersion: "decision-record/2" }).schemaVersion, "decision-record/2");
     }
     assert.deepEqual(verifiedOutcomes(f.ledger).map((o) => o.instance), ["attempt-1"], "an orphan records no observation");
+  } finally {
+    f.cleanup();
+  }
+});
+
+// pi-orchestrator-zb6t: the record folder is shared by every pi process, so
+// it can hold a record type this reader does not know yet, or a torn line.
+// Neither may keep a verdict from being attached.
+
+/** An unplaced effort-ladder record, shaped as 2026-09-28.jsonl:107 was. */
+function unplacedLadderLine(delegationId: string, previousDecisionId: string): string {
+  return JSON.stringify({
+    recordType: "effort-ladder", schemaVersion: "decision-record/3", cause: "effort-ladder", delegationId,
+    timestamp: "2026-09-25T10:00:00.000Z", previousDecisionId, step: "unplaced", mode: "live",
+    detail: "its rung openai-codex/gpt-6-sol:high has no position in the elevated tier of the tier map",
+    taskTextPrefix: "Retry of delegation attempt-0, whose changes were requested.", agentRole: "unknown",
+  });
+}
+
+test("a verdict is attached past an effort-ladder record, a record shape the reader does not know and a torn line in the folder", async () => {
+  const f = folder();
+  try {
+    const decided = await decide(f.records);
+    const unknownShape = JSON.stringify({ ...JSON.parse(unplacedLadderLine("retry-2", "attempt-0")), step: "sideways" });
+    appendFileSync(decided.path, `${unplacedLadderLine("retry-1", "attempt-0")}\n${unknownShape}\n{"recordType":"verdict","schema\n`);
+
+    const attached = attachVerdict({ recordDir: f.records, delegationId: "attempt-1", verdict: "accept", at: REVIEWED_AT, refreshStatePath: f.ledger });
+    assert.equal(attached.status, "attached");
+    if (attached.status !== "attached") return;
+    assert.equal(attached.decision.recordType, "decision");
+
+    const onRetry = attachVerdict({ recordDir: f.records, delegationId: "retry-1", verdict: "request_changes", at: REVIEWED_AT, refreshStatePath: f.ledger });
+    assert.equal(onRetry.status, "attached", "an unplaced ladder record takes the verdict of a retry without a decision");
+    if (onRetry.status !== "attached") return;
+    assert.equal(onRetry.decision.recordType, "effort-ladder");
+    assert.deepEqual(verifiedOutcomes(f.ledger).map((o) => o.instance), ["attempt-1"], "a ladder record teaches the router nothing");
   } finally {
     f.cleanup();
   }

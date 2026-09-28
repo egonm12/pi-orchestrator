@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { readRoutingRecords, VERDICTS, type Verdict } from "../routing/decision-record.ts";
+import { readUsableRoutingRecords, VERDICTS, type Verdict } from "../routing/decision-record.ts";
 import type { GateLevelRaise } from "../routing/decision-record.ts";
 import { attachVerdict } from "../routing/verdicts.ts";
 import { stateDir } from "../router/extension.ts";
@@ -26,7 +26,9 @@ import { planRetry, planText, retrySetup } from "./retry.ts";
 // delegation, with a reason, never lower it (ADR 0011): the verdict is then
 // held to the raised level, and its record names the raise. A request_changes
 // reply names the effort ladder's next rung for a retry (./retry.ts), or says
-// the ladder cannot place the delegation, or why no retry may start.
+// the ladder cannot place the delegation, or why no retry may start. It reads
+// the record folder past lines it cannot validate (pi-orchestrator-zb6t): one
+// foreign or torn line must not block every verdict.
 
 export const SUBAGENTS_VERDICT_TOOL = "subagents_verdict";
 
@@ -82,7 +84,7 @@ function raiseProblem(from: GateLevel, level: GateLevel): string | undefined {
 
 /** What a retry of `id` would do now, with `feedback` as its task, as a request_changes reply says it. */
 function nextClimb(ctx: Parameters<typeof retrySetup>[0], id: string, feedback: string, recordDir: string): string {
-  const records = readRoutingRecords(recordDir);
+  const records = readUsableRoutingRecords(recordDir);
   let task: string;
   try { task = retrySetup(ctx, id, feedback, records).task; } catch (error) {
     const message = (error as Error).message;
@@ -122,7 +124,7 @@ export function registerSubagentsVerdictTool(pi: ExtensionAPI, gateLevels: GateL
       if (!isOrchestratorSession(ctx)) throw refusal("only the orchestrator records verdicts");
       const { delegationId: id, verdict, reason, reviewer, raise } = verdictInput(params);
       const recordDir = join(stateDir(), "routing");
-      const records = readRoutingRecords(recordDir);
+      const records = readUsableRoutingRecords(recordDir);
       const checked = editingDelegationProblem(ctx, records, id);
       if (checked.problem !== undefined) throw refusal(problemText(id, checked.problem));
       const { edits } = checked;

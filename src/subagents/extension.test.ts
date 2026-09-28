@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { after, test } from "node:test";
@@ -11,7 +11,7 @@ import { buildCatalog } from "../catalog/model-catalog.ts";
 import { emptyRefreshState } from "../catalog/refresh-lifecycle.ts";
 import { resetBanLists } from "../policy/ban-lists.ts";
 import { authorizeRecipient, emptyAuthorization, grantOwnerApproval, saveAuthorization } from "../recipients/authorization.ts";
-import { readRoutingRecords } from "../routing/decision-record.ts";
+import { readRoutingRecords, readUsableRoutingRecordEntries } from "../routing/decision-record.ts";
 import { attachVerdict } from "../routing/verdicts.ts";
 import { buildRoutingReport } from "../routing/routing-report.ts";
 import { autoStream } from "../router/auto-stream.ts";
@@ -3027,6 +3027,33 @@ test("subagents_verdict records accept and request_changes with a reason; the re
       [[id, "request_changes", "notes.md lacks a heading"], [id, "accept", "checked notes.md:1"]]);
     assert.equal(verdicts[0]!.decisionFile, `${decision.timestamp.slice(0, 10)}.jsonl`, "attached to the decision record's day file");
     assert.equal(records.some((record) => record.recordType === "orphaned-verdict"), false);
+  } finally { h.cleanup(); }
+});
+
+test("subagents_verdict records a verdict past an effort-ladder record and a line the reader cannot validate in the routing log", async () => {
+  // pi-orchestrator-zb6t: every pi process appends to the same routing log, so it can hold a record type this
+  // session's reader does not know, or a torn line. One such line made every verdict fail.
+  const h = routedHarness();
+  try {
+    const provider = scriptedAnthropic(runningScript);
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    const { worker } = await callSubagents(subagents.tool(), main.ctx, runTask("write", { path: "notes.md", content: "x\n" }));
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    const id = worker.sessionId!;
+    const recordDir = join(h.stateDir, "routing");
+    const day = `${readRoutingRecords(recordDir).find((record) => record.delegationId === id)!.timestamp.slice(0, 10)}.jsonl`;
+    const ladder = { recordType: "effort-ladder", schemaVersion: "decision-record/3", cause: "effort-ladder", delegationId: "bfa81cd8-0000-4000-8000-000000000001",
+      timestamp: new Date().toISOString(), previousDecisionId: "01a0e824-0000-4000-8000-000000000001", step: "unplaced", mode: "live",
+      detail: "its rung openai-codex/gpt-6-sol:high has no position in the elevated tier of the tier map", taskTextPrefix: "Retry of delegation", agentRole: "unknown" };
+    appendFileSync(join(recordDir, day), `${JSON.stringify(ladder)}\n${JSON.stringify({ ...ladder, step: "sideways" })}\n{"recordType":"fail\n`);
+    assert.equal(await recordVerdict(subagents, main.ctx, { delegationId: id, verdict: "accept", reason: "checked notes.md:1" }),
+      `Recorded accept on delegation ${id}.`);
+    assert.match(await recordVerdict(subagents, main.ctx, { delegationId: id, verdict: "request_changes", reason: "notes.md lacks a heading" }),
+      new RegExp(`^Recorded request_changes on delegation ${id}\\. It replaces the earlier accept\\. The effort ladder cannot place it`));
+    const { entries, skipped } = readUsableRoutingRecordEntries(recordDir);
+    assert.deepEqual(entries.flatMap(({ record }) => record.recordType === "verdict" ? [[record.delegationId, record.verdict]] : []), [[id, "accept"], [id, "request_changes"]]);
+    assert.deepEqual(skipped.map((line) => [line.file, line.error.field]), [[day, "step"], [day, "(record)"]], "the unplaced ladder record is read, the other two are skipped");
   } finally { h.cleanup(); }
 });
 

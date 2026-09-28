@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -18,12 +18,15 @@ import {
   buildAgentModelRecord,
   buildEditRecord,
   buildEffortLadderRecord,
+  buildForkRecord,
   buildGateRequirementRecord,
   buildUnplacedLadderRecord,
   DECISION_RECORD_SCHEMA_VERSION,
   decisionRecordPath,
   FREE_TEXT_LIMIT,
   readRoutingRecords,
+  readUsableRoutingRecordEntries,
+  readUsableRoutingRecords,
   RoutingRecordError,
   TASK_TEXT_PREFIX_LIMIT,
   validateRoutingRecord,
@@ -256,6 +259,61 @@ test("a folder reads legacy decisions, explicit records and verdicts beside new 
     assert.throws(() => validateRoutingRecord({ ...oldDecision, ranOn: SONNET }), /field 'ranOn' is not a known field/);
     assert.throws(() => validateRoutingRecord({ ...explicit, surprise: true }), /field 'surprise' is not a known field/);
     assert.throws(() => validateRoutingRecord({ ...verdict, surprise: true }), /field 'surprise' is not a known field/);
+  } finally { cleanup(); }
+});
+
+test("every record type the extension writes reads back; the usable reader skips each line it cannot validate and names it, the strict one throws at the first", async () => {
+  // pi-orchestrator-zb6t: every pi process appends to one folder, so it can hold a record written by
+  // another version of the extension, or a torn line. The verdict path reads past them.
+  const { dir, cleanup } = tempDir();
+  try {
+    const tierMap = fixtureTierMap();
+    const route = fixtureRoute("standard", tierMap);
+    assert.ok(route.ok);
+    const at = NOW;
+    const common = { recordType: "verdict", schemaVersion: DECISION_RECORD_SCHEMA_VERSION, timestamp: at.toISOString() } as const;
+    const written: RoutingRecord[] = [
+      writeDecisionRecord(dir, await liveInput()).record,
+      buildEffortLadderRecord({ delegationId: "retry-1", at, previousDecisionId: "attempt-live-1", step: "same-tier", mode: "live", skipped: [],
+        taskText: TASK, agentRole: "worker", kindOfWork: "implement", tierMap, route }),
+      buildUnplacedLadderRecord({ delegationId: "retry-2", at, previousDecisionId: "attempt-live-1", mode: "live",
+        detail: "its rung openai-codex/gpt-6-sol:high has no position in the elevated tier of the tier map", taskText: TASK, agentRole: "unknown" }),
+      buildForkRecord({ delegationId: "fork-1", at, model: SONNET, effort: "medium", parentSession: "session-1", forkPoint: null, banListException: false }),
+      buildAgentModelRecord({ delegationId: "agent-1", at, agent: "scout", definitionFile: "scout.md", model: SONNET, effort: "low" }),
+      buildEditRecord({ delegationId: "retry-2", at, orchestratorSession: "session-1", tool: "write" }),
+      buildGateRequirementRecord({ delegationId: "retry-2", at, gateLevel: "medium", gateAction: "spot-check" }),
+      { ...common, delegationId: "retry-2", verdict: "accept", decisionFile: "2026-09-25.jsonl", reason: "checked" },
+      { ...common, recordType: "orphaned-verdict", delegationId: "nobody", verdict: "request_changes" },
+    ];
+    for (const record of written.slice(1)) appendRoutingRecord(dir, record);
+    const path = decisionRecordPath(dir, NOW);
+    const readable = readRoutingRecords(dir);
+    assert.deepEqual(readable.map((record) => record.recordType),
+      ["decision", "effort-ladder", "effort-ladder", "fork", "agent-model", "edit", "gate-requirement", "verdict", "orphaned-verdict"]);
+
+    // What an older reader cannot validate: a newer ladder step, a record type it does not know, a newer schema version, a torn line.
+    const unplaced = written[2]!;
+    appendFileSync(path, [
+      JSON.stringify({ ...unplaced, step: "sideways" }),
+      JSON.stringify({ ...unplaced, recordType: "failover" }),
+      JSON.stringify({ ...unplaced, schemaVersion: "decision-record/4" }),
+      '{"recordType":"verdict","schemaVer',
+    ].join("\n") + "\n");
+    appendRoutingRecord(dir, buildEditRecord({ delegationId: "retry-3", at, orchestratorSession: "session-1", tool: "edit" }));
+
+    assert.throws(() => readRoutingRecords(dir), (error: unknown) => {
+      assert.ok(error instanceof RoutingRecordError, String(error));
+      assert.equal(error.message, "routing record 2026-09-25.jsonl:10: field 'step' must be one of effort, same-tier, next-tier, unplaced; got \"sideways\"");
+      return true;
+    });
+    const { entries, skipped } = readUsableRoutingRecordEntries(dir);
+    assert.deepEqual(entries.map((entry) => [entry.line, entry.record.recordType]),
+      [...readable.map((record, index) => [index + 1, record.recordType]), [14, "edit"]], "every valid line, the one after the bad ones too");
+    assert.deepEqual(skipped.map((line) => [line.file, line.line, line.error.field]),
+      [["2026-09-25.jsonl", 10, "step"], ["2026-09-25.jsonl", 11, "recordType"], ["2026-09-25.jsonl", 12, "schemaVersion"], ["2026-09-25.jsonl", 13, "(record)"]]);
+    assert.match(skipped[3]!.error.message, /^routing record 2026-09-25\.jsonl:13: field '\(record\)' is not valid JSON/);
+    assert.deepEqual(readUsableRoutingRecords(dir), entries.map((entry) => entry.record));
+    assert.deepEqual(readUsableRoutingRecordEntries(join(dir, "none")), { entries: [], skipped: [] }, "a folder that does not exist holds no records");
   } finally { cleanup(); }
 });
 
