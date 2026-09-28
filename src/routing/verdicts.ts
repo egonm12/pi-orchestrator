@@ -9,8 +9,12 @@
 //      never parsed.
 //   2. Attaching. `attachVerdict` looks the delegation id up in the
 //      record folder. A known id appends a `verdict` record linked to the
-//      decision; an unknown id appends an `orphaned-verdict` record. Both go
-//      into the day file of the verdict's own timestamp.
+//      delegation's decision: its routing decision, its fork or agent-model
+//      record, or, for an editing delegation the router did not route (routing
+//      off, or switched off by an error), its edit record. An unknown id
+//      appends an `orphaned-verdict` record. Both go into the day file of the
+//      verdict's own timestamp. The orchestrator's `subagents_verdict`
+//      (../subagents/verdict.ts) passes its reason on.
 //   3. Learning data. An `accept` or `request_changes` attached to a decision
 //      that chose a rung is also recorded in ticket 08's observation ledger as
 //      a `verified-task-outcome`: taskType is the classifier's kind of work,
@@ -18,8 +22,8 @@
 //      adds (the ledger dedupes on model, taskType and instance). The model is
 //      the one that ran the work: the chosen rung's model in live mode, the
 //      hand-picked model in shadow mode (owner decision, 2026-09-25), with the
-//      router's rung in the note. `missing`, an orphan and a refused decision
-//      record no observation.
+//      router's rung in the note. `missing`, an orphan, a refused decision
+//      and a delegation the router did not route record no observation.
 
 import { copyFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -36,8 +40,11 @@ import {
   DECISION_RECORD_SCHEMA_VERSION,
   isRoutedDecision,
   readRoutingRecordEntries,
+  type AgentModelRecord,
+  type EditRecord,
   type ForkRecord,
   type RoutedDecisionRecord,
+  type RoutingRecord,
   type Verdict,
 } from "./decision-record.ts";
 
@@ -90,17 +97,22 @@ export interface AttachVerdictInput {
   /** Ticket 18's delegation id of the reviewed work. */
   readonly delegationId: string;
   readonly verdict: Verdict;
+  /** Why the orchestrator judged so; an attached verdict records it, an orphan does not. */
+  readonly reason?: string;
   /** Defaults to now. */
   readonly at?: Date;
   /** Ticket 08's refresh state file holding the observation ledger. */
   readonly refreshStatePath: string;
 }
 
+/** A record a verdict attaches to: the delegation's decision of some kind. */
+export type VerdictTarget = RoutedDecisionRecord | ForkRecord | AgentModelRecord | EditRecord;
+
 export type AttachVerdictOutcome =
   | {
       readonly status: "attached";
       readonly recordPath: string;
-      readonly decision: RoutedDecisionRecord | ForkRecord;
+      readonly decision: VerdictTarget;
       /** Absent for `missing` and for a refused decision. */
       readonly observation?: CapabilityObservation;
     }
@@ -125,12 +137,16 @@ function observationFor(decision: RoutedDecisionRecord, verdict: Verdict, observ
   };
 }
 
+function isDecisionOfSomeKind(record: RoutingRecord): record is RoutedDecisionRecord | ForkRecord | AgentModelRecord {
+  return isRoutedDecision(record) || record.recordType === "fork" || record.recordType === "agent-model";
+}
+
 export function attachVerdict(input: AttachVerdictInput): AttachVerdictOutcome {
   const timestamp = (input.at ?? new Date()).toISOString();
-  const decisions = readRoutingRecordEntries(input.recordDir).filter(
-    (entry) => (isRoutedDecision(entry.record) || entry.record.recordType === "fork") && entry.record.delegationId === input.delegationId,
-  );
-  const latest = decisions.at(-1);
+  const entries = readRoutingRecordEntries(input.recordDir).filter((entry) => entry.record.delegationId === input.delegationId);
+  // An edit record stands in only when the delegation has no decision at all.
+  const latest = entries.filter((entry) => isDecisionOfSomeKind(entry.record)).at(-1) ??
+    entries.filter((entry) => entry.record.recordType === "edit").at(-1);
   if (latest === undefined) {
     const recordPath = appendRoutingRecord(input.recordDir, {
       recordType: "orphaned-verdict",
@@ -141,7 +157,7 @@ export function attachVerdict(input: AttachVerdictInput): AttachVerdictOutcome {
     });
     return { status: "orphaned", recordPath };
   }
-  const decision = latest.record as RoutedDecisionRecord | ForkRecord;
+  const decision = latest.record as VerdictTarget;
   const recordPath = appendRoutingRecord(input.recordDir, {
     recordType: "verdict",
     schemaVersion: DECISION_RECORD_SCHEMA_VERSION,
@@ -149,8 +165,11 @@ export function attachVerdict(input: AttachVerdictInput): AttachVerdictOutcome {
     timestamp,
     verdict: input.verdict,
     decisionFile: latest.file,
+    ...(input.reason === undefined ? {} : { reason: input.reason }),
   });
-  const observation = decision.recordType === "fork" ? undefined : observationFor(decision, input.verdict, timestamp);
+  // Only a routing decision teaches the router: a fork, an agent's named model
+  // and an unrouted worker chose no rung.
+  const observation = isRoutedDecision(decision) ? observationFor(decision, input.verdict, timestamp) : undefined;
   if (observation === undefined) return { status: "attached", recordPath, decision };
   const state = existsSync(input.refreshStatePath) ? loadRefreshState(input.refreshStatePath) : emptyRefreshState();
   saveRefreshState(input.refreshStatePath, recordCapabilityObservation(state, observation));

@@ -5,8 +5,8 @@
 //
 // Reads the record folder's day files and nothing else (no settings, no
 // ledger, no agent dir), and prints one line per tier and rung: decisions,
-// verdicts by kind, and the shadow agreement rate, then the totals and the
-// orphaned verdict count.
+// verdicts by kind, and the shadow agreement rate, then the totals, the
+// orphaned verdict count and the verdicts on unrouted delegations.
 //
 //   - A decision's row is the tier and rung it chose, or `<tier routing
 //     started at>, refused` when the router refused: the classified tier,
@@ -17,6 +17,11 @@
 //     chosen rung's model equals the hand-picked model. A refused shadow
 //     decision chose no rung, so it does not agree.
 //   - Orphaned verdicts count once per delegation id.
+//   - A verdict on a delegation the router did not route (a forked worker, an
+//     agent definition's named model, a worker that ran with routing off) has
+//     no row: it counts in its own line, once per delegation id, the newest
+//     winning.
+//   - Edit records (ADR 0010) mark editing delegations; they are not counted.
 //   - Ticket 27's `explicit` records (a call that named its own model) are
 //     not routing decisions and are not counted.
 //
@@ -50,6 +55,8 @@ export interface RoutingReport {
   readonly rows: readonly RoutingReportRow[];
   readonly totals: Omit<RoutingReportRow, "tier" | "rung">;
   readonly orphanedVerdicts: number;
+  /** The latest verdict of each delegation without a routing decision, by kind. */
+  readonly unroutedVerdicts: Readonly<Record<Verdict, number>>;
   readonly ladders: readonly EffortLadderRecord[];
 }
 
@@ -87,6 +94,8 @@ export function buildRoutingReport(folder: string, reader?: RecordFolderReader):
     else if (record.recordType === "orphaned-verdict") orphans.add(record.delegationId);
     // An `explicit` record (ticket 27) routed nothing: no row, no orphan.
   }
+  const unroutedVerdicts: Record<Verdict, number> = { accept: 0, request_changes: 0, missing: 0 };
+  for (const [delegationId, verdict] of verdicts) if (!decisions.has(delegationId)) unroutedVerdicts[verdict] += 1;
 
   const rows = new Map<string, MutableRow>();
   const totals = emptyCounts();
@@ -113,7 +122,7 @@ export function buildRoutingReport(folder: string, reader?: RecordFolderReader):
     if (b.rung === null) return -1;
     return a.rung < b.rung ? -1 : a.rung > b.rung ? 1 : 0;
   });
-  return { rows: ordered, totals, orphanedVerdicts: orphans.size, ladders: [...decisions.values()].filter((record): record is EffortLadderRecord => record.recordType === "effort-ladder") };
+  return { rows: ordered, totals, orphanedVerdicts: orphans.size, unroutedVerdicts, ladders: [...decisions.values()].filter((record): record is EffortLadderRecord => record.recordType === "effort-ladder") };
 }
 
 function agreement(shadowDecisions: number, shadowAgreements: number): string {
@@ -135,6 +144,8 @@ export function renderRoutingReport(folder: string, report: RoutingReport): stri
   }
   lines.push(`all: ${counts(report.totals)}`);
   lines.push(`orphaned verdicts: ${report.orphanedVerdicts}`);
+  const unrouted = report.unroutedVerdicts;
+  lines.push(`verdicts on unrouted delegations: accept ${unrouted.accept}, request_changes ${unrouted.request_changes}, missing ${unrouted.missing}`);
   for (const ladder of report.ladders) {
     lines.push(`effort ladder: ${ladder.previousDecisionId} -> ${ladder.delegationId}; ${ladder.step}; ${ladder.route.tier} ${ladder.route.rung.rung}`);
   }

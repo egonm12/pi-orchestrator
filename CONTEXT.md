@@ -47,6 +47,10 @@ _Avoid_: Role (that is the orchestrator/worker split), persona
 One handing of one piece of work from the orchestrator to a worker. Each attempt has a delegation id: the id of the worker's pi session. Resuming a finished worker continues the same delegation; a retry on the effort ladder is a new one. A delegation made by a worker, not by the orchestrator, has that worker's delegation as its parent delegation.
 _Avoid_: Dispatch, spawn
 
+**Editing delegation**:
+A delegation whose worker, or a worker it started, changed files or ran something that may have: anything beyond reading, searching, building and testing. It needs a verdict; a research delegation is checked but gets none.
+_Avoid_: Implementation delegation (the kind of work is the classifier's, editing is what the worker did)
+
 **Routing policy**:
 Rules selecting the rung for a task from the tier map, according to task risk, ambiguity, complexity and kind of work, with correctness prioritized over speed and cost. The execution role is the orchestrator's choice, not the router's.
 

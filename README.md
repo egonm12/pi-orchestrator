@@ -2,7 +2,7 @@
 
 A [pi](https://pi.dev) package with three extensions for sessions that delegate work to workers:
 
-- **Subagents**: the built-in `subagents` tool. It starts workers in the orchestrator's own process, on the auto model `orchestrator/auto`, and gives the orchestrator's own session the orchestrator protocol and the exploration budget.
+- **Subagents**: the built-in `subagents` tool. It starts workers in the orchestrator's own process, on the auto model `orchestrator/auto`, and gives the orchestrator's own session the orchestrator protocol, the exploration budget and the `subagents_verdict` tool.
 - **Router extension**: serves the auto model `orchestrator/auto`. It classifies a worker's first request into a tier and routes it to a rung from your tier map.
 - **Guard**: enforces a personal subagent ban list for workers and an optional session ban list for the orchestrator.
 
@@ -90,9 +90,39 @@ A worker's final reply is its Result. Every worker except a fork gets the report
 
 When a worker other than a fork completes, the runtime checks its Result's section headers, without a model call. A markdown heading or a bold label starting with a section's name counts, as does a plain line of the name alone or followed by a colon. A Result missing one or more sections gets a note naming them after its text in that worker's part of the tool result, and the item's `missingSections` in `details` lists them. The check never rejects a Result, and a complete one gets no note.
 
+### Verdicts
+
+A delegation that edited needs the orchestrator's verdict. It edited when its worker, or a worker it started (see Nested delegation below), ran one of these calls:
+
+- `edit` or `write`;
+- `bash` that is neither a read-only search nor a build or test run, as the exploration budget classifies it (see Exploration budget below): unrecognised commands, redirects into a file, and version-control actions such as `git commit` or `git checkout` all count; so does `powershell`;
+- `ctx_execute` or `ctx_execute_file`, which run whatever code they are given, although the budget counts them as exploratory.
+
+Only a call that ran counts: one a `tool_call` hook blocked, or one for a tool the worker does not have, edited nothing. Other tools, `mcp` and `ctx_batch_execute` included, do not count.
+
+The first editing call in a worker's run writes an edit record into the routing record folder (see State below): the delegation id, the orchestrator session and the tool, with `nestedDelegationId` when a worker's own worker made it. The fact outlives the worker, a pi reload and a resume of the orchestrator's session. A resumed delegation keeps its delegation id, and a resume that edits writes another edit record for it. The editing delegation's part of the tool result, and of a background call's completion notice, carries one line after the session file:
+
+```text
+This delegation edited. Judge its Result, then record a verdict with subagents_verdict.
+```
+
+A worker's own `subagents` call does not show the line: its workers' edits count for the worker's delegation, whose own Result shows it.
+
+The orchestrator records its verdict with `subagents_verdict`, `{ "delegationId": string, "verdict": "accept" | "request_changes", "reason": string }`, whether it judged the Result by its own spot check or by a reviewer's Result. The verdict is attached to the delegation's decision record, its fork or agent-model record, or, for a worker the router did not route (routing off or switched off by a failure), its edit record; a verdict on a known editing delegation is never orphaned. The reason is recorded with the verdict, credential-shaped text redacted and cut to 500 characters. A verdict on a routed delegation that chose a rung is also a learning observation, as before. The tool replies `Recorded <verdict> on delegation <id>.`, adding `It replaces the earlier <verdict>.` when there was one: a later verdict on the same delegation replaces the earlier one in the routing report, and the record keeps both. It refuses, and records nothing, when:
+
+- the delegation id is unknown;
+- the delegation did not edit: a research Result is checked but gets no verdict;
+- the id is a worker's own worker: the refusal names the delegation its edits count for;
+- the delegation is still queued or running;
+- the delegation belongs to another orchestrator session;
+- the verdict is not `accept` or `request_changes`, or the reason is blank;
+- a worker calls it: workers never get `subagents_verdict`, even when their agent definition's `tools:` list names it.
+
+The routing report, `node src/routing/routing-report.ts <state dir>/routing`, counts each delegation's latest verdict in its tier and rung's row. Verdicts on delegations without a routing decision (forks, agent-model workers and unrouted workers) have no row; they are counted on their own line, `verdicts on unrouted delegations: ...`.
+
 ### Orchestrator protocol
 
-The orchestrator's own session carries the orchestrator protocol as the `orchestrator_protocol` section of its system prompt: delegate exploration and substantial work to workers, keep small known actions (a single lookup, a small edit, a build or test run, a commit), stay within the exploration budget, which it names with the configured threshold, and treat a worker's Result as evidence to check before acting on it. The text lives in `src/subagents/orchestrator-protocol.ts`. The section is added when each user prompt starts its agent loop, so it holds for every turn of that loop and returns after a compaction. There is no per-prompt reminder line. Workers, forked workers and sessions in a pi-subagents child process never get it; a fork's copied conversation holds the orchestrator's section, and pi removes it from the fork's own prompt.
+The orchestrator's own session carries the orchestrator protocol as the `orchestrator_protocol` section of its system prompt: delegate exploration and substantial work to workers, keep small known actions (a single lookup, a small edit, a build or test run, a commit), stay within the exploration budget, which it names with the configured threshold, treat a worker's Result as evidence to check before acting on it, and judge each editing delegation's Result and record the verdict with `subagents_verdict` (see Verdicts above). The text lives in `src/subagents/orchestrator-protocol.ts`. The section is added when each user prompt starts its agent loop, so it holds for every turn of that loop and returns after a compaction. There is no per-prompt reminder line. Workers, forked workers and sessions in a pi-subagents child process never get it; a fork's copied conversation holds the orchestrator's section, and pi removes it from the fork's own prompt.
 
 A run that a message starts without a user prompt, such as a background call's completion notice or a worker's question, has the protocol for its first turn only: pi rebuilds the prompt of its later turns without the section, until the next user prompt adds it again.
 
@@ -105,7 +135,7 @@ pi-orchestrator: 3 exploratory calls this prompt. Hand the rest of the research 
 ```
 
 - **Exploratory:** `read`, pi's `grep`, `find` and `ls` tools, `web_search`, `fetch_content`, `get_search_content`, `source_check`, the `ctx_*` tools (`ctx_execute`, `ctx_execute_file`, `ctx_search`, `ctx_batch_execute`, `ctx_fetch_and_index`), `mcp` and `mcpScript`, and `bash` searches, listings and reads (`rg`, `grep`, `find`, `ls`, `cat`, `git log`, `git show`, `git diff` and similar). A spot check of a worker's Result counts like any other.
-- **Never counted:** `edit`, `write`, the subagents tools (`subagents`, `subagents_status`, `subagents_message`), an `mcp` install or sign-in (`action` `install`, `auth-start` or `auth-complete`), other tools, and `bash` builds, test runs and version-control actions (`npm test`, `npm run build`, `node --test`, `tsc`, `cargo test`, `git commit`, `git push`, `git add` and similar).
+- **Never counted:** `edit`, `write`, the subagents tools (`subagents`, `subagents_status`, `subagents_message`, `subagents_verdict`), an `mcp` install or sign-in (`action` `install`, `auth-start` or `auth-complete`), other tools, and `bash` builds, test runs and version-control actions (`npm test`, `npm run build`, `node --test`, `tsc`, `cargo test`, `git commit`, `git push`, `git add` and similar).
 - **Unrecognised `bash` counts.** So does any command that redirects output into a file (`> notes.md`, `| tee log`) or rewrites files (`sed -i`, `eslint --fix`, `npm run format`).
 
 A chained command (`&&`, `||`, `;`) is as strong as its strongest part: anything unrecognised, then a version-control action, then a search, then a build or test run. `cd src && rg foo` is a search, `git add -A && git commit -m x` a version-control action, and `rg foo && npm test` a search. A search that only filters a pipe adds nothing, so `npm test 2>&1 | tail -20` is a test run.
@@ -130,7 +160,7 @@ A call that has finished is no longer listed; its results are in its completion 
 
 ### Resume
 
-A `resume` item uses a finished worker's delegation id and a new task instead of `agent` or `fork`. It continues that worker's saved session and original pin without a new routing decision. Unknown, running and not-started workers cannot be resumed, nor can workers from another orchestrator session or those without a recoverable pin. The original pin must still pass the hard filters; otherwise the item fails without re-routing. A preserved agent model's ban-list exception is rechecked against current settings. Later verdicts for the same delegation replace earlier ones in the routing report; the record retains all verdicts. A resume item may be background: its delegation id stays the one it resumes.
+A `resume` item uses a finished worker's delegation id and a new task instead of `agent` or `fork`. It continues that worker's saved session and original pin without a new routing decision. Unknown, running and not-started workers cannot be resumed, nor can workers from another orchestrator session or those without a recoverable pin. The original pin must still pass the hard filters; otherwise the item fails without re-routing. A preserved agent model's ban-list exception is rechecked against current settings. Later verdicts for the same delegation replace earlier ones in the routing report; the record retains all verdicts. A resume that edits asks for a verdict again (see Verdicts above). A resume item may be background: its delegation id stays the one it resumes.
 
 Each item's result has a status:
 
@@ -336,7 +366,7 @@ Runtime state lives in `${PI_CODING_AGENT_DIR:-~/.pi/agent}/pi-orchestrator/`, o
 | File | Contents | When absent |
 |------|----------|-------------|
 | `authorized-recipients.json` | Providers you approved as data recipients | No provider is approved, so every route refuses |
-| `routing/*.jsonl` | One decision record per classified worker session (delegation id), one file per day | Created on the first record |
+| `routing/*.jsonl` | One decision record per classified worker session (delegation id), fork and agent-model records, verdicts, and the edit records of editing delegations, one file per day | Created on the first record |
 | `model-catalog.json` | Prices, context windows and usage headroom | Built from installed models and a pinned models.dev snapshot |
 | `refresh-state.json` | Throttling observations | No throttle |
 
@@ -351,7 +381,7 @@ Decision records keep the first 200 characters of the task text, with credential
   { "packages": [{ "source": "git:github.com/egonm12/pi-orchestrator", "extensions": ["!src/router/extension.ts"] }] }
   ```
 
-  Use `!src/guard/extension.ts` to keep the router and drop the guard, or `!src/subagents/extension.ts` to drop only the built-in `subagents` tool, and with it the orchestrator protocol, the exploration budget and `/pi-orchestrator budget`, and keep routing for other subagent extensions.
+  Use `!src/guard/extension.ts` to keep the router and drop the guard, or `!src/subagents/extension.ts` to drop only the built-in `subagents` tool, and with it the orchestrator protocol, the exploration budget, `/pi-orchestrator budget` and `subagents_verdict`, and keep routing for other subagent extensions.
 - **Everything, for one run**: `pi --no-extensions`.
 - **Uninstall**: `pi remove git:github.com/egonm12/pi-orchestrator`.
 

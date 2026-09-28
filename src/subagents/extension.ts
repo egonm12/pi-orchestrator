@@ -23,6 +23,7 @@ import { openTranscript } from "./transcript-view.ts";
 import { isWorkerSession } from "./worker-sessions.ts";
 import { addOrchestratorProtocol } from "./orchestrator-protocol.ts";
 import { registerExplorationBudget } from "./exploration-budget.ts";
+import { registerSubagentsVerdictTool } from "./verdict.ts";
 
 // The subagents extension (ADR 0007): a third pi extension, separate from the
 // router and the guard, with a `subagents` tool. Each call starts a worker in
@@ -35,6 +36,8 @@ import { registerExplorationBudget } from "./exploration-budget.ts";
 // draws them). Every worker is also on the worker board (worker-board.ts),
 // from the moment its item is queued, for the live worker view; the
 // orchestrator's session shows the active ones below the editor (worker-widget.ts).
+// A worker that edits leaves an edit record (editing.ts), its Result asks for
+// a verdict, and the orchestrator records one with subagents_verdict (verdict.ts).
 
 type ToolParameters = Parameters<ExtensionAPI["registerTool"]>[0]["parameters"];
 
@@ -95,6 +98,7 @@ export type SubagentResult = WorkerModelDetails & (
     readonly sessionId?: never;
     readonly sessionFile?: never;
     readonly missingSections?: never;
+    readonly edited?: never;
     readonly finalText: "";
     readonly error: string;
   })
@@ -103,6 +107,7 @@ export type SubagentResult = WorkerModelDetails & (
     readonly sessionId?: never;
     readonly sessionFile?: never;
     readonly missingSections?: never;
+    readonly edited?: never;
     readonly finalText: "";
     readonly error?: never;
   }));
@@ -125,13 +130,19 @@ export interface SubagentsProgressDetails {
   readonly results: readonly SubagentProgress[];
 }
 
-function resultText(result: SubagentResult): string {
+/** The line that asks the orchestrator for a verdict on an editing delegation (ADR 0010). */
+const EDITED_NOTE = "This delegation edited. Judge its Result, then record a verdict with subagents_verdict.";
+
+/** One item's text in the tool result. `forOrchestrator` is false in a
+ *  worker's own call, whose workers' edits count for the worker's delegation. */
+function resultText(result: SubagentResult, forOrchestrator: boolean): string {
   if (result.status === "not-started") return `Worker not started: ${result.task}`;
   if (result.sessionId === undefined) return `No worker started: ${result.error}`;
   const outcome = result.status === "completed" ? "completed." : `${result.status}${result.error ? `: ${result.error}` : "."}`;
   return [
     `Worker ${result.sessionId} ${outcome}`,
     `Session file: ${result.sessionFile ?? "none, the session was not saved"}`,
+    ...(result.edited && forOrchestrator ? [EDITED_NOTE] : []),
     "",
     result.finalText,
     // The runtime's Result check (ADR 0010) annotates and never rejects.
@@ -410,7 +421,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
             }
           }
           const details: SubagentsDetails = { results };
-          return { text: results.map(resultText).join("\n\n"), details };
+          return { text: results.map((result) => resultText(result, parentDelegationId === undefined)).join("\n\n"), details };
         };
         if (backgroundCall) {
           backgroundCall.finish(finishCall());
@@ -495,6 +506,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
       },
     });
     registerSubagentsStatusTool(pi, backgroundCalls);
+    registerSubagentsVerdictTool(pi);
     pi.on("session_shutdown", () => {
       // First, so the workers stopped below never reach the ending session's UI.
       stopDownEntry?.();

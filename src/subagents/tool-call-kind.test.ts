@@ -139,7 +139,8 @@ test("each tool is classified by its name, and bash by its command", () => {
     ["mcp", { tool: "linear_list_issues" }], ["mcp", { search: "issues" }], ["mcp", {}], ["mcpScript", { code: "emit(1)" }],
   ]), Array(17).fill("read-only"));
   assert.deepEqual(kinds([["edit", { path: "a" }], ["write", { path: "a" }]]), ["edit", "edit"]);
-  assert.deepEqual(kinds([["subagents", { items: [] }], ["subagents_status", {}], ["subagents_message", {}]]), ["delegation", "delegation", "delegation"]);
+  assert.deepEqual(kinds([["subagents", { items: [] }], ["subagents_status", {}], ["subagents_message", {}], ["subagents_verdict", {}]]),
+    Array(4).fill("delegation"));
   assert.deepEqual(kinds([
     ["bash", { command: "rg foo" }], ["bash", { command: "npm test" }], ["bash", { command: "git push" }], ["bash", { command: "rm x" }],
   ]), ["read-only", "build-test", "version-control", "unrecognised"]);

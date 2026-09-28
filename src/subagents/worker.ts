@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { appendRoutingRecord, buildAgentModelRecord, buildForkRecord } from "../routing/decision-record.ts";
 import { stateDir } from "../router/extension.ts";
 import { markWorkerSession } from "./worker-sessions.ts";
+import { trackEdits } from "./editing.ts";
 import type { ResumeWorker } from "./resume.ts";
 import type { BackgroundMessageMode } from "./background.ts";
 import { REPORT_TOOL, reportExtension, type WorkerReports } from "./report.ts";
@@ -48,6 +49,9 @@ export interface WorkerResult {
   /** The Result sections a completed non-fork worker's final text has no
    *  header for (ADR 0010); absent when none is missing, and for a fork. */
   readonly missingSections?: readonly ResultSection[];
+  /** The worker, or a worker it started, edited in this run, so its
+   *  delegation needs a verdict (ADR 0010); absent when it did not. */
+  readonly edited?: true;
 }
 
 export interface WorkerSetup {
@@ -161,20 +165,32 @@ export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
   const activity: ActivitySoFar = { sessionFile: undefined, turns: 0, text: "" };
   const report = (ended: boolean) => setup.onActivity?.({ ...activity, ended });
   try {
-    return await runWorkerSession(setup, activity, () => report(false));
+    const sessionManager = workerSessionManager(setup);
+    // An edit counts for the orchestrator's delegation, however the worker ends (editing.ts).
+    const edits = trackEdits({ sessionId: sessionManager.getSessionId(), orchestratorSession: setup.orchestratorSession.getSessionId(),
+      recordDir: join(stateDir(), "routing"), ...(setup.parentDelegationId === undefined ? {} : { parentDelegationId: setup.parentDelegationId }) });
+    try {
+      const result = await runWorkerSession(setup, sessionManager, edits.extension, activity, () => report(false));
+      return edits.edited() ? { ...result, edited: true } : result;
+    } finally { edits.stop(); }
   } finally { report(true); }
 }
 
-/** `runWorker`'s body: it moves `activity` on and calls `report` at each step. */
-async function runWorkerSession(setup: WorkerSetup, activity: ActivitySoFar, report: () => void): Promise<WorkerResult> {
-  // A fork's session is copied beforehand, already carrying any background delegation id;
-  // a resumed worker reopens its saved session.
+/** The worker's session: a fork's copy, already carrying any background
+ *  delegation id; a resumed worker's saved session; or a new one. */
+function workerSessionManager(setup: WorkerSetup): SessionManager {
   const sessionOptions = setup.sessionId === undefined ? undefined : { id: setup.sessionId };
-  const sessionManager = setup.resume
+  return setup.resume
     ? SessionManager.open(setup.resume.file, workerSessionDir(setup.orchestratorSession), setup.cwd)
     : setup.fork?.sessionManager ?? (setup.orchestratorSession.getSessionFile() === undefined
       ? SessionManager.inMemory(setup.cwd, sessionOptions)
       : SessionManager.create(setup.cwd, workerSessionDir(setup.orchestratorSession), sessionOptions));
+}
+
+/** `runWorker`'s body: it moves `activity` on and calls `report` at each
+ *  step. `editTracking` is the worker's extension that records its edits. */
+async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManager, editTracking: InlineExtension,
+  activity: ActivitySoFar, report: () => void): Promise<WorkerResult> {
   const sessionId = sessionManager.getSessionId();
   activity.sessionFile = sessionManager.getSessionFile();
   report();
@@ -198,7 +214,7 @@ async function runWorkerSession(setup: WorkerSetup, activity: ActivitySoFar, rep
       cwd: setup.cwd,
       agentDir: setup.agentDir,
       resourceLoaderOptions: {
-        extensionFactories: [...(setup.extensionFactories ?? []), ...(reports === undefined ? [] : [reportExtension(reports)])],
+        extensionFactories: [...(setup.extensionFactories ?? []), editTracking, ...(reports === undefined ? [] : [reportExtension(reports)])],
         ...(setup.tools?.includes(SUBAGENTS_TOOL) ? {} : { extensionsOverride: withoutSubagentsTool }),
         ...(appendedPrompt.length === 0 ? {} : { appendSystemPromptOverride: (base: string[]) => [...base, ...appendedPrompt] }),
       },

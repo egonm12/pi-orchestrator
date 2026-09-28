@@ -16,6 +16,7 @@ import {
 import {
   appendRoutingRecord,
   buildAgentModelRecord,
+  buildEditRecord,
   buildEffortLadderRecord,
   DECISION_RECORD_SCHEMA_VERSION,
   decisionRecordPath,
@@ -270,6 +271,44 @@ test("an agent-model record shares the routing day file, validates on read, and 
     assert.throws(() => validateRoutingRecord({ ...record, schemaVersion: "decision-record\/2" }), /field 'schemaVersion'/);
     assert.deepEqual(validateRoutingRecord({ ...record, banListException: true }), { ...record, banListException: true });
     assert.throws(() => validateRoutingRecord({ ...record, banListException: "true" }), /field 'banListException'/);
+  } finally { cleanup(); }
+});
+
+test("an edit record names its orchestrator session and tool, and a worker's own worker beside the delegation it counts for", async () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    const own = buildEditRecord({ delegationId: "worker-1", at: NOW, orchestratorSession: "orchestrator-1", tool: "write" });
+    const nested = buildEditRecord({ delegationId: "worker-1", at: NOW, orchestratorSession: "orchestrator-1", tool: "bash", nestedDelegationId: "worker-2" });
+    appendRoutingRecord(dir, own);
+    appendRoutingRecord(dir, nested);
+    assert.deepEqual(readRoutingRecords(dir), [
+      { recordType: "edit", schemaVersion: "decision-record/3", delegationId: "worker-1", timestamp: NOW.toISOString(), orchestratorSession: "orchestrator-1", tool: "write" },
+      { recordType: "edit", schemaVersion: "decision-record/3", delegationId: "worker-1", timestamp: NOW.toISOString(), orchestratorSession: "orchestrator-1", tool: "bash",
+        nestedDelegationId: "worker-2" },
+    ]);
+    assert.throws(() => validateRoutingRecord({ ...own, surprise: true }), /field 'surprise' is not a known field/);
+    assert.throws(() => validateRoutingRecord({ ...own, orchestratorSession: "" }), /field 'orchestratorSession'/);
+    const { tool: _tool, ...withoutTool } = own;
+    assert.throws(() => validateRoutingRecord(withoutTool), /field 'tool' is missing/);
+    assert.throws(() => validateRoutingRecord({ ...own, nestedDelegationId: "worker-1" }), /field 'nestedDelegationId' must name a different delegation/);
+    assert.throws(() => validateRoutingRecord({ ...own, schemaVersion: "decision-record/2" }), /field 'schemaVersion'/);
+  } finally { cleanup(); }
+});
+
+test("a verdict's reason is optional, must not be blank, and has credentials redacted and its length bounded like other free text", async () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    const verdict = { recordType: "verdict", schemaVersion: DECISION_RECORD_SCHEMA_VERSION, delegationId: "worker-1", timestamp: NOW.toISOString(),
+      verdict: "accept", decisionFile: "2026-09-25.jsonl" } as const;
+    appendRoutingRecord(dir, verdict);
+    appendRoutingRecord(dir, { ...verdict, reason: `checked with api_key=abc123 ${"x".repeat(2 * FREE_TEXT_LIMIT)}` });
+    const [plain, reasoned] = readRoutingRecords(dir);
+    assert.deepEqual(plain, verdict);
+    const reason = (reasoned as { reason?: string }).reason ?? "";
+    assert.ok(reason.startsWith("checked with api_key=[redacted] x"), reason);
+    assert.equal(reason.length, FREE_TEXT_LIMIT);
+    assert.throws(() => validateRoutingRecord({ ...verdict, reason: " " }), /field 'reason'/);
+    assert.throws(() => validateRoutingRecord({ ...verdict, reason: "x".repeat(FREE_TEXT_LIMIT + 1) }), /field 'reason' holds 501 characters/);
   } finally { cleanup(); }
 });
 

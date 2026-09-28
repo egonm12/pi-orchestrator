@@ -15,7 +15,7 @@ import { isOrchestratorSession } from "./orchestrator-session.ts";
 export const ORCHESTRATOR_PROTOCOL_SECTION = "orchestrator_protocol";
 
 // One entry per rule, in the order the orchestrator reads them. A later rule
-// (verdicts, reviewer, gate level) is one more entry here. The exploration
+// (reviewer, retries, gate level) is one more entry here. The exploration
 // budget's entry names the owner's threshold (exploration-budget.ts).
 const paragraphs = (explorationBudget: number): readonly string[] => [
   "You are the orchestrator. You own clarification, task decomposition, delegation, synthesis and acceptance. " +
@@ -34,6 +34,11 @@ const paragraphs = (explorationBudget: number): readonly string[] => [
   "A worker's Result is evidence, not a verdict. Check it before you act on it: does every claim carry file:line evidence, " +
     "does it say what it could not verify, does anything contradict what you already know? Do not build on a claim without " +
     "evidence: check that claim yourself, or resume the worker with the `subagents` tool and ask for it.",
+  "A delegation that edited (its worker, or a worker it started, ran edit, write, ctx_execute or a bash command that is not a " +
+    "read-only search or a build or test run) needs your verdict; its Result says so. Judge the change itself, not the worker's " +
+    "account of it: spot-check the diff and the claims that matter, or read a reviewer's Result. Then record the verdict with " +
+    "`subagents_verdict`: the delegation id, accept or request_changes, and a reason naming what you checked. A later verdict on " +
+    "the same delegation replaces the earlier one, and a resume that edits again needs a new one. A research Result gets no verdict.",
 ];
 
 /** The protocol text, as the orchestrator's system prompt carries it, for

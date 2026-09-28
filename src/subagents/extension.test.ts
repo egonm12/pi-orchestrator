@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { after, test } from "node:test";
@@ -2878,4 +2878,259 @@ test("/pi-orchestrator budget takes only off, and tells the owner which prompt i
     assert.deepEqual(await subagents.runCommand("pi-orchestrator", "budget off", at(false)), ["pi-orchestrator: exploration budget off for the rest of this prompt."]);
     assert.deepEqual(await subagents.runCommand("pi-orchestrator", "budget off", at(true)), ["pi-orchestrator: exploration budget off for the next prompt."]);
   } finally { h.cleanup(); }
+});
+
+// Verdicts on editing delegations (ADR 0010): a worker that edits leaves an
+// edit record behind it, its Result tells the orchestrator to judge it, and
+// subagents_verdict records the verdict on the decision record.
+
+const EDITED_LINE = "This delegation edited. Judge its Result, then record a verdict with subagents_verdict.";
+
+/** A worker makes one tool call for each of its user messages that starts with
+ *  "Run:" (`{ "name": ..., "arguments": ... }` as JSON after it), then says
+ *  "ran"; a worker with none follows delegatingScript. */
+function runningScript(request: ScriptedRequest): ScriptedReply {
+  const runs = request.userMessages.filter((message) => message.startsWith("Run:"));
+  if (runs.length === 0) return delegatingScript(request);
+  if (request.toolResults.length >= runs.length) return { text: "ran" };
+  return { toolCall: JSON.parse(runs.at(-1)!.slice("Run:".length)) as { name: string; arguments: Record<string, unknown> } };
+}
+
+/** A task that makes the worker call `name` with `args` once. */
+const runTask = (name: string, args: Record<string, unknown>) => `Run:${JSON.stringify({ name, arguments: args })}`;
+
+/** Installed tools a worker may have besides pi's built-ins: context-mode's
+ *  ctx_execute, and a guard that blocks writing blocked.txt. */
+const CTX_AND_GUARD: InlineExtension = { name: "ctx-and-guard", factory: (pi) => {
+  pi.registerTool({
+    name: "ctx_execute", label: "ctx_execute", description: "Runs code.",
+    parameters: { type: "object", properties: { code: { type: "string" } } } as unknown as Tool["parameters"],
+    async execute() { return { content: [{ type: "text", text: "ran" }], details: undefined }; },
+  });
+  pi.on("tool_call", (event) => (event.input as { path?: string }).path === "blocked.txt" ? { block: true, reason: "blocked by the guard" } : undefined);
+} };
+
+function editRecords(h: Harness) {
+  return readRoutingRecords(join(h.stateDir, "routing")).flatMap((record) => record.recordType === "edit" ? [record] : []);
+}
+
+async function recordVerdict(subagents: LoadedSubagents, ctx: ExtensionContext, params: Record<string, unknown>): Promise<string> {
+  const result = await subagents.tool("subagents_verdict").execute("verdict-call", params as never, undefined, undefined, ctx);
+  return toolText(result);
+}
+
+async function refusal(subagents: LoadedSubagents, ctx: ExtensionContext, params: Record<string, unknown>): Promise<string> {
+  try { await recordVerdict(subagents, ctx, params); } catch (error) { return (error as Error).message; }
+  assert.fail(`subagents_verdict accepted ${JSON.stringify(params)}`);
+}
+
+function routedHarness(settings?: Record<string, unknown>): Harness {
+  const h = harness(settings);
+  mkdirSync(h.stateDir, { recursive: true });
+  saveAuthorization(join(h.stateDir, "authorized-recipients.json"), approvedAnthropic());
+  return h;
+}
+
+test("edit, write, unrecognised bash, git and ctx_execute in a worker make its delegation editing; reads, builds and blocked calls do not", async () => {
+  const h = routedHarness();
+  try {
+    writeFileSync(join(h.projectDir, "README.md"), "# Project\n");
+    writeFileSync(join(h.projectDir, "index.js"), "export const x = 1;\n");
+    const provider = scriptedAnthropic(runningScript);
+    const subagents = loadSubagents([routerExtension(), provider.extension, CTX_AND_GUARD]);
+    const main = orchestrator(h);
+    const editing = [
+      runTask("write", { path: "notes.md", content: "x\n" }),
+      runTask("edit", { path: "README.md", edits: [{ oldText: "# Project", newText: "# The project" }] }),
+      runTask("bash", { command: "echo hi > out.txt" }),
+      runTask("bash", { command: "git commit -m wip" }),
+      runTask("ctx_execute", { code: "ls" }),
+    ];
+    const notEditing = [
+      runTask("read", { path: "README.md" }),
+      runTask("bash", { command: "rg Project README.md" }),
+      runTask("bash", { command: "node --check index.js" }),
+      runTask("write", { path: "blocked.txt", content: "x\n" }),
+    ];
+    const call = async (id: string, tasks: readonly string[]) => {
+      const result = await subagents.tool().execute(id, { items: tasks.map((task) => ({ task })) } as never, undefined, undefined, main.ctx);
+      const { results } = result.details as SubagentsDetails;
+      assert.deepEqual(results.map((worker) => worker.status), tasks.map(() => "completed"), JSON.stringify(results));
+      // Each item's text in the tool result, split at the next item's first line.
+      return { results, texts: toolText(result).split(/\n\n(?=Worker )/) };
+    };
+    const edited = await call("call-edits", editing);
+    assert.deepEqual(edited.results.map((worker) => worker.edited), Array(5).fill(true));
+    assert.deepEqual(edited.texts.map((text) => text.includes(EDITED_LINE)), Array(5).fill(true), edited.texts.join("\n---\n"));
+    const unedited = await call("call-reads", notEditing);
+    assert.deepEqual(unedited.results.map((worker) => worker.edited), Array(4).fill(undefined));
+    assert.deepEqual(unedited.texts.map((text) => text.includes(EDITED_LINE)), Array(4).fill(false));
+    assert.equal(existsSync(join(h.projectDir, "blocked.txt")), false, "the guard blocked the write");
+    // The edit outlives the worker: one record per editing delegation, naming the orchestrator's session.
+    // Workers run in parallel, so the records come in the order the edits ran.
+    const byDelegation = (rows: readonly (readonly unknown[])[]) => [...rows].sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+    assert.deepEqual(byDelegation(editRecords(h).map((record) => [record.delegationId, record.tool, record.orchestratorSession, record.nestedDelegationId])),
+      byDelegation(edited.results.map((worker, index) => [worker.sessionId, ["write", "edit", "bash", "bash", "ctx_execute"][index], main.sessionId, undefined])));
+  } finally { h.cleanup(); }
+});
+
+test("subagents_verdict records accept and request_changes with a reason; the report counts the latest verdict per delegation", async () => {
+  const h = routedHarness();
+  try {
+    const provider = scriptedAnthropic(runningScript);
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    const { worker } = await callSubagents(subagents.tool(), main.ctx, runTask("write", { path: "notes.md", content: "x\n" }));
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    const id = worker.sessionId!;
+    assert.equal(await recordVerdict(subagents, main.ctx, { delegationId: id, verdict: "request_changes", reason: "notes.md lacks a heading" }),
+      `Recorded request_changes on delegation ${id}.`);
+    const recordDir = join(h.stateDir, "routing");
+    assert.deepEqual(buildRoutingReport(recordDir).totals.verdicts, { accept: 0, request_changes: 1, missing: 0 });
+    assert.equal(await recordVerdict(subagents, main.ctx, { delegationId: id, verdict: "accept", reason: "checked notes.md:1" }),
+      `Recorded accept on delegation ${id}. It replaces the earlier request_changes.`);
+    assert.deepEqual(buildRoutingReport(recordDir).totals.verdicts, { accept: 1, request_changes: 0, missing: 0 });
+    const records = readRoutingRecords(recordDir);
+    const decision = records.find((record) => record.recordType === "decision");
+    assert.ok(decision);
+    const verdicts = records.flatMap((record) => record.recordType === "verdict" ? [record] : []);
+    assert.deepEqual(verdicts.map((record) => [record.delegationId, record.verdict, record.reason]),
+      [[id, "request_changes", "notes.md lacks a heading"], [id, "accept", "checked notes.md:1"]]);
+    assert.equal(verdicts[0]!.decisionFile, `${decision.timestamp.slice(0, 10)}.jsonl`, "attached to the decision record's day file");
+    assert.equal(records.some((record) => record.recordType === "orphaned-verdict"), false);
+  } finally { h.cleanup(); }
+});
+
+test("subagents_verdict refuses an unknown or non-editing delegation, a running one, another orchestrator session's, and a bad verdict or blank reason", async () => {
+  const h = routedHarness();
+  try {
+    const provider = scriptedAnthropic(runningScript, (request) => request.task === "Hold on");
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    const research = await callSubagents(subagents.tool(), main.ctx, "Look around");
+    const editing = await callSubagents(subagents.tool(), main.ctx, runTask("write", { path: "notes.md", content: "x\n" }));
+    const researchId = research.worker.sessionId!, editingId = editing.worker.sessionId!;
+    const accept = (delegationId: string) => ({ delegationId, verdict: "accept", reason: "checked" });
+
+    assert.equal(await refusal(subagents, main.ctx, accept("0b7c7a5e-0000-4000-8000-000000000000")),
+      "subagents_verdict: unknown delegation id 0b7c7a5e-0000-4000-8000-000000000000");
+    assert.equal(await refusal(subagents, main.ctx, accept(researchId)),
+      `subagents_verdict: delegation ${researchId} did not edit; a research Result is checked but gets no verdict`);
+    assert.equal(await refusal(subagents, orchestrator(h).ctx, accept(editingId)),
+      `subagents_verdict: delegation ${editingId} belongs to another orchestrator session`);
+    assert.equal(await refusal(subagents, main.ctx, { delegationId: editingId, verdict: "maybe", reason: "checked" }),
+      "subagents_verdict requires a delegationId, a verdict of accept or request_changes, and a reason");
+    assert.equal(await refusal(subagents, main.ctx, { delegationId: editingId, verdict: "accept", reason: "  " }),
+      "subagents_verdict requires a delegationId, a verdict of accept or request_changes, and a reason");
+
+    const stop = new AbortController();
+    const held = subagents.tool().execute("call-hold", { items: [{ task: "Hold on" }] } as never, stop.signal, undefined, main.ctx);
+    await waitFor(() => provider.requests.some((request) => request.task === "Hold on"), "the held worker's first request");
+    const heldId = provider.requests.find((request) => request.task === "Hold on")!.sessionId!;
+    assert.equal(await refusal(subagents, main.ctx, accept(heldId)),
+      `subagents_verdict: delegation ${heldId} is still running; judge its Result once it has finished`);
+    stop.abort();
+    await held;
+
+    // A worker cannot record verdicts on the orchestrator's delegations.
+    const unmark = markWorkerSession(main.sessionId);
+    try {
+      assert.equal(await refusal(subagents, main.ctx, accept(editingId)), "subagents_verdict: only the orchestrator records verdicts");
+    } finally { unmark(); }
+    assert.equal(readRoutingRecords(join(h.stateDir, "routing")).some((record) => record.recordType === "verdict" || record.recordType === "orphaned-verdict"), false,
+      "a refused verdict is not recorded");
+  } finally { h.cleanup(); }
+});
+
+test("a worker's own worker's edits count for the delegation that started it, which alone takes the verdict", async () => {
+  const h = routedHarness();
+  try {
+    writeAgentDefinition(join(h.agentDir, "agents"), "lead.md", { name: "lead", description: "Delegates", tools: "read, subagents, subagents_verdict" }, "Split the work.");
+    const provider = scriptedAnthropic(runningScript);
+    const subagents = loadSubagents(installedWithSubagents(provider.extension, 1));
+    const main = orchestrator(h);
+    const { worker, text } = await callSubagents(subagents.tool(), main.ctx,
+      `Delegate:${JSON.stringify({ items: [{ task: runTask("write", { path: "notes.md", content: "x\n" }) }] })}`, "lead");
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.equal(worker.edited, true);
+    assert.ok(text.includes(EDITED_LINE), text);
+    const leadRequests = provider.requests.filter((request) => request.sessionId === worker.sessionId);
+    assert.equal(leadRequests[0]?.tools.includes("subagents_verdict"), false, "a worker never gets subagents_verdict");
+    assert.equal(leadRequests.at(-1)?.toolResults[0]?.text.includes(EDITED_LINE), false, "the lead is not asked for a verdict");
+    const [record, ...others] = editRecords(h);
+    assert.deepEqual(others, []);
+    assert.ok(record);
+    const nestedId = record.nestedDelegationId!;
+    assert.equal(record.delegationId, worker.sessionId);
+    assert.equal(record.orchestratorSession, main.sessionId);
+    assert.equal(provider.requests.some((request) => request.sessionId === nestedId), true, "the nested worker made the edit");
+    assert.equal(await refusal(subagents, main.ctx, { delegationId: nestedId, verdict: "accept", reason: "checked" }),
+      `subagents_verdict: delegation ${nestedId} is a worker's own worker; its edits count for delegation ${worker.sessionId}, so record the verdict there`);
+    assert.equal(await recordVerdict(subagents, main.ctx, { delegationId: worker.sessionId!, verdict: "accept", reason: "checked notes.md" }),
+      `Recorded accept on delegation ${worker.sessionId}.`);
+  } finally { h.cleanup(); }
+});
+
+test("a resumed delegation's edits belong to it, and its verdict attaches to its one decision record", async () => {
+  const h = routedHarness();
+  try {
+    writeFileSync(join(h.projectDir, "README.md"), "# Project\n");
+    const provider = scriptedAnthropic(runningScript);
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    const first = await callSubagents(subagents.tool(), main.ctx, runTask("read", { path: "README.md" }));
+    const id = first.worker.sessionId!;
+    assert.equal(first.worker.edited, undefined);
+    assert.equal(await refusal(subagents, main.ctx, { delegationId: id, verdict: "accept", reason: "checked" }),
+      `subagents_verdict: delegation ${id} did not edit; a research Result is checked but gets no verdict`);
+    const resumed = await subagents.tool().execute("call-2", { items: [{ resume: id, task: runTask("write", { path: "notes.md", content: "x\n" }) }] } as never,
+      undefined, undefined, main.ctx);
+    const worker = (resumed.details as SubagentsDetails).results[0]!;
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.equal(worker.sessionId, id);
+    assert.equal(worker.edited, true);
+    assert.ok(toolText(resumed).includes(EDITED_LINE));
+    assert.deepEqual(editRecords(h).map((record) => record.delegationId), [id]);
+    assert.equal(await recordVerdict(subagents, main.ctx, { delegationId: id, verdict: "accept", reason: "checked notes.md" }), `Recorded accept on delegation ${id}.`);
+    assert.deepEqual(buildRoutingReport(join(h.stateDir, "routing")).totals, {
+      decisions: 1, verdicts: { accept: 1, request_changes: 0, missing: 0 }, shadowDecisions: 0, shadowAgreements: 0,
+    });
+  } finally { h.cleanup(); }
+});
+
+test("a verdict on a fork, an agent's named model or an unrouted worker attaches to its record, is never orphaned, and the report counts it", async () => {
+  for (const kind of ["fork", "agent-model", "unrouted"] as const) {
+    const h = routedHarness({ orchestrator: {
+      routing: kind === "unrouted" ? { ...ROUTING, enabled: false } : ROUTING,
+      subagents: { agentDefinitionModel: { use: kind === "agent-model" ? "preserve" : "route" } },
+    } });
+    try {
+      writeAgentDefinition(join(h.agentDir, "agents"), "scribe.md", { name: "scribe", description: "Writes", model: HAIKU }, "Write notes.");
+      const provider = scriptedAnthropic(runningScript);
+      const subagents = loadSubagents([routerExtension(), provider.extension]);
+      const parent = SessionManager.create(h.projectDir, join(h.agentDir, "sessions", "--project--"));
+      parent.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "subagents", arguments: {} }], stopReason: "toolUse", timestamp: Date.now() } as never);
+      const ctx = { cwd: h.projectDir, hasUI: false, sessionManager: parent, model: { provider: "anthropic", id: "claude-haiku-4-5" }, thinkingLevel: "low" } as unknown as ExtensionContext;
+      const task = runTask("write", { path: "notes.md", content: "x\n" });
+      const item = kind === "fork" ? { task, fork: true } : kind === "agent-model" ? { task, agent: "scribe" } : { task };
+      const result = await subagents.tool().execute("call-1", { items: [item] } as never, undefined, undefined, ctx);
+      const worker = (result.details as SubagentsDetails).results[0]!;
+      assert.equal(worker.status, "completed", `${kind}: ${JSON.stringify(worker)}`);
+      assert.equal(worker.edited, true, kind);
+      const id = worker.sessionId!;
+      assert.equal(await recordVerdict(subagents, ctx, { delegationId: id, verdict: "request_changes", reason: "no heading" }), `Recorded request_changes on delegation ${id}.`);
+      const records = readRoutingRecords(join(h.stateDir, "routing"));
+      assert.deepEqual(records.map((record) => record.recordType), [...(kind === "unrouted" ? [] : [kind]), "edit", "verdict"], kind);
+      const report = buildRoutingReport(join(h.stateDir, "routing"));
+      assert.equal(report.orphanedVerdicts, 0, kind);
+      assert.deepEqual(report.unroutedVerdicts, { accept: 0, request_changes: 1, missing: 0 }, kind);
+    } finally { h.cleanup(); }
+  }
+});
+
+test("the protocol tells the orchestrator to judge an editing delegation's Result and record the verdict with subagents_verdict", () => {
+  const protocol = orchestratorProtocol(3);
+  const paragraph = protocol.split("\n\n").find((text) => text.includes("subagents_verdict"));
+  assert.ok(paragraph, protocol);
+  for (const phrase of ["edited", "accept", "request_changes", "reason", "replaces", "research", "resume"]) assert.ok(paragraph.includes(phrase), `${phrase}: ${paragraph}`);
 });

@@ -3,8 +3,9 @@
 // One append-only JSON line per routing decision, one file per UTC day,
 // `<folder>/<YYYY-MM-DD>.jsonl`. The folder is injected; the harness default
 // is `src/state/routing` (git-ignored runtime state, like ticket 08's
-// refresh state). Verdicts attached later (./verdicts.ts) are further lines in
-// the same day files, so the folder holds every routing fact and nothing else.
+// refresh state). Verdicts attached later (./verdicts.ts) and the edit records
+// of editing delegations (../subagents/editing.ts) are further lines in the
+// same day files, so the folder holds every routing fact and nothing else.
 //
 // The writer copies each field it records by name from the values it is
 // given: ticket 23's classification, ticket 22's resolved tier map, ticket
@@ -15,7 +16,8 @@
 // settings file, a token) can reach the file.
 //
 // Free text (task text, the classifier's `why` and reasons, hop details,
-// route messages, removal and drop reasons, skipped-rung details) passes one
+// route messages, removal and drop reasons, skipped-rung details, verdict
+// reasons) passes one
 // function, `recordSafeCopy`, on every write path: credential-shaped
 // substrings become `[redacted]` (best effort, see `CREDENTIAL_PATTERNS`),
 // then task text is cut to its first 200 characters and every other free-text
@@ -107,6 +109,7 @@ const FREE_TEXT_FIELDS: readonly (readonly [path: readonly string[], limit: numb
   [["route", "allowanceApplied"], FREE_TEXT_LIMIT],
   [["route", "removed", "[]", "detail"], FREE_TEXT_LIMIT],
   [["skipped", "[]", "detail"], FREE_TEXT_LIMIT],
+  [["reason"], FREE_TEXT_LIMIT],
 ];
 
 /** A copy with `change` applied to the string at `keys`; anything that is not
@@ -259,8 +262,13 @@ export interface DecisionRecord extends RecordCommon {
 export interface VerdictRecord extends RecordCommon {
   readonly recordType: "verdict";
   readonly verdict: Verdict;
-  /** The day file holding the decision this verdict is attached to. */
+  /** The day file holding the record this verdict is attached to: the
+   *  delegation's decision, fork or agent-model record, or its edit record
+   *  when it has none of those, as a worker the router did not route. */
   readonly decisionFile: string;
+  /** Why the orchestrator judged so (subagents_verdict); absent on verdicts
+   *  read from a reviewer's structured output. */
+  readonly reason?: string;
 }
 
 /** A verdict whose delegation id matches no decision in the folder. Kept, not
@@ -322,8 +330,22 @@ export interface ForkRecord extends RecordCommon {
   readonly banListException: boolean;
 }
 
+/** An editing delegation's edit (ADR 0010): written the first time in a run
+ *  that its worker, or a worker it started, runs an editing tool call. A
+ *  resumed delegation writes another in each run that edits. */
+export interface EditRecord extends RecordCommon {
+  readonly recordType: "edit";
+  /** The orchestrator session the delegation belongs to. */
+  readonly orchestratorSession: string;
+  /** The editing call's tool: `edit`, `write`, `bash`, ... */
+  readonly tool: string;
+  /** The worker's own worker that made the edit, which counts for the
+   *  delegation that started it; absent when the delegation's worker did. */
+  readonly nestedDelegationId?: string;
+}
+
 export type RoutedDecisionRecord = DecisionRecord | EffortLadderRecord;
-export type RoutingRecord = RoutedDecisionRecord | ForkRecord | AgentModelRecord | ExplicitModelRecord | VerdictRecord | OrphanedVerdictRecord;
+export type RoutingRecord = RoutedDecisionRecord | ForkRecord | AgentModelRecord | ExplicitModelRecord | VerdictRecord | OrphanedVerdictRecord | EditRecord;
 
 /** A routed decision for the routing report. Forks accept verdicts but are not routed. */
 export function isRoutedDecision(record: RoutingRecord): record is RoutedDecisionRecord {
@@ -532,7 +554,7 @@ function checkCommon(record: Json): void {
 export function validateRoutingRecord(value: unknown): RoutingRecord {
   if (!isObject(value)) throw new RoutingRecordError("(record)", `must be a JSON object; got ${JSON.stringify(value)}`);
   checkSchemaVersion(value);
-  const recordType = oneOf(value, "recordType", "", ["decision", "effort-ladder", "agent-model", "fork", "explicit", "verdict", "orphaned-verdict"] as const);
+  const recordType = oneOf(value, "recordType", "", ["decision", "effort-ladder", "agent-model", "fork", "explicit", "verdict", "orphaned-verdict", "edit"] as const);
   if (value.schemaVersion === DECISION_RECORD_SCHEMA_VERSION && recordType === "explicit") {
     throw new RoutingRecordError("schemaVersion", `is unsupported for ${recordType} records`);
   }
@@ -595,11 +617,21 @@ export function validateRoutingRecord(value: unknown): RoutingRecord {
     for (const key of ["slot", "model", "agentRole"]) stringAt(value, key, "", { nonBlank: true });
     stringAt(value, "taskTextPrefix", "");
   } else if (recordType === "verdict") {
-    checkKeys(value, "", [...COMMON_KEYS, "verdict", "decisionFile"]);
+    checkKeys(value, "", [...COMMON_KEYS, "verdict", "decisionFile"], ["reason"]);
     checkCommon(value);
     oneOf(value, "verdict", "", VERDICTS);
     const decisionFile = stringAt(value, "decisionFile", "", { nonBlank: true });
     if (!DAY_FILE.test(decisionFile)) throw new RoutingRecordError("decisionFile", `must name a day file YYYY-MM-DD.jsonl; got ${JSON.stringify(decisionFile)}`);
+    if (value.reason !== undefined) stringAt(value, "reason", "", { nonBlank: true });
+  } else if (recordType === "edit") {
+    if (value.schemaVersion !== DECISION_RECORD_SCHEMA_VERSION) throw new RoutingRecordError("schemaVersion", `is unsupported for ${recordType} records`);
+    checkKeys(value, "", [...COMMON_KEYS, "orchestratorSession", "tool"], ["nestedDelegationId"]);
+    checkCommon(value);
+    for (const key of ["orchestratorSession", "tool"]) stringAt(value, key, "", { nonBlank: true });
+    if (value.nestedDelegationId !== undefined) {
+      stringAt(value, "nestedDelegationId", "", { nonBlank: true });
+      if (value.nestedDelegationId === value.delegationId) throw new RoutingRecordError("nestedDelegationId", "must name a different delegation");
+    }
   } else {
     checkKeys(value, "", [...COMMON_KEYS, "verdict"]);
     checkCommon(value);
@@ -775,6 +807,21 @@ export function buildAgentModelRecord(input: {
     delegationId: input.delegationId, timestamp: (input.at ?? new Date()).toISOString(),
     agent: input.agent, definitionFile: input.definitionFile, model: input.model, effort: input.effort,
     ...(input.banListException ? { banListException: true } : {}),
+  });
+}
+
+export function buildEditRecord(input: {
+  readonly delegationId: string;
+  readonly orchestratorSession: string;
+  readonly tool: string;
+  readonly nestedDelegationId?: string;
+  readonly at?: Date;
+}): EditRecord {
+  return checkedRecord({
+    recordType: "edit", schemaVersion: DECISION_RECORD_SCHEMA_VERSION,
+    delegationId: input.delegationId, timestamp: (input.at ?? new Date()).toISOString(),
+    orchestratorSession: input.orchestratorSession, tool: input.tool,
+    ...(input.nestedDelegationId === undefined ? {} : { nestedDelegationId: input.nestedDelegationId }),
   });
 }
 

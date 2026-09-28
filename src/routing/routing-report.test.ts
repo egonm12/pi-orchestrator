@@ -122,6 +122,7 @@ function expectedReport(folder: string): string {
     "tier elevated, refused: decisions 1, accept 0, request_changes 0, missing 0, shadow agreement 0 of 1 (0%)",
     "all: decisions 6, accept 1, request_changes 2, missing 1, shadow agreement 2 of 4 (50%)",
     "orphaned verdicts: 2",
+    "verdicts on unrouted delegations: accept 0, request_changes 0, missing 0",
     "",
   ].join("\n");
 }

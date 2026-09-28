@@ -2,8 +2,8 @@ import { basename } from "node:path";
 
 // What a tool call is: a kind, not a yes or no, so each caller draws its own
 // line. The exploration budget (ADR 0005) counts read-only and unrecognised
-// calls. Telling whether a worker edited (ADR 0010) counts edit, and any bash
-// that is neither read-only nor build-test.
+// calls. Telling whether a worker edited (ADR 0010, ./editing.ts) counts edit,
+// any bash that is neither read-only nor build-test, and ctx_execute.
 //
 // A bash command is read as a list of simple commands joined by `&&`, `||`,
 // `;`, `&`, newlines, pipes and command substitution. Each simple command gets
@@ -29,7 +29,7 @@ export type BashCommandKind =
 export type ToolCallKind = BashCommandKind
   /** `edit` or `write`. */
   | "edit"
-  /** The subagents tools: `subagents`, `subagents_status`, `subagents_message`. */
+  /** The subagents tools: `subagents`, `subagents_status`, `subagents_message`, `subagents_verdict`. */
   | "delegation"
   /** A tool the classification does not know, or an mcp install or sign-in. */
   | "other";
@@ -42,7 +42,7 @@ const READ_ONLY_TOOLS = new Set([
   "mcpScript",
 ]);
 const EDIT_TOOLS = new Set(["edit", "write"]);
-const DELEGATION_TOOLS = new Set(["subagents", "subagents_status", "subagents_message"]);
+const DELEGATION_TOOLS = new Set(["subagents", "subagents_status", "subagents_message", "subagents_verdict"]);
 /** mcp actions that install or sign in to a server: actions, not lookups. */
 const MCP_ACTIONS = new Set(["install", "auth-start", "auth-complete"]);
 

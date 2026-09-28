@@ -5,7 +5,7 @@ status: in-progress
 type: epic
 priority: normal
 created_at: 2026-09-27T21:45:45Z
-updated_at: 2026-09-28T07:15:20Z
+updated_at: 2026-09-28T08:40:24Z
 ---
 
 Design session (split-plan 'orchestrator enforcement', ADR 0005). Keeps the main session in the orchestrator role.
@@ -86,3 +86,6 @@ Rejected: jeyq's redundant vu2o edge (it uses vu2o directly, kept); kokv's stale
 
 
 - y8cd: owner chose to accept and document the protocol gap in message-started runs (no context_with_system fallback).
+
+
+- Open for the owner (from kokv): should ctx_batch_execute in a worker count as editing, like ctx_execute?

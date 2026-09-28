@@ -197,6 +197,8 @@ function expectedReport(folder: string, rows: readonly ExpectedReportRow[], orph
     ...rows.map((row) => `tier ${row.tier}, ${row.rung === null ? "refused" : `rung ${row.rung}`}: ${expectedCounts(row)}`),
     `all: ${expectedCounts(total)}`,
     `orphaned verdicts: ${orphanedVerdicts}`,
+    // Every verdict here is on a routed delegation.
+    "verdicts on unrouted delegations: accept 0, request_changes 0, missing 0",
     "",
   ].join("\n");
 }
