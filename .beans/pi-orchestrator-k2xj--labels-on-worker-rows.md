@@ -7,7 +7,7 @@ priority: normal
 tags:
     - ready-for-agent
 created_at: 2026-09-28T14:30:23Z
-updated_at: 2026-09-28T16:29:07Z
+updated_at: 2026-09-28T19:35:39Z
 parent: pi-orchestrator-cml8
 ---
 
@@ -34,3 +34,11 @@ None, can start immediately.
 ## Summary of Changes
 
 Added an optional subagents label, kept labels and routed tiers on the worker board, and showed consistent compact rows in the widget, picker, nested transcript workers, tool rendering and status output. Added real-board and end-to-end tests for labels, tiers, fallbacks and one-line truncation. Typecheck and full test suite pass.
+
+Review follow-up fixes:
+
+- Resumed named workers and resumed reviewers keep their display identity: the worker outcome now saves the label, and a resume reads the saved label, agent definition and review before the run enters the worker board (`savedWorkerIdentity` in `src/subagents/resume.ts`). End-to-end tests cover a resumed named worker and a resumed reviewer.
+- Compact rows keep tier, rung and state visible at narrow widths: the width for the mandatory fields is reserved first and only the label is shortened, so each worker stays on one line. Widget tests cover narrow widths.
+- The status snapshot no longer prints a separate `Agent:` line when a board row is present, so the board row is the one identity shown for that worker. The status test checks this with an agent-definition worker.
+
+The status test's orchestrator active tools now include `hold`, because the new agent-definition worker in that test lists `hold` as a tool and `resolveAgent` only keeps definition tools the orchestrator has active (`src/subagents/agent-definitions.ts`). Without it the worker never reaches its hold tool and the test times out.

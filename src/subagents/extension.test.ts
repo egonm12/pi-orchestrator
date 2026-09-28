@@ -23,6 +23,7 @@ import { isOrchestratorSession } from "./orchestrator-session.ts";
 import { orchestratorProtocol } from "./orchestrator-protocol.ts";
 import { workerBoard, type BoardWorker } from "./worker-board.ts";
 import { openTranscript } from "./transcript-view.ts";
+import { compactLines, workerRows, widgetLines, widgetRows } from "./worker-widget.ts";
 
 // The subagents extension as pi loads it. A fake ExtensionAPI records the
 // registered tool; a test calls its `execute` as pi does. The worker is a real
@@ -171,7 +172,7 @@ function routerExtension(modelIds: readonly string[] = [HAIKU]): InlineExtension
 type Tool = Parameters<ExtensionAPI["registerTool"]>[0];
 
 /** The orchestrator's active tools in these tests: pi's default built-ins, the probe tool and subagents. */
-const ORCHESTRATOR_TOOLS = ["read", "bash", "edit", "write", "probe", "subagents", "subagents_status", "subagents_message"];
+const ORCHESTRATOR_TOOLS = ["read", "bash", "edit", "write", "probe", "hold", "subagents", "subagents_status", "subagents_message"];
 
 /** A message the extension sent into the orchestrator's session, with its delivery options. */
 interface SentMessage {
@@ -422,9 +423,33 @@ test("a preserved agent model resumes without a second record and keeps its agen
     assert.equal(first.worker.status, "completed");
     const resumed = await tool.execute("resume", { items: [{ resume: first.worker.sessionId, task: "Second task" }] } as never, undefined, undefined, main.ctx);
     assert.equal((resumed.details as SubagentsDetails).results[0]!.status, "completed");
+    const resumedRow = workerBoard().workers().at(-1)!;
+    assert.equal(resumedRow.agent, "reviewer", "the resumed run reads its saved agent definition");
+    const plain = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as Theme;
+    assert.match(compactLines({ rows: workerRows([resumedRow]), more: 0 }, Date.now(), plain, 200)[0]!, /^reviewer · anthropic\/claude-haiku-4-5/);
     assert.equal(readRoutingRecords(join(h.stateDir, "routing")).filter((record) => record.recordType === "agent-model").length, 1);
     assert.ok(provider.requests[1]!.systemText.includes("Review carefully."));
     assert.deepEqual(provider.requests.map((request) => request.tools), [["read", "report"], ["read", "report"]]);
+  } finally { h.cleanup(); }
+});
+
+test("a resumed named worker retains its saved label in the board and widget", async () => {
+  const h = harness();
+  try {
+    mkdirSync(h.stateDir);
+    saveAuthorization(join(h.stateDir, "authorized-recipients.json"), approvedAnthropic());
+    writeAgentDefinition(join(h.agentDir, "agents"), "scout.md", { name: "scout", description: "Scouts" }, "Find files.");
+    const provider = fakeAnthropic("Done");
+    const main = orchestrator(h);
+    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+    const first = await callSubagents(tool, main.ctx, "First task", "scout", "research: budget code");
+    const resumed = await tool.execute("resume", { items: [{ resume: first.worker.sessionId, task: "Second task" }] } as never, undefined, undefined, main.ctx);
+    assert.equal((resumed.details as SubagentsDetails).results[0]!.status, "completed");
+    const row = workerBoard().workers().at(-1)!;
+    assert.equal(row.agent, "scout");
+    assert.equal(row.label, "research: budget code");
+    const plain = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as Theme;
+    assert.match(widgetLines(widgetRows([row], Date.now()), undefined, Date.now(), plain, 200)[3]!, /research: budget co…\s+mechanical · /);
   } finally { h.cleanup(); }
 });
 
@@ -1965,11 +1990,12 @@ test("subagents_status lists background calls, snapshots each item of a call, an
   const h = harness({ orchestrator: { routing: ROUTING, subagents: { maxParallel: 1 } } });
   const hold = holdToolExtension();
   try {
+    writeAgentDefinition(join(h.agentDir, "agents"), "scout.md", { name: "scout", description: "Scouts", tools: "hold" }, "Check the parser.");
     const provider = scriptedAnthropic((request) => request.task === "Fix the parser" && request.toolResults.length === 0
       ? { text: "Reading the parser.\nFound the bug.", toolCall: { name: "hold", arguments: {} } } : { text: "done" });
     const subagents = loadSubagents([routerExtension(), provider.extension, hold.extension]);
     const main = orchestrator(h);
-    const start = (await subagents.tool().execute("call-1", { items: [{ task: "Fix the parser", label: "parser repair" }, { task: "Update the docs" }], background: true } as never,
+    const start = (await subagents.tool().execute("call-1", { items: [{ task: "Fix the parser", agent: "scout", label: "parser repair" }, { task: "Update the docs" }], background: true } as never,
       undefined, undefined, main.ctx)).details as BackgroundStart;
     const [runningId, queuedId] = start.delegationIds;
     await waitFor(() => hold.running() === 1, "the first worker is in its hold tool");
@@ -1989,7 +2015,7 @@ test("subagents_status lists background calls, snapshots each item of a call, an
     assert.deepEqual(call.details.calls.map((snapshot) => snapshot.callId), ["call-1"]);
     const [running, queued] = call.details.calls[0]!.workers;
     assert.deepEqual({ ...running, elapsedMs: undefined, sessionFile: undefined }, {
-      delegationId: runningId, task: "Fix the parser", state: "running", tool: "hold", turns: 1,
+      delegationId: runningId, task: "Fix the parser", agent: "scout", state: "running", tool: "hold", turns: 1,
       elapsedMs: undefined, lastLines: ["Reading the parser.", "Found the bug."], sessionFile: undefined,
     });
     assert.ok(typeof running?.elapsedMs === "number" && running.elapsedMs >= 0, JSON.stringify(running));
@@ -1998,6 +2024,8 @@ test("subagents_status lists background calls, snapshots each item of a call, an
     for (const shown of [`Worker ${runningId}: running: hold`, "Turns: 1", `Session file: ${running!.sessionFile}`, "  Found the bug.", `Worker ${queuedId}: queued`]) {
       assert.ok(call.text.includes(shown), `${shown} in:\n${call.text}`);
     }
+    assert.doesNotMatch(call.text, /Agent:/, "the snapshot must not repeat a conflicting agent identity beside its board row");
+    assert.match(call.text, /parser repair · mechanical/, "the snapshot uses the worker's visible identity");
 
     const one = await status({ id: queuedId });
     assert.deepEqual(one.details.calls.map((snapshot) => [snapshot.callId, snapshot.workers.map((worker) => worker.delegationId)]), [["call-1", [queuedId]]]);
@@ -2471,6 +2499,7 @@ test("/subagents with no arguments opens the picker of every worker when there i
     const provider = fakeAnthropic("done", (finish) => pending.push(finish));
     const subagents = loadSubagents([routerExtension(), provider.extension]);
     const ctx = orchestrator(h).ctx;
+    await subagents.startSession(ctx);
     await subagents.tool().execute("call-1", { items: [{ task: "Unique widget marker one" }], background: true } as never, undefined, undefined, ctx);
     await waitFor(() => pending.length === 1, "the worker is running");
 

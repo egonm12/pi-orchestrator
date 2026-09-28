@@ -39,28 +39,38 @@ const resuming = (): Set<string> => (globalThis as ProcessGlobal)[RESUMING] ??= 
  *  worker's the agent definition it followed, which a retry follows too
  *  (./retry.ts); a resume keeps what an earlier run saved. */
 export function saveWorkerOutcome(file: string | undefined, status: WorkerStatus,
-  setup?: Pick<WorkerSetup, "instructions" | "tools"> & { readonly review?: SavedReview; readonly agent?: string }): void {
+  setup?: Pick<WorkerSetup, "instructions" | "tools"> & { readonly review?: SavedReview; readonly agent?: string; readonly label?: string }): void {
   if (!file || !existsSync(file)) return;
   const previous = existsSync(`${file}.outcome.json`) ? JSON.parse(readFileSync(`${file}.outcome.json`, "utf8")) as Record<string, unknown> : {};
   writeFileSync(`${file}.outcome.json`, JSON.stringify({ ...previous, status,
     ...(setup?.instructions === undefined ? {} : { instructions: setup.instructions }),
     ...(setup?.tools === undefined ? {} : { tools: setup.tools }),
     ...(setup?.agent === undefined ? {} : { agent: setup.agent }),
+    ...(setup?.label === undefined ? {} : { label: setup.label }),
     ...(setup?.review === undefined ? {} : { review: setup.review }) }));
 }
 
 /** A saved worker's outcome: how its latest run ended and, for a reviewer, what it
  *  reviewed; `undefined` when none was saved or it cannot be read. */
-export function readWorkerOutcome(file: string): { readonly status?: WorkerStatus; readonly review?: SavedReview; readonly agent?: string } | undefined {
-  let outcome: { status?: unknown; agent?: unknown; review?: { delegationId?: unknown; startedAt?: unknown; sameRung?: unknown } };
+export function readWorkerOutcome(file: string): { readonly status?: WorkerStatus; readonly review?: SavedReview; readonly agent?: string; readonly label?: string } | undefined {
+  let outcome: { status?: unknown; agent?: unknown; label?: unknown; review?: { delegationId?: unknown; startedAt?: unknown; sameRung?: unknown } };
   try { outcome = JSON.parse(readFileSync(`${file}.outcome.json`, "utf8")) as typeof outcome; } catch { return undefined; }
-  const { status, review, agent } = outcome;
+  const { status, review, agent, label } = outcome;
   return {
     ...(status === "completed" || status === "failed" || status === "aborted" ? { status } : {}),
     ...(typeof review?.delegationId === "string" && typeof review.startedAt === "string"
       ? { review: { delegationId: review.delegationId, startedAt: review.startedAt, ...(review.sameRung === true ? { sameRung: true } : {}) } } : {}),
     ...(typeof agent === "string" ? { agent } : {}),
+    ...(typeof label === "string" ? { label } : {}),
   };
+}
+
+/** The saved display identity, read before a resumed run enters the worker board. */
+export function savedWorkerIdentity(id: string, setup: Pick<WorkerSetup, "cwd" | "orchestratorSession">):
+  Pick<NonNullable<ReturnType<typeof readWorkerOutcome>>, "agent" | "label" | "review"> | undefined {
+  if (!/^[0-9a-f-]{36}$/i.test(id)) return undefined;
+  const file = SessionManager.findById(setup.cwd, id, workerSessionDir(setup.orchestratorSession));
+  return file ? readWorkerOutcome(file) : undefined;
 }
 
 function lastStatus(file: string): WorkerStatus | undefined {

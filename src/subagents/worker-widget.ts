@@ -193,7 +193,10 @@ export function fitted(indent: string, parts: readonly Part[], theme: Theme, wid
 export function compactLines(rows: WidgetRows, now: number, theme: Theme, width: number): string[] {
   const lines = rows.rows.map((row) => {
     const { indent, parts } = rowParts(row, now);
-    return fitted(indent, parts, theme, width);
+    const mandatory = parts.slice(1, row.worker.tier === undefined ? 3 : 4);
+    const labelRoom = width - indent.length - partsWidth(mandatory) - SEPARATOR.length * mandatory.length;
+    return labelRoom < 2 ? fitted(indent, parts, theme, width)
+      : fitted(indent, [[parts[0]![0], cutText(parts[0]![1], labelRoom)], ...parts.slice(1)], theme, width);
   });
   if (rows.more > 0) lines.push(fitted("", [["muted", `+${rows.more} more`]], theme, width));
   return lines;
@@ -232,6 +235,8 @@ export interface AgentRow {
   readonly name: string;
   readonly status: readonly Part[];
   readonly stats: readonly string[];
+  /** Room reserved for tier, rung and state before shortening the name. */
+  readonly required?: number;
 }
 
 const MAIN_ROW: AgentRow = { indent: "", name: MAIN_AGENT, status: [], stats: [] };
@@ -262,7 +267,8 @@ export function agentRow(row: WidgetRow, now: number): AgentRow {
   const worker = row.worker;
   if (worker.tier !== undefined) {
     const { parts } = rowParts(row, now);
-    return { indent: nestIndent(row.depth), name: agentLabel(worker), status: parts.slice(1), stats: [] };
+    return { indent: nestIndent(row.depth), name: agentLabel(worker), status: parts.slice(1), stats: [],
+      required: partsWidth(parts.slice(1, 4)) + SEPARATOR.length * 2 };
   }
   return { indent: nestIndent(row.depth), name: agentLabel(worker), status: statusParts(worker), stats: statsTexts(worker, now) };
 }
@@ -277,15 +283,16 @@ function nameColumn(width: number): number {
  *  stats that fits after the name against the right edge, none when none fits. */
 function agentLine(row: AgentRow, selected: boolean, column: number, theme: Theme, width: number): string {
   const marks = selected ? theme.fg("accent", `${CURSOR}${SELECTED_DOT}`) : `${NO_CURSOR}${theme.fg("dim", DOT)}`;
-  const name = cutText(row.name, Math.max(1, column - row.indent.length));
+  const nameWidth = row.required === undefined ? column : Math.max(MIN_NAME_COLUMN, Math.min(column, width - MARKS_WIDTH - NAME_GAP - row.required));
+  const name = cutText(row.name, Math.max(1, nameWidth - row.indent.length));
   let line = `${marks} ${theme.fg("dim", row.indent)}${selected ? theme.fg("accent", theme.bold(name)) : theme.fg("muted", name)}`;
   let used = MARKS_WIDTH + row.indent.length + name.length;
-  const rest = width - MARKS_WIDTH - column;
+  const rest = width - MARKS_WIDTH - nameWidth;
   const stats = row.stats.find((text) => rest >= STATS_GAP + text.length) ?? "";
   const room = rest - NAME_GAP - (stats === "" ? 0 : STATS_GAP + stats.length);
   const status = room >= MIN_MIDDLE ? cutParts(row.status, room).filter(([, text]) => text !== "") : [];
   if (status.length > 0) {
-    const start = MARKS_WIDTH + column + NAME_GAP;
+    const start = MARKS_WIDTH + nameWidth + NAME_GAP;
     line += `${" ".repeat(Math.max(1, start - used))}${status.map(([color, text]) => theme.fg(color, text)).join("")}`;
     used = Math.max(used + 1, start) + partsWidth(status);
   }

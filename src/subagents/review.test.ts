@@ -16,6 +16,8 @@ import { orchestratorProtocol } from "./orchestrator-protocol.ts";
 import { reviewRules } from "./review.ts";
 import { REVIEWER_EDIT_DENIED } from "./editing.ts";
 import { markWorkerSession } from "./worker-sessions.ts";
+import { workerBoard } from "./worker-board.ts";
+import { compactLines, workerRows } from "./worker-widget.ts";
 
 // Independent reviewers of editing delegations (ADR 0010), as the
 // orchestrator sees them: the subagents tool with a review item, and
@@ -235,6 +237,26 @@ test("a review item is routed at or above the implementer's tier and never on it
     }
     assert.equal(requests[0]!.task, "Check that notes.md has a heading", "the orchestrator's task is the reviewer's task");
     assert.equal(reviewer.edited, undefined, "a review that only reads does not edit");
+  } finally { h.cleanup(); }
+});
+
+test("a resumed reviewer keeps reviewer identity on the real board and in its row", async () => {
+  const h = harness();
+  try {
+    const provider = anthropic();
+    const tools = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h);
+    const implementer = await one(tools, ctx, { task: `[elevated] ${WRITE_NOTES}` });
+    const first = await one(tools, ctx, { task: "Check the notes", review: implementer.sessionId!, label: "wrong identity" });
+    assert.equal(first.status, "completed", JSON.stringify(first));
+    const resumed = await one(tools, ctx, { resume: first.sessionId!, task: "Check again" }, "resume-reviewer");
+    assert.equal(resumed.status, "completed", JSON.stringify(resumed));
+    const worker = workerBoard().workers().at(-1)!;
+    assert.equal(worker.review, implementer.sessionId);
+    const plain = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as never;
+    const row = compactLines({ rows: workerRows([worker]), more: 0 }, Date.now(), plain, 200)[0]!;
+    assert.match(row, /^reviewer · elevated · [^ ]+ · completed · /, row);
+    assert.doesNotMatch(row, /wrong identity/);
   } finally { h.cleanup(); }
 });
 

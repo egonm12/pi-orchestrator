@@ -10,7 +10,7 @@ import { BackgroundCalls, type BackgroundCallResult } from "./background.ts";
 import { registerSubagentsMessageTool } from "./message.ts";
 import { renderSubagentsCall, renderSubagentsResult, shortTask } from "./render.ts";
 import { forkSession } from "./fork-session.ts";
-import { prepareResume, saveWorkerOutcome } from "./resume.ts";
+import { prepareResume, savedWorkerIdentity, saveWorkerOutcome } from "./resume.ts";
 import { workerReports, type WorkerReports } from "./report.ts";
 import { missingSectionsNote } from "./result-format.ts";
 import { loadSubagentsSettings } from "./settings.ts";
@@ -343,8 +343,11 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
           const fork = forks[index];
           const delegationId = delegationIds?.[index] ?? resume;
           const retried = retrySetups[index] instanceof Error ? undefined : retrySetups[index];
-          const task = retried?.task ?? itemTask, agent = itemAgent ?? retried?.agent;
-          return board.add({ callId: toolCallId, background, task, ...(agent === undefined ? {} : { agent }), ...(label === undefined ? {} : { label }), ...(review === undefined ? {} : { review }),
+          const saved = resume === undefined ? undefined : savedWorkerIdentity(resume, { cwd: ctx.cwd, orchestratorSession: ctx.sessionManager });
+          const task = retried?.task ?? itemTask, agent = itemAgent ?? retried?.agent ?? saved?.agent;
+          const displayLabel = label ?? saved?.label, reviewedId = review ?? saved?.review?.delegationId;
+          return board.add({ callId: toolCallId, background, task, ...(agent === undefined ? {} : { agent }), ...(displayLabel === undefined ? {} : { label: displayLabel }),
+            ...(reviewedId === undefined ? {} : { review: reviewedId }),
             ...(delegationId === undefined ? {} : { delegationId }), ...(parentDelegationId === undefined ? {} : { parentDelegationId }),
             model: fork?.model === undefined ? { kind: "routed" } : { kind: "fork", model: fork.model, effort: fork.effort } },
           { stop: () => stopItem(index) });
@@ -541,9 +544,9 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
             // A resumed reviewer is not routed again, so its saved instructions carry the review prompt for it.
             // A review that ran on the reviewed delegation's rung is a same-rung review (review.ts).
             const agentName = definition === undefined ? {} : { agent: definition.name };
-            saveWorkerOutcome(worker.sessionFile, worker.status, reviewing === undefined ? { instructions: resolution.instructions, tools: resolution.tools, ...agentName } : {
+            saveWorkerOutcome(worker.sessionFile, worker.status, reviewing === undefined ? { instructions: resolution.instructions, tools: resolution.tools, ...agentName, label: item.label } : {
               instructions: [reviewing.prompt, ...(resolution.instructions === undefined ? [] : [resolution.instructions])].join("\n\n"),
-              tools: resolution.tools, ...agentName, review: { delegationId: reviewing.delegationId, startedAt: reviewStartedAt,
+              tools: resolution.tools, ...agentName, label: item.label, review: { delegationId: reviewing.delegationId, startedAt: reviewStartedAt,
                 ...(target !== undefined && servedOnRung(worker.sessionId, target.constraints.excludedRung) ? { sameRung: true as const } : {}) },
             });
             results[index] = { ...item, ...workerModel, ...worker, ...(climb === undefined ? {} : { climb: climb.text }), finalText: cutText(worker.finalText, worker.sessionFile) };

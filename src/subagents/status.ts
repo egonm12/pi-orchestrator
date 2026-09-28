@@ -41,11 +41,11 @@ function elapsedText(ms: number): string {
   return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 }
 
-function workerText(worker: WorkerSnapshot): string {
+function workerText(worker: WorkerSnapshot, hasBoardRow: boolean): string {
   const state = worker.state === "not-started" ? "not started" : worker.tool === undefined ? worker.state : `${worker.state}: ${worker.tool}`;
   return [
     `Worker ${worker.delegationId}: ${state}`,
-    `Agent: ${worker.agent ?? "worker"}`,
+    ...(hasBoardRow ? [] : [`Agent: ${worker.agent ?? "worker"}`]),
     `Task: ${worker.task}`,
     `Turns: ${worker.turns}${worker.elapsedMs === undefined ? "" : `, elapsed: ${elapsedText(worker.elapsedMs)}`}`,
     `Session file: ${worker.sessionFile ?? (worker.elapsedMs === undefined ? "none yet" : "none, the session is not saved")}`,
@@ -64,7 +64,7 @@ function boardRow(delegationId: string): string | undefined {
 function snapshotText(calls: readonly CallSnapshot[]): string {
   return calls.map((call) => [`Background call ${call.callId}:`, ...call.workers.map((worker) => {
     const row = boardRow(worker.delegationId);
-    return row === undefined ? workerText(worker) : `${workerText(worker)}\n${row}`;
+    return row === undefined ? workerText(worker, false) : `${workerText(worker, true)}\n${row}`;
   })].join("\n\n")).join("\n\n");
 }
 

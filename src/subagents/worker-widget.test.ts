@@ -143,6 +143,24 @@ test("reviewers ignore their labels and long labels stay on one line", () => {
   assert.ok(widget.every((line) => !line.includes("onto another line")));
 });
 
+test("a narrow row shortens its label before tier, rung and state in compact and widget views", () => {
+  const time = clock();
+  const board = new WorkerBoard({ now: time.now });
+  const feed = board.add({ callId: "call", background: false, task: "Check budget", label: "a very long research label that should yield to routing details", model: { kind: "routed" } });
+  feed.started();
+  feed.session(fakeSession("narrow-1").session);
+  board.setTier("narrow-1", "standard");
+  board.served({ delegationId: "narrow-1", model: "anthropic/sonnet", effort: "high" });
+  const width = 62;
+  const compactRow = compact(board, time.now(), width)[0]!;
+  const widgetRow = lines(board, time.now(), width)[3]!;
+  for (const row of [compactRow, widgetRow]) {
+    assert.ok(row.length <= width, row);
+    assert.match(row, /a very.*….*standard · anthropic\/sonnet:high · running/, row);
+  }
+  assert.equal(compact(board, time.now(), width).length, 1);
+});
+
 test("a compact worker line longer than the render width is cut with an ellipsis", () => {
   const time = clock();
   const board = new WorkerBoard({ now: time.now });
