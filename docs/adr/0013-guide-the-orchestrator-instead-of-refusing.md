@@ -17,5 +17,5 @@ ADR 0005 denied the orchestrator's exploratory calls beyond a flat budget, and A
 
 ## Consequences
 
-- The delegation rate must be measured again once the protocol reaches every run. If it stays near 6 of 29, revisit this decision with that evidence.
+- The delegation rate must be measured again once the protocol reaches every run. If it stays near 6 of 29, revisit this decision with that evidence. "Near" is made concrete in `src/live-check/delegation-rate.md`: on at least 29 prompts labelled as needing delegation, the rate counts as improved only when a one-sided Fisher exact test puts it above 6 of 29 at p < 0.05. The owner's result is recorded in bean pi-orchestrator-53x3 and summarized here in one line.
 - The gate's value now lies in recorded verdicts and in the report of missing ones, not in blocking. ADR 0011's gate levels and gate actions are unchanged: critical work still calls for a reviewer, and not recording one is a missing verdict.
