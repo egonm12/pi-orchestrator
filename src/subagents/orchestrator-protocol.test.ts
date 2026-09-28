@@ -53,7 +53,9 @@ test("a request whose prompt never had the protocol gets it", () => {
 });
 
 test("a request that already has the current protocol is left alone", () => {
-  assert.equal(keep([system({ preamble: "You are pi.", [ORCHESTRATOR_PROTOCOL_SECTION]: `<x>\n${PROTOCOL}\n</x>` }), user("hi")]), undefined);
+  // As pi renders a named section (system-prompt.js buildSystemPromptSections).
+  const rendered = `<${ORCHESTRATOR_PROTOCOL_SECTION}>\n${PROTOCOL}\n</${ORCHESTRATOR_PROTOCOL_SECTION}>`;
+  assert.equal(keep([system({ preamble: "You are pi.", [ORCHESTRATOR_PROTOCOL_SECTION]: rendered }), user("hi")]), undefined);
 });
 
 test("a request with an older protocol gets the current one", () => {

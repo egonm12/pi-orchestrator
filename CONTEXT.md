@@ -142,6 +142,9 @@ A rule that removes rungs before the tier choice and that no preference can over
 The latest known state of one provider's usage for the owner's account: available, low, exhausted or throttled, with the percentage left and the reset time when known. Learned from limit errors and response headers, shared by all the owner's sessions and projects. An exhausted or throttled provider is removed by a hard filter until its limit lifts.
 _Avoid_: Quota, headroom (alone), balance
 
+**Usage line**:
+The last line of the orchestrator protocol, such as `usage: anthropic exhausted until 14:00 · openai-codex 62% left`: per provider, a limit still in force with when it lifts, else the percentage left when known. Read from the usage observations for each request, so it is on every orchestrator run; left out when no observation still says anything. Workers never get it.
+
 **Limit error**:
 A rung's error whose text says the provider refused for usage: a usage limit (the account's allowance is used up until a reset), which makes the provider exhausted, or a rate limit (too many requests for now), which makes it throttled. Each holds until the reset the text states, or for a set time when it states none.
 _Avoid_: Quota error, 429 (alone: Codex also reports a usage limit as a 429)

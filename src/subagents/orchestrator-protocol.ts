@@ -105,9 +105,10 @@ const paragraphs = (explorationNudge: number, gateLevel: GateLevel): readonly st
 ];
 
 /** The protocol text, as the orchestrator's system prompt carries it, for an
- *  exploration nudge after `explorationNudge` exploratory calls per user prompt, at the gate level `gateLevel`. */
-export function orchestratorProtocol(explorationNudge: number, gateLevel: GateLevel): string {
-  return `# Orchestrator protocol\n\n${paragraphs(explorationNudge, gateLevel).join("\n\n")}`;
+ *  exploration nudge after `explorationNudge` exploratory calls per user prompt, at the gate level `gateLevel`,
+ *  ending with the usage line (usage-line.ts) when there is one. */
+export function orchestratorProtocol(explorationNudge: number, gateLevel: GateLevel, usage?: string): string {
+  return `# Orchestrator protocol\n\n${[...paragraphs(explorationNudge, gateLevel), ...(usage === undefined ? [] : [usage])].join("\n\n")}`;
 }
 
 /** The protocol as a section of a system message, delimited as pi renders a named section. */
@@ -120,9 +121,9 @@ function protocolSection(protocol: string): string {
  *  alone. Returns the forced prompt with the protocol appended when an earlier
  *  handler forced one without it. */
 export function addOrchestratorProtocol(event: Pick<BeforeAgentStartEvent, "systemPromptOptions">,
-  ctx: Pick<ExtensionContext, "sessionManager">, explorationNudge: number, gateLevel: GateLevel): BeforeAgentStartEventResult | undefined {
+  ctx: Pick<ExtensionContext, "sessionManager">, explorationNudge: number, gateLevel: GateLevel, usage?: string): BeforeAgentStartEventResult | undefined {
   if (!isOrchestratorSession(ctx)) return undefined;
-  const protocol = orchestratorProtocol(explorationNudge, gateLevel);
+  const protocol = orchestratorProtocol(explorationNudge, gateLevel, usage);
   event.systemPromptOptions.sections[ORCHESTRATOR_PROTOCOL_SECTION] = protocol;
   const forced = event.systemPromptOptions.forceSystemPrompt;
   if (forced === undefined || forced.includes(protocol)) return undefined;
@@ -142,7 +143,7 @@ interface PromptMessage {
  *  stable across the run's requests. Leaves a request without any system
  *  message alone: pi sent it no prompt, and the protocol alone is not one. */
 export function keepOrchestratorProtocol(event: Pick<ContextWithSystemEvent, "messages">,
-  ctx: Pick<ExtensionContext, "sessionManager">, explorationNudge: number, gateLevel: GateLevel): ContextEventResult | undefined {
+  ctx: Pick<ExtensionContext, "sessionManager">, explorationNudge: number, gateLevel: GateLevel, usage?: string): ContextEventResult | undefined {
   if (!isOrchestratorSession(ctx)) return undefined;
   const messages = event.messages as readonly PromptMessage[];
   let lastSystem = -1;
@@ -153,8 +154,10 @@ export function keepOrchestratorProtocol(event: Pick<ContextWithSystemEvent, "me
     const section = message.sections?.[ORCHESTRATOR_PROTOCOL_SECTION];
     if (section !== undefined) current = section;
   });
-  const protocol = orchestratorProtocol(explorationNudge, gateLevel);
-  if (lastSystem < 0 || (typeof current === "string" && current.includes(protocol))) return undefined;
+  const protocol = orchestratorProtocol(explorationNudge, gateLevel, usage);
+  // Exactly the current section: the protocol without a usage line is a prefix of one with it, so a
+  // containment check would keep a line whose limit has lifted. A patch replaces the section by name, never adds one.
+  if (lastSystem < 0 || current === protocolSection(protocol) || current === protocol) return undefined;
   // The last system message's timestamp, not the clock's: the same request prefix on every request of the run.
   const patch = { role: "system", content: "", sections: { [ORCHESTRATOR_PROTOCOL_SECTION]: protocolSection(protocol) },
     timestamp: messages[lastSystem]!.timestamp ?? 0 };

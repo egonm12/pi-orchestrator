@@ -18,7 +18,8 @@ import { createTempRepo } from "../fixtures/temp-repo.ts";
 import { autoStream } from "../router/auto-stream.ts";
 import { createRouterExtension } from "../router/extension.ts";
 import personalGuard from "../guard/extension.ts";
-import { createSubagentsExtension, MAX_TEXT_BYTES, type SubagentResult, type SubagentsDetails, type SubagentsProgressDetails } from "./extension.ts";
+import { recordUsageObservation, usageObservationsPath, type UsageObservation } from "../router/usage-observations.ts";
+import { createSubagentsExtension, MAX_TEXT_BYTES, type SubagentResult, type SubagentsDependencies, type SubagentsDetails, type SubagentsProgressDetails } from "./extension.ts";
 import { markWorkerSession } from "./worker-sessions.ts";
 import { isOrchestratorSession } from "./orchestrator-session.ts";
 import { orchestratorProtocol } from "./orchestrator-protocol.ts";
@@ -2695,9 +2696,10 @@ test("the board's orchestrator state follows the orchestrator's own agent runs, 
 /** The orchestrator's own pi session with the subagents extension installed: a
  *  real saved session that loads `provider`, `others` and the subagents
  *  extension, whose workers load `workerExtensions`. */
-async function orchestratorSession(h: Harness, provider: InlineExtension, workerExtensions: readonly InlineExtension[], others: readonly InlineExtension[] = []) {
+async function orchestratorSession(h: Harness, provider: InlineExtension, workerExtensions: readonly InlineExtension[], others: readonly InlineExtension[] = [],
+  overrides: Partial<SubagentsDependencies> = {}) {
   const services = await createAgentSessionServices({ cwd: h.projectDir, agentDir: h.agentDir, resourceLoaderOptions: {
-    extensionFactories: [provider, ...others, { name: "subagents", factory: createSubagentsExtension({ workerExtensions }) }],
+    extensionFactories: [provider, ...others, { name: "subagents", factory: createSubagentsExtension({ ...overrides, workerExtensions }) }],
   } });
   const model = services.modelRuntime.getModel("anthropic", "claude-haiku-4-5");
   assert.ok(model, "the fake provider serves claude-haiku-4-5");
@@ -2809,6 +2811,207 @@ test("a typed skill prompt keeps the protocol when an extension loaded earlier f
     for (const request of provider.requests) {
       assert.ok(request.systemPrompt.includes("## Project rules"), "the forced prompt is what the model got");
       assert.ok(request.systemPrompt.includes(orchestratorProtocol(3, "medium")), request.systemPrompt);
+    }
+  } finally { h.cleanup(); }
+});
+
+// The usage line (PRD cml8, user story 54): the orchestrator's protocol ends
+// with one line of what the usage store knows, on every request of every run.
+
+/** 12:00 on 29 September 2026, local time: the usage line shows local reset times. */
+const USAGE_NOON = new Date(2026, 8, 29, 12, 0);
+const atLocal = (hours: number, minutes = 0) => new Date(2026, 8, 29, hours, minutes).toISOString();
+
+/** Records `observation` for `provider` in the harness's usage store. */
+function observe(h: Harness, provider: string, observation: UsageObservation): void {
+  recordUsageObservation(usageObservationsPath(h.stateDir), provider, observation);
+}
+
+const occurrences = (text: string, part: string) => text.split(part).length - 1;
+
+test("a prompt's run has the usage line once on every request when the usage store has observations", async () => {
+  const h = harness();
+  try {
+    writeFileSync(join(h.projectDir, "README.md"), "# Project\n");
+    observe(h, "anthropic", { state: "exhausted", resetsAt: atLocal(14), observedAt: atLocal(11, 30), source: "error" });
+    observe(h, "openai-codex", { state: "available", percentLeft: 62, observedAt: atLocal(11, 45), source: "header" });
+    const provider = plannedAnthropic();
+    const session = await orchestratorSession(h, provider.extension, [provider.extension], [], { now: () => USAGE_NOON });
+    try {
+      provider.setOrchestrator(session.sessionId);
+      provider.plan.push(READ, { text: "read" });
+      await session.prompt("Read README.md");
+    } finally { session.dispose(); }
+    assert.equal(provider.requests.length, 2, "two turns");
+    for (const request of provider.requests) {
+      assert.ok(request.systemPrompt.includes("usage: anthropic exhausted until 14:00 · openai-codex 62% left"), request.systemPrompt);
+      assert.equal(occurrences(request.systemPrompt, "usage:"), 1, request.systemPrompt);
+    }
+  } finally { h.cleanup(); }
+});
+
+test("a run a message starts with triggerTurn has the usage line on every request, as the store holds it by then", async () => {
+  const h = harness();
+  try {
+    writeFileSync(join(h.projectDir, "README.md"), "# Project\n");
+    let api: ExtensionAPI | undefined;
+    const waker: InlineExtension = { name: "waker", factory: (pi) => { api = pi; } };
+    const provider = plannedAnthropic();
+    const session = await orchestratorSession(h, provider.extension, [provider.extension], [waker], { now: () => USAGE_NOON });
+    try {
+      provider.setOrchestrator(session.sessionId);
+      provider.plan.push({ text: "ready" }, READ, { text: "answered" });
+      await session.prompt("Wait for questions");
+      // A worker ran into Codex's limit while the orchestrator was idle.
+      observe(h, "openai-codex", { state: "throttled", resetsAt: atLocal(12, 5), observedAt: atLocal(11, 59), source: "error" });
+      await api!.sendMessage({ customType: "worker-question", content: "A worker asks: which config?", display: true }, { triggerTurn: true, deliverAs: "steer" });
+      await until(() => provider.requests.length === 3 && session.isIdle, "the woken run");
+    } finally { session.dispose(); }
+    const [prompted, ...woken] = provider.requests;
+    assert.ok(prompted!.systemPrompt.includes(orchestratorProtocol(3, "medium")), prompted!.systemPrompt);
+    assert.equal(prompted!.systemPrompt.includes("usage:"), false, "the store was empty when the prompt ran");
+    assert.equal(woken.length, 2, "the woken run's two turns");
+    for (const request of woken) {
+      assert.ok(request.systemPrompt.includes(orchestratorProtocol(3, "medium", "usage: openai-codex throttled until 12:05")), request.systemPrompt);
+      assert.equal(occurrences(request.systemPrompt, "usage:"), 1, request.systemPrompt);
+    }
+  } finally { h.cleanup(); }
+});
+
+test("the usage line follows the store within a run: replaced when an observation changes, gone once the limit lifts", async () => {
+  const h = harness();
+  try {
+    writeFileSync(join(h.projectDir, "README.md"), "# Project\n");
+    observe(h, "anthropic", { state: "exhausted", resetsAt: atLocal(14), observedAt: atLocal(11, 30), source: "error" });
+    let clock = USAGE_NOON;
+    // Three turns: after the first, Codex runs low; after the second, it is 14:01 and Anthropic's limit has lifted.
+    const provider = scriptedAnthropic((request) => {
+      if (request.toolResults.length === 0) {
+        observe(h, "openai-codex", { state: "low", percentLeft: 8, observedAt: atLocal(12, 1), source: "header" });
+        return READ;
+      }
+      if (request.toolResults.length === 1) { clock = new Date(2026, 8, 29, 14, 1); return READ; }
+      return { text: "read twice" };
+    });
+    const session = await orchestratorSession(h, provider.extension, [provider.extension], [], { now: () => clock });
+    try { await session.prompt("Read README.md twice"); } finally { session.dispose(); }
+    const lines = provider.requests.map((request) => request.systemPrompt.split("\n").filter((line) => line.startsWith("usage:")));
+    assert.deepEqual(lines, [
+      ["usage: anthropic exhausted until 14:00"],
+      ["usage: anthropic exhausted until 14:00 · openai-codex low, 8% left"],
+      ["usage: openai-codex low, 8% left"],
+    ]);
+    for (const request of provider.requests) assert.ok(request.systemPrompt.includes("# Orchestrator protocol"), request.systemPrompt);
+  } finally { h.cleanup(); }
+});
+
+test("the usage line leaves the protocol once the only limit has lifted during a run", async () => {
+  const h = harness();
+  try {
+    writeFileSync(join(h.projectDir, "README.md"), "# Project\n");
+    observe(h, "anthropic", { state: "throttled", resetsAt: atLocal(12, 5), observedAt: atLocal(11, 59), source: "error" });
+    let clock = USAGE_NOON;
+    const provider = scriptedAnthropic((request) => {
+      if (request.toolResults.length > 0) return { text: "read" };
+      clock = new Date(2026, 8, 29, 12, 6);
+      return READ;
+    });
+    const session = await orchestratorSession(h, provider.extension, [provider.extension], [], { now: () => clock });
+    try { await session.prompt("Read README.md"); } finally { session.dispose(); }
+    const [first, second] = provider.requests;
+    assert.ok(first!.systemPrompt.includes(orchestratorProtocol(3, "medium", "usage: anthropic throttled until 12:05")), first!.systemPrompt);
+    assert.ok(second!.systemPrompt.includes(orchestratorProtocol(3, "medium")), second!.systemPrompt);
+    assert.equal(second!.systemPrompt.includes("usage:"), false, second!.systemPrompt);
+  } finally { h.cleanup(); }
+});
+
+test("a prompt an earlier extension forces carries the usage line once, as the run started", async () => {
+  const h = harness();
+  try {
+    writeFileSync(join(h.projectDir, "README.md"), "# Project\n");
+    observe(h, "openai-codex", { state: "available", percentLeft: 62, observedAt: atLocal(11, 45), source: "header" });
+    const forcing: InlineExtension = { name: "forcing-rules", factory: (pi) => { pi.on("before_agent_start", (event) => ({ systemPrompt: `${event.systemPrompt}\n\n## Project rules` })); } };
+    // After the first turn Anthropic runs into a limit. pi projects the forced text onto every request of the
+    // run, after the context handlers (agent-session.js _installAgentForcedPromptProjection), so the run keeps
+    // the line it started with: never a second one.
+    const provider = scriptedAnthropic((request) => {
+      if (request.toolResults.length > 0) return { text: "read" };
+      observe(h, "anthropic", { state: "throttled", resetsAt: atLocal(12, 5), observedAt: atLocal(12, 0), source: "error" });
+      return READ;
+    });
+    const session = await orchestratorSession(h, provider.extension, [provider.extension], [forcing], { now: () => USAGE_NOON });
+    try { await session.prompt("Read README.md"); } finally { session.dispose(); }
+    assert.equal(provider.requests.length, 2);
+    for (const request of provider.requests) assert.ok(request.systemPrompt.includes("## Project rules"), "the forced prompt is what the model got");
+    const lines = provider.requests.map((request) => request.systemPrompt.split("\n").filter((line) => line.startsWith("usage:")));
+    assert.deepEqual(lines, [["usage: openai-codex 62% left"], ["usage: openai-codex 62% left"]]);
+    const [first, second] = provider.requests;
+    assert.ok(first!.systemPrompt.includes(orchestratorProtocol(3, "medium", "usage: openai-codex 62% left")), first!.systemPrompt);
+    assert.equal(occurrences(second!.systemPrompt, "# Orchestrator protocol"), 1, second!.systemPrompt);
+  } finally { h.cleanup(); }
+});
+
+test("no worker gets the usage line: not a routed worker, not a forked worker", async () => {
+  const h = harness();
+  try {
+    // Not a limit, so routing still serves the fake Anthropic provider.
+    observe(h, "openai-codex", { state: "available", percentLeft: 62, observedAt: atLocal(11, 45), source: "header" });
+    const items = [{ task: "Find the config file" }, { task: "Finish the work", fork: true }];
+    let orchestratorId: string | undefined;
+    const provider = scriptedAnthropic((request) => request.sessionId !== orchestratorId ? { text: "leaf done" }
+      : request.toolResults.length === 0 ? { toolCall: { name: "subagents", arguments: { items } } } : { text: "done" });
+    const session = await orchestratorSession(h, provider.extension, installedWithSubagents(provider.extension, 0), [], { now: () => USAGE_NOON });
+    try {
+      orchestratorId = session.sessionId;
+      await session.prompt("Hand out the work");
+    } finally { session.dispose(); }
+    const orchestratorRequests = provider.requests.filter((request) => request.sessionId === orchestratorId);
+    assert.equal(orchestratorRequests.length, 2);
+    for (const request of orchestratorRequests) assert.ok(request.systemPrompt.includes("usage: openai-codex 62% left"), request.systemPrompt);
+    const workerRequests = provider.requests.filter((request) => request.sessionId !== orchestratorId);
+    assert.equal(new Set(workerRequests.map((request) => request.sessionId)).size, 2, "a routed worker and a forked worker");
+    for (const request of workerRequests) assert.equal(request.systemPrompt.includes("usage:"), false, request.systemPrompt);
+  } finally { h.cleanup(); }
+});
+
+test("the usage line marks an estimated lift time, dates one on another day, and names a state without a percentage", async () => {
+  const h = harness();
+  try {
+    observe(h, "anthropic", { state: "exhausted", observedAt: atLocal(11, 30), source: "error" });
+    observe(h, "google", { state: "throttled", resetsAt: new Date(2026, 8, 30, 9, 0).toISOString(), observedAt: atLocal(11, 50), source: "error" });
+    observe(h, "openai-codex", { state: "low", observedAt: atLocal(11, 55), source: "header" });
+    observe(h, "zai", { state: "available", observedAt: atLocal(11, 56), source: "header" });
+    // Lifted at 11:59, so left out.
+    observe(h, "mistral", { state: "throttled", resetsAt: atLocal(11, 59), observedAt: atLocal(11, 58), source: "error" });
+    const provider = plannedAnthropic();
+    const session = await orchestratorSession(h, provider.extension, [provider.extension], [], { now: () => USAGE_NOON });
+    try {
+      provider.setOrchestrator(session.sessionId);
+      await session.prompt("Say done");
+    } finally { session.dispose(); }
+    assert.equal(provider.requests.length, 1);
+    assert.ok(provider.requests[0]!.systemPrompt.includes(orchestratorProtocol(3, "medium",
+      "usage: anthropic exhausted until about 16:30 · google throttled until 2026-09-30 09:00 · openai-codex low · zai available")),
+    provider.requests[0]!.systemPrompt);
+  } finally { h.cleanup(); }
+});
+
+test("an empty usage store adds no usage line to any request", async () => {
+  const h = harness();
+  try {
+    writeFileSync(join(h.projectDir, "README.md"), "# Project\n");
+    const provider = plannedAnthropic();
+    const session = await orchestratorSession(h, provider.extension, [provider.extension], [], { now: () => USAGE_NOON });
+    try {
+      provider.setOrchestrator(session.sessionId);
+      provider.plan.push(READ, { text: "read" });
+      await session.prompt("Read README.md");
+    } finally { session.dispose(); }
+    assert.equal(existsSync(usageObservationsPath(h.stateDir)), false, "no store file");
+    assert.equal(provider.requests.length, 2);
+    for (const request of provider.requests) {
+      assert.ok(request.systemPrompt.includes(orchestratorProtocol(3, "medium")), request.systemPrompt);
+      assert.equal(request.systemPrompt.includes("usage:"), false, request.systemPrompt);
     }
   } finally { h.cleanup(); }
 });

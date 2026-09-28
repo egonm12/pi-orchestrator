@@ -32,6 +32,8 @@ import { retrySetup, startRetry, type RetrySetup, type StartedRetry } from "./re
 import { delegationRouting, gateAction, recordGateRequirement, type GateLevel } from "./quality-gate.ts";
 import { readRoutingRecords, type RoutingRecord } from "../routing/decision-record.ts";
 import { stateDir } from "../router/extension.ts";
+import { readUsageObservations, usageObservationsPath } from "../router/usage-observations.ts";
+import { usageLine } from "./usage-line.ts";
 
 // The subagents extension (ADR 0007): a third pi extension, separate from the
 // router and the guard, with a `subagents` tool. Each call starts a worker in
@@ -223,6 +225,8 @@ function personalSubagentBanList(agentDir: string): readonly string[] {
 export interface SubagentsDependencies {
   /** Extensions each worker loads besides the installed ones. */
   readonly workerExtensions: readonly InlineExtension[];
+  /** The clock the usage line reads limits against. */
+  readonly now: () => Date;
 }
 
 const DESCRIPTION = "Hand 1 to 8 tasks to workers. At most orchestrator.subagents.maxParallel run at once. " +
@@ -249,7 +253,7 @@ function openWorker(ctx: Pick<ExtensionContext, "ui">, workerId: string): Promis
 }
 
 export function createSubagentsExtension(overrides: Partial<SubagentsDependencies> = {}) {
-  const deps: SubagentsDependencies = { workerExtensions: [], ...overrides };
+  const deps: SubagentsDependencies = { workerExtensions: [], now: () => new Date(), ...overrides };
   return function subagents(pi: ExtensionAPI): void {
     // Each warning is shown once per orchestrator session.
     const warned = new Set<string>();
@@ -694,11 +698,12 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
     registerCommitGate(pi, logOnce, gateLevels);
     // The orchestrator protocol is in the system prompt of every request of every orchestrator run: added as a
     // prompt starts its run, and put back into any request whose prompt lost it, as in a run a message started
-    // (orchestrator-protocol.ts).
-    pi.on("before_agent_start", (event, ctx) =>
-      isOrchestratorSession(ctx) ? addOrchestratorProtocol(event, ctx, explorationNudge.threshold, gateLevels.inForce(ctx).level) : undefined);
-    pi.on("context_with_system", (event, ctx) =>
-      isOrchestratorSession(ctx) ? keepOrchestratorProtocol(event, ctx, explorationNudge.threshold, gateLevels.inForce(ctx).level) : undefined);
+    // (orchestrator-protocol.ts). It ends with the usage line, read from the shared usage store for each request (usage-line.ts).
+    const currentUsageLine = () => usageLine(readUsageObservations(usageObservationsPath(stateDir())), deps.now());
+    pi.on("before_agent_start", (event, ctx) => isOrchestratorSession(ctx)
+      ? addOrchestratorProtocol(event, ctx, explorationNudge.threshold, gateLevels.inForce(ctx).level, currentUsageLine()) : undefined);
+    pi.on("context_with_system", (event, ctx) => isOrchestratorSession(ctx)
+      ? keepOrchestratorProtocol(event, ctx, explorationNudge.threshold, gateLevels.inForce(ctx).level, currentUsageLine()) : undefined);
   };
 }
 

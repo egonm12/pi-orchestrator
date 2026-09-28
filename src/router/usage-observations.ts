@@ -119,20 +119,26 @@ export function recordUsageObservation(path: string, provider: string, observati
   });
 }
 
+/** When an exhausted or throttled observation stops limiting its provider, in
+ *  epoch milliseconds; undefined for any other state. Exhausted holds until its
+ *  reset, or for the five-hour usage window of the Claude and Codex
+ *  subscriptions without one. Throttled holds until its reset, or for five
+ *  minutes without one: long enough to spare the next few delegations, short
+ *  enough that a per-minute rate limit does not keep a provider out for long. */
+export function limitLiftsAt(observation: UsageObservation): number | undefined {
+  if (observation.state !== "exhausted" && observation.state !== "throttled") return undefined;
+  const window = observation.state === "exhausted" ? USAGE_OBSERVATION_WINDOW_MS : THROTTLE_DEFAULT_WINDOW_MS;
+  return observation.resetsAt === undefined ? Date.parse(observation.observedAt) + window : Date.parse(observation.resetsAt);
+}
+
 /** The providers whose observations still limit them at `now`, as the hard
- *  filters read them. Exhausted holds until its reset, or for the five-hour
- *  usage window of the Claude and Codex subscriptions without one. Throttled
- *  holds until its reset, or for five minutes without one: long enough to
- *  spare the next few delegations, short enough that a per-minute rate limit
- *  does not keep a provider out for long. */
+ *  filters read them, each until limitLiftsAt. */
 export function usageLimits(observations: UsageObservations, now: Date): Record<string, ProviderUsage> {
   const at = now.getTime();
   const limits: Record<string, ProviderUsage> = {};
   for (const [provider, observation] of Object.entries(observations)) {
-    if (observation.state !== "exhausted" && observation.state !== "throttled") continue;
-    const window = observation.state === "exhausted" ? USAGE_OBSERVATION_WINDOW_MS : THROTTLE_DEFAULT_WINDOW_MS;
-    const until = observation.resetsAt === undefined ? Date.parse(observation.observedAt) + window : Date.parse(observation.resetsAt);
-    if (!(at < until)) continue;
+    const until = limitLiftsAt(observation);
+    if (until === undefined || !(at < until)) continue;
     const learned = observation.source === "error" ? "a limit error" : "response headers";
     limits[provider] = {
       state: observation.state === "exhausted" ? "out-of-usage" : "throttled",
