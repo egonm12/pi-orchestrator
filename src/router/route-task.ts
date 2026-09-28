@@ -85,6 +85,7 @@ function hardFilterEvidence(router: ActiveRouter, taskText: string, at: Date, ev
     allowance: allowanceConstraint(router.owner, evidence.catalog, { role: "subtask", maxInputTokens: estimatedPromptTokens }),
     authorization: evidence.authorization, banLists: router.banLists,
     ...(constraints.excludedRung === undefined ? {} : { excludedRung: constraints.excludedRung }),
+    ...(constraints.avoidedProvider === undefined ? {} : { avoidedProvider: constraints.avoidedProvider }),
   };
 }
 
@@ -104,8 +105,10 @@ export async function classifyTask(router: ActiveRouter, taskText: string, agent
 
 /** Route under the worker's constraints after classification, while the
  * shared choice queue is held. A minimum tier raises where routing starts,
- * an excluded rung is removed in every tier, and a forced rung replaces the
- * tier choice. The provider usage returned is what the hard filters read. */
+ * an excluded rung is removed in every tier, an avoided provider is passed
+ * over within a tier while another provider survives, and a forced rung
+ * replaces the tier choice. The provider usage returned is what the hard
+ * filters read. */
 export function routeTask(router: ActiveRouter, taskText: string, classification: TierClassification, at: Date, constraints: RoutingConstraints = {}) {
   const evidence = router.evidence();
   const filters = hardFilterEvidence(router, taskText, at, evidence, constraints);

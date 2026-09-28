@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { parseSessionEntries, SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { RiskTier } from "../routing/classifier.ts";
 import type { EditRecord, ForkRecord, GateLevel, RoutingRecord } from "../routing/decision-record.ts";
+import { providerOf } from "../recipients/authorized-delegation.ts";
 import type { ConstraintRung } from "../routing/tier-router.ts";
 import { delegationRouting, editingDelegationProblem, isRunningDelegation } from "./quality-gate.ts";
 import { readWorkerOutcome } from "./resume.ts";
@@ -13,10 +14,13 @@ import { workerSessionDir } from "./worker.ts";
 // delegation of this orchestrator session. The reviewer is routed through the
 // auto model at the delegation's tier or higher, elevated for a delegation
 // without a tier, and never on the rung the delegation ran on: its routing
-// constraints (../router/auto-provider.ts) say so. When a live route leaves no
-// rung and the session model it would fall back to is that rung, the reviewer
-// fails with the reason instead of running. In shadow mode and with routing
-// off no other rung can be chosen, so the reviewer runs on that rung with its
+// constraints (../router/auto-provider.ts) say so. They also name the
+// provider of that rung to avoid, a preference and not a hard filter (ADR
+// 0012): within the tier routing settles on, the reviewer runs on another
+// provider's surviving rung, and on that provider's only when none is left.
+// When a live route leaves no rung and the session model it would fall back
+// to is that rung, the reviewer fails with the reason instead of running. In
+// shadow mode and with routing off no other rung can be chosen, so the reviewer runs on that rung with its
 // fresh context: a same-rung review, which its saved outcome and the verdict
 // it backs record (owner decision 2026-09-28). A reviewer's editing calls are
 // denied (./editing.ts), so it never becomes an editing delegation. Its review
@@ -65,8 +69,9 @@ export interface ReviewTarget {
   readonly delegationId: string;
   /** Absent for a delegation without a tier, which is gated as elevated. */
   readonly tier?: RiskTier;
-  /** The reviewer's routing constraints: at the delegation's tier or higher, never on its rung. */
-  readonly constraints: { readonly minimumTier: RiskTier; readonly excludedRung: ConstraintRung };
+  /** The reviewer's routing constraints: at the delegation's tier or higher,
+   *  never on its rung, and preferably not on its rung's provider. */
+  readonly constraints: { readonly minimumTier: RiskTier; readonly excludedRung: ConstraintRung; readonly avoidedProvider: string };
   readonly material: ReviewMaterial;
 }
 
@@ -197,7 +202,7 @@ export function reviewTarget(ctx: Pick<ExtensionContext, "cwd" | "sessionManager
     refuse("no record names the rung it ran on and the worker board does not show it, so a reviewer cannot be kept off that rung");
   return {
     delegationId: id, ...(routing.tier === undefined ? {} : { tier: routing.tier }),
-    constraints: { minimumTier: routing.tier ?? "elevated", excludedRung: rung },
+    constraints: { minimumTier: routing.tier ?? "elevated", excludedRung: rung, avoidedProvider: providerOf(rung.model) },
     material: delegationMaterial(ctx, id, records),
   };
 }

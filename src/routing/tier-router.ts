@@ -24,8 +24,10 @@ import type { ResolvedTierMap, TierRung } from "./tier-map.ts";
 //            list order breaking ties; ordered tiers take the first survivor.
 //
 // A worker's routing constraints narrow this: a minimum tier raises the tier
-// stage 1 starts at, an excluded rung fails stage 1 in every tier, and a
-// forced rung (`routeForcedRung`) goes through stage 1 alone, with no stage 2.
+// stage 1 starts at, an excluded rung fails stage 1 in every tier, an avoided
+// provider leaves stage 2 its other providers' survivors when the tier has
+// any (a reviewer's preference, ADR 0012), and a forced rung
+// (`routeForcedRung`) goes through stage 1 alone, with no stage 2.
 //
 // All evidence is a plain input, so the router reads no file, no clock and no
 // network. The router extension calls `routeTier` (../router/route-task.ts);
@@ -61,6 +63,10 @@ export interface RouterEvidence {
   /** A rung this worker's routing constraints exclude. Only that model at
    *  that effort is removed, in every tier. */
   readonly excludedRung?: ConstraintRung;
+  /** A provider this worker's routing constraints prefer to avoid: a
+   *  preference, not a hard filter. Stage 2 picks among the other providers'
+   *  survivors of a tier, and among all its survivors when none is left. */
+  readonly avoidedProvider?: string;
 }
 
 /** One model at one effort, as a routing constraint names it. A recorded
@@ -85,6 +91,9 @@ export type RoutingConstraints =
       /** A rung the worker must not run on. Removed in every tier, so escalation
        *  cannot choose it either. */
       readonly excludedRung?: ConstraintRung;
+      /** A provider to avoid where a tier has another provider's survivor. It
+       *  never moves routing to another tier and never brings back a removed rung. */
+      readonly avoidedProvider?: string;
       readonly forcedRung?: undefined;
     }
   | {
@@ -92,6 +101,7 @@ export type RoutingConstraints =
       readonly forcedRung: ForcedRung;
       readonly minimumTier?: undefined;
       readonly excludedRung?: undefined;
+      readonly avoidedProvider?: undefined;
     };
 
 export interface TierRouteInput {
@@ -118,7 +128,8 @@ export interface TierRouteChoice {
   /** The chosen survivor of `tier`. */
   readonly rung: TierRung;
   readonly tierOrder?: "balanced" | "ordered";
-  /** Counts behind a balanced choice, for providers that survived the filters. */
+  /** Counts behind a balanced choice, for the surviving providers it chose
+   *  among: without an avoided provider when another provider survived. */
   readonly providerCounts?: Readonly<Record<string, number>>;
   readonly model: string;
   /** Every survivor of `tier`, in map order. */
@@ -297,19 +308,23 @@ export function routeTier(input: TierRouteInput): TierRouteDecision {
       if (failed === undefined) survivors.push(rung);
       else removed.push(Object.freeze({ tier, rung: rung.rung, model: rung.model, ...failed }));
     }
-    const [first] = survivors;
-    if (first !== undefined) {
+    if (survivors.length > 0) {
+      // The avoided provider is a preference: it only narrows the choice while another provider's survivor is left.
+      const preferred = evidence.avoidedProvider === undefined ? survivors
+        : survivors.filter((rung) => providerOf(rung.model) !== evidence.avoidedProvider);
+      const candidates = preferred.length > 0 ? preferred : survivors;
+      const first = candidates[0]!;
       const tierOrder = input.tierMap.orders[tier];
       const providerCounts: Record<string, number> = {};
       if (tierOrder === "balanced") {
-        for (const rung of survivors) {
+        for (const rung of candidates) {
           const provider = providerOf(rung.model);
           providerCounts[provider] = evidence.providerCounts?.[provider] ?? 0;
         }
       }
       // A future per-provider weight can be added to this score without changing filtering or tier escalation.
       const score = (rung: TierRung) => providerCounts[providerOf(rung.model)] ?? 0;
-      const chosen = tierOrder === "ordered" ? first : survivors.reduce((best, rung) => score(rung) < score(best) ? rung : best, first);
+      const chosen = tierOrder === "ordered" ? first : candidates.reduce((best, rung) => score(rung) < score(best) ? rung : best, first);
       return Object.freeze({
         ok: true,
         refused: false,
