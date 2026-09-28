@@ -3,11 +3,12 @@ import { test } from "node:test";
 import { fixtureClassification, fixtureRoute, fixtureTierMap, SONNET } from "../fixtures/routing-decision.ts";
 import type { RiskTier } from "../routing/classifier.ts";
 import { buildDecisionRecord, buildEditRecord, type RoutingRecord } from "../routing/decision-record.ts";
-import { commitDenial, gatedGitAction, UnjudgedNotices, waitingForVerdict } from "./commit-gate.ts";
+import { commitReminder, gatedGitAction, UnjudgedNotices, waitingForVerdict } from "./commit-gate.ts";
 
-// The commit gate (ADR 0010): while an editing delegation waits for a verdict,
-// the orchestrator's git commit and git push are denied, and a turn end names
-// the delegations. Seams: `gatedGitAction` over a bash command, the deny text,
+// The commit gate (ADR 0010, amended by ADR 0013): while an editing delegation
+// waits for a verdict, the result of the orchestrator's git commit and git push
+// names it, and a turn end names the delegations. Seams: `gatedGitAction` over
+// a bash command, the reminder text,
 // `waitingForVerdict` over the record folder's records and the gate level, and
 // `UnjudgedNotices` over the unjudged delegations at each turn end.
 
@@ -42,13 +43,13 @@ test("a command the reader cannot follow is matched by its text, so a commit mes
   for (const [command, action] of cases) assert.equal(gatedGitAction(command), action, command);
 });
 
-test("the deny names each unjudged delegation and says how to proceed", () => {
-  assert.equal(commitDenial("commit", ["delegation a1 (agent scout)"]),
-    "pi-orchestrator: git commit is denied while an editing delegation waits for your verdict: delegation a1 (agent scout). " +
-    "Judge each Result and record its verdict with `subagents_verdict`, then commit.");
-  assert.equal(commitDenial("push", ["delegation a1", "delegation b2 (still running)"]),
-    "pi-orchestrator: git push is denied while 2 editing delegations wait for your verdict: delegation a1, delegation b2 (still running). " +
-    "Judge each Result and record its verdict with `subagents_verdict`, then push.");
+test("the reminder names each unjudged delegation and says what to do", () => {
+  assert.equal(commitReminder("commit", ["delegation a1 (agent scout)"]),
+    "pi-orchestrator: git commit ran while an editing delegation waits for your verdict: delegation a1 (agent scout). " +
+    "Judge each Result and record its verdict with `subagents_verdict`, or tell the user which verdicts are missing.");
+  assert.equal(commitReminder("push", ["delegation a1", "delegation b2 (still running)"]),
+    "pi-orchestrator: git push ran while 2 editing delegations wait for your verdict: delegation a1, delegation b2 (still running). " +
+    "Judge each Result and record its verdict with `subagents_verdict`, or tell the user which verdicts are missing.");
 });
 
 const label = (id: string) => `delegation ${id}`;
@@ -58,7 +59,7 @@ test("a turn end names the unjudged delegations once, and again only when they c
   const notices = new UnjudgedNotices();
   const first = notices.atTurnEnd(waiting("a"), label);
   assert.equal(first, "pi-orchestrator: an editing delegation waits for your verdict: delegation a. " +
-    "Judge each Result and record its verdict with `subagents_verdict`; git commit and git push are denied until then.");
+    "Judge each Result and record its verdict with `subagents_verdict`.");
   assert.equal(notices.atTurnEnd(waiting("a"), label), undefined, "nothing changed");
   assert.match(notices.atTurnEnd(waiting("a", "b"), label) ?? "", /2 editing delegations wait for your verdict: delegation a, delegation b\./);
   assert.equal(notices.atTurnEnd(waiting("a", "b"), label), undefined);
@@ -87,7 +88,7 @@ async function editedAt(delegationId: string, tier: RiskTier | undefined): Promi
   return [decision, edit];
 }
 
-test("only editing delegations whose gate action is not none wait for a verdict: the commit gate and the turn-end notice never name an ungated one", async () => {
+test("only editing delegations whose gate action is not none wait for a verdict: neither a commit's reminder nor the turn-end notice names an ungated one", async () => {
   const records = [
     ...await editedAt("mechanical", "mechanical"), ...await editedAt("standard", "standard"), ...await editedAt("elevated", "elevated"),
     ...await editedAt("critical", "critical"), ...await editedAt("tierless", undefined),

@@ -10,15 +10,20 @@ import { gitSubcommands } from "./tool-call-kind.ts";
 import { hasEnded, workerBoard } from "./worker-board.ts";
 import { isRunningWorkerSession } from "./worker-sessions.ts";
 
-// The commit gate (ADR 0010): committing unjudged work is the harm the quality
-// gate guards against, so while an editing delegation of this orchestrator
-// session waits for a verdict (./editing.ts), the orchestrator's git commit and
-// git push are denied, with the delegations named. Nothing else is blocked:
-// other bash, new delegations (the runtime cannot tell before a worker runs
-// whether it will edit) and the final reply go on. A verdict of either kind
-// judges a delegation. A delegation whose gate action is none at the gate
-// level in force (./quality-gate.ts, ./gate-level.ts) needs no verdict, so it
-// never waits: neither the gate nor the notice names it.
+// The commit gate (ADR 0010, amended by ADR 0013): it reminds, never blocks.
+// The orchestrator's git commit and git push always run, and while an editing
+// delegation of this orchestrator session waits for a verdict (./editing.ts),
+// the result of each ends with a reminder naming the delegations, so the
+// orchestrator records the verdicts or tells the user which are missing. A
+// skipped verdict stays visible as a missing verdict in the routing report. A
+// verdict of either kind judges a delegation. A delegation whose gate action
+// is none at the gate level in force (./quality-gate.ts, ./gate-level.ts)
+// needs no verdict, so it never waits: neither the reminder nor the notice
+// names it.
+//
+// The reminder joins the call's result in tool_result, as the exploration
+// nudge does (./exploration-nudge.ts), and names what waits once the call has
+// run. A call another extension blocks gets no tool_result, so no reminder.
 //
 // At a turn end with delegations waiting, a notice names them. It goes the way
 // a worker's progress report does (./report.ts): a custom message sent
@@ -36,7 +41,7 @@ import { isRunningWorkerSession } from "./worker-sessions.ts";
 /** The custom message type of the turn-end notice. */
 export const UNJUDGED_NOTICE = "subagents-unjudged";
 
-/** A git action the gate denies. */
+/** A git action whose result the gate reminds in. */
 export type GatedGitAction = "commit" | "push";
 
 /** A git command with its options and their values before the subcommand, for
@@ -61,9 +66,9 @@ function waitingText(labels: readonly string[]): string {
 
 const RECORD_VERDICTS = "Judge each Result and record its verdict with `subagents_verdict`";
 
-/** Why `git <action>` is denied while the delegations `labels` name wait. */
-export function commitDenial(action: GatedGitAction, labels: readonly string[]): string {
-  return `pi-orchestrator: git ${action} is denied while ${waitingText(labels)}. ${RECORD_VERDICTS}, then ${action}.`;
+/** The reminder `git <action>`'s result ends with while the delegations `labels` name wait. */
+export function commitReminder(action: GatedGitAction, labels: readonly string[]): string {
+  return `pi-orchestrator: git ${action} ran while ${waitingText(labels)}. ${RECORD_VERDICTS}, or tell the user which verdicts are missing.`;
 }
 
 /** The turn-end notices of one orchestrator session. */
@@ -84,8 +89,7 @@ export class UnjudgedNotices {
     if (key === this.#last) return undefined;
     this.#last = key;
     if (waiting.length === 0) return undefined;
-    return `pi-orchestrator: ${waitingText(waiting.map((delegation) => label(delegation.delegationId)))}. ` +
-      `${RECORD_VERDICTS}; git commit and git push are denied until then.`;
+    return `pi-orchestrator: ${waitingText(waiting.map((delegation) => label(delegation.delegationId)))}. ${RECORD_VERDICTS}.`;
   }
 }
 
@@ -98,7 +102,7 @@ function delegationLabel(delegationId: string): string {
   return `delegation ${delegationId}${notes.length === 0 ? "" : ` (${notes.join(", ")})`}`;
 }
 
-/** An error's first line, for a deny reason or a log line. */
+/** An error's first line, for a reminder or a log line. */
 function firstLine(error: unknown): string {
   return String(error instanceof Error ? error.message : error).split(/\r?\n/, 1)[0]!;
 }
@@ -116,28 +120,37 @@ function waiting(ctx: Pick<ExtensionContext, "cwd" | "sessionManager">, gateLeve
   return waitingForVerdict(readRoutingRecords(join(stateDir(), "routing")), ctx.sessionManager.getSessionId(), gateLevels.inForce(ctx).level);
 }
 
-/** Hooks the commit gate and the turn-end notice into this extension's
- *  session. A record folder that cannot be read denies a commit or push, with
- *  the reason, since the gate cannot tell whether one is outstanding; at a
- *  turn end it skips the notice and is logged once. */
+/** The reminder the result of the bash call `input` ends with in `ctx`'s
+ *  session, or `undefined` when it is no commit or push, the session is no
+ *  orchestrator's, or nothing waits. A record folder that cannot be read says
+ *  so in the reminder, since the gate cannot tell whether a verdict is outstanding. */
+function reminderFor(input: Record<string, unknown>, ctx: Pick<ExtensionContext, "cwd" | "sessionManager">, gateLevels: GateLevels): string | undefined {
+  if (!isOrchestratorSession(ctx)) return undefined;
+  const command = input.command;
+  const action = typeof command === "string" ? gatedGitAction(command) : undefined;
+  if (action === undefined) return undefined;
+  let unjudged: UnjudgedDelegation[];
+  try {
+    unjudged = waiting(ctx, gateLevels);
+  } catch (error) {
+    return `pi-orchestrator: git ${action} ran, but the edit records cannot be read to tell whether an editing delegation waits for your verdict (${firstLine(error)}).`;
+  }
+  return unjudged.length === 0 ? undefined : commitReminder(action, unjudged.map((item) => delegationLabel(item.delegationId)));
+}
+
+/** Hooks the commit gate's reminder and the turn-end notice into this
+ *  extension's session. A record folder that cannot be read skips the notice
+ *  at a turn end, and is logged once. */
 export function registerCommitGate(pi: ExtensionAPI, logOnce: (line: string) => void, gateLevels: GateLevels): void {
   const notices = new UnjudgedNotices();
   pi.on("session_start", () => { notices.userPrompt(); });
   pi.on("input", (event, ctx) => {
     if (event.source !== "extension" && isOrchestratorSession(ctx)) notices.userPrompt();
   });
-  pi.on("tool_call", (event, ctx) => {
-    if (event.toolName !== "bash" || !isOrchestratorSession(ctx)) return undefined;
-    const command = (event.input as { command?: unknown }).command;
-    const action = typeof command === "string" ? gatedGitAction(command) : undefined;
-    if (action === undefined) return undefined;
-    let unjudged: UnjudgedDelegation[];
-    try {
-      unjudged = waiting(ctx, gateLevels);
-    } catch (error) {
-      return { block: true, reason: `pi-orchestrator: git ${action} is denied: the edit records cannot be read to tell whether every editing delegation has a verdict (${firstLine(error)}).` };
-    }
-    return unjudged.length === 0 ? undefined : { block: true, reason: commitDenial(action, unjudged.map((item) => delegationLabel(item.delegationId))) };
+  pi.on("tool_result", (event, ctx) => {
+    if (event.toolName !== "bash") return undefined;
+    const text = reminderFor(event.input, ctx, gateLevels);
+    return text === undefined ? undefined : { content: [...event.content, { type: "text", text }] };
   });
   pi.on("turn_end", (_event, ctx) => {
     if (!isOrchestratorSession(ctx)) return;

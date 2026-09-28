@@ -66,7 +66,8 @@ const paragraphs = (explorationNudge: number, gateLevel: GateLevel): readonly st
     "account of it: spot-check the diff and the claims that matter, or read a reviewer's Result. Then record the verdict with " +
     "`subagents_verdict`: the delegation id, accept or request_changes, and a reason naming what you checked. A later verdict on " +
     "the same delegation replaces the earlier one, and a resume that edits again needs a new one. A research Result gets no verdict. " +
-    "Your git commit and git push are denied until every editing delegation that needs a verdict has one.",
+    "Your git commit or git push always goes through, and its result names each editing delegation still waiting for a verdict. " +
+    "Record those verdicts, or tell the user which are missing: the routing report counts every missing verdict.",
   gateLevelParagraph(gateLevel),
   "Where your gate level calls for an independent reviewer, an editing delegation needs one before its verdict; its Result says so. " +
     "Start one with a `subagents` item whose `review` is the " +

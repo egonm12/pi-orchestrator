@@ -193,6 +193,8 @@ interface LoadedSubagents {
   agentEvent(type: "agent_start" | "agent_settled" | "turn_end", ctx: ExtensionContext): Promise<void>;
   /** Runs the extension's tool_call handlers, as pi does before a call runs, and returns the first block. */
   toolCall(toolName: string, input: Record<string, unknown>, ctx: ExtensionContext): Promise<unknown>;
+  /** Runs the extension's tool_result handlers, as pi does after a call ran with a result of `content`, and returns the content they leave. */
+  toolResult(toolName: string, input: Record<string, unknown>, ctx: ExtensionContext, content?: readonly TextPart[]): Promise<TextPart[]>;
   /** Runs a registered command as the owner types it, and returns what it showed. */
   runCommand(name: string, args: string, ctx: ExtensionContext): Promise<string[]>;
   /** Runs a registered command with `ctx` exactly as given, for a test that
@@ -206,6 +208,8 @@ interface LoadedSubagents {
   readonly messages: readonly SentMessage[];
 }
 
+/** A text part of a tool result. */
+type TextPart = { type: string; text?: string };
 type Command = Parameters<ExtensionAPI["registerCommand"]>[1];
 type Shortcut = Parameters<ExtensionAPI["registerShortcut"]>[1];
 
@@ -254,6 +258,15 @@ function loadSubagents(workerExtensions: readonly InlineExtension[]): LoadedSuba
         if (result !== undefined) return result;
       }
       return undefined;
+    },
+    async toolResult(toolName, input, ctx, content = [{ type: "text", text: "(no output)" }]) {
+      let current = [...content];
+      for (const handler of handlers.get("tool_result") ?? []) {
+        const result = await handler({ type: "tool_result", toolCallId: "call", toolName, input, content: current, isError: false, details: undefined }, ctx) as
+          { content?: TextPart[] } | undefined;
+        if (result?.content !== undefined) current = result.content;
+      }
+      return current;
     },
     async runCommand(name, args, ctx) {
       const shown: string[] = [];
@@ -3313,8 +3326,9 @@ test("a verdict on a fork, an agent's named model or an unrouted worker attaches
   }
 });
 
-// The commit gate (ADR 0010), in the orchestrator's real pi session: its git
-// commit and git push go through pi's tool_call hooks, and the turn-end notice
+// The commit gate (ADR 0010, amended by ADR 0013), in the orchestrator's real
+// pi session: its git commit and git push always run, and the reminder joins
+// their result through pi's tool_result hooks; the turn-end notice goes
 // through pi's turn_end event.
 
 /** The custom messages of `type` in `session`'s messages from `from` on, as text. */
@@ -3324,78 +3338,144 @@ function customTexts(session: { readonly messages: readonly unknown[] }, type: s
     .map((message) => typeof message.content === "string" ? message.content : JSON.stringify(message.content));
 }
 
-const COMMIT = "git add -A && git -c user.name=o -c user.email=o@x.test commit -qm orchestrator";
+/** A commit of everything in the work tree, empty or not, by the orchestrator, with `message`. */
+const commit = (message: string) => `git add -A && git -c user.name=o -c user.email=o@x.test commit -q --allow-empty -m ${message}`;
 
-test("unjudged edits deny the orchestrator's git commit and push, naming each delegation, until each has a verdict; nothing else is blocked", async () => {
+/** The orchestrator's bash results in `session`'s messages from `from` on:
+ *  whether each ran without error, and the reminder it ends with, if any. */
+function bashResults(session: { readonly messages: readonly unknown[] }, from = 0): { ok: boolean; reminder?: string }[] {
+  return (session.messages.slice(from) as { role: string; toolName?: string; isError?: boolean; content?: { type: string; text?: string }[] }[])
+    .filter((message) => message.role === "toolResult" && message.toolName === "bash")
+    .map((message) => {
+      const last = message.content?.at(-1)?.text ?? "";
+      return { ok: message.isError !== true, ...(last.startsWith("pi-orchestrator:") ? { reminder: last } : {}) };
+    });
+}
+
+/** The reminder a git `action`'s result ends with while `waiting` wait. */
+const gateReminder = (action: "commit" | "push", waiting: string) =>
+  `pi-orchestrator: git ${action} ran while ${waiting} Judge each Result and record its verdict with \`subagents_verdict\`, ` +
+  "or tell the user which verdicts are missing.";
+
+/** The turn-end notice while `waiting` wait. */
+const unjudgedNotice = (waiting: string) => `pi-orchestrator: ${waiting} Judge each Result and record its verdict with \`subagents_verdict\`.`;
+
+/** The subjects of the commits `dir`'s HEAD reaches, newest first. */
+const commitLog = (dir: string) => execFileSync("git", ["log", "--format=%s", "HEAD"], { cwd: dir, encoding: "utf8" }).trim().split("\n");
+
+test("a commit or push with editing delegations waiting goes through, and its result names each one; the report counts them missing until judged", async () => {
   const h = routedHarness();
   try {
     execFileSync("git", ["init", "-q"], { cwd: h.projectDir });
+    const origin = join(h.agentDir, "origin.git");
+    execFileSync("git", ["init", "-q", "--bare", origin]);
+    execFileSync("git", ["remote", "add", "origin", origin], { cwd: h.projectDir });
     writeAgentDefinition(join(h.agentDir, "agents"), "scribe.md", { name: "scribe", description: "Commits", tools: "bash" }, "Commit.");
     const provider = plannedAnthropic(runningScript);
     // Workers load the subagents extension too, and with it the gate's hooks.
     const session = await orchestratorSession(h, provider.extension, installedWithSubagents(provider.extension, 1), [routerExtension()]);
-    const log = () => execFileSync("git", ["log", "--format=%s"], { cwd: h.projectDir, encoding: "utf8" }).trim().split("\n");
     try {
       provider.setOrchestrator(session.sessionId);
       provider.plan.push(
         { toolCall: { name: "subagents", arguments: { items: [{ task: runTask("write", { path: "notes.md", content: "x\n" }) }] } } },
-        { toolCall: { name: "bash", arguments: { command: COMMIT } } },
-        { toolCall: { name: "bash", arguments: { command: "git -C . push origin HEAD" } } },
+        { toolCall: { name: "bash", arguments: { command: commit("orchestrator") } } },
+        { toolCall: { name: "bash", arguments: { command: "git -C . push -q origin HEAD" } } },
         { toolCall: { name: "bash", arguments: { command: "ls" } } },
-        // A new delegation is not blocked, and its worker commits unhindered.
         { toolCall: { name: "subagents", arguments: { items: [{ agent: "scribe",
           task: runTask("bash", { command: "git -c user.name=w -c user.email=w@x.test commit -q --allow-empty -m worker" }) }] } } },
-        { toolCall: { name: "bash", arguments: { command: "npm test; git push" } } },
+        { toolCall: { name: "bash", arguments: { command: "git status --short; git push -q origin HEAD" } } },
       );
-      await session.prompt("Write the notes and commit them");
+      await session.prompt("Write the notes, commit and push them");
       const results = (session.messages as { role: string; toolName?: string; details?: SubagentsDetails }[])
         .filter((message) => message.role === "toolResult" && message.toolName === "subagents").map((message) => message.details!.results[0]!);
       assert.deepEqual(results.map((worker) => [worker.status, worker.edited]), [["completed", true], ["completed", true]], JSON.stringify(results));
       const [writer, scribe] = results.map((worker) => worker.sessionId!) as [string, string];
       const one = `an editing delegation waits for your verdict: delegation ${writer}.`;
       const both = `2 editing delegations wait for your verdict: delegation ${writer}, delegation ${scribe} (agent scribe).`;
-      const outcomes = toolOutcomes(session);
-      assert.deepEqual(outcomes.slice(0, 2), ["subagents ok",
-        `bash refused: pi-orchestrator: git commit is denied while ${one} Judge each Result and record its verdict with \`subagents_verdict\`, then commit.`]);
-      assert.equal(outcomes[2], `bash refused: pi-orchestrator: git push is denied while ${one} Judge each Result and record its verdict with \`subagents_verdict\`, then push.`);
-      assert.deepEqual(outcomes.slice(3, 5), ["bash ok", "subagents ok"]);
-      assert.ok(outcomes[5]?.startsWith(`bash refused: pi-orchestrator: git push is denied while ${both}`), outcomes[5]);
-      assert.deepEqual(log(), ["worker"], "the worker's commit ran; the orchestrator's did not");
-      // A notice at the turn end after each change, none while nothing changed; the final reply ended the prompt.
-      const notice = (waiting: string) => `pi-orchestrator: ${waiting} Judge each Result and record its verdict with \`subagents_verdict\`; git commit and git push are denied until then.`;
-      assert.deepEqual(customTexts(session, "subagents-unjudged"), [notice(one), notice(both)]);
+      assert.deepEqual(toolOutcomes(session), ["subagents ok", "bash ok", "bash ok", "bash ok", "subagents ok", "bash ok"]);
+      assert.deepEqual(bashResults(session), [
+        { ok: true, reminder: gateReminder("commit", one) },
+        { ok: true, reminder: gateReminder("push", one) },
+        { ok: true },
+        { ok: true, reminder: gateReminder("push", both) },
+      ]);
+      assert.deepEqual(commitLog(h.projectDir), ["worker", "orchestrator"], "the orchestrator's commit ran, and the worker's after it");
+      assert.deepEqual(commitLog(origin), ["worker", "orchestrator"], "both pushes reached the origin");
+      // The verdicts are still missing, and the report counts them.
+      assert.equal(reportGate(h).missing, 2);
+      // The turn-end notice stays: once after each change, none while nothing changed; the final reply ended the prompt.
+      assert.deepEqual(customTexts(session, "subagents-unjudged"), [unjudgedNotice(one), unjudgedNotice(both)]);
       const orchestratorRequests = () => provider.requests.filter((request) => request.sessionId === session.sessionId);
       assert.equal(orchestratorRequests().length, 7, "six tool calls and the final reply; the notices start no turn");
-      assert.ok(orchestratorRequests()[1]!.userMessages.some((text) => text.includes(notice(one))), "the notice reaches the orchestrator's next request");
+      assert.ok(orchestratorRequests()[1]!.userMessages.some((text) => text.includes(unjudgedNotice(one))), "the notice reaches the orchestrator's next request");
 
       // A user prompt answered by a final reply alone: the notice follows the reply, once, and starts no turn.
       let from = session.messages.length;
       await session.prompt("Anything left?");
       assert.deepEqual((session.messages.slice(from) as { role: string }[]).map((message) => message.role), ["user", "assistant", "custom"]);
-      assert.deepEqual(customTexts(session, "subagents-unjudged", from), [notice(both)]);
+      assert.deepEqual(customTexts(session, "subagents-unjudged", from), [unjudgedNotice(both)]);
       assert.equal(orchestratorRequests().length, 8);
 
-      // Each verdict judges its delegation, request_changes too; then the commit runs.
+      // Each verdict judges its delegation, request_changes too; once none waits, a commit's result carries no reminder.
       from = session.messages.length;
       provider.plan.push(
         { toolCall: { name: "subagents_verdict", arguments: { delegationId: writer, verdict: "accept", reason: "checked notes.md:1" } } },
-        { toolCall: { name: "bash", arguments: { command: COMMIT } } },
+        { toolCall: { name: "bash", arguments: { command: commit("judged-one") } } },
         { toolCall: { name: "subagents_verdict", arguments: { delegationId: scribe, verdict: "request_changes", reason: "an empty commit" } } },
-        { toolCall: { name: "bash", arguments: { command: COMMIT } } },
+        { toolCall: { name: "bash", arguments: { command: commit("judged-both") } } },
       );
       await session.prompt("Record the verdicts and commit");
-      const later = toolOutcomes(session, from);
-      assert.equal(later[1], `bash refused: pi-orchestrator: git commit is denied while an editing delegation waits for your verdict: delegation ${scribe} (agent scribe). ` +
-        "Judge each Result and record its verdict with `subagents_verdict`, then commit.");
-      assert.deepEqual([later[0], later[2], later[3]], ["subagents_verdict ok", "subagents_verdict ok", "bash ok"]);
-      assert.deepEqual(log(), ["orchestrator", "worker"]);
+      assert.deepEqual(toolOutcomes(session, from), ["subagents_verdict ok", "bash ok", "subagents_verdict ok", "bash ok"]);
+      assert.deepEqual(bashResults(session, from), [
+        { ok: true, reminder: gateReminder("commit", `an editing delegation waits for your verdict: delegation ${scribe} (agent scribe).`) },
+        { ok: true },
+      ]);
+      assert.deepEqual(commitLog(h.projectDir), ["judged-both", "judged-one", "worker", "orchestrator"]);
       // The new prompt names the one still waiting once; once none wait, nothing is said.
-      assert.deepEqual(customTexts(session, "subagents-unjudged", from), [notice(`an editing delegation waits for your verdict: delegation ${scribe} (agent scribe).`)]);
+      assert.deepEqual(customTexts(session, "subagents-unjudged", from), [unjudgedNotice(`an editing delegation waits for your verdict: delegation ${scribe} (agent scribe).`)]);
+      const none = { accept: 0, request_changes: 0 };
+      assert.deepEqual(reportGate(h), { verdicts: { accept: 1, request_changes: 1 }, sameRungVerdicts: none, ungated: 0, missing: 0 });
     } finally { session.dispose(); }
   } finally { h.cleanup(); }
 });
 
-test("the deny names a delegation that edited and still runs as running", async () => {
+test("at each gate level a commit's result names only the delegations that need a verdict there, and the report counts an ungated one apart", async () => {
+  const h = routedHarness();
+  try {
+    execFileSync("git", ["init", "-q"], { cwd: h.projectDir });
+    const provider = plannedAnthropic(runningScript);
+    const session = await orchestratorSession(h, provider.extension, installedWithSubagents(provider.extension, 1), [routerExtension()]);
+    try {
+      provider.setOrchestrator(session.sessionId);
+      await session.prompt("/pi-orchestrator gate low");
+      // The classifier says mechanical: at low its gate action is none.
+      provider.plan.push(
+        { toolCall: { name: "subagents", arguments: { items: [{ task: runTask("write", { path: "notes.md", content: "x\n" }) }] } } },
+        { toolCall: { name: "bash", arguments: { command: commit("at-low") } } },
+      );
+      await session.prompt("Write the notes and commit them");
+      const worker = (session.messages as { role: string; toolName?: string; details?: SubagentsDetails }[])
+        .find((message) => message.role === "toolResult" && message.toolName === "subagents")!.details!.results[0]!;
+      assert.equal(worker.edited, true, JSON.stringify(worker));
+      assert.deepEqual(bashResults(session), [{ ok: true }], "an ungated delegation is named in no commit's result");
+      assert.deepEqual(customTexts(session, "subagents-unjudged"), [], "nor at the turn end");
+      const none = { accept: 0, request_changes: 0 };
+      assert.deepEqual(reportGate(h), { verdicts: none, sameRungVerdicts: none, ungated: 1, missing: 0 });
+
+      // Back at medium it needs the orchestrator's spot check, and a commit's result names it.
+      await session.prompt("/pi-orchestrator gate medium");
+      const from = session.messages.length;
+      provider.plan.push({ toolCall: { name: "bash", arguments: { command: commit("at-medium") } } });
+      await session.prompt("Commit again");
+      assert.deepEqual(bashResults(session, from), [{ ok: true, reminder: gateReminder("commit", `an editing delegation waits for your verdict: delegation ${worker.sessionId}.`) }]);
+      assert.deepEqual(commitLog(h.projectDir), ["at-medium", "at-low"]);
+      // The report keeps the requirement recorded as the delegation ended.
+      assert.deepEqual(reportGate(h), { verdicts: none, sameRungVerdicts: none, ungated: 1, missing: 0 });
+    } finally { session.dispose(); }
+  } finally { h.cleanup(); }
+});
+
+test("a commit's result names a delegation that edited and still runs as running", async () => {
   const h = routedHarness();
   try {
     const provider = scriptedAnthropic((request) => request.toolResults.length === 0
@@ -3408,13 +3488,15 @@ test("the deny names a delegation that edited and still runs as running", async 
     try {
       await waitFor(() => editRecords(h).length === 1, "the worker's edit record");
       const id = editRecords(h)[0]!.delegationId;
-      assert.deepEqual(await subagents.toolCall("bash", { command: "git push" }, main.ctx), { block: true, reason:
-        `pi-orchestrator: git push is denied while an editing delegation waits for your verdict: delegation ${id} (still running). ` +
-        "Judge each Result and record its verdict with `subagents_verdict`, then push." });
-      assert.equal(await subagents.toolCall("bash", { command: "git status" }, main.ctx), undefined);
-      // In the worker's session, the orchestrator's unjudged edits hold nothing back.
+      assert.equal(await subagents.toolCall("bash", { command: "git push" }, main.ctx), undefined, "the push is never blocked");
+      assert.deepEqual(await subagents.toolResult("bash", { command: "git push" }, main.ctx), [{ type: "text", text: "(no output)" },
+        { type: "text", text: gateReminder("push", `an editing delegation waits for your verdict: delegation ${id} (still running).`) }]);
+      assert.deepEqual(await subagents.toolResult("bash", { command: "git status" }, main.ctx), [{ type: "text", text: "(no output)" }]);
+      // In the worker's session, the orchestrator's unjudged edits are not named.
       const unmark = markWorkerSession(main.sessionId);
-      try { assert.equal(await subagents.toolCall("bash", { command: "git push" }, main.ctx), undefined); } finally { unmark(); }
+      try {
+        assert.deepEqual(await subagents.toolResult("bash", { command: "git push" }, main.ctx), [{ type: "text", text: "(no output)" }]);
+      } finally { unmark(); }
     } finally {
       stop.abort();
       await held;
@@ -3422,21 +3504,31 @@ test("the deny names a delegation that edited and still runs as running", async 
   } finally { h.cleanup(); }
 });
 
-test("a record folder that cannot be read denies a commit with the reason, and nothing else", async () => {
+test("a record folder that cannot be read lets a commit through, and its result says the gate cannot tell what waits", async () => {
   const h = routedHarness();
   try {
+    execFileSync("git", ["init", "-q"], { cwd: h.projectDir });
     mkdirSync(join(h.stateDir, "routing"));
     writeFileSync(join(h.stateDir, "routing", "2026-09-28.jsonl"), "not json\n");
-    const subagents = loadSubagents([]);
-    const main = orchestrator(h);
-    const denied = await subagents.toolCall("bash", { command: "git commit -m x" }, main.ctx) as { block: boolean; reason: string };
-    assert.equal(denied.block, true);
-    assert.match(denied.reason, /^pi-orchestrator: git commit is denied: the edit records cannot be read to tell whether every editing delegation has a verdict \(.*2026-09-28\.jsonl:1.*\)\.$/);
-    assert.equal(await subagents.toolCall("bash", { command: "git add -A" }, main.ctx), undefined);
+    const provider = plannedAnthropic();
+    const session = await orchestratorSession(h, provider.extension, [provider.extension]);
+    try {
+      provider.setOrchestrator(session.sessionId);
+      provider.plan.push(
+        { toolCall: { name: "bash", arguments: { command: "git status --short" } } },
+        { toolCall: { name: "bash", arguments: { command: commit("unread") } } },
+      );
+      await session.prompt("Commit");
+      const [status, committed] = bashResults(session);
+      assert.deepEqual(status, { ok: true });
+      assert.equal(committed?.ok, true);
+      assert.match(committed?.reminder ?? "", /^pi-orchestrator: git commit ran, but the edit records cannot be read to tell whether an editing delegation waits for your verdict \(.*2026-09-28\.jsonl:1.*\)\.$/);
+      assert.deepEqual(commitLog(h.projectDir), ["unread"]);
+    } finally { session.dispose(); }
   } finally { h.cleanup(); }
 });
 
-test("/pi-orchestrator gate sets the session's gate level: an ungated delegation is never named by the commit gate or the turn-end notice, and an invalid level prints the usage", async () => {
+test("/pi-orchestrator gate sets the session's gate level: an ungated delegation is never named by a commit's result or the turn-end notice, and an invalid level prints the usage", async () => {
   const h = routedHarness();
   try {
     const provider = scriptedAnthropic(runningScript);
@@ -3452,7 +3544,8 @@ test("/pi-orchestrator gate sets the session's gate level: an ungated delegation
     const worker = (result.details as SubagentsDetails).results[0]!;
     assert.equal(worker.edited, true, JSON.stringify(worker));
     assert.ok(toolText(result).includes("At the low gate level a mechanical delegation needs no verdict: it is ungated."), toolText(result));
-    assert.equal(await subagents.toolCall("bash", { command: "git commit -m x" }, main.ctx), undefined, "an ungated delegation holds back no commit");
+    assert.deepEqual(await subagents.toolResult("bash", { command: "git commit -m x" }, main.ctx), [{ type: "text", text: "(no output)" }],
+      "an ungated delegation is named in no commit's result");
     // Its gate requirement, at the level in force as it ended, makes it ungated in the decision record and the report.
     assert.deepEqual(gateRequirements(h), [[worker.sessionId, "low", "none"]]);
     const none = { accept: 0, request_changes: 0 };
@@ -3461,8 +3554,8 @@ test("/pi-orchestrator gate sets the session's gate level: an ungated delegation
     assert.deepEqual(subagents.messages.filter(({ message }) => message.customType === "subagents-unjudged"), [], "nor is it named at the turn end");
     // Back at medium it needs the orchestrator's spot check, and waits for it.
     await subagents.runCommand("pi-orchestrator", "gate medium", main.ctx);
-    const denied = await subagents.toolCall("bash", { command: "git commit -m x" }, main.ctx) as { block: boolean; reason: string } | undefined;
-    assert.ok(denied?.reason.includes(`waits for your verdict: delegation ${worker.sessionId}.`), JSON.stringify(denied));
+    const reminded = await subagents.toolResult("bash", { command: "git commit -m x" }, main.ctx);
+    assert.ok(reminded.at(-1)?.text?.includes(`waits for your verdict: delegation ${worker.sessionId}.`), JSON.stringify(reminded));
     await subagents.agentEvent("turn_end", main.ctx);
     assert.equal(subagents.messages.filter(({ message }) => message.customType === "subagents-unjudged").length, 1);
     // The report keeps the requirement recorded as the delegation ended, and neither ungated nor missing is a learning observation.
@@ -3478,7 +3571,8 @@ test("the protocol tells the orchestrator to judge an editing delegation's Resul
   const protocol = orchestratorProtocol(3, "medium");
   const paragraph = protocol.split("\n\n").find((text) => text.includes("subagents_verdict"));
   assert.ok(paragraph, protocol);
-  for (const phrase of ["edited", "accept", "request_changes", "reason", "replaces", "research", "resume", "git commit and git push are denied"]) {
+  for (const phrase of ["edited", "accept", "request_changes", "reason", "replaces", "research", "resume", "git commit or git push always goes through",
+    "still waiting for a verdict", "tell the user"]) {
     assert.ok(paragraph.includes(phrase), `${phrase}: ${paragraph}`);
   }
 });
