@@ -15,6 +15,7 @@ import { splitKnownThinkingSuffix, THINKING_LEVELS, type ThinkingLevel } from ".
 import { isRunningWorkerSession } from "./worker-sessions.ts";
 import { loadSubagentsSettings } from "./settings.ts";
 import { workerSessionDir, type WorkerSetup, type WorkerStatus } from "./worker.ts";
+import type { SavedReview } from "./review.ts";
 
 export interface ResumeWorker {
   readonly file: string;
@@ -31,13 +32,29 @@ const RESUMING = Symbol.for("pi-orchestrator.subagents.resuming");
 type ProcessGlobal = typeof globalThis & { [RESUMING]?: Set<string> };
 const resuming = (): Set<string> => (globalThis as ProcessGlobal)[RESUMING] ??= new Set();
 
-/** Saved outcomes distinguish failed or aborted workers from unfinished ones across /resume. */
-export function saveWorkerOutcome(file: string | undefined, status: WorkerStatus, setup?: Pick<WorkerSetup, "instructions" | "tools">): void {
+/** Saved outcomes distinguish failed or aborted workers from unfinished ones across /resume.
+ *  A reviewer's also keeps the delegation it reviewed (./review.ts); a resume keeps what an earlier run saved. */
+export function saveWorkerOutcome(file: string | undefined, status: WorkerStatus,
+  setup?: Pick<WorkerSetup, "instructions" | "tools"> & { readonly review?: SavedReview }): void {
   if (!file || !existsSync(file)) return;
   const previous = existsSync(`${file}.outcome.json`) ? JSON.parse(readFileSync(`${file}.outcome.json`, "utf8")) as Record<string, unknown> : {};
   writeFileSync(`${file}.outcome.json`, JSON.stringify({ ...previous, status,
     ...(setup?.instructions === undefined ? {} : { instructions: setup.instructions }),
-    ...(setup?.tools === undefined ? {} : { tools: setup.tools }) }));
+    ...(setup?.tools === undefined ? {} : { tools: setup.tools }),
+    ...(setup?.review === undefined ? {} : { review: setup.review }) }));
+}
+
+/** A saved worker's outcome: how its latest run ended and, for a reviewer, what it
+ *  reviewed; `undefined` when none was saved or it cannot be read. */
+export function readWorkerOutcome(file: string): { readonly status?: WorkerStatus; readonly review?: SavedReview } | undefined {
+  let outcome: { status?: unknown; review?: { delegationId?: unknown; startedAt?: unknown } };
+  try { outcome = JSON.parse(readFileSync(`${file}.outcome.json`, "utf8")) as typeof outcome; } catch { return undefined; }
+  const { status, review } = outcome;
+  return {
+    ...(status === "completed" || status === "failed" || status === "aborted" ? { status } : {}),
+    ...(typeof review?.delegationId === "string" && typeof review.startedAt === "string"
+      ? { review: { delegationId: review.delegationId, startedAt: review.startedAt } } : {}),
+  };
 }
 
 function lastStatus(file: string): WorkerStatus | undefined {

@@ -8,7 +8,8 @@ import type { ResumeWorker } from "./resume.ts";
 import type { BackgroundMessageMode } from "./background.ts";
 import { REPORT_TOOL, reportExtension, type WorkerReports } from "./report.ts";
 import { missingResultSections, REPORTING_RULES, type ResultSection } from "./result-format.ts";
-import { setResumePin } from "../router/auto-provider.ts";
+import { setResumePin, setRoutingConstraints } from "../router/auto-provider.ts";
+import type { RoutingConstraints } from "../routing/tier-router.ts";
 import type { ThinkingLevel } from "../models/model-info.ts";
 import type { WorkerSession } from "./worker-board.ts";
 import {
@@ -85,6 +86,13 @@ export interface WorkerSetup {
   readonly tools?: readonly string[];
   /** The delegation id of the worker that makes this delegation, if a worker does. */
   readonly parentDelegationId?: string;
+  /** Routing constraints for the worker's first request (../router/auto-provider.ts).
+   *  Only a routed worker takes them: one with a fork, a named model or a resume fails. */
+  readonly routingConstraints?: RoutingConstraints;
+  /** The delegation this worker reviews (ADR 0010): its decision record links
+   *  to it, and `prompt`, the review rules and the reviewed delegation
+   *  (./review.ts), follows the reporting rules in its system prompt. */
+  readonly review?: { readonly delegationId: string; readonly prompt: string };
   /** A preserved agent definition names a real model, so the auto router is
    *  bypassed. `banListException` is set when the model is on the subagent ban
    *  list and the owner's exception let it run. */
@@ -202,11 +210,16 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
     ? { status: "aborted", sessionId, sessionFile: saved(), finalText: "" }
     : { status: "failed", sessionId, sessionFile: saved(), finalText: "", error };
 
-  const { instructions, reports } = setup;
+  const { instructions, reports, review } = setup;
+  // Constraints bind the router's choice, so a worker the router does not choose for must not drop them unseen.
+  if ((setup.routingConstraints !== undefined || review !== undefined) && (setup.fork || setup.namedModel || setup.resume)) {
+    return failed("routing constraints and a review need a newly routed worker, not a fork, a named model or a resume");
+  }
   // Every non-fork worker gets the reporting rules, whatever its agent
   // definition says (ADR 0010); a fork, resumed or not, runs as the orchestrator.
   const getsReportingRules = setup.fork === undefined && setup.resume?.fork !== true;
-  const appendedPrompt = [...(getsReportingRules ? [REPORTING_RULES] : []), ...(instructions === undefined ? [] : [instructions])];
+  const appendedPrompt = [...(getsReportingRules ? [REPORTING_RULES] : []), ...(review === undefined ? [] : [review.prompt]),
+    ...(instructions === undefined ? [] : [instructions])];
   const tools = setup.tools === undefined || reports === undefined ? setup.tools : [...setup.tools, REPORT_TOOL];
   let session: Awaited<ReturnType<typeof createAgentSessionFromServices>>["session"];
   try {
@@ -281,8 +294,9 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
     setup.onTool?.([...runningTools.values()].at(-1));
   });
   // Before binding, so the extensions see the mark at session_start.
-  const unmarkWorkerSession = markWorkerSession(sessionId, setup.parentDelegationId);
+  const unmarkWorkerSession = markWorkerSession(sessionId, setup.parentDelegationId, review?.delegationId);
   const unsetResumePin = setup.resume && !setup.resume.namedModel ? setResumePin(sessionId, setup.resume.pin) : undefined;
+  const unsetConstraints = setup.routingConstraints === undefined ? undefined : setRoutingConstraints(sessionId, setup.routingConstraints);
   let unregisterMessage: (() => void) | undefined;
   try {
     // Binding starts the extensions: the router extension reads its settings
@@ -311,6 +325,7 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
     unsubscribe();
     session.dispose();
     unsetResumePin?.();
+    unsetConstraints?.();
     unmarkWorkerSession();
   }
 }

@@ -54,6 +54,8 @@ export interface NewWorker {
   readonly delegationId?: string;
   /** The delegation of the worker that made this delegation (ADR 0008). */
   readonly parentDelegationId?: string;
+  /** The delegation this worker reviews, for a reviewer (ADR 0010). */
+  readonly review?: string;
   readonly model: WorkerModelSetup;
 }
 

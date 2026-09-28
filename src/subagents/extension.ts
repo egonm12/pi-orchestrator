@@ -25,6 +25,10 @@ import { addOrchestratorProtocol } from "./orchestrator-protocol.ts";
 import { registerCommitGate } from "./commit-gate.ts";
 import { registerExplorationBudget } from "./exploration-budget.ts";
 import { registerSubagentsVerdictTool } from "./verdict.ts";
+import { reviewerPrompt, reviewTarget, type ReviewTarget } from "./review.ts";
+import { delegationRouting, gateAction } from "./quality-gate.ts";
+import { readRoutingRecords, type RoutingRecord } from "../routing/decision-record.ts";
+import { stateDir } from "../router/extension.ts";
 
 // The subagents extension (ADR 0007): a third pi extension, separate from the
 // router and the guard, with a `subagents` tool. Each call starts a worker in
@@ -39,6 +43,9 @@ import { registerSubagentsVerdictTool } from "./verdict.ts";
 // orchestrator's session shows the active ones below the editor (worker-widget.ts).
 // A worker that edits leaves an edit record (editing.ts), its Result asks for
 // a verdict, and the orchestrator records one with subagents_verdict (verdict.ts).
+// An item with `review` starts an independent reviewer for a finished editing
+// delegation (review.ts), which an elevated, critical or tierless one needs
+// before its verdict (quality-gate.ts).
 
 type ToolParameters = Parameters<ExtensionAPI["registerTool"]>[0]["parameters"];
 
@@ -53,6 +60,7 @@ const PARAMETERS = {
         agent: { type: "string", description: "Optional: the name of an agent definition the worker follows." },
         fork: { type: "boolean", description: "Start from the orchestrator's current branch on its session model." },
         resume: { type: "string", description: "Continue a finished delegation by id, in its saved session and on its original pin." },
+        review: { type: "string", description: "Start an independent reviewer of a finished editing delegation, by its id; `task` says what to check." },
       }, required: ["task"], additionalProperties: false,
     } },
     background: { type: "boolean", description: "Optional: return at once with the call id and delegation ids; one completion notice with the results follows when every item has finished." },
@@ -79,6 +87,14 @@ interface SubagentItem {
   readonly agent?: string;
   readonly fork?: boolean;
   readonly resume?: string;
+  /** The delegation a reviewer reviews. */
+  readonly review?: string;
+}
+
+/** An item's own fields, without anything else the call's arguments carry. */
+function itemFields({ task, agent, fork, resume, review }: SubagentItem): SubagentItem {
+  return { task, ...(agent === undefined ? {} : { agent }), ...(fork === true ? { fork: true } : {}),
+    ...(resume === undefined ? {} : { resume }), ...(review === undefined ? {} : { review }) };
 }
 
 /** The model an unrouted worker used, and whether its exception to the
@@ -134,6 +150,21 @@ export interface SubagentsProgressDetails {
 /** The line that asks the orchestrator for a verdict on an editing delegation (ADR 0010). */
 const EDITED_NOTE = "This delegation edited. Judge its Result, then record a verdict with subagents_verdict.";
 
+/** EDITED_NOTE's counterpart for a delegation whose gate action is a reviewer (quality-gate.ts). */
+function reviewerNote(id: string, records: readonly RoutingRecord[]): string {
+  const { tier } = delegationRouting(records, id);
+  return `This delegation edited and is ${tier ?? "without a tier, so it is gated as elevated"}: it needs an independent reviewer. ` +
+    `Start one with a subagents item whose review is ${id}, judge the reviewer's Result, then record a verdict with subagents_verdict naming it as reviewer.`;
+}
+
+/** The note an editing delegation's Result gets: a reviewer's note where its
+ *  gate action is a reviewer, else EDITED_NOTE, also when the records cannot be read. */
+function editedNote(id: string): string {
+  let records: RoutingRecord[];
+  try { records = readRoutingRecords(join(stateDir(), "routing")); } catch { return EDITED_NOTE; }
+  return gateAction(delegationRouting(records, id).tier) === "reviewer" ? reviewerNote(id, records) : EDITED_NOTE;
+}
+
 /** One item's text in the tool result. `forOrchestrator` is false in a
  *  worker's own call, whose workers' edits count for the worker's delegation. */
 function resultText(result: SubagentResult, forOrchestrator: boolean): string {
@@ -143,7 +174,7 @@ function resultText(result: SubagentResult, forOrchestrator: boolean): string {
   return [
     `Worker ${result.sessionId} ${outcome}`,
     `Session file: ${result.sessionFile ?? "none, the session was not saved"}`,
-    ...(result.edited && forOrchestrator ? [EDITED_NOTE] : []),
+    ...(result.edited && forOrchestrator ? [editedNote(result.sessionId)] : []),
     "",
     result.finalText,
     // The runtime's Result check (ADR 0010) annotates and never rejects.
@@ -183,7 +214,10 @@ const DESCRIPTION = "Hand 1 to 8 tasks to workers. At most orchestrator.subagent
   "Set `fork: true` to copy the current branch before this call and run on the session model and effort, without routing. " +
   "With `background: true` the call returns at once with its call id and delegation ids, and one completion notice with the results follows when every item has finished; " +
   "at most orchestrator.subagents.maxBackgroundWorkers background workers may be queued or running at once. " +
-  "Use `resume` with `task` (without `agent`) to continue a finished saved worker on its original pin.";
+  "Use `resume` with `task` (without `agent`) to continue a finished saved worker on its original pin. " +
+  "Use `review` with a finished editing delegation's id and a `task` saying what to check to start an independent reviewer: it is routed at that delegation's tier or higher, " +
+  "elevated for one without a tier, and never on its rung, and it gets the delegation's task, Result and changed files. " +
+  "`review` excludes `fork` and `resume`; an `agent` gives the reviewer instructions and tools, but its model is ignored.";
 
 /** Opens `workerId`'s transcript with no header or bar options: the
  *  transcript view's own defaults (vo0z's fuller header and orchestrator bar)
@@ -242,7 +276,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
         // A resume item's delegation id is the one it resumes.
         const delegationIds = background ? items.map((item) => item.resume ?? randomUUID()) : undefined;
         const forks = items.map((item, index) => {
-          if (item.fork !== true || item.resume !== undefined || !resolveAgent(item.agent, definitions, orchestratorTools).ok) return undefined;
+          if (item.fork !== true || item.resume !== undefined || item.review !== undefined || !resolveAgent(item.agent, definitions, orchestratorTools).ok) return undefined;
           try {
             if (!ctx.model) throw new Error("the session has no model to fork");
             const model = `${ctx.model.provider}/${ctx.model.id}`;
@@ -252,8 +286,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               banListException: banned !== undefined } as const;
           } catch (error) { return { error: error instanceof Error ? error.message : String(error) } as const; }
         });
-        const progress: SubagentProgress[] = items.map(({ task, agent, fork, resume }, index) => ({ task, ...(agent === undefined ? {} : { agent }),
-          ...(fork === true ? { fork: true } : {}), ...(resume === undefined ? {} : { resume }),
+        const progress: SubagentProgress[] = items.map((item, index) => ({ ...itemFields(item),
           ...(forks[index]?.model === undefined ? {} : { model: forks[index].model,
             ...(forks[index].banListException ? { banListException: true } : {}) }), status: "queued" }));
         const sendProgress = () => {
@@ -266,20 +299,19 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
         // Each item can be stopped alone from the transcript view (x), foreground,
         // background or nested; a nested worker's stop leaves its parent running.
         const itemStops = items.map(() => new AbortController());
-        const feeds = items.map(({ task, agent, resume }, index) => {
+        const feeds = items.map(({ task, agent, resume, review }, index) => {
           const fork = forks[index];
           const delegationId = delegationIds?.[index] ?? resume;
-          return board.add({ callId: toolCallId, background, task, ...(agent === undefined ? {} : { agent }),
+          return board.add({ callId: toolCallId, background, task, ...(agent === undefined ? {} : { agent }), ...(review === undefined ? {} : { review }),
             ...(delegationId === undefined ? {} : { delegationId }), ...(parentDelegationId === undefined ? {} : { parentDelegationId }),
             model: fork?.model === undefined ? { kind: "routed" } : { kind: "fork", model: fork.model, effort: fork.effort } },
           { stop: () => stopItem(index) });
         });
         /** An item that never got a worker: its result, with a copied fork session removed. */
         const notStarted = (index: number): SubagentResult => {
-          const { task, agent, fork, resume } = items[index]!;
           const file = forks[index]?.sessionManager?.getSessionFile();
           if (file !== undefined) rmSync(file, { force: true });
-          return { task, ...(agent === undefined ? {} : { agent }), ...(fork === true ? { fork: true } : {}), ...(resume === undefined ? {} : { resume }), status: "not-started", finalText: "" };
+          return { ...itemFields(items[index]!), status: "not-started", finalText: "" };
         };
         const showProgress = (index: number, state: SubagentProgress) => {
           progress[index] = state;
@@ -319,13 +351,14 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
             if (callSignal?.aborted) return;
             const index = next++;
             if (itemSignals[index]!.aborted || results[index] !== undefined) continue;
-            const { task, agent, fork, resume } = items[index]!;
-            const item: SubagentItem = { task, ...(agent === undefined ? {} : { agent }), ...(fork === true ? { fork: true } : {}),
-              ...(resume === undefined ? {} : { resume }) };
+            const item = itemFields(items[index]!);
+            const { task, agent, fork, resume, review } = item;
             if (resume !== undefined) {
               let releaseResume: (() => void) | undefined;
               try {
-                if (agent !== undefined || fork !== undefined) throw new Error("resume excludes agent and fork");
+                if (agent !== undefined || fork !== undefined || review !== undefined) {
+                  throw new Error(review === undefined ? "resume excludes agent and fork" : "resume excludes agent, fork and review");
+                }
                 const prepared = prepareResume(resume, task, { cwd: ctx.cwd, agentDir, orchestratorSession: ctx.sessionManager });
                 releaseResume = prepared.release;
                 showProgress(index, { ...item, status: "running" });
@@ -344,6 +377,19 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               } finally { releaseResume?.(); }
               showProgress(index, results[index]);
               continue;
+            }
+            // A reviewer is always routed, under constraints that keep it off the reviewed delegation's rung (review.ts).
+            let target: ReviewTarget | undefined;
+            if (review !== undefined) {
+              try {
+                if (fork !== undefined) throw new Error("review excludes fork");
+                if (parentDelegationId !== undefined) throw new Error("only the orchestrator starts reviewers");
+                target = reviewTarget(ctx, review, readRoutingRecords(join(stateDir(), "routing")));
+              } catch (error) {
+                results[index] = { ...item, status: "failed", finalText: "", error: error instanceof Error ? error.message : String(error) };
+                showProgress(index, results[index]);
+                continue;
+              }
             }
             const preparedFork = forks[index];
             if (preparedFork?.error !== undefined) {
@@ -364,7 +410,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
             }
             let namedModel: NonNullable<WorkerSetup["namedModel"]> | undefined;
             // A worker's own workers are always routed (ADR 0008).
-            if (!preparedFork && modelSettings.use === "preserve" && definition?.model && parentDelegationId === undefined) {
+            if (!preparedFork && target === undefined && modelSettings.use === "preserve" && definition?.model && parentDelegationId === undefined) {
               const { baseModel, thinkingSuffix } = splitKnownThinkingSuffix(definition.model);
               // The provider ends at the first slash; a model id may hold more.
               const slash = baseModel.indexOf("/");
@@ -396,6 +442,10 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               : { model: namedModel.model, ...(namedModel.banListException ? { banListException: true } : {}) };
             showProgress(index, { ...item, ...workerModel, status: "running" });
             feeds[index]!.started(namedModel === undefined ? undefined : preservedModel(namedModel));
+            const reviewStartedAt = new Date().toISOString();
+            // The Result is cut as the tool result cuts it; the reviewer can read the whole of it in the saved session.
+            const reviewing = target === undefined ? undefined : { delegationId: target.delegationId,
+              prompt: reviewerPrompt({ ...target, material: { ...target.material, result: cutText(target.material.result, target.material.sessionFile) } }) };
             const worker = await runWorker({
               task, cwd: ctx.cwd, agentDir, orchestratorSession: ctx.sessionManager, signal: itemSignals[index],
               ...(backgroundCall === undefined ? {} : { sessionId: backgroundCall.delegationIds[index]! }),
@@ -403,11 +453,16 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               ...(namedModel === undefined ? {} : { namedModel }),
               ...(preparedFork === undefined ? {} : { fork: preparedFork }),
               ...(parentDelegationId === undefined ? {} : { parentDelegationId }),
+              ...(target === undefined || reviewing === undefined ? {} : { routingConstraints: target.constraints, review: reviewing }),
               onActivity: backgroundCall?.onActivity[index], reports, onSession: feeds[index]!.session,
               onTool: (tool) => showProgress(index, { ...item, ...workerModel, status: "running", ...(tool === undefined ? {} : { tool }) }),
               ...(backgroundCall === undefined ? {} : { onMessageReady: (receive) => backgroundCalls.registerWorker(backgroundCall.delegationIds[index]!, receive) }),
             });
-            saveWorkerOutcome(worker.sessionFile, worker.status, { instructions: resolution.instructions, tools: resolution.tools });
+            // A resumed reviewer is not routed again, so its saved instructions carry the review prompt for it.
+            saveWorkerOutcome(worker.sessionFile, worker.status, reviewing === undefined ? { instructions: resolution.instructions, tools: resolution.tools } : {
+              instructions: [reviewing.prompt, ...(resolution.instructions === undefined ? [] : [resolution.instructions])].join("\n\n"),
+              tools: resolution.tools, review: { delegationId: reviewing.delegationId, startedAt: reviewStartedAt },
+            });
             results[index] = { ...item, ...workerModel, ...worker, finalText: cutText(worker.finalText, worker.sessionFile) };
             showProgress(index, results[index]);
           }

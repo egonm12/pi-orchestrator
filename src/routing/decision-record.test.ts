@@ -406,6 +406,24 @@ test("a nested worker's record names its parent delegation, which must be anothe
   }
 });
 
+test("a reviewer's record names the delegation it reviews, which must be another delegation (ADR 0010)", async () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    writeDecisionRecord(dir, await liveInput({ delegationId: "attempt-review-1", reviewedDelegationId: "attempt-live-1" }));
+    writeDecisionRecord(dir, await liveInput({ delegationId: "attempt-live-2" }));
+    const [review, plain] = readRoutingRecords(dir);
+    assert.ok(review?.recordType === "decision" && plain?.recordType === "decision");
+    assert.equal(review.reviewedDelegationId, "attempt-live-1");
+    assert.equal("reviewedDelegationId" in plain, false, "a delegation that reviews nothing has no reviewedDelegationId field");
+
+    for (const [reviewedDelegationId, problem] of [["attempt-review-2", /'reviewedDelegationId' must name a different delegation/], [" ", /'reviewedDelegationId'/], [3, /'reviewedDelegationId'/]] as const) {
+      assert.throws(() => validateRoutingRecord({ ...review, delegationId: "attempt-review-2", reviewedDelegationId }), problem);
+    }
+  } finally {
+    cleanup();
+  }
+});
+
 test("a constrained worker's record names its routing constraints, and a malformed constraints field fails validation, naming the field", async () => {
   const { dir, cleanup } = tempDir();
   try {

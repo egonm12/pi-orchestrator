@@ -15,7 +15,7 @@ import { isOrchestratorSession } from "./orchestrator-session.ts";
 export const ORCHESTRATOR_PROTOCOL_SECTION = "orchestrator_protocol";
 
 // One entry per rule, in the order the orchestrator reads them. A later rule
-// (reviewer, retries, gate level) is one more entry here. The exploration
+// (retries, gate level) is one more entry here. The exploration
 // budget's entry names the owner's threshold (exploration-budget.ts).
 const paragraphs = (explorationBudget: number): readonly string[] => [
   "You are the orchestrator. You own clarification, task decomposition, delegation, synthesis and acceptance. " +
@@ -40,6 +40,14 @@ const paragraphs = (explorationBudget: number): readonly string[] => [
     "`subagents_verdict`: the delegation id, accept or request_changes, and a reason naming what you checked. A later verdict on " +
     "the same delegation replaces the earlier one, and a resume that edits again needs a new one. A research Result gets no verdict. " +
     "Your git commit and git push are denied until every editing delegation has a verdict.",
+  "An elevated or critical editing delegation, and one without a tier (a forked worker, or one whose agent definition names a model), " +
+    "needs an independent reviewer before its verdict; its Result says so. Start one with a `subagents` item whose `review` is the " +
+    "delegation id and whose `task` says what to check. The reviewer is routed at the delegation's tier or higher and never on its rung, " +
+    "gets its task, Result and changed files, reruns nothing unless the task tells it to, and answers accept or request changes with reasons. " +
+    "Judge the reviewer's Result like any other, then record the verdict with `subagents_verdict`, naming the reviewer delegation as " +
+    "`reviewer`; without it the verdict is refused. A review started before the delegation's latest edit does not count. For a mechanical " +
+    "or standard delegation your own spot check is enough, and a reviewer is welcome. If a review fails because the reviewer would run on " +
+    "the delegation's own rung, tell the user: switching the session model or turning on live routing lets it run.",
 ];
 
 /** The protocol text, as the orchestrator's system prompt carries it, for

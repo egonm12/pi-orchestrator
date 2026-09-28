@@ -11,8 +11,8 @@
 // given: ticket 23's classification, ticket 22's resolved tier map, ticket
 // 24's router decision, the worker's routing constraints, and the delegation
 // facts (delegation id, mode, task text, agent role, the model the worker ran
-// on, the hand-picked model in shadow mode, and the parent delegation of a
-// worker's own worker). Nothing else an input object carries (a parsed
+// on, the hand-picked model in shadow mode, the parent delegation of a
+// worker's own worker, and the delegation a reviewer reviews). Nothing else an input object carries (a parsed
 // settings file, a token) can reach the file.
 //
 // Free text (task text, the classifier's `why` and reasons, hop details,
@@ -257,6 +257,8 @@ export interface DecisionRecord extends RecordCommon {
   readonly parentDelegationId?: string;
   /** The worker's routing constraints; absent when it had none. */
   readonly constraints?: RecordedConstraints;
+  /** The delegation this reviewer reviews (ADR 0010); absent for any other worker. */
+  readonly reviewedDelegationId?: string;
 }
 
 export interface VerdictRecord extends RecordCommon {
@@ -562,11 +564,12 @@ export function validateRoutingRecord(value: unknown): RoutingRecord {
     const mode = oneOf(value, "mode", "", ROUTING_MODES);
     const required = [...COMMON_KEYS, "mode", "taskTextPrefix", "agentRole", "classification", "tierMap", "route",
       ...(value.schemaVersion === DECISION_RECORD_SCHEMA_VERSION ? ["ranOn"] : [])];
-    checkKeys(value, "", mode === "shadow" ? [...required, "handPickedModel"] : required, ["parentDelegationId", "constraints"]);
+    checkKeys(value, "", mode === "shadow" ? [...required, "handPickedModel"] : required, ["parentDelegationId", "constraints", "reviewedDelegationId"]);
     checkCommon(value);
-    if (value.parentDelegationId !== undefined) {
-      stringAt(value, "parentDelegationId", "", { nonBlank: true });
-      if (value.parentDelegationId === value.delegationId) throw new RoutingRecordError("parentDelegationId", "must name a different delegation");
+    for (const key of ["parentDelegationId", "reviewedDelegationId"]) {
+      if (value[key] === undefined) continue;
+      stringAt(value, key, "", { nonBlank: true });
+      if (value[key] === value.delegationId) throw new RoutingRecordError(key, "must name a different delegation");
     }
     stringAt(value, "taskTextPrefix", "");
     stringAt(value, "agentRole", "", { nonBlank: true });
@@ -658,6 +661,8 @@ interface DecisionRecordInputCommon {
   readonly parentDelegationId?: string;
   /** The worker's routing constraints; none leaves the record without the field. */
   readonly constraints?: RoutingConstraints;
+  /** The delegation a reviewer reviews (ADR 0010). */
+  readonly reviewedDelegationId?: string;
 }
 
 export type DecisionRecordInput =
@@ -842,6 +847,7 @@ export function buildDecisionRecord(input: DecisionRecordInput): DecisionRecord 
     ...(input.handPickedModel === undefined ? {} : { handPickedModel: input.handPickedModel }),
     ...(input.parentDelegationId === undefined ? {} : { parentDelegationId: input.parentDelegationId }),
     ...(constraints === undefined ? {} : { constraints }),
+    ...(input.reviewedDelegationId === undefined ? {} : { reviewedDelegationId: input.reviewedDelegationId }),
   };
   return checkedRecord(record);
 }

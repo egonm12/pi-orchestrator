@@ -61,7 +61,7 @@ Each item's `task` is the whole task for an ordinary worker, with every fact it 
 ] }
 ```
 
-A fork uses the session model and thinking level at call time, without routing. Later model changes do not move it, even while it is queued. It can use a banned session model as an exception to the subagent ban list; its fork record marks that exception. An `agent` on a fork supplies instructions and narrowed tools, but its `model` and `thinking` are ignored without a warning. A fork gets no reporting rules (see Results below). Forked workers never receive the `subagents` tool. Forks and ordinary workers may share a call. At most `orchestrator.subagents.maxParallel` items (default 4) run at once, the rest queue. The orchestrator waits for every item; Ctrl+C aborts running workers and drops queued ones.
+A fork uses the session model and thinking level at call time, without routing. Later model changes do not move it, even while it is queued. It can use a banned session model as an exception to the subagent ban list; its fork record marks that exception. An `agent` on a fork supplies instructions and narrowed tools, but its `model` and `thinking` are ignored without a warning. A fork gets no reporting rules (see Results below). Forked workers never receive the `subagents` tool. Forks and ordinary workers may share a call. An item with `review` set to a finished editing delegation's id starts an independent reviewer for it (see Reviewers below). At most `orchestrator.subagents.maxParallel` items (default 4) run at once, the rest queue. The orchestrator waits for every item; Ctrl+C aborts running workers and drops queued ones.
 
 ### Background calls
 
@@ -106,16 +106,24 @@ The first editing call in a worker's run writes an edit record into the routing 
 This delegation edited. Judge its Result, then record a verdict with subagents_verdict.
 ```
 
+For a delegation that needs a reviewer (see Reviewers below), the line says so instead:
+
+```text
+This delegation edited and is elevated: it needs an independent reviewer. Start one with a subagents item whose review is <id>, judge the reviewer's Result, then record a verdict with subagents_verdict naming it as reviewer.
+```
+
 A worker's own `subagents` call does not show the line: its workers' edits count for the worker's delegation, whose own Result shows it.
 
-The orchestrator records its verdict with `subagents_verdict`, `{ "delegationId": string, "verdict": "accept" | "request_changes", "reason": string }`, whether it judged the Result by its own spot check or by a reviewer's Result. The verdict is attached to the delegation's decision record, its fork or agent-model record, or, for a worker the router did not route (routing off or switched off by a failure), its edit record; a verdict on a known editing delegation is never orphaned. The reason is recorded with the verdict, credential-shaped text redacted and cut to 500 characters. A verdict on a routed delegation that chose a rung is also a learning observation, as before. The tool replies `Recorded <verdict> on delegation <id>.`, adding `It replaces the earlier <verdict>.` when there was one: a later verdict on the same delegation replaces the earlier one in the routing report, and the record keeps both. It refuses, and records nothing, when:
+The orchestrator records its verdict with `subagents_verdict`, `{ "delegationId": string, "verdict": "accept" | "request_changes", "reason": string, "reviewer"?: string }`, whether it judged the Result by its own spot check or by a reviewer's Result; `reviewer` is the delegation id of that reviewer. The verdict is attached to the delegation's decision record, its fork or agent-model record, or, for a worker the router did not route (routing off or switched off by a failure), its edit record; a verdict on a known editing delegation is never orphaned. The reason is recorded with the verdict, credential-shaped text redacted and cut to 500 characters. A verdict on a routed delegation that chose a rung is also a learning observation, as before. The tool replies `Recorded <verdict> on delegation <id>.`, with `, reviewed by delegation <reviewer id>` before the full stop when it names a reviewer, adding `It replaces the earlier <verdict>.` when there was one: a later verdict on the same delegation replaces the earlier one in the routing report, and the record keeps both. It refuses, and records nothing, when:
 
 - the delegation id is unknown;
 - the delegation did not edit: a research Result is checked but gets no verdict;
 - the id is a worker's own worker: the refusal names the delegation its edits count for;
 - the delegation is still queued or running;
 - the delegation belongs to another orchestrator session;
-- the verdict is not `accept` or `request_changes`, or the reason is blank;
+- the delegation needs a reviewer and the verdict names none (see Reviewers below);
+- the named reviewer is not a completed review of this delegation by this orchestrator session, started after the delegation's latest edit: the refusal says which;
+- the verdict is not `accept` or `request_changes`, or the reason is blank, or a given `reviewer` is blank;
 - a worker calls it: workers never get `subagents_verdict`, even when their agent definition's `tools:` list names it.
 
 While any editing delegation of the orchestrator's session waits for a verdict, its `bash` calls that run `git commit` or `git push` are denied. A delegation waits from its latest edit record until a verdict of either kind, `accept` or `request_changes`, is recorded after it, so a resume that edits again waits again. The reason names each waiting delegation, with its agent and whether it still runs when the orchestrator's process knows them:
@@ -130,9 +138,35 @@ At the end of each orchestrator turn with delegations waiting, a notice names th
 
 The routing report, `node src/routing/routing-report.ts <state dir>/routing`, counts each delegation's latest verdict in its tier and rung's row. Verdicts on delegations without a routing decision (forks, agent-model workers and unrouted workers) have no row; they are counted on their own line, `verdicts on unrouted delegations: ...`.
 
+### Reviewers
+
+At the medium gate level, an elevated or critical editing delegation needs an independent reviewer before its verdict, and so does one without a tier: a fork, a worker on an agent definition's named model, and a worker the router did not route count as elevated. For mechanical and standard delegations the orchestrator's own spot check is enough, and a reviewer is allowed too. The gate level that makes this configurable comes later.
+
+A reviewer is a `subagents` item whose `review` is the delegation id and whose `task` says what to check:
+
+```json
+{ "items": [{ "review": "<delegation id>", "task": "Check that the new validation rule covers empty input" }] }
+```
+
+The reviewed delegation must be a finished editing delegation of this orchestrator session; otherwise the item fails without starting a worker and names why (unknown, did not edit, still running, a worker's own worker, another session's). `review` excludes `fork` and `resume`, and a worker's own `subagents` call cannot start a reviewer. An `agent` gives the reviewer its instructions and tools, but its `model` and `thinking` are ignored: the reviewer is always routed.
+
+The reviewer is routed through the auto model with two routing constraints (see How routing decides below): a minimum tier, the delegation's tier or elevated for one without a tier, and an excluded rung, the rung the delegation ran on. The tier and rung come from the delegation's latest decision, fork or agent-model record; for a routed decision, the tier it routed at and the rung it ran on, which is the session model in shadow mode and on refusal. For a delegation without such a record, the rung is the one the worker board saw serve it; with neither, the item fails, since the reviewer could not be kept off that rung. When routing leaves no other rung, runs in shadow mode or is off, the reviewer would fall back to the orchestrator's session model; if that is the excluded rung, it fails with the reason instead of running:
+
+```text
+no other rung is left: this worker would fall back to the orchestrator session model anthropic/claude-sonnet-4-5:high, which its routing constraints exclude
+```
+
+Switching the session model, or turning on live routing, lets the next review run. In shadow mode, every worker runs on the session model, so a delegation made on it can only be reviewed after the session model changes.
+
+The reviewer's system prompt carries the reporting rules, then review rules: check the change itself against the delegation's task, read the changed files and the diff, rerun nothing from its Verified by section unless the task says to, change nothing, and answer accept or request changes with the reasons, first in its Confirmed section. After them it gets the reviewed delegation: its tier, its saved session file, its task and any later instruction (a resume task or a steering message), its Result, cut at 50 KB like a tool result, and the files its `edit` and `write` calls named. These come from the delegation's saved worker session, or the worker board's copy of its messages when the session was not saved; a fork's copy of the orchestrator's branch is left out. Changes made through `bash`, `ctx_execute` or a worker it started are not listed, and the reviewer is told to check `git status` and `git diff`. An agent definition's instructions follow the review rules.
+
+The reviewer's decision record has `reviewedDelegationId`: the delegation it reviewed. Its saved outcome keeps the same link, so a resumed reviewer keeps its review rules and still counts. A compaction summary of a reviewer is routed without its constraints, like any compaction summary; it only condenses the reviewer's own context.
+
+`subagents_verdict` takes a reviewer whose review completed, of the same delegation, started after that delegation's latest edit. A verdict naming such a reviewer is taken at any tier.
+
 ### Orchestrator protocol
 
-The orchestrator's own session carries the orchestrator protocol as the `orchestrator_protocol` section of its system prompt: delegate exploration and substantial work to workers, keep small known actions (a single lookup, a small edit, a build or test run, a commit), stay within the exploration budget, which it names with the configured threshold, treat a worker's Result as evidence to check before acting on it, and judge each editing delegation's Result and record the verdict with `subagents_verdict`, since its git commit and git push wait for every verdict (see Verdicts above). The text lives in `src/subagents/orchestrator-protocol.ts`. The section is added when each user prompt starts its agent loop, so it holds for every turn of that loop and returns after a compaction. There is no per-prompt reminder line. Workers, forked workers and sessions in a pi-subagents child process never get it; a fork's copied conversation holds the orchestrator's section, and pi removes it from the fork's own prompt.
+The orchestrator's own session carries the orchestrator protocol as the `orchestrator_protocol` section of its system prompt: delegate exploration and substantial work to workers, keep small known actions (a single lookup, a small edit, a build or test run, a commit), stay within the exploration budget, which it names with the configured threshold, treat a worker's Result as evidence to check before acting on it, judge each editing delegation's Result and record the verdict with `subagents_verdict`, since its git commit and git push wait for every verdict (see Verdicts above), and start a reviewer for an elevated, critical or tierless delegation and name it in the verdict (see Reviewers above). The text lives in `src/subagents/orchestrator-protocol.ts`. The section is added when each user prompt starts its agent loop, so it holds for every turn of that loop and returns after a compaction. There is no per-prompt reminder line. Workers, forked workers and sessions in a pi-subagents child process never get it; a fork's copied conversation holds the orchestrator's section, and pi removes it from the fork's own prompt.
 
 A run that a message starts without a user prompt, such as a background call's completion notice or a worker's question, has the protocol for its first turn only: pi rebuilds the prompt of its later turns without the section, until the next user prompt adds it again.
 
@@ -177,7 +211,7 @@ Each item's result has a status:
 | Status | Meaning |
 |--------|---------|
 | `completed` | The worker finished and returned its final text |
-| `failed` | The worker's model call or setup failed, or the item names an unknown agent and no worker started; the result names why |
+| `failed` | The worker's model call or setup failed, or the item names an unknown agent or a delegation it cannot review and no worker started; the result names why |
 | `aborted` | The item's worker was running when the call was aborted |
 | `not-started` | The item was still queued when the call was aborted |
 
@@ -355,10 +389,10 @@ A project's `.pi/settings.json` may replace individual tiers under `orchestrator
 
 A worker started on the auto model is identified by its pi session id (its delegation id). The router extension classifies its first request from the task text, agent role and named file paths. The task text is the first user message, the delegated prompt; context that other extensions append to the request is not part of it. Keyword signals (credentials, security, destructive operations) set a minimum tier. The first rung that passes the hard filters (subagent ban list, allowed-model list, installed model, approved recipient, usage limits, context window and task allowance) is chosen. If no rung survives, routing escalates through higher tiers, then refuses.
 
-pi-orchestrator can set routing constraints for one worker, by its session id, before its first request:
+pi-orchestrator can set routing constraints for one worker, by its session id, before its first request. A reviewer gets a minimum tier and an excluded rung (see Reviewers above):
 
 - A minimum tier raises a lower classified tier to it; escalation goes on from there as usual.
-- An excluded rung is removed in every tier, with the reason `excluded rung`, so escalation cannot choose it either. The same model at another effort stays.
+- An excluded rung is removed in every tier, with the reason `excluded rung`, so escalation cannot choose it either. The same model at another effort stays. A worker whose fallback to the orchestrator's session model (on refusal, in shadow mode or with routing off) would be the excluded rung fails with the reason, and no decision record is written for it.
 - A forced rung, with the tier it stands for, replaces the tier choice. It is pinned if it passes the hard filters. Otherwise routing refuses with the filter it failed, and the worker runs on the orchestrator's session model like any refused worker.
 
 The classifier still runs, so the decision record keeps the tier and why, and its `constraints` field names the constraint. Constraints never lift a hard filter.

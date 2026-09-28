@@ -6,7 +6,7 @@ import { streamReasoning } from "../routing/session-classifier-call.ts";
 import { autoStream } from "./auto-stream.ts";
 import { ROUTER_PREFIX } from "./prefix.ts";
 import { recordedRungPassesHardFilters, routeTask, type ActiveRouter } from "./route-task.ts";
-import { parentDelegationOf } from "../subagents/worker-sessions.ts";
+import { parentDelegationOf, reviewedDelegationOf } from "../subagents/worker-sessions.ts";
 import { publishServedRung, type RungEscalation } from "./served-rungs.ts";
 import type { RiskTier } from "../routing/classifier.ts";
 import type { RoutingConstraints } from "../routing/tier-router.ts";
@@ -93,6 +93,20 @@ function sessionPin(banLists: BanLists): { model: string; effort: string } {
   return { model: baseModel, effort: thinkingSuffix.slice(1) };
 }
 
+/** The session model a worker falls back to when routing is off, refuses or
+ *  runs in shadow mode, unless the worker's routing constraints exclude that
+ *  rung: a reviewer never runs on the reviewed delegation's rung (ADR 0010),
+ *  so it fails with the reason instead of running. */
+function fallbackPin(banLists: BanLists, constraints: RoutingConstraints | undefined): Pin {
+  const pin = sessionPin(banLists);
+  const excluded = constraints?.excludedRung;
+  if (excluded?.model === pin.model && excluded.effort === pin.effort) {
+    throw new SessionModelError(`no other rung is left: this worker would fall back to the orchestrator session model ${pin.model}:${pin.effort}, ` +
+      "which its routing constraints exclude");
+  }
+  return pin;
+}
+
 export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConfig {
   const pins = new Map<string, ServedPin>();
   return {
@@ -114,12 +128,12 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
           wasPinned = pin !== undefined;
           if (!pin) {
             const router = deps.disabled() ? undefined : deps.router();
-            if (!router) pin = sessionPin(deps.banLists());
+            const constraints = routingConstraints().get(sessionId);
+            if (!router) pin = fallbackPin(deps.banLists(), constraints);
             else {
               try {
                 const at = deps.now();
                 const { taskText, agentRole } = firstTaskAndRole(context);
-                const constraints = routingConstraints().get(sessionId);
                 const latest = router.mode === "live" ? latestDecision(router.recordDir, sessionId) : undefined;
                 // A decision made under other constraints could restore a rung these exclude.
                 if (latest?.mode === "live" && latest.route.outcome === "chosen" &&
@@ -130,12 +144,14 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
                 } else {
                   const { classification, route } = await routeTask(router, taskText, agentRole, at, constraints);
                   pin = router.mode === "shadow" || !route.ok
-                    ? sessionPin(router.banLists)
+                    ? fallbackPin(router.banLists, constraints)
                     : { model: route.rung.model, effort: route.rung.effort, ...escalationOf(route) };
                   const ranOn = `${pin.model}:${pin.effort}`;
                   const parentDelegationId = parentDelegationOf(sessionId);
+                  const reviewedDelegationId = reviewedDelegationOf(sessionId);
                   const common = { delegationId: sessionId, at, taskText, agentRole, classification, tierMap: router.tierMap, route, ranOn,
-                    ...(parentDelegationId === undefined ? {} : { parentDelegationId }), ...(constraints === undefined ? {} : { constraints }) };
+                    ...(parentDelegationId === undefined ? {} : { parentDelegationId }), ...(constraints === undefined ? {} : { constraints }),
+                    ...(reviewedDelegationId === undefined ? {} : { reviewedDelegationId }) };
                   appendRoutingRecord(router.recordDir, buildDecisionRecord(router.mode === "shadow"
                     ? { ...common, mode: "shadow", handPickedModel: pin.model }
                     : { ...common, mode: "live" }));
@@ -144,7 +160,7 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
                 // An unavailable or banned session model is a refusal, not a router bug.
                 if (error instanceof SessionModelError) throw error;
                 deps.disable(error);
-                pin = sessionPin(deps.banLists());
+                pin = fallbackPin(deps.banLists(), constraints);
               }
             }
             pins.set(sessionId, pin);

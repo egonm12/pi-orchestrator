@@ -1,0 +1,407 @@
+import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, test } from "node:test";
+import { SessionManager, type ExtensionAPI, type ExtensionContext, type InlineExtension } from "@earendil-works/pi-coding-agent";
+import { buildCatalog } from "../catalog/model-catalog.ts";
+import { emptyRefreshState } from "../catalog/refresh-lifecycle.ts";
+import { resetBanLists } from "../policy/ban-lists.ts";
+import { authorizeRecipient, emptyAuthorization, grantOwnerApproval, saveAuthorization } from "../recipients/authorization.ts";
+import { readRoutingRecords, type DecisionRecord } from "../routing/decision-record.ts";
+import { autoStream } from "../router/auto-stream.ts";
+import { createRouterExtension } from "../router/extension.ts";
+import { createSubagentsExtension, type SubagentResult, type SubagentsDetails } from "./extension.ts";
+import { orchestratorProtocol } from "./orchestrator-protocol.ts";
+import { REVIEW_RULES } from "./review.ts";
+import { markWorkerSession } from "./worker-sessions.ts";
+
+// Independent reviewers of editing delegations (ADR 0010), as the
+// orchestrator sees them: the subagents tool with a review item, and
+// subagents_verdict. As in extension.test.ts, each worker is a real
+// in-process pi session; the model provider, the classifier call, the
+// evidence, the clock, settings files and the environment are fakes.
+// Assertions read the tool results, the requests the provider got and the
+// records in the state folder.
+
+const originalEnv = {
+  HOME: process.env.HOME,
+  PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
+  PI_ORCHESTRATOR_STATE_DIR: process.env.PI_ORCHESTRATOR_STATE_DIR,
+  PI_ORCHESTRATOR_ROUTER_PROBE: process.env.PI_ORCHESTRATOR_ROUTER_PROBE,
+  PI_ORCHESTRATOR_SESSION_MODEL: process.env.PI_ORCHESTRATOR_SESSION_MODEL,
+  PI_SUBAGENT_CHILD: process.env.PI_SUBAGENT_CHILD,
+};
+delete process.env.PI_ORCHESTRATOR_ROUTER_PROBE;
+delete process.env.PI_SUBAGENT_CHILD;
+after(() => {
+  for (const [name, value] of Object.entries(originalEnv)) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+  resetBanLists();
+});
+
+const HAIKU = "anthropic/claude-haiku-4-5";
+const SONNET = "anthropic/claude-sonnet-5";
+const NOW = new Date("2026-09-28T12:00:00.000Z");
+/** An elevated or critical worker runs on haiku:high, which leaves sonnet:high for its reviewer. */
+const TIERS = { mechanical: [`${HAIKU}:low`], standard: [`${HAIKU}:medium`], elevated: [`${HAIKU}:high`, `${SONNET}:high`], critical: [`${HAIKU}:high`, `${SONNET}:high`] };
+const ROUTING = { enabled: true, mode: "live", classifier: { model: `${HAIKU}:low`, timeoutMs: 1_000 }, tiers: TIERS };
+
+interface Harness {
+  readonly agentDir: string;
+  readonly projectDir: string;
+  readonly stateDir: string;
+  cleanup(): void;
+}
+
+function harness(orchestratorSettings: Record<string, unknown> = { routing: ROUTING }): Harness {
+  const home = mkdtempSync(join(tmpdir(), "pi-harness-review-"));
+  const agentDir = join(home, "agent"), projectDir = join(home, "project"), stateDir = join(home, "state");
+  mkdirSync(agentDir);
+  mkdirSync(projectDir);
+  mkdirSync(stateDir);
+  writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ orchestrator: orchestratorSettings }));
+  saveAuthorization(join(stateDir, "authorized-recipients.json"), approvedAnthropic());
+  process.env.HOME = home;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  process.env.PI_ORCHESTRATOR_STATE_DIR = stateDir;
+  process.env.PI_ORCHESTRATOR_SESSION_MODEL = `${HAIKU}:medium`;
+  return { agentDir, projectDir, stateDir, cleanup: () => rmSync(home, { recursive: true, force: true }) };
+}
+
+function approvedAnthropic() {
+  const approval = grantOwnerApproval({ approvedBy: "owner", scope: "data-recipient", acknowledgement: "send delegation data to anthropic" });
+  return authorizeRecipient(emptyAuthorization(), "anthropic", approval);
+}
+
+/** The router extension as a worker loads it. Its classifier answers the
+ *  tier a task names in brackets, such as `[elevated]`, and mechanical otherwise. */
+function routerExtension(): InlineExtension {
+  const answer = (tier: string) => JSON.stringify({ tier, risk: { level: "none", reasons: [] }, ambiguity: "clear", complexity: "low", kindOfWork: "implement", why: `fake classifier says ${tier}` });
+  return {
+    name: "router",
+    factory: createRouterExtension({
+      classifierCall: () => async (prompt) => answer(/\[(standard|elevated|critical)\]/.exec(prompt)?.[1] ?? "mechanical"),
+      evidence: () => () => ({ catalog: buildCatalog({ modelIds: [HAIKU, SONNET], now: NOW }), refreshState: emptyRefreshState(), authorization: approvedAnthropic() }),
+      now: () => NOW,
+    }),
+  };
+}
+
+type ProviderConfig = NonNullable<Parameters<ExtensionAPI["registerProvider"]>[1]>;
+
+interface Request {
+  readonly sessionId: string | undefined;
+  /** `provider/model:effort`. */
+  readonly rung: string;
+  readonly task: string;
+  readonly systemPrompt: string;
+}
+
+const textOf = (content: string | readonly { type: string; text?: string }[]) =>
+  typeof content === "string" ? content : content.map((part) => part.type === "text" ? part.text ?? "" : "").join("");
+
+/** A fake `anthropic` provider serving claude-haiku-4-5 and claude-sonnet-5. A worker whose
+ *  latest user message holds "Run:" makes that one tool call
+ *  (`{ "name": ..., "arguments": ... }` as JSON) and then says "ran"; a
+ *  reviewer answers accept; any other worker says "done". */
+function anthropic() {
+  const requests: Request[] = [];
+  const config: ProviderConfig = {
+    name: "Fake Anthropic", baseUrl: "http://localhost/unused", apiKey: "unused", api: "fake-anthropic" as never,
+    models: ["claude-haiku-4-5", "claude-sonnet-5"].map((id) => ({ id, name: id, reasoning: true, input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200_000, maxTokens: 64_000 })),
+    streamSimple(model, context, options) {
+      const sections = new Map<string, string>();
+      for (const message of context.messages) {
+        if (message.role !== "system") continue;
+        for (const [name, section] of Object.entries(message.sections ?? {})) {
+          if (section === null) sections.delete(name);
+          else sections.set(name, section);
+        }
+      }
+      const users = context.messages.flatMap((message) => message.role === "user" ? [textOf(message.content)] : []);
+      const systemPrompt = [...sections.values()].join("\n\n");
+      requests.push({ sessionId: options?.sessionId, rung: `${model.provider}/${model.id}:${options?.reasoning ?? "off"}`, task: users[0] ?? "", systemPrompt });
+      const toolResults = context.messages.filter((message) => message.role === "toolResult").length;
+      const latest = users.at(-1) ?? "";
+      const run = latest.indexOf("Run:");
+      const reply: { readonly text: string } | { readonly toolCall: { readonly name: string; readonly arguments: Record<string, unknown> } } = run >= 0 && toolResults < users.filter((text) => text.includes("Run:")).length
+        ? { toolCall: JSON.parse(latest.slice(run + "Run:".length)) as { name: string; arguments: Record<string, unknown> } }
+        : { text: run >= 0 ? "ran" : systemPrompt.includes("# Review rules") ? "## Confirmed\nAnswer: accept" : "done" };
+      const { stream, push, end } = autoStream();
+      const message = {
+        role: "assistant", api: model.api, provider: model.provider, model: model.id,
+        content: "toolCall" in reply ? [{ type: "toolCall", id: `call-${requests.length}`, name: reply.toolCall.name, arguments: reply.toolCall.arguments }]
+          : [{ type: "text", text: reply.text }],
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+        stopReason: "toolCall" in reply ? "toolUse" : "stop", timestamp: Date.now(),
+      };
+      push({ type: "start", partial: { ...message, content: [] } } as never);
+      push({ type: "done", reason: message.stopReason, message } as never);
+      end({ api: model.api, provider: model.provider, model: model.id });
+      return stream;
+    },
+  };
+  return { extension: { name: "fake-anthropic", factory: (pi) => pi.registerProvider("anthropic", config) } as InlineExtension, requests };
+}
+
+type Tool = Parameters<ExtensionAPI["registerTool"]>[0];
+
+/** The subagents extension's tools as pi registers them in the orchestrator's session. */
+function loadSubagents(workerExtensions: readonly InlineExtension[]): (name: string) => Tool {
+  const tools: Tool[] = [];
+  createSubagentsExtension({ workerExtensions })({
+    registerTool(tool: Tool) { tools.push(tool); },
+    registerCommand() {}, registerShortcut() {}, on() {}, sendMessage() {},
+    getActiveTools: () => ["read", "bash", "edit", "write", "subagents", "subagents_status", "subagents_message"],
+  } as unknown as ExtensionAPI);
+  return (name) => {
+    const found = tools.filter((tool) => tool.name === name).at(-1);
+    assert.ok(found, `tool ${name} is registered`);
+    return found;
+  };
+}
+
+/** The orchestrator's context on a saved pi session whose latest entry is
+ *  the assistant message making the subagents call `callId`, so a fork can copy the branch before it. */
+function orchestrator(h: Harness, callId = "call"): ExtensionContext {
+  const sessionManager = SessionManager.create(h.projectDir, join(h.agentDir, "sessions", "--project--"));
+  sessionManager.appendMessage({ role: "user", content: "Write the notes", timestamp: Date.now() });
+  sessionManager.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: callId, name: "subagents", arguments: {} }], stopReason: "toolUse", timestamp: Date.now() } as never);
+  return { cwd: h.projectDir, hasUI: false, sessionManager, model: { provider: "anthropic", id: "claude-haiku-4-5" }, thinkingLevel: "low" } as unknown as ExtensionContext;
+}
+
+const toolText = (result: { content: readonly { type: string; text?: string }[] }) => result.content.map((part) => part.text ?? "").join("");
+
+/** One subagents call; its results and text. */
+async function call(tools: (name: string) => Tool, ctx: ExtensionContext, items: readonly Record<string, unknown>[], callId = "call") {
+  const result = await tools("subagents").execute(callId, { items } as never, undefined, undefined, ctx);
+  return { results: (result.details as SubagentsDetails).results, text: toolText(result) };
+}
+
+async function one(tools: (name: string) => Tool, ctx: ExtensionContext, item: Record<string, unknown>, callId = "call"): Promise<SubagentResult & { text: string }> {
+  const { results: [result], text } = await call(tools, ctx, [item], callId);
+  assert.ok(result);
+  return { ...result, text };
+}
+
+async function verdict(tools: (name: string) => Tool, ctx: ExtensionContext, params: Record<string, unknown>): Promise<string> {
+  try { return toolText(await tools("subagents_verdict").execute("verdict", params as never, undefined, undefined, ctx)); } catch (error) { return (error as Error).message; }
+}
+
+const runTask = (name: string, args: Record<string, unknown>) => `Run:${JSON.stringify({ name, arguments: args })}`;
+const WRITE_NOTES = runTask("write", { path: "notes.md", content: "# Notes\n" });
+
+function decisionOf(h: Harness, delegationId: string): DecisionRecord {
+  const record = readRoutingRecords(join(h.stateDir, "routing")).find((entry): entry is DecisionRecord => entry.recordType === "decision" && entry.delegationId === delegationId);
+  assert.ok(record, `a decision record for ${delegationId}`);
+  return record;
+}
+
+test("a review item is routed at or above the implementer's tier and never on its rung, its decision record links to the reviewed delegation, and it gets the review rules and the delegation's task, Result and files", async () => {
+  const h = harness();
+  try {
+    const provider = anthropic();
+    const tools = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h);
+    const implementer = await one(tools, ctx, { task: `[elevated] ${WRITE_NOTES}` });
+    assert.equal(implementer.status, "completed", JSON.stringify(implementer));
+    const id = implementer.sessionId!;
+    assert.equal(decisionOf(h, id).ranOn, `${HAIKU}:high`);
+    assert.ok(implementer.text.includes(`This delegation edited and is elevated: it needs an independent reviewer. Start one with a subagents item whose review is ${id}`), implementer.text);
+
+    const reviewer = await one(tools, ctx, { task: "Check that notes.md has a heading", review: id });
+    assert.equal(reviewer.status, "completed", JSON.stringify(reviewer));
+    assert.equal(reviewer.review, id);
+    const record = decisionOf(h, reviewer.sessionId!);
+    assert.equal(record.reviewedDelegationId, id);
+    assert.equal(record.classification.tier, "mechanical", "the reviewer's own task classifies lower");
+    assert.ok(record.route.outcome === "chosen");
+    assert.deepEqual([record.route.startedAtTier, record.route.tier, record.route.rung.rung, record.ranOn], ["elevated", "elevated", `${SONNET}:high`, `${SONNET}:high`]);
+    assert.deepEqual(record.route.removed.map((removed) => [removed.rung, removed.reason]), [[`${HAIKU}:high`, "excluded rung"]]);
+    assert.deepEqual(record.constraints, { minimumTier: "elevated", excludedRung: `${HAIKU}:high` });
+    const requests = provider.requests.filter((request) => request.sessionId === reviewer.sessionId);
+    assert.deepEqual(requests.map((request) => request.rung), [`${SONNET}:high`]);
+    const prompt = requests[0]!.systemPrompt;
+    assert.ok(prompt.includes(REVIEW_RULES), prompt);
+    assert.ok(prompt.indexOf("# Reporting rules") < prompt.indexOf(REVIEW_RULES), "the review rules follow the reporting rules");
+    for (const part of [`Delegation ${id}, routed at the elevated tier.`, `Its saved session, with the whole transcript: ${implementer.sessionFile}`,
+      `<task>\n[elevated] ${WRITE_NOTES}\n</task>`, "<result>\nran\n</result>", "Files its edit and write calls named: notes.md."]) {
+      assert.ok(prompt.includes(part), `${part}\n---\n${prompt}`);
+    }
+    assert.equal(requests[0]!.task, "Check that notes.md has a heading", "the orchestrator's task is the reviewer's task");
+    assert.equal(reviewer.edited, undefined, "a review that only reads does not edit");
+  } finally { h.cleanup(); }
+});
+
+test("subagents_verdict refuses a self-judged verdict on an elevated or critical delegation and takes one naming its completed reviewer; a spot check suffices below", async () => {
+  const h = harness();
+  try {
+    const provider = anthropic();
+    const tools = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h);
+    const ids: Record<string, string> = {};
+    for (const tier of ["mechanical", "standard", "elevated", "critical"]) {
+      const worker = await one(tools, ctx, { task: `[${tier}] ${runTask("write", { path: `${tier}.md`, content: "x\n" })}` });
+      assert.equal(worker.status, "completed", JSON.stringify(worker));
+      ids[tier] = worker.sessionId!;
+    }
+    const accept = (tier: string, reviewer?: string) => ({ delegationId: ids[tier], verdict: "accept", reason: "checked", ...(reviewer === undefined ? {} : { reviewer }) });
+    for (const tier of ["elevated", "critical"]) {
+      assert.equal(await verdict(tools, ctx, accept(tier)), `subagents_verdict: delegation ${ids[tier]} is ${tier} and needs an independent reviewer: ` +
+        `start one with a subagents item whose review is ${ids[tier]}, judge its Result, then name it here as reviewer`);
+    }
+    for (const tier of ["mechanical", "standard"]) assert.equal(await verdict(tools, ctx, accept(tier)), `Recorded accept on delegation ${ids[tier]}.`);
+
+    const reviewer = await one(tools, ctx, { task: "Check it", review: ids.critical });
+    assert.equal(reviewer.status, "completed", JSON.stringify(reviewer));
+    const reviewerId = reviewer.sessionId!;
+    const reviewerRecord = decisionOf(h, reviewerId);
+    assert.ok(reviewerRecord.route.outcome === "chosen");
+    assert.deepEqual([decisionOf(h, ids.critical!).ranOn, reviewerRecord.route.tier, reviewerRecord.ranOn], [`${HAIKU}:high`, "critical", `${SONNET}:high`],
+      "routed at critical, off the implementer's rung");
+    // Not a reviewer, the reviewer of another delegation, and the delegation itself are refused.
+    assert.equal(await verdict(tools, ctx, accept("critical", ids.elevated)),
+      `subagents_verdict: delegation ${ids.elevated} is not a reviewer of this orchestrator session; start one with a subagents item whose review is ${ids.critical}`);
+    assert.equal(await verdict(tools, ctx, accept("elevated", reviewerId)), `subagents_verdict: reviewer ${reviewerId} reviewed delegation ${ids.critical}, not ${ids.elevated}`);
+    assert.equal(await verdict(tools, ctx, accept("critical", ids.critical)), `subagents_verdict: delegation ${ids.critical} cannot be its own reviewer`);
+    assert.equal(await verdict(tools, ctx, { ...accept("critical"), reviewer: " " }), "subagents_verdict: a reviewer, when given, is the review delegation's id");
+    assert.equal(await verdict(tools, ctx, accept("critical", reviewerId)), `Recorded accept on delegation ${ids.critical}, reviewed by delegation ${reviewerId}.`);
+    // A reviewer is welcome at any tier.
+    const mechanicalReviewer = await one(tools, ctx, { task: "Check it", review: ids.mechanical });
+    assert.equal(await verdict(tools, ctx, { ...accept("mechanical", mechanicalReviewer.sessionId!), verdict: "request_changes" }),
+      `Recorded request_changes on delegation ${ids.mechanical}, reviewed by delegation ${mechanicalReviewer.sessionId}. It replaces the earlier accept.`);
+    const verdicts = readRoutingRecords(join(h.stateDir, "routing")).flatMap((record) => record.recordType === "verdict" ? [record.delegationId] : []);
+    assert.deepEqual(verdicts, [ids.mechanical, ids.standard, ids.critical, ids.mechanical], "a refused verdict is not recorded");
+  } finally { h.cleanup(); }
+});
+
+test("a review started before the delegation's latest edit, or one that failed, does not count", async () => {
+  const h = harness();
+  try {
+    const provider = anthropic();
+    const tools = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h);
+    const implementer = await one(tools, ctx, { task: `[elevated] ${WRITE_NOTES}` });
+    const id = implementer.sessionId!;
+    const reviewer = await one(tools, ctx, { task: "Check it", review: id });
+    assert.equal(reviewer.status, "completed", JSON.stringify(reviewer));
+    // The delegation edits again after the review.
+    const resumed = await one(tools, ctx, { resume: id, task: runTask("write", { path: "notes.md", content: "# Notes\nmore\n" }) });
+    assert.equal(resumed.edited, true, JSON.stringify(resumed));
+    assert.equal(await verdict(tools, ctx, { delegationId: id, verdict: "accept", reason: "checked", reviewer: reviewer.sessionId }),
+      `subagents_verdict: reviewer ${reviewer.sessionId} started before delegation ${id}'s latest edit; start a new review`);
+    const again = await one(tools, ctx, { task: "Check it again", review: id });
+    assert.equal(await verdict(tools, ctx, { delegationId: id, verdict: "accept", reason: "checked", reviewer: again.sessionId }),
+      `Recorded accept on delegation ${id}, reviewed by delegation ${again.sessionId}.`);
+    // The reviewer's system prompt names the later task too.
+    const prompt = provider.requests.find((request) => request.sessionId === again.sessionId)!.systemPrompt;
+    assert.ok(prompt.includes(`<later-instruction>\n${runTask("write", { path: "notes.md", content: "# Notes\nmore\n" })}\n</later-instruction>`), prompt);
+  } finally { h.cleanup(); }
+});
+
+test("a fork and an agent's named model have no tier: gated as elevated, and reviewed at elevated or higher, off their rung", async () => {
+  for (const kind of ["fork", "agent-model"] as const) {
+    const h = harness({ routing: ROUTING, subagents: { agentDefinitionModel: { use: kind === "agent-model" ? "preserve" : "route" } } });
+    try {
+      mkdirSync(join(h.agentDir, "agents"));
+      writeFileSync(join(h.agentDir, "agents", "scribe.md"), `---\nname: scribe\ndescription: Writes\nmodel: ${HAIKU}\nthinking: high\n---\n\nWrite notes.\n`);
+      const provider = anthropic();
+      const tools = loadSubagents([routerExtension(), provider.extension]);
+      const ctx = orchestrator(h);
+      const implementer = await one(tools, ctx, kind === "fork" ? { task: WRITE_NOTES, fork: true } : { task: WRITE_NOTES, agent: "scribe" });
+      assert.equal(implementer.status, "completed", `${kind}: ${JSON.stringify(implementer)}`);
+      const id = implementer.sessionId!;
+      const rung = kind === "fork" ? `${HAIKU}:low` : `${HAIKU}:high`;
+      assert.deepEqual(provider.requests.filter((request) => request.sessionId === id).map((request) => request.rung).at(0), rung, kind);
+      assert.ok(implementer.text.includes("This delegation edited and is without a tier, so it is gated as elevated: it needs an independent reviewer."), implementer.text);
+      assert.equal(await verdict(tools, ctx, { delegationId: id, verdict: "accept", reason: "checked" }),
+        `subagents_verdict: delegation ${id} is without a tier, so it is gated as elevated, and needs an independent reviewer: ` +
+        `start one with a subagents item whose review is ${id}, judge its Result, then name it here as reviewer`, kind);
+      // An agent gives the reviewer instructions, but its model does not bypass the constraints.
+      const reviewer = await one(tools, ctx, { task: "Check it", review: id, agent: "scribe" });
+      assert.equal(reviewer.status, "completed", `${kind}: ${JSON.stringify(reviewer)}`);
+      const record = decisionOf(h, reviewer.sessionId!);
+      assert.ok(record.route.outcome === "chosen");
+      assert.equal(record.route.startedAtTier, "elevated", kind);
+      assert.deepEqual(record.constraints, { minimumTier: "elevated", excludedRung: rung }, kind);
+      assert.notEqual(record.ranOn, rung, kind);
+      assert.equal(record.reviewedDelegationId, id);
+      const prompt = provider.requests.find((request) => request.sessionId === reviewer.sessionId)!.systemPrompt;
+      assert.ok(prompt.includes(`Delegation ${id}, without a tier, so it is gated as elevated.`), prompt);
+      assert.ok(prompt.indexOf(REVIEW_RULES) < prompt.indexOf("Write notes."), "the agent's instructions follow the review rules");
+      // A fork's review names only its own task, not the orchestrator's conversation it copied.
+      assert.ok(prompt.includes(`<task>\n${WRITE_NOTES}\n</task>`), prompt);
+      assert.equal(prompt.includes("<task>\nWrite the notes"), false, prompt);
+      assert.equal(await verdict(tools, ctx, { delegationId: id, verdict: "accept", reason: "checked", reviewer: reviewer.sessionId }),
+        `Recorded accept on delegation ${id}, reviewed by delegation ${reviewer.sessionId}.`, kind);
+    } finally { h.cleanup(); }
+  }
+});
+
+test("a reviewer whose only way to run is the implementer's rung fails with the reason, and a verdict cannot name it", async () => {
+  // In shadow mode every worker runs on the session model, the implementer's rung too.
+  const h = harness({ routing: { ...ROUTING, mode: "shadow" } });
+  try {
+    const provider = anthropic();
+    const tools = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h);
+    const implementer = await one(tools, ctx, { task: `[elevated] ${WRITE_NOTES}` });
+    const id = implementer.sessionId!;
+    assert.equal(decisionOf(h, id).ranOn, `${HAIKU}:medium`);
+    const reviewer = await one(tools, ctx, { task: "Check it", review: id });
+    assert.equal(reviewer.status, "failed");
+    assert.equal(reviewer.error, `no other rung is left: this worker would fall back to the orchestrator session model ${HAIKU}:medium, which its routing constraints exclude`);
+    assert.equal(provider.requests.some((request) => request.sessionId === reviewer.sessionId), false, "the reviewer never ran");
+    assert.equal(await verdict(tools, ctx, { delegationId: id, verdict: "accept", reason: "checked", reviewer: reviewer.sessionId }),
+      `subagents_verdict: reviewer ${reviewer.sessionId} ended failed; only a completed review counts`);
+    // Another session model lets it run.
+    process.env.PI_ORCHESTRATOR_SESSION_MODEL = `${HAIKU}:high`;
+    const next = await one(tools, ctx, { task: "Check it", review: id });
+    assert.equal(next.status, "completed", JSON.stringify(next));
+    assert.deepEqual(provider.requests.filter((request) => request.sessionId === next.sessionId).map((request) => request.rung), [`${HAIKU}:high`]);
+  } finally { h.cleanup(); }
+});
+
+test("a review item is refused, without starting a worker, with fork or resume, from a worker, and for a delegation that is unknown or did not edit", async () => {
+  const h = harness();
+  try {
+    const provider = anthropic();
+    const tools = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h);
+    const implementer = await one(tools, ctx, { task: `[elevated] ${WRITE_NOTES}` });
+    const research = await one(tools, ctx, { task: "Look around" });
+    const id = implementer.sessionId!;
+    const unknown = "0b7c7a5e-0000-4000-8000-000000000000";
+    const { results } = await call(tools, ctx, [
+      { task: "Check it", review: id, fork: true },
+      { task: "Check it", review: id, resume: research.sessionId },
+      { task: "Check it", review: unknown },
+      { task: "Check it", review: research.sessionId },
+    ]);
+    assert.deepEqual(results.map((result) => [result.status, result.sessionId, result.error]), [
+      ["failed", undefined, "review excludes fork"],
+      ["failed", undefined, "resume excludes agent, fork and review"],
+      ["failed", undefined, `cannot review delegation ${unknown}: unknown delegation id`],
+      ["failed", undefined, `cannot review delegation ${research.sessionId}: it did not edit; only an editing delegation gets a reviewer`],
+    ]);
+    const unmark = markWorkerSession(ctx.sessionManager.getSessionId());
+    try {
+      const nested = await one(tools, ctx, { task: "Check it", review: id });
+      assert.deepEqual([nested.status, nested.error], ["failed", "only the orchestrator starts reviewers"]);
+    } finally { unmark(); }
+    assert.equal(readRoutingRecords(join(h.stateDir, "routing")).some((record) => record.recordType === "decision" && record.reviewedDelegationId !== undefined), false);
+  } finally { h.cleanup(); }
+});
+
+test("the protocol describes reviewers: when one is needed, how to start one and how to name it in the verdict", () => {
+  const paragraph = orchestratorProtocol(3).split("\n\n").find((text) => text.includes("independent reviewer"));
+  assert.ok(paragraph);
+  for (const phrase of ["elevated or critical", "without a tier", "`review`", "never on its rung", "reruns nothing", "accept or request changes",
+    "`reviewer`", "refused", "latest edit", "spot check", "tell the user"]) {
+    assert.ok(paragraph.includes(phrase), `${phrase}: ${paragraph}`);
+  }
+});

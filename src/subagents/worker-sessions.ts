@@ -8,16 +8,19 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 // out of a worker: the remembered session model, the session ban list and the
 // fresh-install notice.
 // A worker started by another worker (ADR 0008) is kept with its parent
-// delegation, which the router extension writes into its decision record.
+// delegation, and a reviewer (ADR 0010) with the delegation it reviews; the
+// router extension writes both into the worker's decision record.
 //
 // pi loads each extension with a fresh module copy (jiti moduleCache: false),
 // so the map is kept on the process's global object.
 
 const WORKER_SESSIONS = Symbol.for("pi-orchestrator.subagents.worker-sessions");
 
-/** A worker's session: `parentDelegationId` is set when a worker, not the orchestrator, started it. */
+/** A worker's session: `parentDelegationId` is set when a worker, not the
+ *  orchestrator, started it, and `reviewedDelegationId` when it is a reviewer. */
 interface WorkerSession {
   readonly parentDelegationId?: string;
+  readonly reviewedDelegationId?: string;
 }
 
 type ProcessGlobal = typeof globalThis & { [WORKER_SESSIONS]?: Map<string, WorkerSession> };
@@ -27,9 +30,11 @@ function workerSessions(): Map<string, WorkerSession> {
 }
 
 /** Marks `sessionId` as a worker's session until the returned function is
- *  called. `parentDelegationId` names the worker that started it, if any. */
-export function markWorkerSession(sessionId: string, parentDelegationId?: string): () => void {
-  workerSessions().set(sessionId, parentDelegationId === undefined ? {} : { parentDelegationId });
+ *  called. `parentDelegationId` names the worker that started it, if any, and
+ *  `reviewedDelegationId` the delegation it reviews, if it is a reviewer. */
+export function markWorkerSession(sessionId: string, parentDelegationId?: string, reviewedDelegationId?: string): () => void {
+  workerSessions().set(sessionId, { ...(parentDelegationId === undefined ? {} : { parentDelegationId }),
+    ...(reviewedDelegationId === undefined ? {} : { reviewedDelegationId }) });
   return () => { workerSessions().delete(sessionId); };
 }
 
@@ -48,4 +53,9 @@ export function isWorkerSession(ctx: Partial<Pick<ExtensionContext, "sessionMana
  *  `undefined` for the orchestrator's workers and for any other session. */
 export function parentDelegationOf(sessionId: string): string | undefined {
   return workerSessions().get(sessionId)?.parentDelegationId;
+}
+
+/** The delegation the reviewer `sessionId` reviews; `undefined` for any other session. */
+export function reviewedDelegationOf(sessionId: string): string | undefined {
+  return workerSessions().get(sessionId)?.reviewedDelegationId;
 }

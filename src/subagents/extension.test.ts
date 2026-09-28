@@ -3128,9 +3128,17 @@ test("a verdict on a fork, an agent's named model or an unrouted worker attaches
       assert.equal(worker.status, "completed", `${kind}: ${JSON.stringify(worker)}`);
       assert.equal(worker.edited, true, kind);
       const id = worker.sessionId!;
-      assert.equal(await recordVerdict(subagents, ctx, { delegationId: id, verdict: "request_changes", reason: "no heading" }), `Recorded request_changes on delegation ${id}.`);
+      // Without a tier, each is gated as elevated and needs a reviewer (ADR 0010), which must run on
+      // another rung than the worker's: here the session model it falls back to, moved to another effort.
+      process.env.PI_ORCHESTRATOR_SESSION_MODEL = `${HAIKU}:high`;
+      const review = await subagents.tool().execute("call-2", { items: [{ task: "Check the notes", review: id }] } as never, undefined, undefined, ctx);
+      const reviewer = (review.details as SubagentsDetails).results[0]!;
+      assert.equal(reviewer.status, "completed", `${kind}: ${JSON.stringify(reviewer)}`);
+      assert.equal(await recordVerdict(subagents, ctx, { delegationId: id, verdict: "request_changes", reason: "no heading", reviewer: reviewer.sessionId }),
+        `Recorded request_changes on delegation ${id}, reviewed by delegation ${reviewer.sessionId}.`);
       const records = readRoutingRecords(join(h.stateDir, "routing"));
-      assert.deepEqual(records.map((record) => record.recordType), [...(kind === "unrouted" ? [] : [kind]), "edit", "verdict"], kind);
+      // The reviewer's decision carries the router's fixed clock, so it may sit in another day file.
+      assert.deepEqual(records.map((record) => record.recordType).sort(), (kind === "unrouted" ? ["edit", "verdict"] : [kind, "edit", "decision", "verdict"]).sort(), kind);
       const report = buildRoutingReport(join(h.stateDir, "routing"));
       assert.equal(report.orphanedVerdicts, 0, kind);
       assert.deepEqual(report.unroutedVerdicts, { accept: 0, request_changes: 1, missing: 0 }, kind);
