@@ -1,11 +1,11 @@
 ---
 # pi-orchestrator-3p1z
 title: 'Orchestrator enforcement: protocol, exploration budget, quality gate'
-status: in-progress
+status: completed
 type: epic
 priority: normal
 created_at: 2026-09-27T21:45:45Z
-updated_at: 2026-09-28T13:46:46Z
+updated_at: 2026-09-28T14:24:08Z
 ---
 
 Design session (split-plan 'orchestrator enforcement', ADR 0005). Keeps the main session in the orchestrator role.
@@ -19,9 +19,9 @@ Design session (split-plan 'orchestrator enforcement', ADR 0005). Keeps the main
 - Binds only the orchestrator session; workers, forked workers and pi-subagents children are exempt.
 
 ## Open
-- [ ] Worker self-verification and orchestrator as quality gate (learn from claude-plugins)
-- [ ] Classifier-adjusted threshold per prompt
-- [ ] User override of the budget
+- [x] Worker self-verification and orchestrator as quality gate (learn from claude-plugins)
+- [x] Classifier-adjusted threshold per prompt
+- [x] User override of the budget
 
 
 ## Findings: claude-plugins quality gate
@@ -50,7 +50,7 @@ Design session (split-plan 'orchestrator enforcement', ADR 0005). Keeps the main
 - The runtime checks Result section headers without a model call and only annotates when one is missing.
 
 ## Open (round 4)
-- [ ] Configurable gate strength (low/medium/high/max) or orchestrator-judged criticality
+- [x] Configurable gate strength (low/medium/high/max) or orchestrator-judged criticality
 
 
 ## Settled (round 4)
@@ -102,3 +102,21 @@ All but the last are folded into ir82; l8af counts same-rung reviews apart. ADR 
 
 ## Owner decision (2026-09-28): ADR 0013 is leading
 ADR 0013 supersedes ADR 0005 and amends ADR 0010: the exploration budget becomes an exploration nudge and the commit/push block becomes a notice, and an editing delegation is defined by working-tree comparison. ir82's ctx_batch_execute criterion is superseded. Open: whether the rework of jeyq, kokv and mw81 and the changes to mxmz and l8af belong in this epic.
+
+
+## Summary of Changes
+All 11 tickets delivered, each gated by the orchestrator and committed on main:
+- vu2o (6394e6e): shared orchestrator-session check; /pi-orchestrator subcommands.
+- 8ftz (b22302e): reporting rules for non-fork workers; Result section check.
+- uezs (ef0433a): per-worker routing constraints (minimum tier, excluded rung, forced rung).
+- y8cd (ea145f0): orchestrator protocol in the system prompt; gap in message-started runs documented (owner choice).
+- jeyq (10ff0d2): per-prompt exploration budget and tool-call classification.
+- kokv (ad94cf2): edit records and the subagents_verdict tool.
+- mw81 (1755725): commit/push gate and turn-end notice for unjudged delegations.
+- 247s (97f9552): independent reviewers routed at the implementer's tier or higher.
+- ir82 (5183d43, 2a56505): effort-ladder retries with a two-climb limit, unplaced climbs, same-rung reviews in shadow/off, read-only reviewers.
+- mxmz (3408cb4): gate level table, settings, /pi-orchestrator gate, raise-only per delegation.
+- l8af (d281fad): gate requirements; ungated, missing and same-rung counts in the routing report; old verdict-reviewer retired.
+Docs: ADRs 0010 and 0011, glossary entries (Result, Quality gate, Gate level, Gate action, Ungated delegation, Missing verdict, Same-rung review, Unplaced climb, Editing delegation).
+Final check on a clean worktree of d281fad: typecheck clean; npm test 774 pass, 0 fail, 16 skipped (live tests).
+ADR 0013 (owner: leading) turns the budget and commit gate into guidance and redefines editing delegations; that rework is epic pi-orchestrator-atod.
