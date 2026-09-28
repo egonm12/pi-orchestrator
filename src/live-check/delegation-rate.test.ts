@@ -15,7 +15,8 @@ function sessionFile(id: string, entries: readonly Record<string, unknown>[]): s
     ...entries.map((entry) => ({ id: `${id}-e${++n}`, parentId: null, timestamp: "2026-09-30T09:00:00.000Z", ...entry }))];
   return lines.map((line) => JSON.stringify(line)).join("\n");
 }
-const system = (protocol = true) => ({ type: "message", message: { role: "system", content: protocol ? `You are pi.\n${PROTOCOL}` : "You are pi.",
+/** The first system message pi records: a structured prompt has empty content and its text in sections. */
+const system = (protocol = true) => ({ type: "message", message: { role: "system", content: "",
   sections: protocol ? { preamble: "You are pi.", orchestrator_protocol: PROTOCOL } : { preamble: "You are pi." } } });
 const user = (text: string, timestamp?: string) => ({ type: "message", ...(timestamp ? { timestamp } : {}),
   message: { role: "user", content: [{ type: "text", text }] } });
@@ -48,7 +49,7 @@ test("a prompt's outcome counts the workers it started and the exploratory calls
     [{ id: outcome.id, route: "", kind: "plain", text: "Why does the reminder not fire when I run release?" }]);
 });
 
-test("each prompt gets its own nudges, gate reminders and wake-ups, and a skill prompt reads as the /skill: line typed", () => {
+test("each prompt gets its own nudges, gate reminders and subagents messages, and a skill prompt reads as the /skill: line typed", () => {
   const skill = `<skill name="research" location="/Users/me/.agents/skills/research/SKILL.md">\nReferences are relative to /x.\n\nBody\n</skill>\n\nlist the ADRs`;
   const found = promptsOfSession(sessionFile("S2", [
     system(),
@@ -65,9 +66,9 @@ test("each prompt gets its own nudges, gate reminders and wake-ups, and a skill 
   assert.ok(found);
   const [first, second] = found.outcomes;
   assert.ok(first && second && found.labels[0]);
-  assert.deepEqual([first.kind, first.nudges, first.gateReminders, first.wakeUps, first.delegations], ["skill", 1, 1, 1, 0]);
+  assert.deepEqual([first.kind, first.nudges, first.gateReminders, first.subagentMessages, first.delegations], ["skill", 1, 1, 1, 0]);
   assert.equal(first.exploratoryBeforeDelegation, 1, "without a worker, every exploratory call came before delegating");
-  assert.deepEqual([second.kind, second.nudges, second.gateReminders, second.wakeUps, second.exploratory], ["plain", 0, 0, 0, 1]);
+  assert.deepEqual([second.kind, second.nudges, second.gateReminders, second.subagentMessages, second.exploratory], ["plain", 0, 0, 0, 1]);
   assert.equal(found.labels[0].text, "/skill:research list the ADRs");
   assert.equal(first.session, second.session);
 });
@@ -83,13 +84,61 @@ test("a session that never had the protocol is not sampled, and outcomes carry n
   assert.deepEqual(found.labels.map((label) => label.id), found.outcomes.map((outcome) => outcome.id));
 });
 
+test("a later system message patches the sections before it: a tools-only or unrelated patch keeps the protocol, a null removes it", () => {
+  const toolsOnly = { type: "message", message: { role: "system", content: "", toolsAdded: [{ name: "subagents", description: "d", parameters: {} }] } };
+  const otherSection = { type: "message", message: { role: "system", content: "", sections: { skills: "<skills/>" } } };
+  const removed = { type: "message", message: { role: "system", content: "", sections: { orchestrator_protocol: null } } };
+  const restored = { type: "message", message: { role: "system", content: "", sections: { orchestrator_protocol: PROTOCOL } } };
+  const found = promptsOfSession(sessionFile("S7", [
+    system(), user("first"), toolsOnly, user("after a tools-only patch"), otherSection, user("after another section changed"),
+    removed, user("after the protocol was removed"), restored, user("after it came back"),
+  ]));
+  assert.ok(found);
+  assert.deepEqual(found.outcomes.map((outcome) => outcome.protocol), [true, true, true, false, true]);
+  const textOnly = promptsOfSession(sessionFile("S8", [{ type: "message", message: { role: "system", content: `You are pi.\n${PROTOCOL}` } }, toolsOnly, user("q")]));
+  assert.deepEqual(textOnly?.outcomes.map((outcome) => outcome.protocol), [true], "a system message's text stays in the prompt");
+});
+
+/** A fork of `original` the way pi writes one: a new header, then the copied entries unchanged (same ids and timestamps), then `more`. */
+function forkFile(original: string, id: string, more: readonly Record<string, unknown>[]): string {
+  const [, ...copied] = original.split("\n");
+  const header = { type: "session", version: 3, id, timestamp: "2026-09-30T10:00:00.000Z", cwd: "/private/other", parentSession: "/x/a.jsonl" };
+  let n = 0;
+  return [JSON.stringify(header), ...copied, ...more.map((entry) => JSON.stringify({ id: `${id}-e${++n}`, parentId: null, timestamp: "2026-09-30T10:30:00.000Z", ...entry }))].join("\n");
+}
+
+test("a forked session's copied prompts count once, the fork's own calls and prompts count, and the same text in another session is its own prompt", () => {
+  const root = mkdtempSync(join(tmpdir(), "delegation-rate-fork-"));
+  const sessions = join(root, "sessions");
+  mkdirSync(join(sessions, "--private-project--"), { recursive: true });
+  mkdirSync(join(sessions, "--private-other--"), { recursive: true });
+  const original = sessionFile("S9", [system(), user("Trace the failure"), call("subagents", { items: [{ task: "trace" }] }), user("And the other one?"), call("read", { path: "a" })]);
+  writeFileSync(join(sessions, "--private-project--", "2026-09-30T08-00-00-000Z_S9.jsonl"), original);
+  // Sorted before the original by name, and in another project folder: the fork is still read after it.
+  writeFileSync(join(sessions, "--private-other--", "0-fork.jsonl"), forkFile(original, "S10", [
+    call("subagents", { items: [{ task: "the other one" }] }), user("A new question"), call("read", { path: "b" })]));
+  writeFileSync(join(sessions, "--private-project--", "other.jsonl"), sessionFile("S11", [system(), user("Trace the failure")]));
+
+  const out = join(root, "out");
+  const summary = runExtract({ sessionsDir: sessions, outDir: out, since: new Date("2026-09-29T00:00:00Z"), repoRoot: join(root, "repo") });
+  assert.deepEqual([summary.sessions, summary.orchestratorSessions, summary.prompts, summary.copiedPrompts], [3, 3, 4, 2]);
+  const labels = readRows<LabelRow>(join(out, "labels.jsonl"));
+  const outcomes = readRows<PromptOutcome>(join(out, "outcomes.jsonl"));
+  const byText = (text: string) => labels.filter((label) => label.text === text).map((label) => outcomes.find((outcome) => outcome.id === label.id));
+  assert.deepEqual(byText("Trace the failure").map((outcome) => outcome?.delegations).sort(), [0, 1], "the copy is gone; the same text in another session stays");
+  assert.deepEqual(byText("And the other one?").map((outcome) => [outcome?.delegations, outcome?.exploratory, outcome?.exploratoryBeforeDelegation]), [[1, 1, 1]],
+    "the read counts once, and the worker the fork started after it counts toward the copied prompt");
+  assert.deepEqual(byText("A new question").map((outcome) => outcome?.exploratory), [1]);
+  assert.equal(new Set(labels.map((label) => label.id)).size, labels.length);
+});
+
 /** A labelled prompt and its outcome. */
 interface Row { readonly route: Route; readonly delegated?: boolean; readonly nudges?: number; readonly kind?: "plain" | "skill"; readonly explored?: number; readonly session?: string }
 function sample(rows: readonly Row[]): { labels: LabelRow[]; outcomes: PromptOutcome[] } {
   const labels = rows.map((row, i): LabelRow => ({ id: `p${i}`, route: row.route, kind: row.kind ?? "plain", text: `prompt ${i}` }));
   const outcomes = rows.map((row, i): PromptOutcome => ({ id: `p${i}`, session: row.session ?? "s1", at: `2026-09-30T09:${String(i % 60).padStart(2, "0")}:00.000Z`,
     kind: row.kind ?? "plain", model: "anthropic/claude-opus-4-5", protocol: true, delegations: row.delegated ? 1 : 0,
-    exploratory: row.explored ?? 0, exploratoryBeforeDelegation: row.explored ?? 0, nudges: row.nudges ?? 0, gateReminders: 0, wakeUps: 0 }));
+    exploratory: row.explored ?? 0, exploratoryBeforeDelegation: row.explored ?? 0, nudges: row.nudges ?? 0, gateReminders: 0, subagentMessages: 0 }));
   return { labels, outcomes };
 }
 const summarized = (rows: readonly Row[]) => { const { labels, outcomes } = sample(rows); return summarize(labels, outcomes); };
@@ -107,7 +156,7 @@ test("the decision compares plain delegate prompts with the baseline's 6 of 29 b
   const near = summarized(needed(12, 29));
   assert.equal(near.decision, "near-baseline", "p = 0.077");
   assert.ok(near.lines.includes("one-sided Fisher exact test against the baseline: p = 0.077"), near.lines.join("\n"));
-  assert.equal(near.lines.at(-1), "DECISION: NEAR BASELINE. Revisit ADR 0013 with this evidence: the rate is not above the baseline at p < 0.05.");
+  assert.equal(near.lines.at(-1), "DECISION: NEAR BASELINE. Revisit ADR 0013 with this evidence: the rate is not statistically shown above the baseline at p < 0.05.");
 
   const small = summarized(needed(28, 28));
   assert.equal(small.decision, "insufficient");
@@ -134,7 +183,8 @@ test("skill prompts, skipped rows and quick prompts stay out of the headline and
     "not delegated although needed (plain): 17 prompts",
     "models: anthropic/claude-opus-4-5 35",
     "protocol recorded before the prompt: 35 of 35",
-    "exploration nudges seen: 2 in 1 prompt; gate reminders seen: 0 in 0 prompts; wake-ups: 0",
+    "exploration nudges seen: 2 in 1 prompt; gate reminders seen: 0 in 0 prompts",
+    "subagents messages (completion notices, reports, gate notices; notices, not wake-ups): 0",
   ]) assert.ok(lines.includes(line), `missing ${line}\n${lines.join("\n")}`);
   assert.ok(!lines.join("\n").includes("prompt 1"), "no prompt text in the summary");
 });

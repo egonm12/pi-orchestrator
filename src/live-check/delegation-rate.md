@@ -10,8 +10,9 @@ The method follows the baseline so the two figures can be compared. The baseline
 
 | Term | Definition |
 |------|------------|
-| Prompt | One user message in an orchestrator session, from that message to the next user message. Runs that a completion notice, a report or a gate reminder wakes belong to the prompt before them. |
+| Prompt | One user message in an orchestrator session, from that message to the next user message. Runs that a completion notice, a report or a gate reminder wakes belong to the prompt before them. A prompt a forked session copied is the same prompt and counts once (see below). |
 | Orchestrator session | A main pi session (a top-level file in a project folder under `~/.pi/agent/sessions`) whose recorded system prompt held the orchestrator protocol at least once. Workers' sessions live in `subagents/` and are never read. |
+| Protocol before a prompt | Whether the system prompt pi had recorded by that prompt held the protocol. It is replayed the way pi replays it: the first system message holds the whole prompt, and each later one is a patch. A section set to text replaces that section, a section set to null removes it, a section the patch leaves out stays, and a patch that only declares tools changes no section. |
 | Needed (denominator) | A plain prompt the owner labelled `delegate`: answering it needs an investigation. |
 | Delegated (numerator) | A needed prompt in which the orchestrator started at least one worker: a `subagents` call (each item counts), or a pi-subagents `subagent` call. An attempt counts even if routing refused it: it measures the decision to delegate. |
 | Headline rate | delegated / needed, over plain prompts only. The baseline routed slash commands apart, so its 29 hold no skill prompts. Skill prompts are reported on their own line. |
@@ -21,7 +22,8 @@ The summary also reports, as context and not part of the decision:
 
 - quick prompts (`self`) that started a worker anyway, which is the over-delegation ADR 0013 mentions
 - needed prompts with more than 2 exploratory calls before the first worker, or in total when none was started (the baseline's 15 of 29). Exploratory calls are counted the way the exploration nudge counts them.
-- exploration nudges and gate reminders seen in tool results, and wake-ups by `subagents-*` messages
+- exploration nudges and gate reminders seen in tool results
+- `subagents-*` messages after the prompt: completion notices, worker reports and questions, gate notices. This counts notices, not wake-ups: a notice that arrived while the orchestrator was busy started no run of its own.
 - the models the orchestrator ran on, and how many prompts followed a recorded system prompt with the protocol
 
 ## Decision threshold
@@ -32,7 +34,7 @@ The decision compares the headline with the baseline by a one-sided Fisher exact
 |---------------------|------|-----------------------------|
 | `DECISION: INSUFFICIENT SAMPLE` | fewer than 29 plain prompts labelled `delegate` | no decision yet; extend the window once (step 6) |
 | `DECISION: IMPROVED` | p < 0.05 | the decision stands |
-| `DECISION: NEAR BASELINE` | p ≥ 0.05 with at least 29 needed | revisit ADR 0013 with this evidence, as its consequences say |
+| `DECISION: NEAR BASELINE` | p ≥ 0.05 with at least 29 needed | the rate is not statistically shown above the baseline. It may still be higher, but this sample does not show it. Revisit ADR 0013 with this evidence, as its consequences say |
 
 At exactly 29 needed prompts, IMPROVED takes at least 13 delegated (45%, p = 0.046). 12 of 29 gives p = 0.077.
 
@@ -58,7 +60,7 @@ From the repository root:
    node src/live-check/delegation-rate.ts extract --since 2026-09-29T00:08:31+02:00 --until <end, ISO> --out "$OUT"
    ```
 
-   It prints how many session files it read, how many orchestrator sessions and prompts it found, and the two files it wrote.
+   It prints how many session files it read, how many orchestrator sessions and prompts it found, how many copies in forked sessions it left out, and the two files it wrote.
 
 3. Label blind. Open `$OUT/labels.jsonl` in an editor and do **not** open `$OUT/outcomes.jsonl`. Each line is `{"id":…,"route":"","kind":…,"text":…}`, in id order, not time order. Set `route` on every line from the text alone, using the baseline's criteria:
 
@@ -123,5 +125,7 @@ Then add the result to ADR 0013's consequences, in one line such as `Remeasured 
 
 - The labeller is not blind to their own memory of the session. A second labeller a few days later reduces that.
 - Entries are read in file order. A session branched with `/tree` puts both branches' calls under the prompt before them.
+- A forked session (`/fork`, `/clone`, `pi --fork`) is a new top-level file that starts with copies of its parent's entries, with their ids and timestamps unchanged. The script counts an entry once across all files by its id and timestamp, reading files in the order their sessions started, so a parent comes before its forks. A copied prompt is labelled and counted once, under the session it first appeared in. What the fork did after its last copied prompt counts toward that prompt, like a `/tree` branch. Prompts typed in the fork are new entries and count as new prompts. The same text typed again in another session is a different entry and counts again.
+- Two entries only match when both their 8-character id and their millisecond timestamp match, so two genuinely new prompts are not merged in practice. An entry without an id (an old session format) is never matched, so a fork of such a session would count its copies twice. pi writes ids in the current format.
 - A user message another extension sent looks like a typed one in the transcript. Mark it `skip`. Its calls are then left out, and they do not count toward the prompt before it.
 - The baseline was Claude Code with a different harness. The comparison is the one ADR 0013 asks for, not a controlled experiment.
