@@ -7,7 +7,7 @@ priority: normal
 tags:
     - ready-for-agent
 created_at: 2026-09-27T22:07:20Z
-updated_at: 2026-09-28T13:47:32Z
+updated_at: 2026-09-28T14:25:18Z
 parent: pi-orchestrator-3p1z
 blocked_by:
     - pi-orchestrator-kokv
@@ -62,3 +62,6 @@ ON HOLD: `ctx_batch_execute counts as editing` remains unchecked because a separ
 
 
 Orchestrator verdict: accepted for everything but the on-hold ctx_batch_execute criterion. typecheck clean; npm test 761 pass 0 fail. Bean stays in progress until the owner decides whether ADR 0013's working-tree definition of an editing delegation supersedes that criterion.
+
+
+Correction: the notes above that say the ctx_batch_execute criterion is on hold and the bean stays in progress are out of date. The owner made ADR 0013 leading, the criterion is superseded, and the bean is completed.
