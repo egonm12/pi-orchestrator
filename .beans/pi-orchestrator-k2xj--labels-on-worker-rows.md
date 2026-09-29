@@ -7,7 +7,7 @@ priority: normal
 tags:
     - ready-for-agent
 created_at: 2026-09-28T14:30:23Z
-updated_at: 2026-09-28T19:35:39Z
+updated_at: 2026-09-29T20:05:10Z
 parent: pi-orchestrator-cml8
 ---
 
@@ -31,7 +31,7 @@ Each item of the subagents tool gains an optional short `label`, such as `resear
 
 None, can start immediately.
 
-## Summary of Changes
+## Summary of changes
 
 Added an optional subagents label, kept labels and routed tiers on the worker board, and showed consistent compact rows in the widget, picker, nested transcript workers, tool rendering and status output. Added real-board and end-to-end tests for labels, tiers, fallbacks and one-line truncation. Typecheck and full test suite pass.
 
