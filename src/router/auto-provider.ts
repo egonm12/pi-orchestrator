@@ -17,7 +17,7 @@ import type { RiskTier } from "../routing/classifier.ts";
 import type { ProviderUsage, RoutingConstraints } from "../routing/tier-router.ts";
 import { providerOf } from "../recipients/authorized-delegation.ts";
 import { limitErrorObservation } from "./limit-errors.ts";
-import { limitLiftsAt, percentHoldsUntil, readUsageObservations, recordUsageObservation, type UsageObservation } from "./usage-observations.ts";
+import { limitLiftsAt, percentHoldsUntil, readUsageObservations, recordUsageObservation, replaces, type UsageObservation } from "./usage-observations.ts";
 import { quotaHeaderObservation } from "./quota-headers.ts";
 
 type ProviderConfig = NonNullable<Parameters<ExtensionAPI["registerProvider"]>[1]>;
@@ -185,7 +185,7 @@ function fallbackPin(banLists: BanLists, constraints: RoutingConstraints | undef
  *  so a failed write never routes this process's workers to a provider it saw
  *  limited. Other processes see it once a later write succeeds. */
 export async function saveObservation(deps: AutoProviderDependencies, router: ActiveRouter, provider: string, observation: UsageObservation): Promise<void> {
-  try { await recordUsageObservation(router.usagePath, provider, observation); } catch (error) {
+  try { await recordUsageObservation(router.usagePath, provider, observation, deps.now()); } catch (error) {
     const until = limitLiftsAt(observation);
     const reason = (error instanceof Error ? error.message : String(error)).split(/\r?\n/, 1)[0];
     deps.warn(`usage-store:${router.usagePath}:${provider}`, `could not save the usage observation for ${provider} ` +
@@ -213,15 +213,14 @@ export async function recordQuotaHeaders(deps: AutoProviderDependencies, provide
   headers: Readonly<Record<string, string>>): Promise<void> {
   const router = deps.disabled() ? undefined : deps.router();
   if (router === undefined) return;
-  const observation = quotaHeaderObservation(status, headers, deps.now());
+  const now = deps.now();
+  const observation = quotaHeaderObservation(status, headers, now);
   if (observation === undefined) return;
-  const stored = readUsageObservations(router.usagePath)[provider];
+  const stored = readUsageObservations(router.usagePath, now)[provider];
   if (stored !== undefined) {
-    const at = Date.parse(observation.observedAt);
-    const limitHolds = at < (limitLiftsAt(stored) ?? Number.NEGATIVE_INFINITY);
     const sameReading = stored.source === "header" && stored.state === observation.state && stored.percentLeft === observation.percentLeft &&
-      stored.resetsAt === observation.resetsAt && at < percentHoldsUntil(stored);
-    if (limitHolds || sameReading) return;
+      stored.resetsAt === observation.resetsAt && Date.parse(observation.observedAt) < percentHoldsUntil(stored);
+    if (!replaces(observation, stored, now) || sameReading) return;
   }
   await saveObservation(deps, router, provider, observation);
 }

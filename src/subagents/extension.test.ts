@@ -2927,6 +2927,28 @@ test("the usage line leaves the protocol once the only limit has lifted during a
   } finally { h.cleanup(); }
 });
 
+test("the usage line leaves out a header reading past its window's reset, or five hours old without one", async () => {
+  const h = harness();
+  try {
+    writeFileSync(join(h.projectDir, "README.md"), "# Project\n");
+    observe(h, "anthropic", { state: "available", percentLeft: 71, resetsAt: atLocal(12, 5), observedAt: atLocal(11, 40), source: "header" });
+    observe(h, "openai-codex", { state: "low", percentLeft: 8, resetsAt: atLocal(12, 5), observedAt: atLocal(11, 50), source: "header" });
+    // Read at 6:59 without a reset: it holds until 11:59, so it is out already.
+    observe(h, "zai", { state: "available", percentLeft: 40, observedAt: atLocal(6, 59), source: "header" });
+    let clock = USAGE_NOON;
+    const provider = scriptedAnthropic((request) => {
+      if (request.toolResults.length > 0) return { text: "read" };
+      clock = new Date(2026, 8, 29, 12, 6);
+      return READ;
+    });
+    const session = await orchestratorSession(h, provider.extension, [provider.extension], [], { now: () => clock });
+    try { await session.prompt("Read README.md"); } finally { session.dispose(); }
+    const [first, second] = provider.requests;
+    assert.ok(first!.systemPrompt.includes(orchestratorProtocol(3, "medium", "usage: anthropic 71% left · openai-codex low, 8% left")), first!.systemPrompt);
+    assert.equal(second!.systemPrompt.includes("usage:"), false, second!.systemPrompt);
+  } finally { h.cleanup(); }
+});
+
 test("a prompt an earlier extension forces carries the usage line once, as the run started", async () => {
   const h = harness();
   try {

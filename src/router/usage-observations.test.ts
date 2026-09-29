@@ -151,20 +151,111 @@ test("an observation the store cannot save fails the write, this process still r
   } finally { store.cleanup(); }
 });
 
-test("a header observation made while an error's limit still holds does not replace it, and one made once it lifts does", async () => {
+// A limit and a header reading of one provider, stamped a few seconds apart
+// around the current time, as two sessions record them: the limit from a
+// worker's limit error, the header from another session's success response
+// that the provider answered just before or after it. Whichever commits
+// first, the limit holds until its reset; after it, newer headers count.
+
+const minutes = (count: number) => count * 60_000;
+const iso = (at: number) => new Date(at).toISOString();
+
+/** Now, and a Codex limit an error reported a minute ago that resets in 40 minutes. */
+function liveLimit(): { now: Date; limit: UsageObservation; liftsAt: number } {
+  const at = Date.now();
+  const liftsAt = at + minutes(40);
+  return { now: new Date(at), liftsAt, limit: { state: "exhausted", resetsAt: iso(liftsAt), observedAt: iso(at - minutes(1)), source: "error" } };
+}
+
+/** A success response's reading, observed at `at`, of a 5-hour window that resets in 3 hours. */
+function headerAt(at: number): UsageObservation {
+  return { state: "available", percentLeft: 63, resetsAt: iso(at + minutes(180)), observedAt: iso(at), source: "header" };
+}
+
+test("an active limit wins over a later-stamped header whichever of the two writes commits first", async () => {
+  for (const order of ["header first", "limit first"] as const) {
+    const store = stateFolder();
+    try {
+      const { now, limit } = liveLimit();
+      const header = headerAt(now.getTime() - 5_000);
+      assert.ok(Date.parse(header.observedAt) > Date.parse(limit.observedAt), "the header is the later-stamped one");
+      const writes = order === "header first" ? [header, limit] : [limit, header];
+      for (const observation of writes) await recordUsageObservation(store.path, "openai-codex", observation, now);
+      assert.deepEqual(readUsageObservations(store.path, now), { "openai-codex": limit }, `${order}: the limit holds`);
+      const saved = JSON.parse(readFileSync(store.path, "utf8")) as { providers: unknown };
+      assert.deepEqual(saved.providers, { "openai-codex": limit }, `${order}: other processes read the limit too`);
+    } finally { store.cleanup(); }
+  }
+});
+
+test("once the limit lifts a newer header replaces it, and a header observed before the lift no longer loses to it", async () => {
   const store = stateFolder();
   try {
-    await recordUsageObservation(store.path, "openai-codex", EXHAUSTED);
-    // Written by a session that read the store before the limit was saved.
-    const during: UsageObservation = { state: "available", percentLeft: 63, observedAt: "2026-09-26T12:10:00.000Z", source: "header" };
-    await recordUsageObservation(store.path, "openai-codex", during);
-    assert.deepEqual(readUsageObservations(store.path), { "openai-codex": EXHAUSTED });
-    const after: UsageObservation = { ...during, observedAt: EXHAUSTED.resetsAt! };
-    await recordUsageObservation(store.path, "openai-codex", after);
-    assert.deepEqual(readUsageObservations(store.path), { "openai-codex": after });
-    // A later limit still replaces a header observation.
-    const again: UsageObservation = { ...EXHAUSTED, observedAt: "2026-09-26T12:50:00.000Z", resetsAt: "2026-09-26T13:30:00.000Z" };
-    await recordUsageObservation(store.path, "openai-codex", again);
-    assert.deepEqual(readUsageObservations(store.path), { "openai-codex": again });
+    const { now, limit, liftsAt } = liveLimit();
+    await recordUsageObservation(store.path, "openai-codex", limit, now);
+    const duringLimit = headerAt(liftsAt - minutes(5));
+    await recordUsageObservation(store.path, "openai-codex", duringLimit, new Date(liftsAt - minutes(5)));
+    assert.deepEqual(readUsageObservations(store.path, new Date(liftsAt - minutes(5))), { "openai-codex": limit });
+    // After the reset the same header, committed late, is newer than the lifted limit and wins.
+    const afterLift = new Date(liftsAt + minutes(1));
+    await recordUsageObservation(store.path, "openai-codex", duringLimit, afterLift);
+    assert.deepEqual(readUsageObservations(store.path, afterLift), { "openai-codex": duringLimit });
+    const newer = headerAt(liftsAt + minutes(2));
+    await recordUsageObservation(store.path, "openai-codex", newer, new Date(liftsAt + minutes(2)));
+    assert.deepEqual(readUsageObservations(store.path, new Date(liftsAt + minutes(2))), { "openai-codex": newer });
+    // A new limit replaces a header reading.
+    const again: UsageObservation = { ...limit, observedAt: iso(liftsAt + minutes(3)), resetsAt: iso(liftsAt + minutes(60)) };
+    await recordUsageObservation(store.path, "openai-codex", again, new Date(liftsAt + minutes(3)));
+    assert.deepEqual(readUsageObservations(store.path, new Date(liftsAt + minutes(3))), { "openai-codex": again });
   } finally { store.cleanup(); }
+});
+
+test("observations this process could not save merge with the store by the same rule, and a lifted one does not linger", async () => {
+  const store = stateFolder();
+  try {
+    const { now, limit, liftsAt } = liveLimit();
+    // A folder where the store file should be: this process's writes fail and stay unsaved.
+    mkdirSync(join(store.path, "in-the-way"), { recursive: true });
+    await assert.rejects(recordUsageObservation(store.path, "openai-codex", limit, now));
+    const later = headerAt(now.getTime() + 10_000);
+    await assert.rejects(recordUsageObservation(store.path, "openai-codex", later, new Date(now.getTime() + 10_000)));
+    assert.deepEqual(readUsageObservations(store.path, now), { "openai-codex": limit }, "a later unsaved header does not end the unsaved limit");
+    // Another process saved a later-stamped header meanwhile: the unsaved limit still wins while it holds.
+    rmSync(store.path, { recursive: true });
+    writeFileSync(store.path, JSON.stringify({ schemaVersion: "usage-observations/1", providers: { "openai-codex": later } }));
+    assert.deepEqual(readUsageObservations(store.path, now), { "openai-codex": limit });
+    const afterLift = new Date(liftsAt + minutes(1));
+    assert.deepEqual(readUsageObservations(store.path, afterLift), { "openai-codex": later }, "after the reset the saved header counts");
+    // The next write after the reset does not save the lifted limit over that header.
+    await recordUsageObservation(store.path, "anthropic", headerAt(afterLift.getTime()), afterLift);
+    const saved = JSON.parse(readFileSync(store.path, "utf8")) as { providers: Record<string, unknown> };
+    assert.deepEqual(saved.providers["openai-codex"], later);
+  } finally { store.cleanup(); }
+});
+
+/** Two writer processes that start together, one recording `limit`, the
+ *  other `header`, for openai-codex at `now`. Resolves with their exit codes. */
+async function racingLimitAndHeader(path: string, limit: UsageObservation, header: UsageObservation, now: Date): Promise<(number | null)[]> {
+  const { spawn } = await import("node:child_process");
+  const startAt = Date.now() + 700;
+  const script = `import { recordUsageObservation } from ${JSON.stringify(STORE_MODULE)};
+    while (Date.now() < ${startAt}) {}
+    await recordUsageObservation(process.argv[1], "openai-codex", JSON.parse(process.argv[2]), new Date(${JSON.stringify(now.toISOString())}));`;
+  return Promise.all([limit, header].map((observation) => new Promise<number | null>((resolve, reject) => {
+    const child = spawn(process.execPath, ["--input-type=module", "-e", script, path, JSON.stringify(observation)], { stdio: ["ignore", "ignore", "inherit"] });
+    child.on("error", reject);
+    child.on("exit", (code) => resolve(code));
+  })));
+}
+
+test("a limit and a later-stamped header racing from two processes leave the limit in the store", async () => {
+  for (let round = 0; round < 3; round += 1) {
+    const store = stateFolder();
+    try {
+      const { now, limit } = liveLimit();
+      assert.deepEqual(await racingLimitAndHeader(store.path, limit, headerAt(now.getTime() - 5_000), now), [0, 0]);
+      assert.deepEqual(readUsageObservations(store.path, now), { "openai-codex": limit }, `round ${round}`);
+      assert.deepEqual(readdirSync(store.dir), ["usage-observations.json"], `round ${round}: nothing is left next to the store`);
+    } finally { store.cleanup(); }
+  }
 });

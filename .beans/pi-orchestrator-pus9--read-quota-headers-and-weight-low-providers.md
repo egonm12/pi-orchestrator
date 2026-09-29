@@ -53,3 +53,15 @@ Ticket 12 (`pi-orchestrator-ugoi`) stays in progress: no limit or error response
 
 Not verified live: that a worker's auto-model request in a real pi session fires `after_provider_response` with the rung's headers. pi 0.87.1 source shows the agent's `onResponse` option passes through `ModelRuntime.streamSimple` and the auto model forwards it to the rung (existing test), but no live run checked it.
 
+
+## Review follow-up
+
+An independent review of 9242702 found a blocking cross-process race: when a later-stamped success header committed before an earlier-stamped limit error, the store kept the header, because the later observation won, and routing could send workers back to the limited provider.
+
+- src/router/usage-observations.ts: `replaces(observation, kept, now)` now ranks an exhausted or throttled observation that still holds at `now` above any non-limit observed before it lifts, in both directions, so the commit order no longer matters. Once the limit lifts, the later observation wins again, so a newer header replaces a lifted limit and no stale limit outranks it. The same rule merges this process's unsaved observations with the store, on read and under the write lock. `readUsageObservations` and `recordUsageObservation` take `now` (default: the clock); the router passes its `deps.now()`, routing its decision time, the usage line its clock.
+- src/router/auto-provider.ts: the header write's pre-check uses the same `replaces` rule instead of its own copy.
+- src/subagents/usage-line.ts: a low or available reading past its window's reset, or 5 hours old without one (`percentHoldsUntil`), is left out of the usage line, as a lifted limit is.
+- README: the tie at exactly 5 delegations more goes to list order; the header/limit precedence is order-independent. CONTEXT: same for the usage observation.
+- Tests: usage-store seam, with times around the current clock: both write orders of a limit and a later-stamped header, lift and newer headers after it, unsaved-map merge by the same rule and no lifted limit written over a newer header, and two writer processes racing a limit against a header (3 rounds; a simulation, the order-specific test is the deterministic red). Usage line: expired readings with and without a reset.
+
+Still open, unchanged: limit and error header behaviour waits for ticket 12's limit captures and r94j; no limit header is read or invented, ticket 12 fixtures are untouched.

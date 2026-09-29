@@ -80,7 +80,7 @@ function providerUsageAt(observations: UsageObservations, evidence: RoutingEvide
 function hardFilterEvidence(router: ActiveRouter, taskText: string, at: Date, evidence: RoutingEvidence,
   constraints: RoutingConstraints): RouterEvidence {
   const estimatedPromptTokens = Buffer.byteLength(taskText, "utf8");
-  const observations = readUsageObservations(router.usagePath);
+  const observations = readUsageObservations(router.usagePath, at);
   const lowUsageProviders = lowOnUsage(observations, at);
   return {
     providerUsage: providerUsageAt(observations, evidence, at), catalog: evidence.catalog, estimatedPromptTokens,

@@ -139,7 +139,7 @@ A verdict whose delegation id matches no decision record. Kept and counted, neve
 A rule that removes rungs before the tier choice and that no preference can override: the subagent ban list, the allowed-model list, usage limits, context window, task budget and approved recipients.
 
 **Usage observation**:
-The latest known state of one provider's usage for the owner's account: available, low, exhausted or throttled, with the percentage left and the reset time when known. Learned from limit errors and response headers, shared by all the owner's sessions and projects. An exhausted or throttled provider is removed by a hard filter until its limit lifts. Response headers only ever give available or low (under 10% left), from a success response, attributed to the provider of the request in flight; they never end a limit an error reported while it holds.
+The latest known state of one provider's usage for the owner's account: available, low, exhausted or throttled, with the percentage left and the reset time when known. Learned from limit errors and response headers, shared by all the owner's sessions and projects. An exhausted or throttled provider is removed by a hard filter until its limit lifts. Response headers only ever give available or low (under 10% left), from a success response, attributed to the provider of the request in flight; they never end a limit an error reported while it holds, in whichever order sessions record the two.
 _Avoid_: Quota, headroom (alone), balance
 
 **Usage line**:

@@ -93,32 +93,42 @@ function unsaved(): Map<string, Record<string, UsageObservation>> {
 
 const laterThan = (a: UsageObservation, b: UsageObservation) => Date.parse(a.observedAt) > Date.parse(b.observedAt);
 
-/** Whether `observation` may take `kept`'s place: it is not older, and it
- *  does not end a limit that still holds at its time with something that is
- *  no limit. A success response's headers say nothing about a usage limit an
- *  error reported (quota-headers.ts), so they must not clear it early. */
-function replaces(observation: UsageObservation, kept: UsageObservation | undefined): boolean {
-  if (kept === undefined) return true;
-  if (laterThan(kept, observation)) return false;
-  const lifts = limitLiftsAt(kept);
-  return lifts === undefined || limitLiftsAt(observation) !== undefined || !(Date.parse(observation.observedAt) < lifts);
+/** Whether the exhausted or throttled observation `limit` outranks `other`,
+ *  which is no limit: the limit still holds at `now`, and `other` was observed
+ *  before it lifts. A success response's headers say nothing about a usage
+ *  limit an error reported (quota-headers.ts), so while the limit holds they
+ *  never end it, whether they were observed before or after it, and in
+ *  whichever order two sessions commit them. Once it lifts they do. */
+function limitOutranks(limit: UsageObservation, other: UsageObservation, now: Date): boolean {
+  const lifts = limitLiftsAt(limit);
+  return lifts !== undefined && limitLiftsAt(other) === undefined && now.getTime() < lifts && Date.parse(other.observedAt) < lifts;
 }
 
-/** `base` with each of `extra`'s observations that replaces `base`'s. */
-function withLatest(base: UsageObservations, extra: UsageObservations): Record<string, UsageObservation> {
+/** Whether `observation` may take `kept`'s place at `now`. A limit that holds
+ *  outranks a non-limit observed before it lifts (limitOutranks); otherwise
+ *  the later observation wins, and at the same time the new one. */
+export function replaces(observation: UsageObservation, kept: UsageObservation | undefined, now: Date): boolean {
+  if (kept === undefined) return true;
+  if (limitOutranks(kept, observation, now)) return false;
+  if (limitOutranks(observation, kept, now)) return true;
+  return !laterThan(kept, observation);
+}
+
+/** `base` with each of `extra`'s observations that replaces `base`'s at `now`. */
+function withLatest(base: UsageObservations, extra: UsageObservations, now: Date): Record<string, UsageObservation> {
   const merged: Record<string, UsageObservation> = { ...base };
   for (const [provider, observation] of Object.entries(extra)) {
-    if (replaces(observation, merged[provider])) merged[provider] = observation;
+    if (replaces(observation, merged[provider], now)) merged[provider] = observation;
   }
   return merged;
 }
 
 /** Every valid observation in the store at `path`, with the ones this process
- *  could not save there, the later one per provider. A missing or unreadable
- *  file, or an entry that is not an observation, adds nothing: the store is
- *  advice, and the next limit error writes it again. */
-export function readUsageObservations(path: string): UsageObservations {
-  return withLatest(savedObservations(path), unsaved().get(path) ?? {});
+ *  could not save there, the one per provider that wins at `now` (replaces).
+ *  A missing or unreadable file, or an entry that is not an observation, adds
+ *  nothing: the store is advice, and the next limit error writes it again. */
+export function readUsageObservations(path: string, now: Date = new Date()): UsageObservations {
+  return withLatest(savedObservations(path), unsaved().get(path) ?? {}, now);
 }
 
 function savedObservations(path: string): UsageObservations {
@@ -257,19 +267,22 @@ async function whileLocked(path: string, write: () => void): Promise<void> {
   }
 }
 
-/** Records `observation` as `provider`'s latest, unless the store already
- *  holds a later one, or a limit that still holds at its time and that it,
- *  being no limit, would end. Rejects when the store cannot be written. This process
- *  reads the observation all the same (readUsageObservations), and saves it
- *  with its next write that succeeds; until then other processes don't see it. */
-export async function recordUsageObservation(path: string, provider: string, observation: UsageObservation): Promise<void> {
-  const pending = withLatest(unsaved().get(path) ?? {}, { [provider]: observation });
+/** Records `observation` as `provider`'s latest, unless the store holds one
+ *  that wins over it at `now` (replaces): a later one, or a limit that still
+ *  holds and that it, being no limit observed before the lift, would end. A
+ *  limit likewise replaces a later non-limit, so the order in which sessions
+ *  commit does not matter. Rejects when the store cannot be written. This
+ *  process reads the observation all the same (readUsageObservations), and
+ *  saves it with its next write that succeeds; until then other processes
+ *  don't see it. */
+export async function recordUsageObservation(path: string, provider: string, observation: UsageObservation, now: Date = new Date()): Promise<void> {
+  const pending = withLatest(unsaved().get(path) ?? {}, { [provider]: observation }, now);
   unsaved().set(path, pending);
   mkdirSync(dirname(path), { recursive: true });
   await whileLocked(path, () => {
     removeLeftovers(path);
     const saved = savedObservations(path);
-    const merged = withLatest(saved, unsaved().get(path) ?? {});
+    const merged = withLatest(saved, unsaved().get(path) ?? {}, now);
     if (Object.keys(merged).some((name) => merged[name] !== saved[name])) {
       const temporary = temporaryPath(path);
       writeFileSync(temporary, `${JSON.stringify({ schemaVersion: SCHEMA_VERSION, providers: merged }, null, 2)}\n`);

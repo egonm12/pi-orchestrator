@@ -699,7 +699,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
     // The orchestrator protocol is in the system prompt of every request of every orchestrator run: added as a
     // prompt starts its run, and put back into any request whose prompt lost it, as in a run a message started
     // (orchestrator-protocol.ts). It ends with the usage line, read from the shared usage store for each request (usage-line.ts).
-    const currentUsageLine = () => usageLine(readUsageObservations(usageObservationsPath(stateDir())), deps.now());
+    const currentUsageLine = () => { const now = deps.now(); return usageLine(readUsageObservations(usageObservationsPath(stateDir()), now), now); };
     pi.on("before_agent_start", (event, ctx) => isOrchestratorSession(ctx)
       ? addOrchestratorProtocol(event, ctx, explorationNudge.threshold, gateLevels.inForce(ctx).level, currentUsageLine()) : undefined);
     pi.on("context_with_system", (event, ctx) => isOrchestratorSession(ctx)
