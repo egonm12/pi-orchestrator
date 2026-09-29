@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
 import { buildCatalog, type ModelCatalog } from "../catalog/model-catalog.ts";
 import { emptyRefreshState, type RefreshState, type ThrottlingObservation } from "../catalog/refresh-lifecycle.ts";
@@ -24,6 +25,7 @@ import type { TestContext as ExtensionContext } from "../fixtures/extension-cont
 import type { SessionModelRegistry } from "../routing/model-stream.ts";
 import { createRouterExtension, type RouterDependencies, type RoutingEvidence } from "./extension.ts";
 import { setRoutingConstraints } from "./auto-provider.ts";
+import { readUsageObservations, recordUsageObservation, usageObservationsPath, type UsageObservation } from "./usage-observations.ts";
 import { useOwnerBanLists } from "../fixtures/owner-ban-lists.ts";
 
 type ProviderConfigInput = NonNullable<Parameters<ExtensionAPI["registerProvider"]>[1]>;
@@ -190,6 +192,13 @@ async function loadAutoProvider(h: Harness, registry: SessionModelRegistry, deps
  *  in pi unless `deps` replaces it: the in-session call over the registry. */
 async function loadAutoProviderWith(h: Harness, registry: SessionModelRegistry, deps: Partial<RouterDependencies>,
   session: { readonly cwd?: string } = {}): Promise<AutoStream> {
+  return (await loadRouterWith(h, registry, deps, session)).stream;
+}
+
+/** The router extension as pi loads it: the auto model's stream and the
+ *  event handlers the extension registered. */
+async function loadRouterWith(h: Harness, registry: SessionModelRegistry, deps: Partial<RouterDependencies>,
+  session: { readonly cwd?: string } = {}): Promise<{ stream: AutoStream; handlers: ReturnType<typeof piHandlers> }> {
   let provider: ProviderConfigInput | undefined;
   const handlers = piHandlers();
   const createIsolatedRouterExtension = await isolatedRouterExtension();
@@ -203,7 +212,7 @@ async function loadAutoProviderWith(h: Harness, registry: SessionModelRegistry, 
   });
   assert.equal(provider?.models?.[0]?.id, "auto");
   assert.ok(provider.streamSimple);
-  return provider.streamSimple;
+  return { stream: provider.streamSimple, handlers };
 }
 
 async function autoEvents(stream: AutoStream, messages: unknown[], sessionId?: string, options: Partial<Parameters<AutoStream>[2]> = {}) {
@@ -2143,5 +2152,302 @@ test("a first-request limit with no other provider's rung left fails the worker 
     assert.deepEqual(records.map((record) => record.recordType), ["decision"]);
     assert.ok(records[0]?.recordType === "decision");
     assert.equal(records[0].ranOn, "openai-codex/gpt-6-luna:low");
+  } finally { h.cleanup(); }
+});
+
+// ---------------------------------------------------------------------------
+// Low usage in balancing (PRD cml8, story 51): a provider the usage store
+// holds under 10% left for counts extra use in a balanced tier. It is never
+// removed, and the weight lapses when the window it was read for resets.
+// ---------------------------------------------------------------------------
+
+async function observe(h: Harness, provider: string, observation: UsageObservation): Promise<void> {
+  await recordUsageObservation(usageObservationsPath(h.stateDir), provider, observation);
+}
+
+const CODEX_LOW = { state: "low", percentLeft: 8, resetsAt: "2026-09-26T13:00:00.000Z", observedAt: "2026-09-26T11:59:00.000Z", source: "header" } as const;
+
+test("a stored low percentage shifts a balanced choice to the other provider and the decision record names it", async () => {
+  const h = harness({ ...LIVE, tiers: CODEX_FIRST });
+  try {
+    await seedDecision(h, "earlier-anthropic", NOW, "live");
+    await observe(h, "openai-codex", CODEX_LOW);
+    const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
+    await autoEvents(await loadAutoProvider(h, registry), FIX_README, "weighted-worker");
+    assert.deepEqual(forwardedRungs(registry), [`${HAIKU}:low`], "codex counts 0 + 5 against anthropic's 1");
+    const [record] = recordsOf(h, "weighted-worker");
+    assert.ok(record?.recordType === "decision" && record.route.outcome === "chosen");
+    assert.deepEqual(record.route.providerCounts, { "openai-codex": 0, anthropic: 1 });
+    assert.deepEqual(record.route.lowUsageProviders, ["openai-codex"]);
+    assert.deepEqual(record.route.removed, [], "a low provider is not filtered");
+  } finally { h.cleanup(); }
+});
+
+test("a low provider is still chosen when the other is used far more, and the weight lapses at the stated reset", async () => {
+  const h = harness({ ...LIVE, tiers: CODEX_FIRST });
+  try {
+    for (let index = 0; index < 6; index += 1) await seedDecision(h, `anthropic-${index}`, NOW, "live");
+    await observe(h, "openai-codex", CODEX_LOW);
+    const busy = fakeSessionRegistry([{ events: answerEvents("ok") }]);
+    await autoEvents(await loadAutoProvider(h, busy), FIX_README, "busy-worker");
+    assert.deepEqual(forwardedRungs(busy), ["openai-codex/gpt-6-luna:low"], "codex 0 + 5 is still below anthropic's 6");
+
+    const h2 = harness({ ...LIVE, tiers: CODEX_FIRST });
+    try {
+      await seedDecision(h2, "earlier-anthropic", NOW, "live");
+      await observe(h2, "openai-codex", CODEX_LOW);
+      const afterReset = fakeSessionRegistry([{ events: answerEvents("ok") }]);
+      await autoEvents(await loadAutoProvider(h2, afterReset, { now: () => new Date(CODEX_LOW.resetsAt) }), FIX_README, "after-reset-worker");
+      assert.deepEqual(forwardedRungs(afterReset), ["openai-codex/gpt-6-luna:low"]);
+      const [record] = recordsOf(h2, "after-reset-worker");
+      assert.ok(record?.recordType === "decision" && record.route.outcome === "chosen");
+      assert.equal(record.route.lowUsageProviders, undefined);
+    } finally { h2.cleanup(); }
+  } finally { h.cleanup(); }
+});
+
+// ---------------------------------------------------------------------------
+// Quota headers (PRD cml8, story 50): pi hands every provider response's
+// status and headers to the session's after_provider_response handlers,
+// which do not say which provider answered. The router attributes them to the
+// request in flight: a worker's rung on the auto model, or the model of the
+// session's own request. They add a percentage left to the usage store.
+//
+// The first tests replay the sanitized captures of ticket 12
+// (src/fixtures/usage, bean pi-orchestrator-ugoi): every `response` record's
+// status and headers, as captured. They are all 200 responses far from a
+// limit; no limit or error response has been captured yet.
+// ---------------------------------------------------------------------------
+
+const USAGE_FIXTURES = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures", "usage");
+
+interface CapturedRecord { readonly kind: string; readonly status?: number; readonly headers?: Record<string, string> }
+
+/** The records of one captured case, read line by line as the fixture README says. */
+function capturedRecords(file: string): CapturedRecord[] {
+  return readFileSync(join(USAGE_FIXTURES, file), "utf8").split("\n").filter((line) => line.trim() !== "")
+    .map((line) => JSON.parse(line) as CapturedRecord);
+}
+
+/** The status and headers of each captured `response` record. */
+function capturedResponses(file: string): { status: number; headers: Record<string, string> }[] {
+  return capturedRecords(file).filter((record) => record.kind === "response")
+    .map((record) => ({ status: record.status!, headers: record.headers! }));
+}
+
+/** A worker's session as its after_provider_response handlers see it: its
+ *  session model is the auto model, which names no provider that answered. */
+function workerContext(h: Harness, sessionId: string, registry: SessionModelRegistry): ExtensionContext {
+  return { cwd: h.projectDir, hasUI: false, model: { provider: "orchestrator", id: "auto" }, modelRegistry: registry, thinkingLevel: "medium",
+    sessionManager: { getSessionId: () => sessionId } } as unknown as ExtensionContext;
+}
+
+/** The request options pi's agent gives a worker's auto-model request: its
+ *  onResponse emits after_provider_response in the worker's session. */
+function responsesTo(handlers: ReturnType<typeof piHandlers>, ctx: ExtensionContext) {
+  return { onResponse: async (response: { status: number; headers: Record<string, string> }) => {
+    await handlers.get("after_provider_response")?.({ type: "after_provider_response", status: response.status, headers: response.headers }, ctx);
+  } } as Partial<Parameters<AutoStream>[2]>;
+}
+
+function storedObservations(h: Harness) {
+  return readUsageObservations(usageObservationsPath(h.stateDir));
+}
+
+test("captured Anthropic shaped-path headers on a worker's rung store anthropic's percentage left from the tighter window", async () => {
+  const h = harness(LIVE);
+  try {
+    const [response, ...more] = capturedResponses("anthropic/shaped-ok.jsonl");
+    assert.equal(more.length, 0, "the capture has one response record");
+    const registry = fakeSessionRegistry([{ events: answerEvents("ok"), response: response! }]);
+    const { stream, handlers } = await loadRouterWith(h, registry, { classifierCall: () => answering("mechanical").call });
+    await autoEvents(stream, FIX_README, "anthropic-worker", responsesTo(handlers, workerContext(h, "anthropic-worker", registry)));
+    assert.deepEqual(forwardedRungs(registry), [`${HAIKU}:low`]);
+    // 5h utilization 0.05 is 95% left, 7d 0.39 is 61% left; the 7d window resets 2026-10-04T04:00:00Z.
+    assert.deepEqual(storedObservations(h), { anthropic: { state: "available", percentLeft: 61, resetsAt: "2026-10-04T04:00:00.000Z",
+      observedAt: NOW.toISOString(), source: "header" } });
+  } finally { h.cleanup(); }
+});
+
+test("captured Codex SSE headers on a worker's rung store openai-codex's percentage left, not the auto model's provider", async () => {
+  const h = harness({ ...LIVE, tiers: CODEX_FIRST });
+  try {
+    const [response, ...more] = capturedResponses("openai-codex/sse-ok.jsonl");
+    assert.equal(more.length, 0, "the capture has one response record");
+    const registry = fakeSessionRegistry([{ events: answerEvents("ok"), response: response! }]);
+    const { stream, handlers } = await loadRouterWith(h, registry, { classifierCall: () => answering("mechanical").call });
+    await autoEvents(stream, FIX_README, "codex-worker", responsesTo(handlers, workerContext(h, "codex-worker", registry)));
+    assert.deepEqual(forwardedRungs(registry), ["openai-codex/gpt-6-luna:low"]);
+    // Primary (300 min) 2% used is 98% left, secondary (10080 min) 37% used is 63% left, resetting 2026-10-05T09:47:17Z.
+    assert.deepEqual(storedObservations(h), { "openai-codex": { state: "available", percentLeft: 63, resetsAt: "2026-10-05T09:47:17.000Z",
+      observedAt: NOW.toISOString(), source: "header" } });
+  } finally { h.cleanup(); }
+});
+
+test("the captured Codex WebSocket case has no response record, so a worker on it adds nothing to the usage store", async () => {
+  const h = harness({ ...LIVE, tiers: CODEX_FIRST });
+  try {
+    const records = capturedRecords("openai-codex/websocket-ok.jsonl");
+    assert.deepEqual(records.map((record) => record.kind), ["session", "request", "result"]);
+    const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
+    const { stream, handlers } = await loadRouterWith(h, registry, { classifierCall: () => answering("mechanical").call });
+    await autoEvents(stream, FIX_README, "websocket-worker", responsesTo(handlers, workerContext(h, "websocket-worker", registry)));
+    assert.deepEqual(storedObservations(h), {});
+  } finally { h.cleanup(); }
+});
+
+test("captured headers of the session's own request are attributed to the model that request was sent with", async () => {
+  const h = harness(LIVE);
+  try {
+    const [response] = capturedResponses("anthropic/shaped-ok.jsonl");
+    const registry = fakeSessionRegistry([]);
+    const { handlers } = await loadRouterWith(h, registry, { classifierCall: () => answering("mechanical").call });
+    const ctx = { cwd: h.projectDir, hasUI: false, model: { provider: "anthropic", id: "claude-haiku-4-5" }, modelRegistry: registry,
+      thinkingLevel: "medium", sessionManager: { getSessionId: () => "parent" } } as unknown as ExtensionContext;
+    await handlers.get("before_provider_request")?.({ type: "before_provider_request", payload: { model: "claude-haiku-4-5" } }, ctx);
+    // The owner switches models while the request is in flight: the response still belongs to anthropic.
+    const switched = { ...ctx, model: { provider: "openai-codex", id: "gpt-6-sol" } } as unknown as ExtensionContext;
+    await handlers.get("after_provider_response")?.({ type: "after_provider_response", ...response! }, switched);
+    assert.deepEqual(Object.keys(storedObservations(h)), ["anthropic"]);
+    assert.equal(storedObservations(h).anthropic?.percentLeft, 61);
+  } finally { h.cleanup(); }
+});
+
+// ---------------------------------------------------------------------------
+// Quota headers, synthetic cases. These values were NOT captured: ticket 12
+// saw only 200 responses at 2% to 39% used. They check the reader's own
+// rules (under 10% left, boundaries, malformed values, statuses it does not
+// read, a live limit a success header must not clear) on the header names the
+// captures showed. They say nothing about what a provider sends near a limit.
+// ---------------------------------------------------------------------------
+
+/** The captured Anthropic headers with some values replaced (synthetic). */
+function anthropicHeaders(overrides: Record<string, string | undefined>): Record<string, string> {
+  const headers: Record<string, string | undefined> = { ...capturedResponses("anthropic/shaped-ok.jsonl")[0]!.headers, ...overrides };
+  return Object.fromEntries(Object.entries(headers).filter((entry): entry is [string, string] => entry[1] !== undefined));
+}
+
+/** The captured Codex SSE headers with some values replaced (synthetic). */
+function codexHeaders(overrides: Record<string, string | undefined>): Record<string, string> {
+  const headers: Record<string, string | undefined> = { ...capturedResponses("openai-codex/sse-ok.jsonl")[0]!.headers, ...overrides };
+  return Object.fromEntries(Object.entries(headers).filter((entry): entry is [string, string] => entry[1] !== undefined));
+}
+
+/** Runs one worker whose rung answers with `response`, at `now`, and returns the store. */
+async function workerWithResponse(h: Harness, sessionId: string, response: { status: number; headers: Record<string, string> },
+  now: Date = NOW) {
+  const registry = fakeSessionRegistry([{ events: answerEvents("ok"), response }]);
+  const { stream, handlers } = await loadRouterWith(h, registry, { classifierCall: () => answering("mechanical").call, now: () => now });
+  await autoEvents(stream, FIX_README, sessionId, responsesTo(handlers, workerContext(h, sessionId, registry)));
+  return { registry, observations: storedObservations(h) };
+}
+
+test("synthetic: a Codex window under 10% left is stored low, and the next routing weighs openai-codex", async () => {
+  const h = harness({ ...LIVE, tiers: CODEX_FIRST });
+  try {
+    const { observations } = await workerWithResponse(h, "codex-worker", { status: 200, headers: codexHeaders({ "x-codex-primary-used-percent": "93" }) });
+    assert.deepEqual(observations["openai-codex"], { state: "low", percentLeft: 7, resetsAt: "2026-09-29T13:14:09.000Z",
+      observedAt: NOW.toISOString(), source: "header" });
+    // codex has 1 pinned delegation + 5 for low usage; anthropic none.
+    const next = fakeSessionRegistry([{ events: answerEvents("ok") }]);
+    await autoEvents(await loadAutoProvider(h, next), FIX_README, "next-worker");
+    assert.deepEqual(forwardedRungs(next), [`${HAIKU}:low`]);
+    const [record] = recordsOf(h, "next-worker");
+    assert.ok(record?.recordType === "decision" && record.route.outcome === "chosen");
+    assert.deepEqual(record.route.lowUsageProviders, ["openai-codex"]);
+  } finally { h.cleanup(); }
+});
+
+const BOUNDARY_CASES = [
+  { label: "Anthropic utilization 0.9 is exactly 10% left: available", headers: () => anthropicHeaders({ "anthropic-ratelimit-unified-7d-utilization": "0.9" }),
+    tiers: TEST_TIERS, provider: "anthropic", expected: { state: "available", percentLeft: 10, resetsAt: "2026-10-04T04:00:00.000Z" } },
+  { label: "Anthropic utilization 0.905 is 9.5% left: low", headers: () => anthropicHeaders({ "anthropic-ratelimit-unified-5h-utilization": "0.905" }),
+    tiers: TEST_TIERS, provider: "anthropic", expected: { state: "low", percentLeft: 9.5, resetsAt: "2026-09-29T11:50:00.000Z" } },
+  { label: "Anthropic utilization 1 is 0% left: low, never exhausted from a success header",
+    headers: () => anthropicHeaders({ "anthropic-ratelimit-unified-5h-utilization": "1" }),
+    tiers: TEST_TIERS, provider: "anthropic", expected: { state: "low", percentLeft: 0, resetsAt: "2026-09-29T11:50:00.000Z" } },
+  { label: "Codex 90% used is exactly 10% left: available", headers: () => codexHeaders({ "x-codex-secondary-used-percent": "90" }),
+    tiers: CODEX_FIRST, provider: "openai-codex", expected: { state: "available", percentLeft: 10, resetsAt: "2026-10-05T09:47:17.000Z" } },
+  { label: "Codex 100% used is 0% left: low", headers: () => codexHeaders({ "x-codex-primary-used-percent": "100" }),
+    tiers: CODEX_FIRST, provider: "openai-codex", expected: { state: "low", percentLeft: 0, resetsAt: "2026-09-29T13:14:09.000Z" } },
+  { label: "a malformed window is skipped and the other window still counts",
+    headers: () => codexHeaders({ "x-codex-secondary-used-percent": "lots" }),
+    tiers: CODEX_FIRST, provider: "openai-codex", expected: { state: "available", percentLeft: 98, resetsAt: "2026-09-29T13:14:09.000Z" } },
+  { label: "a malformed reset leaves the percentage without a reset",
+    headers: () => anthropicHeaders({ "anthropic-ratelimit-unified-7d-reset": "soon" }),
+    tiers: TEST_TIERS, provider: "anthropic", expected: { state: "available", percentLeft: 61 } },
+] as const;
+
+for (const { label, headers, tiers, provider, expected } of BOUNDARY_CASES) {
+  test(`synthetic: ${label}`, async () => {
+    const h = harness({ ...LIVE, tiers });
+    try {
+      const { observations } = await workerWithResponse(h, "boundary-worker", { status: 200, headers: headers() });
+      assert.deepEqual(observations, { [provider]: { ...expected, observedAt: NOW.toISOString(), source: "header" } });
+    } finally { h.cleanup(); }
+  });
+}
+
+const NOTHING_STORED_CASES = [
+  { label: "Anthropic utilization above 1", headers: () => anthropicHeaders({ "anthropic-ratelimit-unified-5h-utilization": "1.2",
+    "anthropic-ratelimit-unified-7d-utilization": "-0.1" }), tiers: TEST_TIERS },
+  { label: "Anthropic utilization that is no number", headers: () => anthropicHeaders({ "anthropic-ratelimit-unified-5h-utilization": "",
+    "anthropic-ratelimit-unified-7d-utilization": "0.39%" }), tiers: TEST_TIERS },
+  { label: "Codex used percent above 100 or below 0", headers: () => codexHeaders({ "x-codex-primary-used-percent": "101",
+    "x-codex-secondary-used-percent": "-1" }), tiers: CODEX_FIRST },
+  { label: "no quota headers at all", headers: () => ({ "content-type": "text/event-stream" }), tiers: TEST_TIERS },
+] as const;
+
+for (const { label, headers, tiers } of NOTHING_STORED_CASES) {
+  test(`synthetic: ${label} stores nothing`, async () => {
+    const h = harness({ ...LIVE, tiers });
+    try {
+      assert.deepEqual((await workerWithResponse(h, "malformed-worker", { status: 200, headers: headers() })).observations, {});
+    } finally { h.cleanup(); }
+  });
+}
+
+test("synthetic: headers on a status other than 2xx are not read, since no limit response has been captured", async () => {
+  const h = harness(LIVE);
+  try {
+    const low = anthropicHeaders({ "anthropic-ratelimit-unified-5h-utilization": "0.99", "anthropic-ratelimit-unified-status": "rejected" });
+    assert.deepEqual((await workerWithResponse(h, "rejected-worker", { status: 429, headers: low })).observations, {});
+  } finally { h.cleanup(); }
+});
+
+test("synthetic: a success header does not clear an exhausted limit from an error while it holds, and writes once it has lifted", async () => {
+  const h = harness(LIVE);
+  try {
+    const limit = { state: "exhausted", resetsAt: "2026-09-26T12:30:00.000Z", observedAt: "2026-09-26T11:50:00.000Z", source: "error" } as const;
+    await observe(h, "anthropic", limit);
+    const response = { status: 200, headers: capturedResponses("anthropic/shaped-ok.jsonl")[0]!.headers };
+    // Routing avoids anthropic, so the worker here runs on codex; the header arrives as if from a request still in flight on anthropic.
+    const registry = fakeSessionRegistry([]);
+    const { handlers } = await loadRouterWith(h, registry, { classifierCall: () => answering("mechanical").call });
+    const ctx = { cwd: h.projectDir, hasUI: false, model: { provider: "anthropic", id: "claude-haiku-4-5" }, modelRegistry: registry,
+      thinkingLevel: "medium", sessionManager: { getSessionId: () => "parent" } } as unknown as ExtensionContext;
+    await handlers.get("before_provider_request")?.({ type: "before_provider_request", payload: {} }, ctx);
+    await handlers.get("after_provider_response")?.({ type: "after_provider_response", ...response }, ctx);
+    assert.deepEqual(storedObservations(h).anthropic, limit, "the limit stays while it holds");
+
+    const lifted = await loadRouterWith(h, registry, { classifierCall: () => answering("mechanical").call, now: () => new Date(limit.resetsAt) });
+    await lifted.handlers.get("before_provider_request")?.({ type: "before_provider_request", payload: {} }, ctx);
+    await lifted.handlers.get("after_provider_response")?.({ type: "after_provider_response", ...response }, ctx);
+    assert.deepEqual(storedObservations(h).anthropic, { state: "available", percentLeft: 61, resetsAt: "2026-10-04T04:00:00.000Z",
+      observedAt: limit.resetsAt, source: "header" });
+  } finally { h.cleanup(); }
+});
+
+test("synthetic: a later response with the same reading does not write the store again", async () => {
+  const h = harness(LIVE);
+  try {
+    const response = { status: 200, headers: capturedResponses("anthropic/shaped-ok.jsonl")[0]!.headers };
+    await workerWithResponse(h, "first-worker", response);
+    const later = new Date(NOW.getTime() + 60_000);
+    const { observations } = await workerWithResponse(h, "second-worker", response, later);
+    assert.equal(observations.anthropic?.observedAt, NOW.toISOString(), "the unchanged reading keeps its first observation");
+    const changed = await workerWithResponse(h, "third-worker",
+      { status: 200, headers: anthropicHeaders({ "anthropic-ratelimit-unified-7d-utilization": "0.4" }) }, later);
+    assert.deepEqual([changed.observations.anthropic?.percentLeft, changed.observations.anthropic?.observedAt], [60, later.toISOString()]);
   } finally { h.cleanup(); }
 });

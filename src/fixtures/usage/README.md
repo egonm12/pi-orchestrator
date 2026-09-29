@@ -2,6 +2,8 @@
 
 These fixtures hold real quota headers of Anthropic and OpenAI Codex, captured with the live check in [`src/live-check/quota-capture.md`](../../live-check/quota-capture.md) (bean `pi-orchestrator-ugoi`). Ticket 13 (bean `pi-orchestrator-pus9`, reading quota headers) tests against them.
 
+Ticket 12 stays open for the limit cases it has not observed. Its captured 200 responses are enough for ticket 13's success-header reading and nothing more: the header reader reads a 2xx response's utilization or used-percent and reset headers only, and interprets no `*-status` header and no non-2xx response, because no limit response has been captured. Those wait for ticket 12's limit captures.
+
 Nothing here is written by hand. Every record is a line from a real capture, sanitized as described under "Redaction exceptions". The captures were agent-run at the owner's request on 2026-09-29 with pi 0.87.1 (not the owner's own run). At the owner's request only the installed-extension Anthropic path was captured. Plain pi (`-ne`), the TUI warning step and the extra-usage cases were skipped.
 
 ## Layout

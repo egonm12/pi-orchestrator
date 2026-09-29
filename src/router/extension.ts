@@ -1,7 +1,7 @@
 import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { toModelInfo, splitKnownThinkingSuffix, type ModelInfo } from "../models/model-info.ts";
-import { autoProviderConfig } from "./auto-provider.ts";
+import { autoProviderConfig, providerInFlight, recordQuotaHeaders, type AutoProviderDependencies } from "./auto-provider.ts";
 import { autoModelLimits, withAutoModelLimits } from "./auto-model-limits.ts";
 import { refuseAutoModelForMainThread } from "./main-thread.ts";
 import type { ActiveRouter } from "./route-task.ts";
@@ -159,7 +159,7 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
     /** This copy's session when it is the orchestrator's, whose router retries climb through (./orchestrator-router.ts). */
     let orchestratorSessionId: string | undefined;
     let sessionRegistry: ExtensionContext["modelRegistry"];
-    const autoConfig = autoProviderConfig({
+    const autoDeps: AutoProviderDependencies = {
       router: () => active, registry: () => sessionRegistry, now: deps.now,
       banLists: () => active?.banLists ?? loadBanListsOrDefaults().banLists,
       disabled: () => disabled,
@@ -170,7 +170,8 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
         reported.add(key);
         process.stderr.write(`${ROUTER_WARNING_PREFIX} ${message}\n`);
       },
-    });
+    };
+    const autoConfig = autoProviderConfig(autoDeps);
     if (typeof pi.registerProvider === "function") pi.registerProvider("orchestrator", autoConfig);
     refuseAutoModelForMainThread(pi);
     const disable = (error: unknown) => {
@@ -237,6 +238,32 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
     pi.on("session_shutdown", () => {
       if (orchestratorSessionId !== undefined) publishOrchestratorRouter(orchestratorSessionId, undefined);
       orchestratorSessionId = undefined;
+    });
+
+    // Quota headers (PRD cml8, story 50). pi's after_provider_response names
+    // no provider, so its headers are attributed to the request in flight in
+    // the same session: an auto-model request's rung (auto-provider.ts), else
+    // the model the session's own request was sent with, taken when that
+    // request started. The auto model itself never answers a request.
+    const ownRequests = new Map<string, string>();
+    const sessionIdOf = (ctx: ExtensionContext) => ctx.sessionManager?.getSessionId();
+    pi.on("before_provider_request", (_event, ctx) => {
+      const id = sessionIdOf(ctx);
+      if (id === undefined) return undefined;
+      const provider = ctx.model?.provider;
+      if (provider === undefined || provider === "orchestrator") ownRequests.delete(id);
+      else ownRequests.set(id, provider);
+      return undefined;
+    });
+    pi.on("after_provider_response", async (event, ctx) => {
+      const id = sessionIdOf(ctx);
+      if (id === undefined) return;
+      const provider = providerInFlight(id) ?? ownRequests.get(id);
+      if (provider === undefined) return;
+      // Header reading is advice: a failure warns and never stops the response.
+      try { await recordQuotaHeaders(autoDeps, provider, event.status, event.headers ?? {}); } catch (error) {
+        autoDeps.warn(`quota-headers:${provider}`, `could not read the quota headers of a ${provider} response: ${String(error).split(/\r?\n/, 1)[0]}`);
+      }
     });
 
     pi.on("model_select", (event, ctx) => {

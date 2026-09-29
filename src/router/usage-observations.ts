@@ -93,12 +93,22 @@ function unsaved(): Map<string, Record<string, UsageObservation>> {
 
 const laterThan = (a: UsageObservation, b: UsageObservation) => Date.parse(a.observedAt) > Date.parse(b.observedAt);
 
-/** `base` with each of `extra`'s observations that `base` holds no later one for. */
+/** Whether `observation` may take `kept`'s place: it is not older, and it
+ *  does not end a limit that still holds at its time with something that is
+ *  no limit. A success response's headers say nothing about a usage limit an
+ *  error reported (quota-headers.ts), so they must not clear it early. */
+function replaces(observation: UsageObservation, kept: UsageObservation | undefined): boolean {
+  if (kept === undefined) return true;
+  if (laterThan(kept, observation)) return false;
+  const lifts = limitLiftsAt(kept);
+  return lifts === undefined || limitLiftsAt(observation) !== undefined || !(Date.parse(observation.observedAt) < lifts);
+}
+
+/** `base` with each of `extra`'s observations that replaces `base`'s. */
 function withLatest(base: UsageObservations, extra: UsageObservations): Record<string, UsageObservation> {
   const merged: Record<string, UsageObservation> = { ...base };
   for (const [provider, observation] of Object.entries(extra)) {
-    const kept = merged[provider];
-    if (kept === undefined || !laterThan(kept, observation)) merged[provider] = observation;
+    if (replaces(observation, merged[provider])) merged[provider] = observation;
   }
   return merged;
 }
@@ -248,7 +258,8 @@ async function whileLocked(path: string, write: () => void): Promise<void> {
 }
 
 /** Records `observation` as `provider`'s latest, unless the store already
- *  holds a later one. Rejects when the store cannot be written. This process
+ *  holds a later one, or a limit that still holds at its time and that it,
+ *  being no limit, would end. Rejects when the store cannot be written. This process
  *  reads the observation all the same (readUsageObservations), and saves it
  *  with its next write that succeeds; until then other processes don't see it. */
 export async function recordUsageObservation(path: string, provider: string, observation: UsageObservation): Promise<void> {
@@ -296,4 +307,27 @@ export function usageLimits(observations: UsageObservations, now: Date): Record<
     };
   }
   return limits;
+}
+
+/** Below this percentage left a provider is low on usage (PRD cml8, story 51). */
+export const LOW_USAGE_PERCENT = 10;
+
+/** The providers whose observations hold under LOW_USAGE_PERCENT left at
+ *  `now`, for balancing to weigh. An exhausted or throttled observation is
+ *  the hard filters' (usageLimits), not this. A percentage holds until the
+ *  reset of the window it was read for, or for the five-hour usage window
+ *  from when it was observed without one. */
+export function lowOnUsage(observations: UsageObservations, now: Date): string[] {
+  const at = now.getTime();
+  return Object.keys(observations).sort().filter((provider) => {
+    const observation = observations[provider]!;
+    if (limitLiftsAt(observation) !== undefined || observation.percentLeft === undefined || !(observation.percentLeft < LOW_USAGE_PERCENT)) return false;
+    return at < percentHoldsUntil(observation);
+  });
+}
+
+/** When a percentage-left observation stops saying anything: the reset of the
+ *  window it was read for, else five hours after it was observed. */
+export function percentHoldsUntil(observation: UsageObservation): number {
+  return observation.resetsAt === undefined ? Date.parse(observation.observedAt) + USAGE_OBSERVATION_WINDOW_MS : Date.parse(observation.resetsAt);
 }

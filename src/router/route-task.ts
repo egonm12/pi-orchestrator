@@ -7,7 +7,7 @@ import { failedHardFilter, routeForcedRung, routeTier, type ConstraintRung, type
 import { nextRungAfterFailure, type FailedDecision, type LadderDecision } from "../routing/effort-ladder.ts";
 import { isAtLeastTier } from "../routing/classifier.ts";
 import { deriveProviderUsage, type RoutingEvidence, type RoutingEvidenceSource } from "./evidence.ts";
-import { readUsageObservations, usageLimits } from "./usage-observations.ts";
+import { lowOnUsage, readUsageObservations, usageLimits, type UsageObservations } from "./usage-observations.ts";
 import { readUsableRoutingRecords, type RoutingMode } from "../routing/decision-record.ts";
 import { providerOf } from "../recipients/authorized-delegation.ts";
 import { pendingRoutingChoices } from "./routing-choice-reservations.ts";
@@ -68,10 +68,10 @@ function namedPaths(taskText: string): string[] {
 }
 
 /** Each provider's limit at `at`, from ticket 08's observations and the usage
- *  store, read now. Out of usage wins over throttled. */
-function providerUsageAt(router: ActiveRouter, evidence: RoutingEvidence, at: Date): Record<string, ProviderUsage> {
+ *  store's `observations`. Out of usage wins over throttled. */
+function providerUsageAt(observations: UsageObservations, evidence: RoutingEvidence, at: Date): Record<string, ProviderUsage> {
   const usage = deriveProviderUsage(evidence, at);
-  for (const [provider, limit] of Object.entries(usageLimits(readUsageObservations(router.usagePath), at))) {
+  for (const [provider, limit] of Object.entries(usageLimits(observations, at))) {
     if (usage[provider]?.state !== "out-of-usage" || limit.state === "out-of-usage") usage[provider] = limit;
   }
   return usage;
@@ -80,8 +80,11 @@ function providerUsageAt(router: ActiveRouter, evidence: RoutingEvidence, at: Da
 function hardFilterEvidence(router: ActiveRouter, taskText: string, at: Date, evidence: RoutingEvidence,
   constraints: RoutingConstraints): RouterEvidence {
   const estimatedPromptTokens = Buffer.byteLength(taskText, "utf8");
+  const observations = readUsageObservations(router.usagePath);
+  const lowUsageProviders = lowOnUsage(observations, at);
   return {
-    providerUsage: providerUsageAt(router, evidence, at), catalog: evidence.catalog, estimatedPromptTokens,
+    providerUsage: providerUsageAt(observations, evidence, at), catalog: evidence.catalog, estimatedPromptTokens,
+    ...(lowUsageProviders.length === 0 ? {} : { lowUsageProviders }),
     allowance: allowanceConstraint(router.owner, evidence.catalog, { role: "subtask", maxInputTokens: estimatedPromptTokens }),
     authorization: evidence.authorization, banLists: router.banLists,
     ...(constraints.excludedRung === undefined ? {} : { excludedRung: constraints.excludedRung }),

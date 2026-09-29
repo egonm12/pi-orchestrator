@@ -150,3 +150,21 @@ test("an observation the store cannot save fails the write, this process still r
     assert.deepEqual(readUsageObservations(store.path), {}, "a saved observation is read from the store only");
   } finally { store.cleanup(); }
 });
+
+test("a header observation made while an error's limit still holds does not replace it, and one made once it lifts does", async () => {
+  const store = stateFolder();
+  try {
+    await recordUsageObservation(store.path, "openai-codex", EXHAUSTED);
+    // Written by a session that read the store before the limit was saved.
+    const during: UsageObservation = { state: "available", percentLeft: 63, observedAt: "2026-09-26T12:10:00.000Z", source: "header" };
+    await recordUsageObservation(store.path, "openai-codex", during);
+    assert.deepEqual(readUsageObservations(store.path), { "openai-codex": EXHAUSTED });
+    const after: UsageObservation = { ...during, observedAt: EXHAUSTED.resetsAt! };
+    await recordUsageObservation(store.path, "openai-codex", after);
+    assert.deepEqual(readUsageObservations(store.path), { "openai-codex": after });
+    // A later limit still replaces a header observation.
+    const again: UsageObservation = { ...EXHAUSTED, observedAt: "2026-09-26T12:50:00.000Z", resetsAt: "2026-09-26T13:30:00.000Z" };
+    await recordUsageObservation(store.path, "openai-codex", again);
+    assert.deepEqual(readUsageObservations(store.path), { "openai-codex": again });
+  } finally { store.cleanup(); }
+});

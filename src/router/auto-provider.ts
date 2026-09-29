@@ -17,14 +17,19 @@ import type { RiskTier } from "../routing/classifier.ts";
 import type { ProviderUsage, RoutingConstraints } from "../routing/tier-router.ts";
 import { providerOf } from "../recipients/authorized-delegation.ts";
 import { limitErrorObservation } from "./limit-errors.ts";
-import { limitLiftsAt, recordUsageObservation, type UsageObservation } from "./usage-observations.ts";
+import { limitLiftsAt, percentHoldsUntil, readUsageObservations, recordUsageObservation, type UsageObservation } from "./usage-observations.ts";
+import { quotaHeaderObservation } from "./quota-headers.ts";
 
 type ProviderConfig = NonNullable<Parameters<ExtensionAPI["registerProvider"]>[1]>;
 
 const RESUME_PINS = Symbol.for("pi-orchestrator.subagents.resume-pins");
 const ROUTING_CONSTRAINTS = Symbol.for("pi-orchestrator.router.routing-constraints");
+const REQUESTS_IN_FLIGHT = Symbol.for("pi-orchestrator.router.requests-in-flight");
 type Pin = { model: string; effort: string };
-type ProcessGlobal = typeof globalThis & { [RESUME_PINS]?: Map<string, Pin>; [ROUTING_CONSTRAINTS]?: Map<string, RoutingConstraints> };
+/** The provider of the rung an auto-model request is running on, and the request it belongs to. */
+type InFlight = { readonly provider: string; readonly request: symbol };
+type ProcessGlobal = typeof globalThis & { [RESUME_PINS]?: Map<string, Pin>; [ROUTING_CONSTRAINTS]?: Map<string, RoutingConstraints>;
+  [REQUESTS_IN_FLIGHT]?: Map<string, InFlight> };
 function resumePins(): Map<string, Pin> { return (globalThis as ProcessGlobal)[RESUME_PINS] ??= new Map(); }
 /** A checked resume keeps its original pin without making a new routing decision. */
 export function setResumePin(id: string, pin: Pin): () => void {
@@ -40,6 +45,18 @@ function routingConstraints(): Map<string, RoutingConstraints> { return (globalT
 export function setRoutingConstraints(id: string, constraints: RoutingConstraints): () => void {
   routingConstraints().set(id, constraints);
   return () => { routingConstraints().delete(id); };
+}
+
+// pi's after_provider_response names no provider, and a worker's session
+// model is the auto model. So the rung each auto-model request runs on is kept
+// by session id, from the moment its request starts until the request ends,
+// on the process's global object like the pins above.
+function requestsInFlight(): Map<string, InFlight> { return (globalThis as ProcessGlobal)[REQUESTS_IN_FLIGHT] ??= new Map(); }
+
+/** The provider of the rung the auto-model request of session `sessionId` is
+ *  running on, or undefined when none is in flight. */
+export function providerInFlight(sessionId: string): string | undefined {
+  return requestsInFlight().get(sessionId)?.provider;
 }
 
 export interface AutoProviderDependencies {
@@ -167,7 +184,7 @@ function fallbackPin(banLists: BanLists, constraints: RoutingConstraints | undef
  *  process keeps the observation and goes on reading it (usage-observations.ts),
  *  so a failed write never routes this process's workers to a provider it saw
  *  limited. Other processes see it once a later write succeeds. */
-async function saveObservation(deps: AutoProviderDependencies, router: ActiveRouter, provider: string, observation: UsageObservation): Promise<void> {
+export async function saveObservation(deps: AutoProviderDependencies, router: ActiveRouter, provider: string, observation: UsageObservation): Promise<void> {
   try { await recordUsageObservation(router.usagePath, provider, observation); } catch (error) {
     const until = limitLiftsAt(observation);
     const reason = (error instanceof Error ? error.message : String(error)).split(/\r?\n/, 1)[0];
@@ -184,6 +201,29 @@ async function recordLimitError(deps: AutoProviderDependencies, provider: string
   if (router === undefined || text === undefined) return;
   const observation = limitErrorObservation(text, deps.now());
   if (observation !== undefined) await saveObservation(deps, router, provider, observation);
+}
+
+/** Records the percentage left that a response's quota headers give for
+ *  `provider`, the provider of the request in flight (quota-headers.ts).
+ *  Nothing is written with routing off, for a response without readable quota
+ *  headers, while the store holds a limit from an error that still holds, or
+ *  when the store already holds the same reading, still current: a worker's
+ *  every response would otherwise write the shared store. */
+export async function recordQuotaHeaders(deps: AutoProviderDependencies, provider: string, status: number,
+  headers: Readonly<Record<string, string>>): Promise<void> {
+  const router = deps.disabled() ? undefined : deps.router();
+  if (router === undefined) return;
+  const observation = quotaHeaderObservation(status, headers, deps.now());
+  if (observation === undefined) return;
+  const stored = readUsageObservations(router.usagePath)[provider];
+  if (stored !== undefined) {
+    const at = Date.parse(observation.observedAt);
+    const limitHolds = at < (limitLiftsAt(stored) ?? Number.NEGATIVE_INFINITY);
+    const sameReading = stored.source === "header" && stored.state === observation.state && stored.percentLeft === observation.percentLeft &&
+      stored.resetsAt === observation.resetsAt && at < percentHoldsUntil(stored);
+    if (limitHolds || sameReading) return;
+  }
+  await saveObservation(deps, router, provider, observation);
 }
 
 export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConfig {
@@ -203,6 +243,7 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
         let pendingFailover: FailoverRecord | undefined;
         let pendingRecordDir: string | undefined;
         let failover: FailoverContext | undefined;
+        const inFlightToken = Symbol("auto-model request");
         try {
           if (!sessionId) throw new Error("auto model request has no sessionId");
           const registry = deps.registry();
@@ -216,6 +257,8 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
               message.role === "assistant" && message.provider === model.provider && message.model === model.id
                 ? { ...message, provider: rung.provider, model: rung.id, api: rung.api } : message) };
             const reasoning = streamReasoning(rung, selected.effort);
+            // Before the stream starts, so its response headers find their provider.
+            requestsInFlight().set(sessionId!, { provider: rung.provider, request: inFlightToken });
             const inner = registry.streamSimple(rung, inward, { ...rest, ...(reasoning === undefined ? {} : { reasoning }) });
             return { rung, inner };
           }
@@ -436,6 +479,7 @@ export function autoProviderConfig(deps: AutoProviderDependencies): ProviderConf
             usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
               cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } });
         } finally {
+          if (sessionId && requestsInFlight().get(sessionId)?.request === inFlightToken) requestsInFlight().delete(sessionId);
           if (probeRung && process.env.PI_ORCHESTRATOR_ROUTER_PROBE === "1") process.stderr.write(`${ROUTER_PREFIX} request ${sessionId} rung ${probeRung}, pin ${wasPinned ? "reused" : "new"}, ${(performance.now() - started).toFixed(1)} ms\n`);
           end({ api: model.api, provider: model.provider, model: model.id });
         }

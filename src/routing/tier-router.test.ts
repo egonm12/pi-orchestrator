@@ -119,6 +119,38 @@ test("ordered tier retains first-survivor preference despite counts", () => {
   }
 });
 
+// Story 51: a provider under 10% left counts as LOW_USAGE_WEIGHT extra
+// delegations in a balanced choice. It is never removed.
+test("a low provider counts five extra delegations in a balanced tier and is still chosen when the other provider is used more", () => {
+  const shifted = routeTier(input("standard", { providerCounts: { "openai-codex": 0, anthropic: 4 }, lowUsageProviders: ["openai-codex"] }));
+  assert.equal(shifted.ok && shifted.rung.model, SONNET, "codex scores 0 + 5, anthropic 4");
+  if (shifted.ok) {
+    assert.deepEqual(shifted.providerCounts, { "openai-codex": 0, anthropic: 4 }, "the recorded counts stay the pinned delegations");
+    assert.deepEqual(shifted.lowUsageProviders, ["openai-codex"]);
+  }
+  const tie = routeTier(input("standard", { providerCounts: { "openai-codex": 0, anthropic: 5 }, lowUsageProviders: ["openai-codex"] }));
+  assert.equal(tie.ok && tie.rung.model, `${LUNA}`, "a tie of 5 and 5 goes to list order");
+  const stillUsed = routeTier(input("standard", { providerCounts: { "openai-codex": 0, anthropic: 6 }, lowUsageProviders: ["openai-codex"] }));
+  assert.equal(stillUsed.ok && stillUsed.rung.model, LUNA, "low is a weight, not a filter");
+  if (stillUsed.ok) assert.deepEqual(stillUsed.removed, []);
+});
+
+test("low usage never removes a rung, leaves an ordered tier alone and weighs nothing when every candidate is low", () => {
+  const onlyLow = routeTier(input("standard", { providerUsage: { anthropic: { state: "throttled" } }, providerCounts: {}, lowUsageProviders: ["openai-codex"] }));
+  assert.equal(onlyLow.ok && onlyLow.rung.model, LUNA, "the only survivor is low and still chosen");
+  const bothLow = routeTier(input("standard", { providerCounts: { "openai-codex": 2, anthropic: 1 }, lowUsageProviders: ["openai-codex", "anthropic"] }));
+  assert.equal(bothLow.ok && bothLow.rung.model, SONNET, "both weighted, the counts decide");
+  const map = fixtureTierMap({ orchestrator: { routing: { tiers: {
+    mechanical: TIERS.mechanical, standard: { order: "ordered", rungs: TIERS.standard },
+    elevated: TIERS.elevated, critical: TIERS.critical,
+  } } } }, undefined);
+  const ordered = routeTier({ tier: "standard", tierMap: map, evidence: evidence({ providerCounts: {}, lowUsageProviders: ["openai-codex"] }) });
+  assert.equal(ordered.ok && ordered.rung.model, LUNA, "an ordered tier keeps its first survivor");
+  if (ordered.ok) assert.equal(ordered.lowUsageProviders, undefined);
+  const notCandidate = routeTier(input("standard", { providerCounts: {}, lowUsageProviders: ["somebody-else"] }));
+  if (notCandidate.ok) assert.equal(notCandidate.lowUsageProviders, undefined, "only candidates' low usage is recorded");
+});
+
 // ---------------------------------------------------------------------------
 // Story 23: the first surviving rung of the classified tier
 // ---------------------------------------------------------------------------

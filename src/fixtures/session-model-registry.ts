@@ -19,12 +19,23 @@ export interface RecordedStreamCall {
   readonly options: StreamSimpleOptions | undefined;
 }
 
-/** What one `streamSimple` call does: play these events in order, throw
+/** An HTTP response as pi-ai hands it to the request's `onResponse` option,
+ *  which pi's agent turns into the session's `after_provider_response` event. */
+export interface ProviderResponse {
+  readonly status: number;
+  readonly headers: Record<string, string>;
+}
+
+type ResponseOption = { onResponse?: (response: ProviderResponse, model: RegistryModel) => void | Promise<void> };
+
+/** What one `streamSimple` call does: play these events in order, after
+ *  passing `response` to the call's `onResponse` option when given, as pi-ai
+ *  does before it reads the response stream; throw
  *  synchronously (defensive; pi 0.87.1 reports setup and auth failures as an
  *  `error` event, which `errorEvents` scripts), or never end until the call's
  *  signal aborts, then end with pi's `aborted` error event. */
 export type StreamScript =
-  | { readonly events: readonly AssistantMessageEvent[] }
+  | { readonly events: readonly AssistantMessageEvent[]; readonly response?: ProviderResponse }
   | { readonly throws: string }
   | { readonly hangUntilAborted: true };
 
@@ -62,9 +73,12 @@ export function errorEvents(errorMessage: string): AssistantMessageEvent[] {
 
 async function* play(
   script: Exclude<StreamScript, { readonly throws: string }>,
-  signal: AbortSignal | undefined,
+  model: RegistryModel,
+  options: StreamSimpleOptions | undefined,
 ): AsyncGenerator<AssistantMessageEvent> {
+  const signal = options?.signal;
   if ("events" in script) {
+    if (script.response !== undefined) await (options as ResponseOption | undefined)?.onResponse?.(script.response, model);
     for (const event of script.events) yield event;
     return;
   }
@@ -95,7 +109,7 @@ export function fakeSessionRegistry(
       calls.push({ model, context, options });
       if (script === undefined) throw new Error(`fake registry: no stream scripted for call ${calls.length}`);
       if ("throws" in script) throw new Error(script.throws);
-      return play(script, options?.signal);
+      return play(script, model, options);
     },
   };
 }

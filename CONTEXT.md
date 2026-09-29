@@ -100,7 +100,7 @@ _Avoid_: Model (alone), deployment
 The owner's list of rungs per tier. A project may override it. Initial routing chooses listed rungs; the effort ladder may raise a listed model to its next supported effort. Each tier has a tier order.
 
 **Tier order**:
-How a tier picks among the rungs that survive the hard filters. *Balanced* (the default): the rung whose provider started the fewest delegations in the last 5 hours, across all the owner's sessions and projects, with list order breaking ties. *Ordered*: the first survivor in the list.
+How a tier picks among the rungs that survive the hard filters. *Balanced* (the default): the rung whose provider started the fewest delegations in the last 5 hours, across all the owner's sessions and projects, with list order breaking ties. A provider under 10% left counts 5 extra delegations; it is weighed, never removed. *Ordered*: the first survivor in the list.
 _Avoid_: Load balancing, round-robin, priority
 _Avoid_: Model list, pool
 
@@ -139,7 +139,7 @@ A verdict whose delegation id matches no decision record. Kept and counted, neve
 A rule that removes rungs before the tier choice and that no preference can override: the subagent ban list, the allowed-model list, usage limits, context window, task budget and approved recipients.
 
 **Usage observation**:
-The latest known state of one provider's usage for the owner's account: available, low, exhausted or throttled, with the percentage left and the reset time when known. Learned from limit errors and response headers, shared by all the owner's sessions and projects. An exhausted or throttled provider is removed by a hard filter until its limit lifts.
+The latest known state of one provider's usage for the owner's account: available, low, exhausted or throttled, with the percentage left and the reset time when known. Learned from limit errors and response headers, shared by all the owner's sessions and projects. An exhausted or throttled provider is removed by a hard filter until its limit lifts. Response headers only ever give available or low (under 10% left), from a success response, attributed to the provider of the request in flight; they never end a limit an error reported while it holds.
 _Avoid_: Quota, headroom (alone), balance
 
 **Usage line**:

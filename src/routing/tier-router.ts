@@ -22,6 +22,8 @@ import type { ResolvedTierMap, TierRung } from "./tier-map.ts";
 //            filters. Every removed rung carries its reason and a detail.
 //   stage 2  the least-used provider among survivors in balanced order, with
 //            list order breaking ties; ordered tiers take the first survivor.
+//            A provider under 10% left counts LOW_USAGE_WEIGHT extra
+//            delegations there (PRD cml8, story 51): a weight, never a filter.
 //
 // A worker's routing constraints narrow this: a minimum tier raises the tier
 // stage 1 starts at, an excluded rung fails stage 1 in every tier, an avoided
@@ -48,6 +50,9 @@ export interface RouterEvidence {
   readonly providerUsage: Readonly<Record<string, ProviderUsage>>;
   /** Pinned delegations in the rolling window, per provider. Unknown providers count as zero. */
   readonly providerCounts?: Readonly<Record<string, number>>;
+  /** Providers the usage store holds under 10% left for. Each counts
+   *  LOW_USAGE_WEIGHT extra delegations in a balanced choice; none is removed. */
+  readonly lowUsageProviders?: readonly string[];
   /** Read for `contextWindow` only. */
   readonly catalog: ModelCatalog;
   readonly estimatedPromptTokens: number;
@@ -131,6 +136,9 @@ export interface TierRouteChoice {
   /** Counts behind a balanced choice, for the surviving providers it chose
    *  among: without an avoided provider when another provider survived. */
   readonly providerCounts?: Readonly<Record<string, number>>;
+  /** The candidate providers of a balanced choice that were weighted as low
+   *  on usage; absent when none was. */
+  readonly lowUsageProviders?: readonly string[];
   readonly model: string;
   /** Every survivor of `tier`, in map order. */
   readonly survivors: readonly TierRung[];
@@ -172,6 +180,12 @@ export type TierRouteDecision = TierRouteChoice | TierRouteRefusal;
 
 /** The context window must hold the estimated prompt plus this share. */
 export const CONTEXT_WINDOW_HEADROOM_PERCENT = 5;
+
+/** The extra delegations a provider under 10% left counts for in a balanced
+ *  choice: the other provider takes the next five delegations before the low
+ *  one is chosen again, and a low provider is still chosen when it is the
+ *  only survivor or the other is used far more. */
+export const LOW_USAGE_WEIGHT = 5;
 
 function neededTokens(estimated: number): number {
   return estimated + Math.ceil((estimated * CONTEXT_WINDOW_HEADROOM_PERCENT) / 100);
@@ -316,14 +330,20 @@ export function routeTier(input: TierRouteInput): TierRouteDecision {
       const first = candidates[0]!;
       const tierOrder = input.tierMap.orders[tier];
       const providerCounts: Record<string, number> = {};
+      const low: string[] = [];
       if (tierOrder === "balanced") {
         for (const rung of candidates) {
           const provider = providerOf(rung.model);
+          if (Object.hasOwn(providerCounts, provider)) continue;
           providerCounts[provider] = evidence.providerCounts?.[provider] ?? 0;
+          if (evidence.lowUsageProviders?.includes(provider)) low.push(provider);
         }
       }
-      // A future per-provider weight can be added to this score without changing filtering or tier escalation.
-      const score = (rung: TierRung) => providerCounts[providerOf(rung.model)] ?? 0;
+      // The weight only orders candidates: filtering and tier escalation never see it.
+      const score = (rung: TierRung) => {
+        const provider = providerOf(rung.model);
+        return (providerCounts[provider] ?? 0) + (low.includes(provider) ? LOW_USAGE_WEIGHT : 0);
+      };
       const chosen = tierOrder === "ordered" ? first : candidates.reduce((best, rung) => score(rung) < score(best) ? rung : best, first);
       return Object.freeze({
         ok: true,
@@ -331,6 +351,7 @@ export function routeTier(input: TierRouteInput): TierRouteDecision {
         rung: chosen,
         tierOrder,
         ...(tierOrder === "balanced" ? { providerCounts: Object.freeze(providerCounts) } : {}),
+        ...(low.length > 0 ? { lowUsageProviders: Object.freeze(low) } : {}),
         model: chosen.model,
         survivors: Object.freeze(survivors),
         startedAtTier: input.tier,
