@@ -1,13 +1,13 @@
 ---
 # pi-orchestrator-ugoi
 title: Live check of quota headers and limit errors
-status: in-progress
+status: completed
 type: task
 priority: normal
 tags:
     - ready-for-agent
 created_at: 2026-09-28T14:30:23Z
-updated_at: 2026-09-29T08:43:28Z
+updated_at: 2026-09-29T14:47:26Z
 parent: pi-orchestrator-cml8
 ---
 
@@ -23,16 +23,16 @@ A live check that records the real quota headers (through `after_provider_respon
 
 - [x] Live check script and instructions prepared
 - [x] Owner has run it for both providers (agent-run at owner request on 2026-09-29, normal cases only: Anthropic shaped path, Codex WebSocket and SSE. Anthropic plain pi, TUI warning and extra-usage steps skipped at owner request)
-- [ ] Captured headers and limit errors stored as fixtures, with notes on which paths expose headers (headers and path notes done, agent-run at owner request; limit errors: two real error texts from pi session logs stored as supplementary fixtures in `src/fixtures/usage/session-errors/`, but no limit captured by the live check, so still open)
+- [x] Captured headers and limit errors stored as fixtures, with notes on which paths expose headers (qualified per the owner-confirmed goal tweak: success headers from the agent-run captures at owner request, Anthropic installed-extension path and Codex WebSocket and SSE; limit errors as two sanitized real error texts from pi session logs in `src/fixtures/usage/session-errors/`, not from the capture extension. Anthropic plain pi, TUI warning and extra usage are excluded by the owner. See "Not verified")
 - [x] Findings recorded in this bean (for the captured normal cases)
 
 ## Blocked by
 
 None, can start immediately.
 
-## Prepared, waiting for the owner's run
+## Prepared tooling
 
-The capture tool and instructions are ready. The remaining criteria wait for the owner to run the check and hand back the output. No results are recorded yet.
+The capture tool and instructions below were prepared by the agent. The captures were then agent-run at the owner's request on 2026-09-29 (see Summary of changes).
 
 - **Tool:** `src/live-check/quota-capture.ts`, a pi extension loaded with `pi -e`. It writes JSONL records: `session`, `request` (session model and payload model, never the payload), `response` (from `after_provider_response`: the request in flight, attempt, HTTP status, every header) and `result` (from each assistant `message_end`: stop reason, full error text, diagnostics, response count). Cookie and credential header values, bearer tokens, `sk-` keys and JWTs are redacted. Unit test: `src/live-check/quota-capture.test.ts`.
 - **Instructions:** `src/live-check/quota-capture.md`. Each case writes to `~/quota-capture/<case>.jsonl` through `PI_QUOTA_CAPTURE_FILE`. Without it, the file lands in `<state dir>/live-check/quota-capture-<time>-<pid>.jsonl`.
@@ -40,10 +40,10 @@ The capture tool and instructions are ready. The remaining criteria wait for the
   - OpenAI Codex: the WebSocket path (`transport` auto) and the SSE path (`transport` sse through `/settings`, set back to auto afterwards).
   - Limits: a limit cannot be triggered on demand. Run the limit cases when near or at a limit, or load the capture in daily sessions with an alias until one hits. Otherwise hand back the normal captures only.
   - Hand-back: a leak check with grep, a tar of `~/quota-capture`, and a note with the pi version, plans, extra-usage state and spend, the warning, and the limit and reset times.
-- **Fixtures:** `src/fixtures/usage/README.md` sets the layout `<provider>/<case>.jsonl` (the capture's v1 records, unchanged) and a notes table on which paths expose headers. Filled on 2026-09-29 with the captured normal cases (see Summary).
-- **Read from pi 0.87.1 source, still to be confirmed live:** Anthropic calls `after_provider_response` only for successful responses, because the SDK throws on a non-2xx first. So a limit is expected as error text with no response record. Codex's WebSocket path never calls it, and its SSE path calls it for every attempt, including a 429. The event carries no model, so the capture ties each response to the latest request of the same session.
+- **Fixtures:** `src/fixtures/usage/README.md` sets the layout `<provider>/<case>.jsonl` (the capture's v1 records, unchanged) and a notes table on which paths expose headers. Filled on 2026-09-29 with the captured normal cases (see Summary of changes).
+- **Read from pi 0.87.1 source, not confirmed live (see Not verified):** Anthropic calls `after_provider_response` only for successful responses, because the SDK throws on a non-2xx first. So a limit is expected as error text with no response record. Codex's WebSocket path never calls it, and its SSE path calls it for every attempt, including a 429. The event carries no model, so the capture ties each response to the latest request of the same session.
 
-## Summary
+## Summary of changes
 
 Captures were agent-run at the owner's request on 2026-09-29 with pi 0.87.1, not by the owner. At the owner's request only the installed-extension Anthropic path is in scope. Plain pi (`-ne`), the TUI warning step and the extra-usage cases were skipped. No limit was hit, so no limit error was captured.
 
@@ -52,8 +52,16 @@ Captures were agent-run at the owner's request on 2026-09-29 with pi 0.87.1, not
 - **Codex, WebSocket:** confirmed that `after_provider_response` never fires (no response record, `responses` 0), so this path has no headers.
 - **Codex, SSE:** `after_provider_response` fires (status 200). Quota headers are `x-codex-*`: primary (300 min) and secondary (10080 min) `used-percent`, `window-minutes`, `reset-at` and `reset-after-seconds`, plus `plan-type`, `active-limit` and `credits-*`. Used percent is a whole number (`2`), and reset is in Unix seconds.
 - **Session-log error texts (added 2026-09-29):** two real limit error texts were found by timestamp and provider in the assistant messages of local pi session logs (`~/.pi/agent/sessions`) and stored in `src/fixtures/usage/session-errors/`, separate from the capture's v1 JSONL. Anthropic, 2026-09-28T15:50:54.413Z, stopReason `error`: `429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit. Please try again later."},"request_id":"[redacted]"}`. Codex, 2026-09-28T19:29:36.088Z, stopReason `error`: `Codex error: The usage limit has been reached`. Both come from worker sessions on `orchestrator/auto`, so the routed rung is not attributed, and the provider is read from the error text. They carry no HTTP status, response count, headers, reset time or transport. `src/router/limit-errors.test.ts` checks that the classifier gives `throttled` for the Anthropic text and `exhausted` for the Codex text, each with no reset. The classifier needed no change.
-- **Still open:** the quota capture's behaviour on a non-2xx response (no limit was hit during a capture, so there is no response or result record for a limit), the Codex SSE 429 (whether `after_provider_response` fires for it), reset times for a limit (neither error text states one, and no limit header has been seen), headers near or at a limit, and the Anthropic plain and extra-usage paths. The expectations from the pi source for limits remain unconfirmed.
+## Not verified
 
-## Why this stays in progress
+The owner confirmed a goal tweak: this ticket closes on the agent-run success captures and the sanitized session-log limit error fixtures. These points were not observed and no data was invented for them:
 
-The limit-error half of the fixture criterion is not met. The session-log error texts show what the error text looks like, but no limit was observed through the live check, and no status, header, reset or transport data is invented. The parent story 55 (`pi-orchestrator-cml8`) also asks explicitly for "Claude's extra-usage case", which the owner chose to skip. Completing this bean would claim story 55 is covered when it isn't. It should close only once limit errors are captured and the owner decides whether the extra-usage case is still required or dropped from story 55.
+- The quota capture's behaviour on a non-2xx or 429 response (no limit was hit during a capture, so there is no capture `response` or `result` record for a limit). The pi source expectation for Anthropic (error text, no `response` record) is unconfirmed.
+- Headers near or at a limit (every captured status is `allowed`, usage was low).
+- Reset times for a limit (neither session-log error text states one, and no limit header was seen).
+- Codex SSE 429, including whether `after_provider_response` fires for it.
+- Anthropic plain pi (`-ne`), the TUI warning and the extra-usage cases, excluded at the owner's request. Story 55's extra-usage wording is left for the owner to settle on the parent story.
+
+## Closing note
+
+Completed on 2026-09-29 under the owner-confirmed goal tweak. The limit-error fixtures come from pi session logs, not from the capture extension, and the success captures were agent-run at the owner's request, not run by the owner.
