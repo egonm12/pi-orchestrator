@@ -81,6 +81,7 @@ const paragraphs = (explorationNudge: number, gateLevel: GateLevel): readonly st
     "it edited when the working tree changed while its worker, or a worker it started, ran, or when one of them ran edit or write; " +
     "a command that changed nothing is research. Without a repository it edited when one of them ran edit, write, ctx_execute or a " +
     "bash command that is not a read-only search or a build or test run. " +
+    "If a repository's working tree cannot be read when the worker ends, that same command rule decides. " +
     "Judge the change itself, not the worker's " +
     "account of it: spot-check the diff and the claims that matter, or read a reviewer's Result. Then record the verdict with " +
     "`subagents_verdict`: the delegation id, accept or request_changes, and a reason naming what you checked. A later verdict on " +

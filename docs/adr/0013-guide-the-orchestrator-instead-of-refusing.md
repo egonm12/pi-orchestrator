@@ -12,7 +12,7 @@ ADR 0005 denied the orchestrator's exploratory calls beyond a flat budget, and A
 ## Considered options
 
 - **Keep the refusals and add owner overrides** (a check allowance per result, a gate waive command): keeps the measured effect, but every override is another rule the orchestrator must work around. The unnecessary workers remain.
-- **Protocol text only**: ADR 0005 measured advice alone at 6 of 29 needed delegations. That was measured while the protocol was missing from runs started by completion notices, worker reports and gate reminders, so the figure understates advice that is actually present.
+- **Protocol text only**: ADR 0005 measured advice alone at 6 of 29 needed delegations. That was measured while the protocol was missing from runs started by completion notices and worker questions, and from the requests that carried worker progress reports and gate reminders, so the figure understates advice that is actually present.
 - **Protocol on every run plus a nudge at the moment of drifting** (chosen).
 
 ## Consequences

@@ -111,7 +111,8 @@ test("the protocol says what makes a delegation editing: the working tree in a r
   const paragraph = PROTOCOL.split("\n\n").find((text) => text.startsWith("A delegation that edited"));
   assert.ok(paragraph, PROTOCOL);
   for (const phrase of ["In a git repository", "the working tree changed", "edit or write", "a command that changed nothing is research",
-    "Without a repository", "ctx_execute", "read-only search or a build or test run"]) {
+    "Without a repository", "ctx_execute", "read-only search or a build or test run",
+    "If a repository's working tree cannot be read when the worker ends, that same command rule decides"]) {
     assert.ok(paragraph.includes(phrase), `${phrase}: ${paragraph}`);
   }
 });

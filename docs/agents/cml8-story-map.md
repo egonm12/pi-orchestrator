@@ -48,7 +48,7 @@ Status on 2026-09-29: 12 of the 13 original children are completed. `pi-orchestr
 | 12 | Missing verdicts counted in the report | gwbk | extension.test.ts:3870 |
 | 13 | Gate levels and actions unchanged | gwbk | extension.test.ts:3946, :4035; review.test.ts:637 |
 | 14 | Protocol on a completion notice | 6yxt | extension.test.ts:2747 |
-| 15 | Protocol on a worker report or question | 6yxt | extension.test.ts:2772 |
+| 15 | Protocol on a worker report or question | 6yxt | A worker question is sent with `triggerTurn: true` (report.ts:91), so it starts a run, and the integration test extension.test.ts:2772 checks the protocol on that run. A progress report is sent with `triggerTurn: false` (report.ts:84), so it starts no run and the protocol stays on the ongoing run or the next request; no standalone wake test covers it |
 | 16 | Protocol on a gate reminder | 6yxt | The reminder is appended to the bash tool result (commit-gate.ts:150-154) and the turn-end notice is sent with `triggerTurn: false` (commit-gate.ts:161-162), so neither starts a run; the per-request hook covers both (orchestrator-protocol.test.ts:37). No end-to-end test checks the protocol on a reminder's request |
 | 17 | Protocol after a typed skill prompt | 6yxt | extension.test.ts:2794; orchestrator-protocol.test.ts:87 |
 | 18 | Live check of the protocol | 6yxt | protocol-probe.test.ts:31; 6yxt bean "Live check result" (PASS, 2026-09-29) |
