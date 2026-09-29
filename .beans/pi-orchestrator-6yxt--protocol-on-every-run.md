@@ -1,13 +1,13 @@
 ---
 # pi-orchestrator-6yxt
 title: Protocol on every run
-status: in-progress
+status: completed
 type: task
 priority: normal
 tags:
     - ready-for-agent
 created_at: 2026-09-28T14:30:23Z
-updated_at: 2026-09-28T22:08:24Z
+updated_at: 2026-09-29T08:41:05Z
 parent: pi-orchestrator-cml8
 ---
 
@@ -26,7 +26,7 @@ The orchestrator protocol is in the system prompt of every orchestrator run, inc
 - [x] Protocol present after a typed skill prompt, with the cause of the earlier gap explained
 - [x] Workers never get the protocol
 - [x] Live check script and instructions prepared
-- [ ] Owner has run the live check and its result is recorded here
+- [x] Live check run by the agent at the owner’s request, with its result recorded here
 
 ## Blocked by
 
@@ -71,3 +71,18 @@ Prepared, not yet run by the owner: `src/live-check/protocol-probe.ts` (a `pi -e
 - `CONTEXT.md`: glossary entry **Orchestrator protocol**.
 
 Remaining: the owner runs the live check and records its result here; then this bean can be completed.
+
+## Live check result
+
+Agent-run at the owner’s request on 2026-09-29 in a real interactive pi 0.87.1 session, orchestrator model anthropic/claude-sonnet-5-5, commit faf7093. The installed pi-claude-rules forced the system prompt on the typed skill run. A temporary Haiku effort correction was used for routing during the probe and restored; it did not change protocol injection. Evidence: ~/.pi/agent/pi-orchestrator/live-check/protocol-probe-2026-09-29.jsonl and -summary.txt.
+
+```text
+PASS: a typed skill prompt’s run (2 requests)
+PASS: a run a completion notice started (2 requests)
+PASS: a turn after a tool call in a run a message started (1 request)
+PASS: every orchestrator request has the protocol (5 of 5)
+PASS: no worker request has the protocol (0 worker requests probed)
+RESULT: PASS
+```
+
+No worker request was seen by this probe; the real-session tests cover workers. A skill prompt queued while a run was streaming was not exercised (queuedSkills 0). This run was performed by the agent under the owner’s explicit instruction, rather than personally by the owner.
