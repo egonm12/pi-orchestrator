@@ -1,0 +1,14 @@
+{
+  "provider": "openai-codex",
+  "timestamp": "2026-09-28T19:29:36.088Z",
+  "stopReason": "error",
+  "errorMessage": "Codex error: The usage limit has been reached",
+  "provenance": "pi session assistant message",
+  "redactions": [],
+  "uncertainty": [
+    "The entry records provider 'orchestrator' and model 'auto' (a worker session on the auto model). 'openai-codex' is attributed from the 'Codex error:' prefix of the error text. The session does not record the routed rung, so no model is attributed.",
+    "The transport was not recorded and is not claimed. No HTTP status, response count, headers or reset time was recorded, and none is claimed here.",
+    "The owner's own session recorded the same text about 2.6 s later on its direct openai-codex model. That does not identify this worker's routed rung.",
+    "A delegated research report gave the time as 2026-09-28T19:29:36.086Z. The entry's own timestamp is the value above, 2 ms later."
+  ]
+}

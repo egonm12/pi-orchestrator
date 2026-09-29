@@ -1,0 +1,17 @@
+{
+  "provider": "anthropic",
+  "timestamp": "2026-09-28T15:50:54.413Z",
+  "stopReason": "error",
+  "errorMessage": "429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"This request would exceed your account's rate limit. Please try again later.\"},\"request_id\":\"[redacted]\"}",
+  "provenance": "pi session assistant message",
+  "redactions": [
+    "the request_id value in the error body is replaced with [redacted]"
+  ],
+  "uncertainty": [
+    "The entry records provider 'orchestrator' and model 'auto' (a worker session on the auto model). 'anthropic' is attributed from the shape of the error text: the Anthropic API error envelope with a request_id. The session does not record the routed rung, so no model is attributed.",
+    "The leading 429 is part of the error text as pi recorded it. No HTTP status, response count, headers, reset time or transport was recorded, and none is claimed here.",
+    "The same session holds three earlier assistant error entries (2026-09-28T15:50:39.230Z, 15:50:41.631Z, 15:50:45.999Z) whose text is identical after the same redaction. How many provider responses they stand for is not known.",
+    "The text alone does not say whether this was a short-term throttle or a subscription usage cap. Extra-usage behaviour remains unverified.",
+    "A delegated research report gave the time as 2026-09-28T15:50:54.407Z. The entry's own timestamp is the value above, 6 ms later."
+  ]
+}

@@ -4,7 +4,7 @@ These fixtures hold real quota headers of Anthropic and OpenAI Codex, captured w
 
 Ticket 12 stays open for the limit cases it has not observed. Its captured 200 responses are enough for ticket 13's success-header reading and nothing more: the header reader reads a 2xx response's utilization or used-percent and reset headers only, and interprets no `*-status` header and no non-2xx response, because no limit response has been captured. Those wait for ticket 12's limit captures.
 
-Nothing here is written by hand. Every record is a line from a real capture, sanitized as described under "Redaction exceptions". The captures were agent-run at the owner's request on 2026-09-29 with pi 0.87.1 (not the owner's own run). At the owner's request only the installed-extension Anthropic path was captured. Plain pi (`-ne`), the TUI warning step and the extra-usage cases were skipped.
+No data here is written by hand. Every capture record is a line from a real capture, sanitized as described under "Redaction exceptions". The captures were agent-run at the owner's request on 2026-09-29 with pi 0.87.1 (not the owner's own run). At the owner's request only the installed-extension Anthropic path was captured. Plain pi (`-ne`), the TUI warning step and the extra-usage cases were skipped. The `session-errors/` files are the exception to the capture format: their error texts come from pi session logs, and only their `redactions` and `uncertainty` notes are written by hand.
 
 ## Layout
 
@@ -17,6 +17,9 @@ src/fixtures/usage/
   openai-codex/
     websocket-ok.jsonl       # transport auto (WebSocket), gpt-5.5
     sse-ok.jsonl             # transport sse, gpt-5.5
+  session-errors/            # not capture records, see "Session errors" below
+    anthropic-rate-limit-error.json
+    openai-codex-usage-limit-error.json
 ```
 
 A file name is the capture's case name without its provider prefix (`anthropic-shaped-ok.jsonl` becomes `anthropic/shaped-ok.jsonl`, `codex-sse-ok.jsonl` becomes `openai-codex/sse-ok.jsonl`). Only captured cases get a file. A case that never happened has no file, and the path matrix below says so.
@@ -25,7 +28,7 @@ A file name is the capture's case name without its provider prefix (`anthropic-s
 
 The capture's JSONL records, version 1: `session`, `request`, `response` and `result`. [`quota-capture.md`](../../live-check/quota-capture.md) describes their fields. Record order, record count, every field name, every header name, every status, every quota header value and every timestamp are as captured.
 
-A test reads a file line by line with `JSON.parse`. It passes the `headers` of each `response` record to the header reader, and the `errorMessage` of each `result` record to the error-text classifier. No fixture has a `result` record with an `errorMessage` yet.
+A test reads a file line by line with `JSON.parse`. It passes the `headers` of each `response` record to the header reader, and the `errorMessage` of each `result` record to the error-text classifier. No capture fixture has a `result` record with an `errorMessage` yet. The only real limit error texts are the session errors below.
 
 ### Redaction exceptions
 
@@ -46,15 +49,28 @@ The records are the capture's v1 records unchanged, except for these fields, whi
 
 `set-cookie` was already `[redacted]` by the capture. No quota header was changed.
 
+## Session errors
+
+`session-errors/` holds real limit error texts taken from assistant messages in local pi session logs (`~/.pi/agent/sessions`), found by timestamp and provider on 2026-09-29. These files are separate from the capture's v1 JSONL. They are single JSON objects, not capture records, and have none of the capture's `request`, `response` or `result` detail.
+
+Each file holds only `provider`, `timestamp` (the session entry's own), `stopReason`, `errorMessage` (redacted), `provenance` (`pi session assistant message`), `redactions` and `uncertainty` notes. Neither has a routed model: both entries come from worker sessions whose recorded model is `orchestrator/auto`, and the session does not record the rung. The provider is attributed from the error text. No HTTP status, response count, headers, reset time or transport is recorded or claimed. The leading `429` in the Anthropic file is part of the error text as pi recorded it. The only redaction is the Anthropic `request_id` value, which becomes `[redacted]`.
+
+| File | Provider | Timestamp | Error text (redacted) |
+|------|----------|-----------|-----------------------|
+| `anthropic-rate-limit-error.json` | anthropic | 2026-09-28T15:50:54.413Z | `429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit. Please try again later."},"request_id":"[redacted]"}` |
+| `openai-codex-usage-limit-error.json` | openai-codex | 2026-09-28T19:29:36.088Z | `Codex error: The usage limit has been reached` |
+
+`src/router/limit-errors.test.ts` passes each text to the error-text classifier.
+
 ## Path matrix
 
 | Provider | Path | Fixture | `after_provider_response` fires | Quota headers seen | Limit error text |
 |----------|------|---------|---------------------------------|--------------------|------------------|
-| Anthropic | shaped (installed packages, `@gotgenes/pi-anthropic-auth`) | `anthropic/shaped-ok.jsonl` | yes, once, status 200 | yes, `anthropic-ratelimit-unified-*` | not captured, no limit was hit |
+| Anthropic | shaped (installed packages, `@gotgenes/pi-anthropic-auth`) | `anthropic/shaped-ok.jsonl` | yes, once, status 200 | yes, `anthropic-ratelimit-unified-*` | not captured by the live check. The session-log Anthropic 429 `rate_limit_error` text in `session-errors/` has no recorded path, so it is not tied to this one |
 | Anthropic | plain pi (`-ne`, extra usage) | none | skipped at owner request | skipped at owner request | skipped at owner request |
 | Anthropic | extra usage switched off (shaped or plain) | none | skipped at owner request | skipped at owner request | skipped at owner request |
-| OpenAI Codex | WebSocket (`transport` auto) | `openai-codex/websocket-ok.jsonl` | no: no `response` record, `result.responses` is 0 | none, the path exposes no headers | not captured, no limit was hit |
-| OpenAI Codex | SSE (`transport` sse) | `openai-codex/sse-ok.jsonl` | yes, once, status 200 | yes, `x-codex-*` | not captured, no limit was hit |
+| OpenAI Codex | WebSocket (`transport` auto) | `openai-codex/websocket-ok.jsonl` | no: no `response` record, `result.responses` is 0 | none, the path exposes no headers | not captured by the live check. The session-log Codex text in `session-errors/` has no recorded transport, so it is not tied to this path |
+| OpenAI Codex | SSE (`transport` sse) | `openai-codex/sse-ok.jsonl` | yes, once, status 200 | yes, `x-codex-*` | not captured by the live check. The session-log Codex text in `session-errors/` has no recorded transport, so an SSE 429 remains unverified |
 
 ## Findings
 
@@ -112,6 +128,7 @@ Anthropic sends utilization as a fraction (`0.05`). Codex sends used percent as 
 
 These cases have no fixture. Do not add hand-written data for them.
 
-- **Limit errors on every path.** No usage limit or rate limit was hit during the capture, so there is no 429, no limit error text and no `result` record with an `errorMessage`. The Anthropic expectation from the pi source (a limit arrives as error text with no `response` record, because the SDK throws on a non-2xx first) and the Codex SSE expectation (`after_provider_response` fires for a 429 too) are still unconfirmed.
+- **Limit errors in the live check.** No usage limit or rate limit was hit during the capture, so there is no capture `result` record with an `errorMessage` and no non-2xx `response` record. Two real error texts from session logs are in `session-errors/`, but they carry no HTTP status, headers, response count, reset time or transport, so they confirm neither of these expectations. The Anthropic expectation from the pi source (a limit arrives as error text with no `response` record, because the SDK throws on a non-2xx first) and the Codex SSE expectation (`after_provider_response` fires for a 429 too) are still unconfirmed.
 - **Headers near or at a limit.** Every captured status is `allowed`, and usage was low (Anthropic 5%/39%, Codex 2%/37%). Values such as a non-`allowed` status, a `seven_day` representative claim, or utilization at 1 have not been seen.
+- **Reset times for a limit.** Neither session error text states a reset, and no limit response header has been seen.
 - **Anthropic plain pi and extra usage.** Plain pi (`-ne`), the TUI warning, and extra usage switched on or off were skipped at the owner's request. The shaped path reports `overage-status` `rejected` with `org_level_disabled`, but how the extra-usage path behaves is unknown.
