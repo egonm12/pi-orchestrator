@@ -7,7 +7,7 @@ priority: normal
 tags:
     - ready-for-agent
 created_at: 2026-09-28T14:30:23Z
-updated_at: 2026-09-28T22:26:13Z
+updated_at: 2026-09-29T19:58:16Z
 parent: pi-orchestrator-cml8
 blocked_by:
     - pi-orchestrator-2uc7
@@ -47,3 +47,8 @@ Prepared, not yet run by the owner. No live result exists yet: the sessions that
 Definitions: the denominator is plain prompts the owner labels delegate (skill prompts are reported apart, as the baseline routed slash commands apart); the numerator is those in which the orchestrator started at least one worker. Decision: fewer than 29 needed prompts is insufficient; otherwise IMPROVED when a one-sided Fisher exact test against 6 of 29 gives p < 0.05, else NEAR BASELINE: the rate is not statistically shown above the baseline, and ADR 0013 is revisited. The summary counts subagents-* messages as notices, not as wake-ups. A parsing smoke run over the owner's existing sessions (counts only, output deleted, before the window) read 46 session files and found 21 orchestrator sessions (106 prompts, no fork copies, on the rerun after the review fixes); that is not a measurement.
 
 Remaining for the owner: run the window, label, summarize and record per delegation-rate.md, then tick the last two criteria.
+
+
+## Deferral note (owner, 2026-09-29)
+
+The window was predeclared as 2026-09-29T08:35:57Z to 2026-10-06T08:35:57Z. The owner has waived this measurement for the cml8 goal: no extraction, labels, summary or ADR 0013 result is required for the goal to close. The bean stays in progress for later. The script and instructions (src/live-check/delegation-rate.ts, src/live-check/delegation-rate.md) are preserved as they are. No result exists and none is claimed. The two unmeasured criteria stay unchecked until the owner runs the measurement.

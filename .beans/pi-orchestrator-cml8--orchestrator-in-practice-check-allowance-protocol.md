@@ -145,4 +145,4 @@ Using pi-orchestrator in practice showed six problems:
 
 ## Story map
 
-All 55 user stories are mapped to the 13 original child beans in [docs/agents/cml8-story-map.md](../docs/agents/cml8-story-map.md). Pending: story 19 (pi-orchestrator-53x3), the predeclared delegation-rate result after 2026-10-06T08:35:57Z. Story 55 is completed under the owner-approved exception described in the map.
+All 55 user stories are mapped to the 13 original child beans in [docs/agents/cml8-story-map.md](../docs/agents/cml8-story-map.md). Story 19 (pi-orchestrator-53x3) is deferred for this goal by owner waiver: the delegation-rate measurement (window predeclared 2026-09-29T08:35:57Z to 2026-10-06T08:35:57Z) is not required for the goal to close, and the bean stays in progress for later with its measurement criteria unchecked. Story 55 is completed under the owner-approved exception described in the map.
