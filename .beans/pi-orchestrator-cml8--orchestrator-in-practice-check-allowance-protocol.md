@@ -1,13 +1,13 @@
 ---
 # pi-orchestrator-cml8
 title: 'Orchestrator in practice: guidance instead of refusal, protocol on every run, labels, balanced tiers, editing detection, usage and rate limits'
-status: in-progress
+status: completed
 type: feature
 priority: normal
 tags:
     - ready-for-agent
 created_at: 2026-09-28T09:31:08Z
-updated_at: 2026-09-29T14:55:37Z
+updated_at: 2026-09-29T20:01:43Z
 ---
 
 ## Problem statement
@@ -146,3 +146,11 @@ Using pi-orchestrator in practice showed six problems:
 ## Story map
 
 All 55 user stories are mapped to the 13 original child beans in [docs/agents/cml8-story-map.md](../docs/agents/cml8-story-map.md). Story 19 (pi-orchestrator-53x3) is deferred for this goal by owner waiver: the delegation-rate measurement (window predeclared 2026-09-29T08:35:57Z to 2026-10-06T08:35:57Z) is not required for the goal to close, and the bean stays in progress for later with its measurement criteria unchecked. Story 55 is completed under the owner-approved exception described in the map.
+
+## Summary of changes
+
+Delivered and independently reviewed the twelve completed original child beans. The thirteenth original bean, pi-orchestrator-53x3, retains its prepared delegation-rate script and instructions but remains in progress: the owner waived the measurement for this goal, its two measurement criteria are unchecked, and no result was recorded in ADR 0013. The predeclared window can be used later.
+
+The 55 numbered stories are mapped in docs/agents/cml8-story-map.md. Story 19 is deferred by that waiver. Story 55 closed under the owner-approved exception: real owner-directed agent-run Anthropic installed-extension and Codex success captures, plus sanitized real historical limit-error texts. Quota-capture 429 and near-limit headers, reset times, Codex SSE 429, and Anthropic plain pi and extra usage remain unverified. The later follow-up pi-orchestrator-r94j remains open outside this goal pending Codex 429 evidence.
+
+The reviewed scoped commits include their changed bean files. Follow-up commits were needed for review findings; the owner approved multiple commits per ticket and no history rewrite. Final verification on 2026-09-29: npm run typecheck passed; npm test ran 929 tests, 913 passed, 16 skipped, 0 failed. The working tree was clean before this parent-bean update.
