@@ -1,13 +1,13 @@
 ---
 # pi-orchestrator-cml8
 title: 'Orchestrator in practice: guidance instead of refusal, protocol on every run, labels, balanced tiers, editing detection, usage and rate limits'
-status: todo
+status: in-progress
 type: feature
 priority: normal
 tags:
     - ready-for-agent
 created_at: 2026-09-28T09:31:08Z
-updated_at: 2026-09-28T20:36:52Z
+updated_at: 2026-09-29T14:55:37Z
 ---
 
 ## Problem statement
@@ -142,3 +142,7 @@ Using pi-orchestrator in practice showed six problems:
 - Domain terms are in CONTEXT.md: exploration nudge, quality gate, label, tier order, editing delegation.
 - Decisions: ADR 0012 (balanced tier order, amending 0001) and ADR 0013 (guidance instead of refusal, superseding 0005 and amending 0010).
 - Suggested order: the nudge and reminding gate first (they remove today's blocks), then the protocol fix, editing detection, usage and rate limits (error signals first, the live header check before header reading), labels and balancing.
+
+## Story map
+
+All 55 user stories are mapped to the 13 original child beans in [docs/agents/cml8-story-map.md](../docs/agents/cml8-story-map.md). Pending: story 19 (pi-orchestrator-53x3), the predeclared delegation-rate result after 2026-10-06T08:35:57Z. Story 55 is completed under the owner-approved exception described in the map.
