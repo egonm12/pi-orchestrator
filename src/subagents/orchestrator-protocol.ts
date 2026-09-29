@@ -12,12 +12,15 @@ import { tiersByGateAction, type GateAction, type GateLevel } from "./quality-ga
 //   as pi-claude-rules does), the provider gets that forced text instead of the
 //   sections, so the protocol is appended to it.
 // - context_with_system, before each request: a run a message starts
-//   (sendMessage with triggerTurn: completion notices, worker reports and
-//   questions, gate reminders) skips before_agent_start, and pi 0.87.1 builds
+//   (sendMessage with triggerTurn: completion notices and worker questions)
+//   skips before_agent_start, and pi 0.87.1 builds
 //   its turns from the base prompt, so its second turn removes the section,
 //   and a later such run starts without it. When the request's replayed prompt
 //   lacks the current protocol, the request, not the transcript, gets a section
-//   patch after its last system message.
+//   patch after its last system message. The commit gate starts no run: its
+//   reminder is appended to the bash tool result, and its turn-end notice is
+//   sent with triggerTurn: false (commit-gate.ts), so each lands in a request
+//   this hook already covers.
 // pi exposes no supported way to add a section to the base prompt (tool
 // guidelines render only without a custom SYSTEM.md, as bullets, and reach
 // workers that have the subagents tool), and sending wake-ups as user messages
@@ -74,8 +77,10 @@ const paragraphs = (explorationNudge: number, gateLevel: GateLevel): readonly st
   "A worker's Result is evidence, not a verdict. Check it before you act on it: does every claim carry file:line evidence, " +
     "does it say what it could not verify, does anything contradict what you already know? Do not build on a claim without " +
     "evidence: check that claim yourself, or resume the worker with the `subagents` tool and ask for it.",
-  "A delegation that edited (its worker, or a worker it started, ran edit, write, ctx_execute or a bash command that is not a " +
-    "read-only search or a build or test run) needs your verdict unless your gate level leaves it ungated; its Result says which. " +
+  "A delegation that edited needs your verdict unless your gate level leaves it ungated; its Result says which. In a git repository " +
+    "it edited when the working tree changed while its worker, or a worker it started, ran, or when one of them ran edit or write; " +
+    "a command that changed nothing is research. Without a repository it edited when one of them ran edit, write, ctx_execute or a " +
+    "bash command that is not a read-only search or a build or test run. " +
     "Judge the change itself, not the worker's " +
     "account of it: spot-check the diff and the claims that matter, or read a reviewer's Result. Then record the verdict with " +
     "`subagents_verdict`: the delegation id, accept or request_changes, and a reason naming what you checked. A later verdict on " +

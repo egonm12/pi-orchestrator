@@ -49,7 +49,7 @@ Status on 2026-09-29: 12 of the 13 original children are completed. `pi-orchestr
 | 13 | Gate levels and actions unchanged | gwbk | extension.test.ts:3946, :4035; review.test.ts:637 |
 | 14 | Protocol on a completion notice | 6yxt | extension.test.ts:2747 |
 | 15 | Protocol on a worker report or question | 6yxt | extension.test.ts:2772 |
-| 16 | Protocol on a gate reminder | 6yxt | orchestrator-protocol.test.ts:37; extension.test.ts:2772 (same triggerTurn path) |
+| 16 | Protocol on a gate reminder | 6yxt | The reminder is appended to the bash tool result (commit-gate.ts:150-154) and the turn-end notice is sent with `triggerTurn: false` (commit-gate.ts:161-162), so neither starts a run; the per-request hook covers both (orchestrator-protocol.test.ts:37). No end-to-end test checks the protocol on a reminder's request |
 | 17 | Protocol after a typed skill prompt | 6yxt | extension.test.ts:2794; orchestrator-protocol.test.ts:87 |
 | 18 | Live check of the protocol | 6yxt | protocol-probe.test.ts:31; 6yxt bean "Live check result" (PASS, 2026-09-29) |
 | 19 | Delegation rate measured again | 53x3 | Pending: predeclared result after 2026-10-06T08:35:57Z; tooling delegation-rate.test.ts:147 |

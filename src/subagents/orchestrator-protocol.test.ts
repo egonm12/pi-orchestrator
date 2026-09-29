@@ -106,3 +106,12 @@ test("the protocol text opens with its heading, so a section patch is self-delim
   assert.ok(PROTOCOL.includes("Your gate level is medium."), PROTOCOL);
   assert.ok(PROTOCOL.includes("No call is denied"), PROTOCOL);
 });
+
+test("the protocol says what makes a delegation editing: the working tree in a repository, the command rule without one", () => {
+  const paragraph = PROTOCOL.split("\n\n").find((text) => text.startsWith("A delegation that edited"));
+  assert.ok(paragraph, PROTOCOL);
+  for (const phrase of ["In a git repository", "the working tree changed", "edit or write", "a command that changed nothing is research",
+    "Without a repository", "ctx_execute", "read-only search or a build or test run"]) {
+    assert.ok(paragraph.includes(phrase), `${phrase}: ${paragraph}`);
+  }
+});
