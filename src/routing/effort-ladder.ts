@@ -18,7 +18,10 @@ export interface EffortLadderInput {
 export type LadderStep = "effort" | "same-tier" | "next-tier";
 export type LadderSkippedRung = Omit<RemovedRung, "reason"> & { readonly reason: LadderSkipReason };
 export type LadderChoice = TierRouteChoice & { readonly step: LadderStep; readonly skipped: readonly LadderSkippedRung[] };
-export type LadderDecision = LadderChoice | (TierRouteRefusal & { readonly step: "blocker"; readonly skipped: readonly LadderSkippedRung[] });
+/** The failed rung has no position in the resolved tier map, so the ladder cannot climb from it. A
+ *  result, not an error: callers across module copies cannot tell a thrown class by `instanceof`. */
+export interface LadderNoPosition { readonly step: "no-position" }
+export type LadderDecision = LadderChoice | (TierRouteRefusal & { readonly step: "blocker"; readonly skipped: readonly LadderSkippedRung[] }) | LadderNoPosition;
 
 /** Pure retry routing. The installed registry supplies capabilities; every
  * candidate uses ticket 24's single hard-filter implementation. */
@@ -40,7 +43,7 @@ export function nextRungAfterFailure(input: EffortLadderInput): LadderDecision {
       if (rung.model === failed.rung.model && levels.indexOf(rung.effort) <= current) index = position;
     }
   }
-  if (index < 0) throw new Error("effort ladder: failed rung has no position in the resolved tier map.");
+  if (index < 0) return { step: "no-position" };
   const next = current < 0 ? undefined : levels[current + 1];
   const maxListed = RISK_TIERS.some((tier) => tierMap.tiers[tier].some((rung) => rung.model === failed.rung.model && rung.effort === "max"));
   if (next === "max" && !maxListed) skipped.push({ tier: failed.tier, rung: `${failed.rung.model}:max`, model: failed.rung.model, reason: MAX_NOT_LISTED, detail: "max requires an explicitly listed rung for this model in the resolved tier map" });

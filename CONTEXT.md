@@ -113,7 +113,7 @@ Bounded recovery's retry order after a changes-requested review: one supported e
 _Avoid_: Reclassification, suitability-score escalation
 
 **Unplaced climb**:
-A retry of an attempt the effort ladder cannot position: routing is off, the attempt was a fork or named-model worker, its route refused, or its rung is no longer in the tier map. Its effort-ladder record has step `unplaced` and no rung. It counts toward the two-climb limit; with routing on it routes normally, without a forced rung.
+A retry of an attempt the effort ladder cannot position: routing is off, the attempt was a fork or named-model worker, its route refused, its rung is no longer in the tier map, or the climb failed with an error, which its record names. Its effort-ladder record has step `unplaced` and no rung. It counts toward the two-climb limit; with routing on it routes normally, without a forced rung.
 
 **Verdict**:
 The quality gate's outcome for a delegated task: accepted or changes requested, recorded by the orchestrator whether it came from its own check or an independent reviewer. The only feedback signal the router learns from.

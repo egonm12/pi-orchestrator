@@ -124,7 +124,11 @@ export function routeTask(router: ActiveRouter, taskText: string, classification
 
 /** The effort ladder's next rung after `failed` (ADR 0010), through the same
  *  hard filters as a first request, for a retry whose task is `taskText`.
- *  Throws when the failed rung has no position in the tier map. */
+ *  Its step is `no-position` when the failed rung has no position in the tier
+ *  map. Throws when the hard filters' evidence cannot be read, or when
+ *  `router.owner` was not minted by this module copy's task allowance
+ *  (../budget/task-allowance.ts), so callers in another extension climb
+ *  through the router's published climb (./orchestrator-router.ts). */
 export function climbEffortLadder(router: ActiveRouter, failed: FailedDecision, taskText: string, at: Date): LadderDecision {
   const evidence = hardFilterEvidence(router, taskText, at, router.evidence(), {});
   return nextRungAfterFailure({ failed, tierMap: router.tierMap, installedModels: router.installedModels,
