@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { TestContext } from "node:test";
 import { liveTest as test } from "../fixtures/live.ts";
-import { createGuardedAgentDir, credentialsAvailable, liveAuthExtensionPath, realAgentDirPath } from "../fixtures/guarded-agent-dir.ts";
+import { createGuardedAgentDir, credentialsAvailable, liveAuthExtensionPath, piSubagentsPackagePath } from "../fixtures/guarded-agent-dir.ts";
 import { piEvents, PROVIDER_REFUSAL, type PiEvent } from "../fixtures/live-pi-session.ts";
 import { installPiLaunchLog } from "../fixtures/pi-launch-log.ts";
 import { createTempRepo } from "../fixtures/temp-repo.ts";
@@ -148,7 +148,7 @@ async function withParentSession<T>(t: TestContext, setup: SessionSetup, inspect
   const liveModel = selectedLivePiModel();
   if (liveModel !== HAIKU) { t.skip(`the auto model's live test is approved on ${HAIKU} only; PI_ORCHESTRATOR_LIVE_MODEL selected ${liveModel}`); return undefined; }
   const authPackage = liveAuthExtensionPath();
-  const subagentsPackage = join(realAgentDirPath(), "npm", "node_modules", "pi-subagents");
+  const subagentsPackage = piSubagentsPackagePath();
   if (!credentialsAvailable() || !authPackage) { t.skip("live credentials/auth package unavailable"); return undefined; }
   if (!existsSync(join(subagentsPackage, "package.json"))) { t.skip(`pi-subagents is not installed at ${subagentsPackage}`); return undefined; }
   const tiers = setup.tiers ?? TIERS;

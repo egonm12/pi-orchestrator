@@ -57,6 +57,16 @@ export function liveAuthExtensionPath(): string | undefined {
   return existsSync(path) ? path : undefined;
 }
 
+/**
+ * The pi-subagents package directory the live tests that start workers
+ * through pi-subagents load: `PI_ORCHESTRATOR_PI_SUBAGENTS_DIR` when set,
+ * otherwise the copy installed in the real agent directory. The owner removed
+ * pi-subagents (ADR 0007), so a throwaway install can stand in for it.
+ */
+export function piSubagentsPackagePath(): string {
+  return process.env.PI_ORCHESTRATOR_PI_SUBAGENTS_DIR || join(realAgentDirPath(), "npm", "node_modules", "pi-subagents");
+}
+
 export function createGuardedAgentDir(options: GuardedAgentDirOptions = {}): GuardedAgentDir {
   const home = mkdtempSync(join(tmpdir(), "pi-harness-agentdir-"));
   const dir = join(home, AGENT_DIR_UNDER_HOME);

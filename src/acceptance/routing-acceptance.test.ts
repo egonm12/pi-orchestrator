@@ -7,7 +7,7 @@ import { test, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 import { buildCatalog, saveCatalog } from "../catalog/model-catalog.ts";
 import { emptyRefreshState, saveRefreshState, updateFromCallResult } from "../catalog/refresh-lifecycle.ts";
-import { createGuardedAgentDir, credentialsAvailable, liveAuthExtensionPath, realAgentDirPath } from "../fixtures/guarded-agent-dir.ts";
+import { createGuardedAgentDir, credentialsAvailable, liveAuthExtensionPath, piSubagentsPackagePath } from "../fixtures/guarded-agent-dir.ts";
 import { piEvents, PROVIDER_REFUSAL, type PiEvent } from "../fixtures/live-pi-session.ts";
 import { installPiLaunchLog, type PiLaunch } from "../fixtures/pi-launch-log.ts";
 import { fixtureClassification, fixtureRefusal, fixtureRoute, fixtureTierMap, HAIKU as FIXTURE_HAIKU, OPUS, SONNET } from "../fixtures/routing-decision.ts";
@@ -438,7 +438,7 @@ test(`routing acceptance gate on ${HAIKU}: six routed delegations, project overr
     mkdirSync(join(agent.dir, "extensions", "subagent"));
     writeFileSync(join(agent.dir, "extensions", "subagent", "config.json"), JSON.stringify(SUBAGENT_CONFIG));
     const authPackage = authExtension;
-    const subagentsPackage = join(realAgentDirPath(), "npm", "node_modules", "pi-subagents");
+    const subagentsPackage = piSubagentsPackagePath();
     assert.ok(existsSync(join(subagentsPackage, "package.json")), `pi-subagents is not installed at ${subagentsPackage}`);
     const orchestratorPackage = resolve(import.meta.dirname, "..", "..");
     const writePersonalSettings = (mode: "shadow" | "live") => writeFileSync(join(agent.dir, "settings.json"), JSON.stringify({
