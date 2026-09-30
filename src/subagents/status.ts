@@ -21,7 +21,8 @@ const PARAMETERS = {
   type: "object",
   properties: {
     id: { type: "string", description: "Optional: a background call id for a snapshot of each item, or a delegation id for that worker's snapshot." },
-    wait: { type: "boolean", description: "With a call id: block until the call finishes and return its results instead of its completion notice." },
+    wait: { type: "boolean", description: "With a call id: block until the call finishes and return its results instead of its completion notice. " +
+      "It holds your turn: use it only when you cannot go on without the results." },
   },
   additionalProperties: false,
 } as unknown as ToolParameters;
@@ -29,7 +30,8 @@ const PARAMETERS = {
 const DESCRIPTION = "Check this session's background subagents calls. Without `id`, list them with each worker's state. " +
   "With a call id, a snapshot of each item; with a delegation id, that worker's snapshot: state, current tool, turns, elapsed time, " +
   "the last lines of its text and its session file. With a call id and `wait: true`, block until the call finishes and return its results; " +
-  "its completion notice is then not delivered. Aborting a wait stops only the wait, not the workers.";
+  "its completion notice is then not delivered. A wait holds your turn until the call finishes, so wait only when you cannot go on without " +
+  "the results; otherwise carry on and let the completion notice bring them. Aborting a wait stops only the wait, not the workers.";
 
 /** The result's `details` for a listing or a snapshot. */
 export interface SubagentsStatusDetails {

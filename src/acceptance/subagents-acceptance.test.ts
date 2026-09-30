@@ -166,7 +166,8 @@ test(`live ${HAIKU} session: two parallel workers through the built-in subagents
     ];
     const prompt = [
       "Call the subagents tool exactly once, with exactly these arguments and no others, and do nothing else yourself:",
-      JSON.stringify({ items }),
+      // In the foreground, so the tool's own result carries both workers' results (ADR 0008).
+      JSON.stringify({ items, background: false }),
       "When the tool returns, reply with the single word DONE.",
     ].join("\n");
 

@@ -181,7 +181,7 @@ const toolText = (result: { content: readonly { type: string; text?: string }[] 
 
 /** One subagents call; its results and text. */
 async function call(tools: (name: string) => Tool, ctx: ExtensionContext, items: readonly Record<string, unknown>[], callId = "call") {
-  const result = await tools("subagents").execute(callId, { items } as never, undefined, undefined, ctx);
+  const result = await tools("subagents").execute(callId, { items, background: false } as never, undefined, undefined, ctx);
   return { results: (result.details as SubagentsDetails).results, text: toolText(result) };
 }
 

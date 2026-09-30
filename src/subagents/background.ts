@@ -2,7 +2,8 @@ import type { SubagentProgress, SubagentsDetails } from "./extension.ts";
 import { shortTask } from "./render.ts";
 import type { WorkerActivity } from "./worker.ts";
 
-// Background calls (ADR 0008). A `background: true` subagents call returns at
+// Background calls (ADR 0008). A background subagents call, the orchestrator's
+// default or `background: true` from any session but a worker's, returns at
 // once and its items run on here. When every item has finished, the call's one
 // completion notice is delivered. The tool's abort signal, which Ctrl+C fires,
 // does not reach these workers: each call has signals of its own, which

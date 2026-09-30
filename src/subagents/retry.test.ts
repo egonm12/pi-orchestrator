@@ -194,7 +194,7 @@ async function orchestrator(h: Harness, approved = true): Promise<Orchestrator> 
 const toolText = (result: { content: readonly { type: string; text?: string }[] }) => result.content.map((part) => part.text ?? "").join("");
 
 async function call(o: Orchestrator, items: readonly Record<string, unknown>[]): Promise<{ results: readonly SubagentResult[]; text: string }> {
-  const result = await o.tool("subagents").execute("call", { items } as never, undefined, undefined, o.ctx);
+  const result = await o.tool("subagents").execute("call", { items, background: false } as never, undefined, undefined, o.ctx);
   return { results: (result.details as SubagentsDetails).results, text: toolText(result) };
 }
 

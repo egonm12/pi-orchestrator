@@ -140,7 +140,7 @@ function orchestratorTools() {
   } as unknown as ExtensionAPI);
   const subagents = tools.filter((tool) => tool.name === "subagents").at(-1)!;
   async function one(ctx: ExtensionContext, item: Record<string, unknown>): Promise<SubagentResult> {
-    const result = await subagents.execute("call", { items: [item] } as never, undefined, undefined, ctx);
+    const result = await subagents.execute("call", { items: [item], background: false } as never, undefined, undefined, ctx);
     const [first] = (result.details as SubagentsDetails).results;
     assert.ok(first);
     assert.equal(first.status, "completed", JSON.stringify(first));

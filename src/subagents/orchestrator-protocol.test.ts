@@ -107,6 +107,14 @@ test("the protocol text opens with its heading, so a section patch is self-delim
   assert.ok(PROTOCOL.includes("No call is denied"), PROTOCOL);
 });
 
+test("the protocol says a subagents call runs in the background unless foreground is chosen, and not to wait on it by default", () => {
+  const paragraph = PROTOCOL.split("\n\n").find((text) => text.startsWith("A `subagents` call runs in the background"));
+  assert.ok(paragraph, PROTOCOL);
+  for (const phrase of ["`background: false`", "short, bounded task", "`subagents_status`", "`wait: true`", "completion notice"]) {
+    assert.ok(paragraph.includes(phrase), `${phrase}: ${paragraph}`);
+  }
+});
+
 test("the protocol says what makes a delegation editing: the working tree in a repository, the command rule without one", () => {
   const paragraph = PROTOCOL.split("\n\n").find((text) => text.startsWith("A delegation that edited"));
   assert.ok(paragraph, PROTOCOL);

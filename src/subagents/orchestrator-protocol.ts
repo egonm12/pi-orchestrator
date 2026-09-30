@@ -67,6 +67,12 @@ const paragraphs = (explorationNudge: number, gateLevel: GateLevel): readonly st
     "\"any risks?\" or \"why does this fail?\", or when the output will be large and you only need the conclusion. " +
     "Decide before your first command, not after the fifth. Give each worker one bounded task. Check on a background worker " +
     "with `subagents_status`, and steer it or answer the question in its Report with `subagents_message`.",
+  "A `subagents` call runs in the background unless you set `background: false`: it returns its call id and delegation ids at once, " +
+    "and you stay free to answer the user, do unrelated work, check on or steer its workers. Its results come in one completion notice. " +
+    "Keep the default for exploration, coding, reviews and anything whose length you cannot tell. Set `background: false` only for a " +
+    "short, bounded task whose result your very next step needs; a foreground call holds your turn, and the user's messages wait, " +
+    "until every worker has finished. Do not follow a background call with `subagents_status` and `wait: true` by habit, which " +
+    "holds your turn just the same: wait only when you cannot go on without the result, and otherwise let the completion notice bring it.",
   "Keep small known actions yourself: a single lookup, a small edit you can already see, a build or test run, a commit, " +
     "or a decision only you can make.",
   `After ${explorationNudge} exploratory call${explorationNudge === 1 ? "" : "s"} in one user prompt, the result of each further one ends ` +

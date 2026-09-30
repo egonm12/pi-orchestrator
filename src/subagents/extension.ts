@@ -6,7 +6,7 @@ import { banListsFromSettings, personalAgentDir, readSettingsFile, subagentBanLi
 import { THINKING_LEVELS, splitKnownThinkingSuffix, type ThinkingLevel } from "../models/model-info.ts";
 import { agentDefinitionDirs, agentDefinitionListing, loadAgentDefinitions, resolveAgent } from "./agent-definitions.ts";
 import { callingDelegation } from "./nested-delegation.ts";
-import { BackgroundCalls, type BackgroundCallResult } from "./background.ts";
+import { BackgroundCalls, type BackgroundCallResult, type CompletionNotice } from "./background.ts";
 import { registerSubagentsMessageTool } from "./message.ts";
 import { renderSubagentsCall, renderSubagentsResult, shortTask } from "./render.ts";
 import { forkSession } from "./fork-session.ts";
@@ -72,7 +72,9 @@ const PARAMETERS = {
         retry: { type: "string", description: "Retry a delegation whose latest verdict is request_changes, by its id, on the effort ladder's next rung; `task` is your feedback." },
       }, required: ["task"], additionalProperties: false,
     } },
-    background: { type: "boolean", description: "Optional: return at once with the call id and delegation ids; one completion notice with the results follows when every item has finished." },
+    background: { type: "boolean", description: "Optional: the orchestrator's calls run in the background by default, returning at once with the call id and delegation ids; " +
+      "one completion notice with the results follows when every item has finished. Set `background: false` only for a short, bounded task " +
+      "whose result your next step needs: the call then waits for every item. A worker's calls always run in the foreground." },
   },
   required: ["items"],
   additionalProperties: false,
@@ -230,14 +232,18 @@ export interface SubagentsDependencies {
 }
 
 const DESCRIPTION = "Hand 1 to 8 tasks to workers. At most orchestrator.subagents.maxParallel run at once. " +
-  "Results keep item order; abort stops running workers and leaves queued workers not started. " +
+  "The orchestrator's calls run in the background by default: the call returns at once with its call id and delegation ids, " +
+  "and one completion notice with the results, in item order, follows when every item has finished; " +
+  "at most orchestrator.subagents.maxBackgroundWorkers background workers may be queued or running at once. " +
+  "Keep the default for exploration, coding, reviews and work of uncertain length, and check on or steer workers meanwhile. " +
+  "Set `background: false` only for a short, bounded task whose result your next step needs: the call then waits for every item, " +
+  "returns the results in item order, and abort stops running workers and leaves queued workers not started. " +
+  "A worker's own calls always run in the foreground. " +
   "An ordinary worker sees only its task text, so put every fact it needs in it. " +
   "An item's `agent` is optional: it names an agent definition, whose instructions the worker follows and whose tools list narrows the worker's tools. " +
   "An optional short `label` says what the delegation is for in the worker list. " +
   "An unknown agent fails that item without starting its worker. " +
   "Set `fork: true` to copy the current branch before this call and run on the session model and effort, without routing. " +
-  "With `background: true` the call returns at once with its call id and delegation ids, and one completion notice with the results follows when every item has finished; " +
-  "at most orchestrator.subagents.maxBackgroundWorkers background workers may be queued or running at once. " +
   "Use `resume` with `task` (without `agent`) to continue a finished saved worker on its original pin. " +
   "Use `review` with a finished editing delegation's id and a `task` saying what to check to start an independent reviewer: it is routed at that delegation's tier or higher, " +
   "elevated for one without a tier, and never on its rung, and it gets the delegation's task, Result and changed files. " +
@@ -272,19 +278,43 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
     };
     // The gate level in force, and `/pi-orchestrator gate` to set it for the session (gate-level.ts).
     const gateLevels = registerGateLevel(pi, logOnce);
-    const backgroundCalls = new BackgroundCalls(({ text, details }, startTurn) => pi.sendMessage(
+    const sendNotice = ({ text, details }: CompletionNotice, startTurn: boolean) => pi.sendMessage(
       { customType: COMPLETION_NOTICE, content: text, display: true, details },
       startTurn ? { triggerTurn: true, deliverAs: "followUp" } : { triggerTurn: false },
-    ));
+    );
+    // pi checks a run's follow-up queue for the last time after agent_end (after
+    // any agent_before_settle handlers), but counts the run as streaming until
+    // agent_settled; only a follow-up queued after that last check is never read
+    // (bean 5sqy). No event marks the check, so a notice that would start a turn
+    // anywhere from agent_end to agent_settled is held, and handed over when pi
+    // takes it again: at agent_settled pi runs it as a new turn, at the
+    // agent_start of a continued run it follows that run, and session shutdown
+    // records it without a turn.
+    let settling = false;
+    const held: CompletionNotice[] = [];
+    const sendHeld = (startTurn: boolean) => {
+      settling = false;
+      for (const notice of held.splice(0)) sendNotice(notice, startTurn);
+    };
+    const backgroundCalls = new BackgroundCalls((notice, startTurn) => {
+      if (startTurn && settling) held.push(notice);
+      else sendNotice(notice, startTurn);
+    });
+    pi.on("agent_end", () => { settling = true; });
+    pi.on("agent_start", () => sendHeld(true));
+    pi.on("agent_settled", () => sendHeld(true));
     const registerSubagentsTool = (description: string) => pi.registerTool({
       name: SUBAGENTS_TOOL,
       label: "Subagents",
       description,
       parameters: PARAMETERS,
       async execute(toolCallId, params, signal, onUpdate, ctx) {
-        const { items, background = false } = params as { items: SubagentItem[]; background?: boolean };
+        const { items, background: requested } = params as { items: SubagentItem[]; background?: boolean };
         if (!Array.isArray(items) || items.length < 1 || items.length > 8) throw new Error("subagents requires 1 to 8 items per call");
         const parentDelegationId = callingDelegation(ctx, params as { background?: unknown; items?: unknown });
+        // The orchestrator's calls run in the background unless it asks for the foreground; any other session's run in the
+        // foreground unless it asks for the background, which a worker may not (ADR 0008).
+        const background = requested === undefined ? isOrchestratorSession(ctx) : requested === true;
         const agentDir = personalAgentDir();
         const { settings, allowProjectOverrides, ignoredProjectKeys } = loadSubagentsSettings(agentDir, ctx.cwd);
         for (const key of ignoredProjectKeys) logOnce(`ignored project settings key ${key}`);
@@ -665,6 +695,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
       stopDownEntry = undefined;
       widget?.stop();
       widget = undefined;
+      sendHeld(false);
       // Ctrl+C leaves background workers running; the session's end stops them, and pi waits for that.
       return backgroundCalls.shutdown();
     });
