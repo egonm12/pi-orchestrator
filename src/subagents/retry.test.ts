@@ -11,7 +11,7 @@ import { resetBanLists } from "../policy/ban-lists.ts";
 import { authorizeRecipient, emptyAuthorization, grantOwnerApproval, saveAuthorization } from "../recipients/authorization.ts";
 import { readRoutingRecords, type DecisionRecord, type EffortLadderRecord, type RoutingRecord } from "../routing/decision-record.ts";
 import { buildRoutingReport } from "../routing/routing-report.ts";
-import { autoStream } from "../router/auto-stream.ts";
+import { providerStream } from "../fixtures/provider-stream.ts";
 import { createRouterExtension } from "../router/extension.ts";
 import { orchestratorRouter } from "../router/orchestrator-router.ts";
 import { createSubagentsExtension, type SubagentResult, type SubagentsDetails } from "./extension.ts";
@@ -129,7 +129,7 @@ function anthropic() {
       const runs = task.split("\n").filter((line) => line.startsWith("Run:")).map((line) => JSON.parse(line.slice("Run:".length)) as { name: string; arguments: Record<string, unknown> });
       const done = context.messages.filter((message) => message.role === "toolResult").length;
       const call = runs[done];
-      const { stream, push, end } = autoStream();
+      const { stream, push, end } = providerStream();
       const message = {
         role: "assistant", api: model.api, provider: model.provider, model: model.id,
         content: call === undefined ? [{ type: "text", text: runs.length > 0 ? "ran" : reviewer ? "## Confirmed\nAnswer: accept" : "done" }]

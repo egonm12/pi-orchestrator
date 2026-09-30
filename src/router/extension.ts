@@ -1,8 +1,9 @@
 import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { toModelInfo, splitKnownThinkingSuffix, type ModelInfo } from "../models/model-info.ts";
-import { autoProviderConfig, providerInFlight, recordQuotaHeaders, type AutoProviderDependencies } from "./auto-provider.ts";
-import { autoModelLimits, withAutoModelLimits } from "./auto-model-limits.ts";
+import { AUTO_MODEL_ID, AUTO_MODEL_THINKING_LEVELS, AUTO_PROVIDER, createAutoModelRouter, isAutoModel, recordLimitError, recordQuotaHeaders,
+  type AutoModelDependencies, type AutoModelState } from "./auto-model.ts";
+import { autoModelLimits, type AutoModelLimits } from "./auto-model-limits.ts";
 import { refuseAutoModelForMainThread } from "./main-thread.ts";
 import type { ActiveRouter } from "./route-task.ts";
 import { newTaskLedger, TaskAllowanceOwner } from "../budget/task-allowance.ts";
@@ -27,8 +28,8 @@ import { publishOrchestratorRouter } from "./orchestrator-router.ts";
 export type { RoutingEvidence, RoutingEvidenceSource, EvidenceSetup } from "./evidence.ts";
 
 // The router extension (ADR 0006): a personal pi extension, separate from the
-// guard, that serves the auto model `orchestrator/auto` as the `orchestrator`
-// provider. It hooks no tool calls.
+// guard, that serves the auto model `orchestrator/auto` as a pi virtual model
+// (ADR 0014). It hooks no tool calls.
 
 import { ROUTER_PREFIX } from "./prefix.ts";
 export { ROUTER_PREFIX };
@@ -164,9 +165,8 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
     let active: ActiveRouter | undefined;
     /** This copy's session when it is the orchestrator's, whose router retries climb through (./orchestrator-router.ts). */
     let orchestratorSessionId: string | undefined;
-    let sessionRegistry: ExtensionContext["modelRegistry"];
-    const autoDeps: AutoProviderDependencies = {
-      router: () => active, registry: () => sessionRegistry, now: deps.now,
+    const autoDeps: AutoModelDependencies = {
+      router: () => active, now: deps.now,
       banLists: () => active?.banLists ?? loadBanListsOrDefaults().banLists,
       disabled: () => disabled,
       disable: (error) => disable(error),
@@ -177,8 +177,13 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
         process.stderr.write(`${ROUTER_WARNING_PREFIX} ${message}\n`);
       },
     };
-    const autoConfig = autoProviderConfig(autoDeps);
-    if (typeof pi.registerProvider === "function") pi.registerProvider("orchestrator", autoConfig);
+    const autoModel = createAutoModelRouter(autoDeps);
+    // Registering again replaces the virtual model; its route keeps no pins of its own.
+    const registerAutoModel = (limits: AutoModelLimits = {}) => pi.registerVirtualModel<AutoModelState>({
+      provider: AUTO_PROVIDER, id: AUTO_MODEL_ID, name: "Orchestrator auto", thinkingLevels: AUTO_MODEL_THINKING_LEVELS, ...limits,
+      route: (request, ctx) => autoModel.route(request, ctx),
+    });
+    registerAutoModel();
     refuseAutoModelForMainThread(pi);
     const disable = (error: unknown) => {
       active = undefined;
@@ -210,14 +215,13 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
     // worker's or a child process's session model is not remembered.
     const rememberSessionModel = (model: { provider: string; id: string } | undefined, effort: string, ctx: ExtensionContext) => {
       if (!isOrchestratorSession(ctx)) return;
-      if (model?.provider === "orchestrator" && model.id === "auto") return;
+      if (isAutoModel(model)) return;
       if (model) process.env.PI_ORCHESTRATOR_SESSION_MODEL = `${model.provider}/${model.id}:${effort}`;
       else delete process.env.PI_ORCHESTRATOR_SESSION_MODEL;
     };
     let noticeShown = false;
     pi.on("session_start", (_event, ctx) => {
       rememberSessionModel(ctx.model, ctx.thinkingLevel ?? "off", ctx);
-      sessionRegistry = ctx.modelRegistry;
       if (orchestratorSessionId !== undefined) publishOrchestratorRouter(orchestratorSessionId, undefined);
       orchestratorSessionId = isOrchestratorSession(ctx) ? ctx.sessionManager?.getSessionId() : undefined;
       if (disabled) return;
@@ -234,9 +238,7 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
         }
         active = startRouting(ctx, deps);
         if (orchestratorSessionId !== undefined) publishOrchestratorRouter(orchestratorSessionId, active);
-        if (active && typeof pi.registerProvider === "function") {
-          pi.registerProvider("orchestrator", withAutoModelLimits(autoConfig, autoModelLimits(active.tierMap, active.installedModels)));
-        }
+        if (active) registerAutoModel(autoModelLimits(active.tierMap, active.installedModels));
         if (probe && active) process.stderr.write(`${ROUTER_PREFIX} routing enabled, mode ${active.mode}, records ${active.recordDir}\n`);
       } catch (error) { disable(error); }
     });
@@ -248,28 +250,45 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
 
     // Quota headers (PRD cml8, story 50). pi's after_provider_response names
     // no provider, so its headers are attributed to the request in flight in
-    // the same session: an auto-model request's rung (auto-provider.ts), else
-    // the model the session's own request was sent with, taken when that
-    // request started. The auto model itself never answers a request.
+    // the same session: the physical model an auto-model request was routed
+    // to (auto-model.ts), else the model the session's own request was sent
+    // with, taken when that request started.
     const ownRequests = new Map<string, string>();
     const sessionIdOf = (ctx: ExtensionContext) => ctx.sessionManager?.getSessionId();
     pi.on("before_provider_request", (_event, ctx) => {
       const id = sessionIdOf(ctx);
       if (id === undefined) return undefined;
       const provider = ctx.model?.provider;
-      if (provider === undefined || provider === "orchestrator") ownRequests.delete(id);
-      else ownRequests.set(id, provider);
+      // A request on the auto model was routed just before it started.
+      if (isAutoModel(ctx.model)) ownRequests.delete(id);
+      else if (provider === undefined) ownRequests.delete(id);
+      else {
+        autoModel.forget(id);
+        ownRequests.set(id, provider);
+      }
       return undefined;
     });
     pi.on("after_provider_response", async (event, ctx) => {
       const id = sessionIdOf(ctx);
       if (id === undefined) return;
-      const provider = providerInFlight(id) ?? ownRequests.get(id);
+      const provider = autoModel.providerInFlight(id) ?? ownRequests.get(id);
       if (provider === undefined) return;
       // Header reading is advice: a failure warns and never stops the response.
       try { await recordQuotaHeaders(autoDeps, provider, event.status, event.headers ?? {}); } catch (error) {
         autoDeps.warn(`quota-headers:${provider}`, `could not read the quota headers of a ${provider} response: ${String(error).split(/\r?\n/, 1)[0]}`);
       }
+    });
+
+    // Usage observations (PRD cml8, "Signals"): a worker's failed response
+    // names the physical model it ran on, and a limit error in it marks that
+    // model's provider in the usage store before the worker or pi's retry
+    // goes on. A response whose routing failed names the auto model: no rung answered.
+    pi.on("message_end", async (event, ctx) => {
+      const message = event.message as { role?: string; stopReason?: string; errorMessage?: string; provider?: string };
+      if (message.role !== "assistant" || message.stopReason !== "error" || !isAutoModel(ctx.model)) return undefined;
+      if (message.provider === undefined || message.provider === AUTO_PROVIDER) return undefined;
+      await recordLimitError(autoDeps, message.provider, message.errorMessage);
+      return undefined;
     });
 
     pi.on("model_select", (event, ctx) => {

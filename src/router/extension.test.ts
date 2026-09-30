@@ -24,25 +24,28 @@ import { SettingsManager, type ExtensionAPI } from "@earendil-works/pi-coding-ag
 import type { TestContext as ExtensionContext } from "../fixtures/extension-context.ts";
 import type { SessionModelRegistry } from "../routing/model-stream.ts";
 import { createRouterExtension, type RouterDependencies, type RoutingEvidence } from "./extension.ts";
-import { setRoutingConstraints } from "./auto-provider.ts";
+import { setResumePin, setRoutingConstraints } from "./auto-model.ts";
 import { readUsageObservations, recordUsageObservation, usageObservationsPath, type UsageObservation } from "./usage-observations.ts";
 import { useOwnerBanLists } from "../fixtures/owner-ban-lists.ts";
 
-type ProviderConfigInput = NonNullable<Parameters<ExtensionAPI["registerProvider"]>[1]>;
-type AutoStream = NonNullable<ProviderConfigInput["streamSimple"]>;
-const AUTO_MODEL = { provider: "orchestrator", id: "auto", api: "orchestrator-auto" } as Parameters<AutoStream>[0];
+type VirtualModel = Parameters<ExtensionAPI["registerVirtualModel"]>[0];
+type RouteRequest = Parameters<VirtualModel["route"]>[0];
+type RoutedModel = RouteRequest["model"];
+const AUTO_MODEL = { provider: "orchestrator", id: "auto", api: "pi-virtual" };
 
 useOwnerBanLists();
 
-// Seam 1 (ADR 0006, "Testing decisions"): the router extension as pi loads it.
-// A fake ExtensionAPI records the registered provider and the event handlers;
-// a test calls the provider's `streamSimple` with a worker's request, as pi
-// does. The fakes sit at the system boundaries only: the session model
-// registry, the classifier model call, the evidence source (catalog, ticket 08
-// refresh state, approved recipients), the clock, settings files in a
-// throwaway agent dir and project dir, and the environment. Assertions read
-// what pi or the owner can observe: the returned events, the request forwarded
-// to the rung, the records in the state folder and printed lines.
+// The route seam (ADR 0014, spec 23b3 "Testing decisions"): the router
+// extension as pi loads it. A fake ExtensionAPI records the registered
+// virtual model and the event handlers; a test calls the virtual model's
+// `route` with requests built as pi builds them, one per request reason, with
+// the router state, `previous` and `failed` pi would pass. The fakes sit at
+// the system boundaries only: the session model registry, the classifier
+// model call, the evidence source (catalog, ticket 08 refresh state, approved
+// recipients), the clock, settings files in a throwaway agent dir and project
+// dir, and the environment. Assertions read what pi or the owner can observe:
+// the physical model and thinking level a request is routed to, the records
+// in the state folder, the usage store and printed lines.
 
 const originalEnv = {
   HOME: process.env.HOME,
@@ -183,46 +186,138 @@ function classifierAnswer(tier: string): string {
   return JSON.stringify({ tier, risk: { level: "none", reasons: [] }, ambiguity: "clear", complexity: "low", kindOfWork: "implement", why: `session classifier says ${tier}` });
 }
 
-async function loadAutoProvider(h: Harness, registry: SessionModelRegistry, deps: Partial<RouterDependencies> = {},
-  session: { readonly cwd?: string } = {}): Promise<AutoStream> {
-  return loadAutoProviderWith(h, registry, { classifierCall: () => answering("mechanical").call, ...deps }, session);
+const FIX_README = [{ role: "user", content: "Fix the typo in README.md", timestamp: 0 }];
+
+/** One request as the auto model routed it: the physical model and thinking
+ *  level pi sends it with, as `provider/id:level`, and the state it returned. */
+interface Routed {
+  readonly rung: string;
+  readonly model: RoutedModel;
+  readonly thinkingLevel: string;
+  readonly state: unknown;
+}
+
+/** A worker's requests on the auto model, carrying what pi would pass:
+ *  the router state last returned on the branch, `previous` once a request
+ *  answered, and `failed` on a retry. */
+interface WorkerRequests {
+  /** The first request after a message the user wrote: the task, a steer or a follow-up. */
+  user(): Promise<Routed>;
+  /** A request after tool results or extension messages. */
+  continuation(): Promise<Routed>;
+  /** The latest request ends with `errorMessage`, having produced `output`
+   *  first when given: the worker's message_end handlers see the failed
+   *  response, as pi runs them before it retries or the worker fails. */
+  fail(errorMessage: string, output?: string): Promise<void>;
+  /** The latest request fails as `fail` says, and pi retries it automatically. */
+  retry(errorMessage: string, output?: string): Promise<Routed>;
+  /** A request outside the agent loop, such as a compaction summary: no state. */
+  direct(): Promise<Routed>;
+  /** The latest request answered: later requests carry it as `previous`. */
+  answered(): void;
+  /** The router state pi keeps on the branch. */
+  readonly state: unknown;
+  /** Every request's routed rung, in order. */
+  readonly rungs: readonly string[];
+}
+
+/** The auto model as pi loaded it in a session whose model registry is `registry`. */
+interface AutoModel {
+  /** Every registration of the virtual model, in order. */
+  readonly registered: readonly VirtualModel[];
+  readonly handlers: ReturnType<typeof piHandlers>;
+  /** Routes one request of the worker session `sessionId` through the latest
+   *  registration, as pi does before it sends it: reason user and no state
+   *  unless `request` says otherwise. `branch` is the session branch route's
+   *  context exposes. */
+  route(sessionId: string | undefined, messages?: readonly unknown[], request?: Partial<RouteRequest>, branch?: readonly unknown[]): Promise<Routed>;
+  /** A worker session on the auto model, whose requests carry state and previous as pi passes them. */
+  worker(sessionId: string, messages?: readonly unknown[]): WorkerRequests;
+}
+
+async function loadAutoModel(h: Harness, registry: SessionModelRegistry, deps: Partial<RouterDependencies> = {},
+  session: { readonly cwd?: string } = {}): Promise<AutoModel> {
+  return loadRouterWith(h, registry, { classifierCall: () => answering("mechanical").call, ...deps }, session);
+}
+
+/** A worker's context as pi hands it to route and to the worker's handlers:
+ *  its session model is the auto model, which names no provider that answered. */
+function workerContext(h: Harness, sessionId: string | undefined, registry: SessionModelRegistry, branch: readonly unknown[] = []): ExtensionContext {
+  return { cwd: h.projectDir, hasUI: false, model: { provider: "orchestrator", id: "auto" }, modelRegistry: registry, thinkingLevel: "medium",
+    sessionManager: { getSessionId: () => sessionId, getBranch: () => branch } } as unknown as ExtensionContext;
 }
 
 /** The router extension as pi loads it, with the classifier call it would use
  *  in pi unless `deps` replaces it: the in-session call over the registry. */
-async function loadAutoProviderWith(h: Harness, registry: SessionModelRegistry, deps: Partial<RouterDependencies>,
-  session: { readonly cwd?: string } = {}): Promise<AutoStream> {
-  return (await loadRouterWith(h, registry, deps, session)).stream;
-}
-
-/** The router extension as pi loads it: the auto model's stream and the
- *  event handlers the extension registered. */
 async function loadRouterWith(h: Harness, registry: SessionModelRegistry, deps: Partial<RouterDependencies>,
-  session: { readonly cwd?: string } = {}): Promise<{ stream: AutoStream; handlers: ReturnType<typeof piHandlers> }> {
-  let provider: ProviderConfigInput | undefined;
+  session: { readonly cwd?: string } = {}): Promise<AutoModel> {
+  const registered: VirtualModel[] = [];
   const handlers = piHandlers();
   const createIsolatedRouterExtension = await isolatedRouterExtension();
   createIsolatedRouterExtension({ evidence: () => () => evidenceOf(), now: () => NOW, ...deps })({
-    registerProvider(name: string, config: ProviderConfigInput) { assert.equal(name, "orchestrator"); provider = config; },
-    registerVirtualModel() {},
+    registerProvider() { assert.fail("the router extension registers no provider"); },
+    registerVirtualModel(definition: VirtualModel) { registered.push(definition); },
     on(event: string, handler: Handler) { handlers.on(event, handler); },
   } as unknown as ExtensionAPI);
   await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, {
     cwd: session.cwd ?? h.projectDir, hasUI: false, model: SESSION_MODEL, modelRegistry: registry, thinkingLevel: "medium",
     sessionManager: { getSessionId: () => "parent" },
   });
-  assert.equal(provider?.models?.[0]?.id, "auto");
-  assert.ok(provider.streamSimple);
-  return { stream: provider.streamSimple, handlers };
+  assert.deepEqual(registered.map((definition) => `${definition.provider}/${definition.id}`).at(-1), "orchestrator/auto");
+  const route = async (sessionId: string | undefined, messages: readonly unknown[] = FIX_README, request: Partial<RouteRequest> = {},
+    branch: readonly unknown[] = []): Promise<Routed> => {
+    const routed = await registered.at(-1)!.route({ model: AUTO_MODEL, thinkingLevel: "medium", reason: "user", messages, ...request } as RouteRequest,
+      workerContext({ ...h, projectDir: session.cwd ?? h.projectDir }, sessionId, registry, branch) as never);
+    return { rung: `${routed.model.provider}/${routed.model.id}:${routed.thinkingLevel}`, model: routed.model, thinkingLevel: routed.thinkingLevel,
+      state: routed.state };
+  };
+  const worker = (sessionId: string, messages: readonly unknown[] = FIX_README): WorkerRequests => {
+    let state: unknown;
+    let previous: RouteRequest["previous"];
+    let latest: Routed | undefined;
+    const rungs: string[] = [];
+    const send = async (reason: RouteRequest["reason"], extra: Partial<RouteRequest> = {}) => {
+      const routed = await route(sessionId, messages, { reason, ...(reason === "direct" ? {} : { state }), ...(previous ? { previous } : {}), ...extra });
+      // pi stores returned state before it sends the request, except for a direct request's.
+      if (reason !== "direct" && routed.state !== undefined && routed.state !== state) state = routed.state;
+      latest = routed;
+      rungs.push(routed.rung);
+      return routed;
+    };
+    const failure = (errorMessage: string, output?: string) => {
+      assert.ok(latest, "a failure follows a request");
+      return { ...assistantMessage({ stopReason: "error", errorMessage, content: output === undefined ? [] : [{ type: "text", text: output }] }),
+        provider: latest.model.provider, model: latest.model.id };
+    };
+    const fail = async (errorMessage: string, output?: string) => {
+      await handlers.get("message_end")?.({ type: "message_end", message: failure(errorMessage, output) },
+        workerContext({ ...h, projectDir: session.cwd ?? h.projectDir }, sessionId, registry));
+    };
+    return {
+      user: () => send("user"),
+      continuation: () => send("continuation"),
+      direct: () => send("direct"),
+      fail,
+      async retry(errorMessage, output) {
+        await fail(errorMessage, output);
+        const message = failure(errorMessage, output);
+        return send("retry", { failed: { model: latest!.model, thinkingLevel: latest!.thinkingLevel, message } } as Partial<RouteRequest>);
+      },
+      answered() {
+        assert.ok(latest, "an answer follows a request");
+        previous = { model: latest.model, thinkingLevel: latest.thinkingLevel } as RouteRequest["previous"];
+      },
+      get state() { return state; },
+      rungs,
+    };
+  };
+  return { registered, handlers, route, worker };
 }
 
-async function autoEvents(stream: AutoStream, messages: unknown[], sessionId?: string, options: Partial<Parameters<AutoStream>[2]> = {}) {
-  const events = [];
-  for await (const event of stream(AUTO_MODEL, { messages } as unknown as Parameters<AutoStream>[1], { ...options, sessionId })) events.push(event);
-  return events;
+/** A worker's first request: reason user, no router state and no previous response. */
+async function firstRequest(auto: AutoModel, messages: readonly unknown[], sessionId: string): Promise<Routed> {
+  return auto.route(sessionId, messages);
 }
-
-const FIX_README = [{ role: "user", content: "Fix the typo in README.md", timestamp: 0 }];
 
 // context-mode's pi adapter appends this as a plain user message through the
 // `context` hook, after the delegated prompt and before the first reply.
@@ -233,8 +328,8 @@ test("text another extension appends after the delegated prompt sets no keyword 
   const h = harness(LIVE);
   try {
     const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-    const stream = await loadAutoProvider(h, registry);
-    await autoEvents(stream, [...FIX_README, { role: "user", content: CONTEXT_MODE_ANCHOR }], "injected-worker");
+    const auto = await loadAutoModel(h, registry);
+    await firstRequest(auto, [...FIX_README, { role: "user", content: CONTEXT_MODE_ANCHOR }], "injected-worker");
     const [record] = h.records();
     assert.ok(record?.recordType === "decision");
     assert.deepEqual(record.classification.floorSignals, []);
@@ -362,8 +457,8 @@ test("the classifier sees the worker's task, its agent role and the file paths t
   const h = harness(SHADOW);
   try {
     const classifier = answering("mechanical");
-    const stream = await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("ok") }]), { classifierCall: () => classifier.call });
-    await autoEvents(stream, [
+    const auto = await loadAutoModel(h, fakeSessionRegistry([{ events: answerEvents("ok") }]), { classifierCall: () => classifier.call });
+    await firstRequest(auto, [
       { role: "system", content: '<active_agent name="worker"/>', timestamp: 0 },
       { role: "user", content: "Fix `src/math.ts` and README.md, e.g. the add() typo; see https://example.com/issues/3 and (docs/specs/auto-routing.md).", timestamp: 0 },
     ], "paths-worker");
@@ -419,9 +514,8 @@ for (const [label, overrides, rung, reasons] of USAGE_CASES) {
     const h = harness(LIVE);
     try {
       const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-      const stream = await loadAutoProvider(h, registry, { evidence: () => () => evidenceOf(overrides) });
-      await autoEvents(stream, FIX_README, "usage-worker");
-      assert.equal(`${registry.calls[0]?.model.provider}/${registry.calls[0]?.model.id}:${registry.calls[0]?.options?.reasoning}`, rung);
+      const auto = await loadAutoModel(h, registry, { evidence: () => () => evidenceOf(overrides) });
+      assert.equal((await firstRequest(auto, FIX_README, "usage-worker")).rung, rung);
       const [record] = h.records();
       assert.equal(record?.recordType === "decision" && record.ranOn, rung);
       if (record?.recordType === "decision") assert.deepEqual(record.route.removed.map((removed) => removed.reason), reasons);
@@ -444,9 +538,8 @@ test("with the session allowance unable to cover any rung the route refuses on t
   const h = harness(LIVE);
   try {
     const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-    const stream = await loadAutoProvider(h, registry, { evidence: () => () => evidenceOf({ catalog: unaffordable(evidenceOf().catalog) }) });
-    assert.equal((await autoEvents(stream, FIX_README, "unaffordable-worker")).at(-1)?.type, "done");
-    assert.equal(registry.calls[0]?.options?.reasoning, "medium", "the session model's effort");
+    const auto = await loadAutoModel(h, registry, { evidence: () => () => evidenceOf({ catalog: unaffordable(evidenceOf().catalog) }) });
+    assert.equal((await firstRequest(auto, FIX_README, "unaffordable-worker")).rung, `${HAIKU}:medium`, "the session model at its effort");
     const [record] = h.records();
     assert.equal(record?.recordType === "decision" && record.route.outcome, "refused");
     if (record?.recordType === "decision") {
@@ -463,14 +556,15 @@ test("an unwritable record folder disables routing with one line and the worker 
     mkdirSync(h.stateDir);
     writeFileSync(join(h.stateDir, "routing"), "a file where the record folder should be\n");
     const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
+    let routed: Routed | undefined;
     const stderr = await stderrOf(async () => {
-      const stream = await loadAutoProvider(h, registry);
-      assert.equal((await autoEvents(stream, FIX_README, "unrecorded-worker")).at(-1)?.type, "done");
+      const auto = await loadAutoModel(h, registry);
+      routed = await firstRequest(auto, FIX_README, "unrecorded-worker");
     });
     const lines = stderr.split("\n").filter(Boolean);
     assert.equal(lines.length, 1, stderr);
     assert.match(lines[0]!, /^pi-orchestrator router disabled: .*(EEXIST|ENOTDIR)/);
-    assert.equal(registry.calls[0]?.options?.reasoning, "medium", "the session model's effort");
+    assert.equal(routed?.rung, `${HAIKU}:medium`, "the session model at its effort");
   } finally { h.cleanup(); }
 });
 
@@ -480,9 +574,9 @@ test("the state folder's approved-recipients store decides whether a rung surviv
   const h = harness(LIVE);
   try {
     const fakes = { evidence: stateFolderEvidence, classifierCall: () => answering("mechanical").call };
-    await autoEvents(await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("ok") }]), fakes), FIX_README, "worker-without-store");
+    await firstRequest(await loadAutoModel(h, fakeSessionRegistry([{ events: answerEvents("ok") }]), fakes), FIX_README, "worker-without-store");
     saveAuthorization(join(h.stateDir, "authorized-recipients.json"), approved("anthropic"));
-    await autoEvents(await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("ok") }]), fakes), FIX_README, "worker-with-store");
+    await firstRequest(await loadAutoModel(h, fakeSessionRegistry([{ events: answerEvents("ok") }]), fakes), FIX_README, "worker-with-store");
     assert.deepEqual(h.records().map((record) => [record.delegationId, record.recordType === "decision" && record.route.outcome, record.recordType === "decision" && record.ranOn]), [
       ["worker-without-store", "refused", `${HAIKU}:medium`],
       ["worker-with-store", "chosen", `${HAIKU}:low`],
@@ -495,7 +589,7 @@ test("under PI_ORCHESTRATOR_ROUTER_PROBE=1 the router says it loaded and that ro
   const h = harness(LIVE);
   process.env.PI_ORCHESTRATOR_ROUTER_PROBE = "1";
   try {
-    const stderr = await stderrOf(async () => { await loadAutoProvider(h, fakeSessionRegistry([])); });
+    const stderr = await stderrOf(async () => { await loadAutoModel(h, fakeSessionRegistry([])); });
     assert.deepEqual(stderr.split("\n").filter(Boolean), [
       "pi-orchestrator router: loaded",
       `pi-orchestrator router: routing enabled, mode live, records ${join(h.stateDir, "routing")}`,
@@ -511,7 +605,7 @@ test("the main session exports its model and effort at startup", async () => {
   try {
     delete process.env.PI_ORCHESTRATOR_SESSION_MODEL;
     const registry = fakeSessionRegistry([]);
-    await loadAutoProvider(h, registry);
+    await loadAutoModel(h, registry);
     assert.equal(process.env.PI_ORCHESTRATOR_SESSION_MODEL, `${HAIKU}:medium`);
   } finally { h.cleanup(); }
 });
@@ -547,26 +641,30 @@ test("a refused route runs on the session model with its effort and records ranO
   const h = harness(LIVE);
   try {
     const registry = fakeSessionRegistry([{ events: answerEvents("fallback") }]);
-    const stream = await loadAutoProvider(h, registry, { evidence: () => () => evidenceOf({ authorization: emptyAuthorization() }) });
+    const auto = await loadAutoModel(h, registry, { evidence: () => () => evidenceOf({ authorization: emptyAuthorization() }) });
     process.env.PI_ORCHESTRATOR_SESSION_MODEL = "anthropic/claude-sonnet-5:high";
-    const events = await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "refused-worker");
-    assert.equal(events.at(-1)?.type, "done");
-    assert.equal(registry.calls[0]?.model.id, "claude-sonnet-5");
-    assert.equal(registry.calls[0]?.options?.reasoning, "high");
+    const routed = await firstRequest(auto, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "refused-worker");
+    assert.equal(routed.rung, "anthropic/claude-sonnet-5:high");
     const [record] = h.records();
     assert.equal(record?.recordType === "decision" && record.route.outcome, "refused");
     assert.equal(record?.recordType === "decision" && record.ranOn, "anthropic/claude-sonnet-5:high");
   } finally { h.cleanup(); }
 });
 
-test("shadow mode runs on the session model but records the chosen rung", async () => {
+test("shadow mode runs on the orchestrator's physical session model, records the rung live routing would choose, and stays there", async () => {
   const h = harness(SHADOW);
   try {
-    const registry = fakeSessionRegistry([{ events: answerEvents("shadow") }]);
-    const stream = await loadAutoProvider(h, registry);
+    const registry = fakeSessionRegistry([]);
+    const auto = await loadAutoModel(h, registry);
     process.env.PI_ORCHESTRATOR_SESSION_MODEL = "anthropic/claude-sonnet-5:high";
-    assert.equal((await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "shadow-worker")).at(-1)?.type, "done");
-    assert.equal(registry.calls[0]?.model.id, "claude-sonnet-5");
+    const worker = auto.worker("shadow-worker", [{ role: "user", content: "Fix README.md", timestamp: 0 }]);
+    assert.equal((await worker.user()).rung, "anthropic/claude-sonnet-5:high");
+    worker.answered();
+    // The orchestrator moves on; its worker keeps the model it started on.
+    process.env.PI_ORCHESTRATOR_SESSION_MODEL = "anthropic/claude-opus-5:low";
+    assert.equal((await worker.continuation()).rung, "anthropic/claude-sonnet-5:high");
+    assert.equal((await worker.user()).rung, "anthropic/claude-sonnet-5:high");
+    assert.equal(h.records().length, 1);
     const [record] = h.records();
     assert.equal(record?.recordType === "decision" && record.route.outcome === "chosen" && record.route.rung.rung, `${HAIKU}:low`);
     assert.equal(record?.recordType === "decision" && record.handPickedModel, "anthropic/claude-sonnet-5");
@@ -593,10 +691,10 @@ test("balanced routing counts only pinned decisions inside the rolling five hour
     await seedDecision(h, "other-session", new Date(NOW.getTime() - 5 * 60 * 60 * 1000), "live");
     await seedDecision(h, "other-tier", NOW, "live", "anthropic", "standard");
     const otherProject = projectWithMechanicalTier(h, "other-project", [`${HAIKU}:low`]);
-    const other = await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("other") }]), {}, { cwd: otherProject });
-    await autoEvents(other, FIX_README, "other-project-worker");
-    const stream = await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("ok") }]));
-    await autoEvents(stream, FIX_README, "current-session");
+    const other = await loadAutoModel(h, fakeSessionRegistry([{ events: answerEvents("other") }]), {}, { cwd: otherProject });
+    await firstRequest(other, FIX_README, "other-project-worker");
+    const auto = await loadAutoModel(h, fakeSessionRegistry([{ events: answerEvents("ok") }]));
+    await firstRequest(auto, FIX_README, "current-session");
     const record = h.records().find((entry) => entry.delegationId === "current-session");
     assert.ok(record?.recordType === "decision" && record.route.outcome === "chosen");
     assert.equal(record.route.rung.model.split("/")[0], "openai-codex");
@@ -614,8 +712,8 @@ test("an ordered project tier pins its first surviving rung even when another pr
     writeFileSync(join(project, ".pi", "settings.json"), JSON.stringify({ orchestrator: { routing: {
       tiers: { mechanical: { order: "ordered", rungs: TEST_TIERS.mechanical } },
     } } }));
-    const stream = await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("ok") }]), {}, { cwd: project });
-    await autoEvents(stream, FIX_README, "ordered-worker");
+    const auto = await loadAutoModel(h, fakeSessionRegistry([{ events: answerEvents("ok") }]), {}, { cwd: project });
+    await firstRequest(auto, FIX_README, "ordered-worker");
     const record = h.records().find((entry) => entry.delegationId === "ordered-worker");
     assert.ok(record?.recordType === "decision" && record.route.outcome === "chosen");
     assert.equal(record.route.rung.model, HAIKU);
@@ -629,8 +727,8 @@ test("shadow recommendations do not change a live balanced choice", async () => 
   const h = harness(LIVE);
   try {
     await seedDecision(h, "shadow-other-session", NOW, "shadow");
-    const stream = await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("ok") }]));
-    await autoEvents(stream, FIX_README, "live-worker");
+    const auto = await loadAutoModel(h, fakeSessionRegistry([{ events: answerEvents("ok") }]));
+    await firstRequest(auto, FIX_README, "live-worker");
     const record = h.records().find((entry) => entry.delegationId === "live-worker");
     assert.ok(record?.recordType === "decision" && record.route.outcome === "chosen");
     assert.equal(record.route.rung.model, HAIKU);
@@ -642,8 +740,8 @@ test("parallel fan-out pins distinct providers and the second record sees the fi
   const h = harness(LIVE);
   try {
     const registry = fakeSessionRegistry([{ events: answerEvents("one") }, { events: answerEvents("two") }]);
-    const stream = await loadAutoProvider(h, registry);
-    await Promise.all([autoEvents(stream, FIX_README, "fanout-one"), autoEvents(stream, FIX_README, "fanout-two")]);
+    const auto = await loadAutoModel(h, registry);
+    await Promise.all([firstRequest(auto, FIX_README, "fanout-one"), firstRequest(auto, FIX_README, "fanout-two")]);
     const records = h.records().filter((entry) => entry.recordType === "decision");
     assert.equal(records.length, 2);
     assert.deepEqual(records.map((record) => record.route.outcome === "chosen" && record.route.rung.model.split("/")[0]), ["anthropic", "openai-codex"]);
@@ -667,15 +765,14 @@ test("parallel fan-out across separate worker providers reserves each choice in 
     const firstRegistry = fakeSessionRegistry([{ events: answerEvents("one") }]);
     const secondRegistry = fakeSessionRegistry([{ events: answerEvents("two") }]);
     const [first, second] = await Promise.all([
-      loadAutoProvider(h, firstRegistry, { classifierCall }),
-      loadAutoProvider(h, secondRegistry, { classifierCall }),
+      loadAutoModel(h, firstRegistry, { classifierCall }),
+      loadAutoModel(h, secondRegistry, { classifierCall }),
     ]);
-    const events = await Promise.all([
-      autoEvents(first, FIX_README, "separate-fanout-one"),
-      autoEvents(second, FIX_README, "separate-fanout-two"),
+    const routed = await Promise.all([
+      firstRequest(first, FIX_README, "separate-fanout-one"),
+      firstRequest(second, FIX_README, "separate-fanout-two"),
     ]);
-    assert.deepEqual(events.map((stream) => stream.at(-1)?.type), ["done", "done"]);
-    assert.deepEqual([firstRegistry.calls[0]?.model.provider, secondRegistry.calls[0]?.model.provider].sort(), ["anthropic", "openai-codex"]);
+    assert.deepEqual(routed.map((request) => request.model.provider).sort(), ["anthropic", "openai-codex"]);
     const records = h.records().filter((record) => record.recordType === "decision");
     assert.equal(records.length, 2);
     assert.deepEqual(records.map((record) => record.route.outcome === "chosen" && record.route.providerCounts), [
@@ -684,33 +781,17 @@ test("parallel fan-out across separate worker providers reserves each choice in 
   } finally { h.cleanup(); }
 });
 
-test("separate workers spread while the first request is pending but has not emitted an event", async () => {
+test("a worker's decision is recorded when its first request is routed, so the next worker routed spreads before the first answers", async () => {
   const h = harness(LIVE);
-  let release!: () => void;
-  const pending = new Promise<void>((resolve) => { release = resolve; });
   try {
-    const firstRegistry = fakeSessionRegistry([{ events: answerEvents("one") }]);
-    const delayed = { ...firstRegistry, streamSimple(model: Parameters<SessionModelRegistry["streamSimple"]>[0],
-      context: Parameters<SessionModelRegistry["streamSimple"]>[1], options: Parameters<SessionModelRegistry["streamSimple"]>[2]) {
-      const inner = firstRegistry.streamSimple(model, context, options);
-      return (async function* () { await pending; yield* inner; })();
-    } };
-    const secondRegistry = fakeSessionRegistry([{ events: answerEvents("two") }]);
-    const first = await loadAutoProvider(h, delayed);
-    const second = await loadAutoProvider(h, secondRegistry);
-    const firstResult = autoEvents(first, FIX_README, "pending-first");
-    for (let i = 0; firstRegistry.calls.length === 0 && i < 100; i++) await new Promise((resolve) => setTimeout(resolve, 2));
-    assert.equal(firstRegistry.calls.length, 1);
-    const secondResult = await autoEvents(second, FIX_README, "while-pending");
-    assert.equal(secondResult.at(-1)?.type, "done");
-    assert.equal(secondRegistry.calls[0]?.model.provider, "openai-codex");
-    const [record] = h.records();
-    assert.equal(record?.recordType === "decision" && record.delegationId, "while-pending", "only the started request has a decision");
+    const first = await loadAutoModel(h, fakeSessionRegistry([]));
+    const second = await loadAutoModel(h, fakeSessionRegistry([]));
+    assert.equal((await firstRequest(first, FIX_README, "routed-first")).model.provider, "anthropic");
+    assert.deepEqual(h.records().map((record) => record.delegationId), ["routed-first"], "recorded before pi sends the request");
+    assert.equal((await firstRequest(second, FIX_README, "routed-next")).model.provider, "openai-codex");
+    const record = h.records().find((entry) => entry.delegationId === "routed-next");
     assert.equal(record?.recordType === "decision" && record.route.outcome === "chosen" && record.route.providerCounts?.anthropic, 1);
-    release();
-    assert.equal((await firstResult).at(-1)?.type, "done");
-    assert.equal(h.records().length, 2);
-  } finally { release(); h.cleanup(); }
+  } finally { h.cleanup(); }
 });
 
 test("a slower classifier sees a later worker's pin when it finally chooses", async () => {
@@ -720,21 +801,18 @@ test("a slower classifier sees a later worker's pin when it finally chooses", as
   const wait = new Promise<void>((resolve) => { release = resolve; });
   const entered = new Promise<void>((resolve) => { arrived = resolve; });
   try {
-    const slowRegistry = fakeSessionRegistry([{ events: answerEvents("slow") }]);
-    const fastRegistry = fakeSessionRegistry([{ events: answerEvents("fast") }]);
     let slowClock = NOW;
-    const slow = await loadAutoProvider(h, slowRegistry, {
+    const slow = await loadAutoModel(h, fakeSessionRegistry([]), {
       now: () => slowClock,
       classifierCall: () => async () => { arrived(); await wait; return classifierAnswer("mechanical"); },
     });
-    const fast = await loadAutoProvider(h, fastRegistry, { now: () => new Date(NOW.getTime() + 1_000) });
-    const slowResult = autoEvents(slow, FIX_README, "slow-classifier");
+    const fast = await loadAutoModel(h, fakeSessionRegistry([]), { now: () => new Date(NOW.getTime() + 1_000) });
+    const slowResult = firstRequest(slow, FIX_README, "slow-classifier");
     await entered;
-    assert.equal((await autoEvents(fast, FIX_README, "fast-classifier")).at(-1)?.type, "done");
+    assert.equal((await firstRequest(fast, FIX_README, "fast-classifier")).model.provider, "anthropic");
     slowClock = new Date(NOW.getTime() + 2_000);
     release();
-    assert.equal((await slowResult).at(-1)?.type, "done");
-    assert.equal(slowRegistry.calls[0]?.model.provider, "openai-codex", "the choice uses the clock after classification");
+    assert.equal((await slowResult).model.provider, "openai-codex", "the choice uses the clock after classification");
     const slowRecord = h.records().find((record) => record.delegationId === "slow-classifier");
     assert.ok(slowRecord?.recordType === "decision" && slowRecord.route.outcome === "chosen");
     assert.deepEqual(slowRecord.route.providerCounts, { anthropic: 1, "openai-codex": 0 });
@@ -748,118 +826,71 @@ test("a corrupt pending-choice file cannot disable routing for later workers", a
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "torn.json"), "{not valid json");
     writeFileSync(join(dir, "null.json"), "null");
-    const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-    const stream = await loadAutoProvider(h, registry);
-    assert.equal((await autoEvents(stream, FIX_README, "after-corrupt-reservation")).at(-1)?.type, "done");
-    assert.equal(registry.calls[0]?.model.provider, "anthropic");
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]));
+    assert.equal((await firstRequest(auto, FIX_README, "after-corrupt-reservation")).model.provider, "anthropic");
     const decision = h.records().find((record) => record.delegationId === "after-corrupt-reservation");
     assert.ok(decision?.recordType === "decision" && decision.mode === "live");
   } finally { h.cleanup(); }
 });
 
-test("a decision write failure disables the router after a request has started", async () => {
+test("a decision write failure disables the router with one line and the worker runs on the session model", async () => {
   const h = harness(LIVE);
   const dir = join(h.stateDir, "routing");
   try {
-    const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-    // Classification and routing can read this folder, and the provider can
-    // start, but appending the decision after its first event fails.
+    // Classification and routing can read this folder, but appending the decision fails.
     mkdirSync(dir, { recursive: true });
     chmodSync(dir, 0o500);
+    let routed: Routed | undefined;
     const output = await stderrOf(async () => {
-      const stream = await loadAutoProvider(h, registry);
-      assert.equal((await autoEvents(stream, FIX_README, "cannot-write-decision")).at(-1)?.type, "error");
+      const auto = await loadAutoModel(h, fakeSessionRegistry([]));
+      routed = await firstRequest(auto, FIX_README, "cannot-write-decision");
     });
     assert.match(output, /router disabled/);
+    assert.equal(routed?.rung, `${HAIKU}:medium`, "no request goes out on a rung the records do not show");
+    assert.equal(routed?.state, undefined, "a fallback after a failure pins nothing");
   } finally { if (existsSync(dir)) chmodSync(dir, 0o700); h.cleanup(); }
 });
 
-test("a lazy request preparation failure does not count as a pinned delegation", async () => {
-  const h = harness(LIVE);
-  try {
-    const registry = fakeSessionRegistry([{ events: answerEvents("unused") }]);
-    const lazy = { ...registry, streamSimple(model: Parameters<SessionModelRegistry["streamSimple"]>[0],
-      context: Parameters<SessionModelRegistry["streamSimple"]>[1], options: Parameters<SessionModelRegistry["streamSimple"]>[2]) {
-      registry.streamSimple(model, context, options);
-      return (async function* (): AsyncGenerator<ReturnType<typeof answerEvents>[number]> { throw new Error("lazy request preparation failed"); })();
-    } };
-    const first = await loadAutoProvider(h, lazy);
-    assert.equal((await autoEvents(first, FIX_README, "lazy-failed")).at(-1)?.type, "error");
-    assert.deepEqual(h.records(), []);
-    const next = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-    const second = await loadAutoProvider(h, next);
-    assert.equal((await autoEvents(second, FIX_README, "after-lazy-failure")).at(-1)?.type, "done");
-    assert.equal(next.calls[0]?.model.provider, "anthropic");
-  } finally { h.cleanup(); }
-});
-
-test("a rung missing from the registry never counts as a pinned delegation", async () => {
+test("a rung missing from the registry fails the worker's request and never counts as a pinned delegation", async () => {
   const h = harness({ ...LIVE, tiers: { ...TEST_TIERS, mechanical: ["anthropic/claude-sonnet-5:low", "openai-codex/gpt-6-luna:low"] } });
   try {
     const missing = fakeSessionRegistry([]);
     let unavailable = false;
     const registry = { ...missing, find: (provider: string, id: string) =>
       unavailable && id === "claude-sonnet-5" ? undefined : missing.find(provider, id) };
-    const first = await loadAutoProvider(h, registry, { classifierCall: () => answering("mechanical").call });
+    const first = await loadAutoModel(h, registry, { classifierCall: () => answering("mechanical").call });
     unavailable = true;
-    const failed = await autoEvents(first, FIX_README, "missing-rung-worker");
-    assert.equal(failed.at(-1)?.type, "error");
-    assert.equal(missing.calls.length, 0);
-    assert.deepEqual(h.records(), [], "a failed lookup made no provider request");
+    await assert.rejects(firstRequest(first, FIX_README, "missing-rung-worker"), /pinned rung anthropic\/claude-sonnet-5 is missing from the session model registry/);
+    assert.deepEqual(h.records(), [], "a failed lookup records nothing");
 
-    const restored = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-    const second = await loadAutoProvider(h, restored);
-    assert.equal((await autoEvents(second, FIX_README, "after-missing-rung")).at(-1)?.type, "done");
-    assert.equal(restored.calls[0]?.model.provider, "anthropic", "a failed lookup cannot skew balancing");
+    const second = await loadAutoModel(h, fakeSessionRegistry([]));
+    assert.equal((await firstRequest(second, FIX_README, "after-missing-rung")).model.provider, "anthropic", "a failed lookup cannot skew balancing");
     const record = h.records().find((entry) => entry.delegationId === "after-missing-rung");
     assert.ok(record?.recordType === "decision" && record.route.outcome === "chosen");
     assert.deepEqual(record.route.providerCounts, { anthropic: 0, "openai-codex": 0 });
   } finally { h.cleanup(); }
 });
 
-test("a provider request that fails to start does not reserve a balanced choice", async () => {
-  const h = harness(LIVE);
-  try {
-    const failedRegistry = fakeSessionRegistry([{ throws: "could not start request" }]);
-    const first = await loadAutoProvider(h, failedRegistry);
-    assert.equal((await autoEvents(first, FIX_README, "cannot-start")).at(-1)?.type, "error");
-    assert.deepEqual(h.records(), []);
-    const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-    const second = await loadAutoProvider(h, registry);
-    assert.equal((await autoEvents(second, FIX_README, "after-cannot-start")).at(-1)?.type, "done");
-    assert.equal(registry.calls[0]?.model.provider, "anthropic");
-  } finally { h.cleanup(); }
-});
-
 test("when routing is not enabled the auto model runs on the session model without a record", async () => {
   const h = harness({ ...LIVE, enabled: false });
   try {
-    const registry = fakeSessionRegistry([{ events: answerEvents("unrouted") }]);
-    const stream = await loadAutoProvider(h, registry);
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]));
     process.env.PI_ORCHESTRATOR_SESSION_MODEL = "anthropic/claude-sonnet-5:medium";
-    assert.equal((await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "off-worker")).at(-1)?.type, "done");
-    assert.equal(registry.calls[0]?.model.id, "claude-sonnet-5");
-    assert.equal(registry.calls[0]?.options?.reasoning, "medium");
+    const routed = await firstRequest(auto, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "off-worker");
+    assert.equal(routed.rung, "anthropic/claude-sonnet-5:medium");
+    assert.equal(routed.state, undefined, "with routing off nothing is pinned, as before");
     assert.deepEqual(h.records(), []);
   } finally { h.cleanup(); }
 });
 
-test("the auto model fails with a reason and forwards nothing when the session model is missing or banned", async () => {
+test("the auto model refuses the request with a reason when the session model is missing or banned", async () => {
   const h = harness(LIVE, { subagentBanList: ["sonnet"] });
   try {
-    const registry = fakeSessionRegistry([]);
-    const stream = await loadAutoProvider(h, registry, { evidence: () => () => evidenceOf({ authorization: emptyAuthorization() }) });
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]), { evidence: () => () => evidenceOf({ authorization: emptyAuthorization() }) });
     delete process.env.PI_ORCHESTRATOR_SESSION_MODEL;
-    const missing = await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "missing-worker");
-    assert.equal(missing.at(-1)?.type, "error");
-    const missingFinal = missing.at(-1);
-    if (missingFinal?.type === "error") assert.match(missingFinal.error.errorMessage ?? "", /PI_ORCHESTRATOR_SESSION_MODEL.*missing/);
+    await assert.rejects(firstRequest(auto, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "missing-worker"), /PI_ORCHESTRATOR_SESSION_MODEL.*missing/);
     process.env.PI_ORCHESTRATOR_SESSION_MODEL = "anthropic/claude-sonnet-5:high";
-    const banned = await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "banned-worker");
-    assert.equal(banned.at(-1)?.type, "error");
-    const bannedFinal = banned.at(-1);
-    if (bannedFinal?.type === "error") assert.match(bannedFinal.error.errorMessage ?? "", /subagent ban list.*sonnet/);
-    assert.equal(registry.calls.length, 0);
+    await assert.rejects(firstRequest(auto, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "banned-worker"), /subagent ban list.*sonnet/);
     assert.deepEqual(h.records(), []);
   } finally { h.cleanup(); }
 });
@@ -867,67 +898,63 @@ test("the auto model fails with a reason and forwards nothing when the session m
 test("an internal routing failure disables routing once and later workers still run on the session model", async () => {
   const h = harness(LIVE);
   try {
-    const registry = fakeSessionRegistry([{ events: answerEvents("first") }, { events: answerEvents("second") }]);
-    const stream = await loadAutoProvider(h, registry, { evidence: () => () => { throw new Error("evidence exploded"); } });
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]), { evidence: () => () => { throw new Error("evidence exploded"); } });
     process.env.PI_ORCHESTRATOR_SESSION_MODEL = "anthropic/claude-sonnet-5:high";
+    const rungs: string[] = [];
     const stderr = await stderrOf(async () => {
-      for (const id of ["failed-one", "failed-two"]) {
-        const events = await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], id);
-        assert.equal(events.at(-1)?.type, "done");
-      }
+      for (const id of ["failed-one", "failed-two"]) rungs.push((await firstRequest(auto, [{ role: "user", content: "Fix README.md", timestamp: 0 }], id)).rung);
     });
     assert.deepEqual(stderr.split("\n").filter(Boolean), ["pi-orchestrator router disabled: evidence exploded"]);
-    assert.deepEqual(registry.calls.map((call) => [call.model.id, call.options?.reasoning]), [["claude-sonnet-5", "high"], ["claude-sonnet-5", "high"]]);
+    assert.deepEqual(rungs, ["anthropic/claude-sonnet-5:high", "anthropic/claude-sonnet-5:high"]);
     assert.deepEqual(h.records(), []);
   } finally { h.cleanup(); }
 });
 
-test("provider and startup failures across extension instances print one disabled line per process", async () => {
+test("routing and startup failures across extension instances print one disabled line per process", async () => {
   const first = harness(LIVE);
   const second = harness({ ...LIVE, classifier: { model: "anthropic/unknown:low" } });
   try {
     startFreshProcess();
-    const setup = async (h: Harness, failure: "provider" | "startup") => {
+    const setup = async (h: Harness, failure: "routing" | "startup") => {
       // pi gives every load its own module copy; the line is still once per process.
       const { createRouterExtension: fresh } = await import(`./extension.ts?disable-process-${failure}-${++isolatedModule}`);
       process.env.PI_CODING_AGENT_DIR = h.agentDir;
       process.env.PI_ORCHESTRATOR_STATE_DIR = h.stateDir;
       const handlers = piHandlers();
-      let provider: ProviderConfigInput | undefined;
+      let definition: VirtualModel | undefined;
       fresh({ classifierCall: () => answering("mechanical").call,
         evidence: () => () => { if (failure !== "startup") throw new Error(`${failure} evidence exploded`); return evidenceOf(); }, now: () => NOW })({
         on(event: string, handler: Handler) { handlers.on(event, handler); },
-        registerProvider(_name: string, config: ProviderConfigInput) { provider = config; },
-        registerVirtualModel() {},
+        registerVirtualModel(registered: VirtualModel) { definition = registered; },
       } as unknown as ExtensionAPI);
+      const registry = fakeSessionRegistry([]);
       await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, {
-        cwd: h.projectDir, hasUI: false, model: SESSION_MODEL, thinkingLevel: "medium", modelRegistry: fakeSessionRegistry([{ events: answerEvents("ok") }]),
+        cwd: h.projectDir, hasUI: false, model: SESSION_MODEL, thinkingLevel: "medium", modelRegistry: registry,
         sessionManager: { getSessionId: () => "parent" },
       });
-      return { stream: provider?.streamSimple };
+      return { definition, ctx: workerContext(h, "routing-failure", registry) };
     };
     const stderr = await stderrOf(async () => {
-      const provider = await setup(first, "provider");
-      assert.ok(provider.stream);
-      assert.equal((await autoEvents(provider.stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "provider-failure")).at(-1)?.type, "done");
+      const { definition, ctx } = await setup(first, "routing");
+      assert.ok(definition);
+      const routed = await definition.route({ model: AUTO_MODEL, thinkingLevel: "medium", reason: "user", messages: FIX_README } as unknown as RouteRequest, ctx as never);
+      assert.equal(`${routed.model.provider}/${routed.model.id}`, HAIKU);
       await setup(second, "startup");
     });
-    assert.deepEqual(stderr.split("\n").filter(Boolean), ["pi-orchestrator router disabled: provider evidence exploded"]);
+    assert.deepEqual(stderr.split("\n").filter(Boolean), ["pi-orchestrator router disabled: routing evidence exploded"]);
   } finally { first.cleanup(); second.cleanup(); }
 });
 
-test("a startup routing failure still forwards the auto model to the session model", async () => {
+test("a startup routing failure still routes the auto model to the session model", async () => {
   const h = harness({ ...LIVE, classifier: { model: "anthropic/unknown:low" } });
   try {
-    const registry = fakeSessionRegistry([{ events: answerEvents("startup fallback") }]);
-    let stream!: AutoStream;
+    let routed: Routed | undefined;
     const stderr = await stderrOf(async () => {
-      stream = await loadAutoProvider(h, registry);
-      const events = await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "startup-failed-worker");
-      assert.equal(events.at(-1)?.type, "done");
+      const auto = await loadAutoModel(h, fakeSessionRegistry([]));
+      routed = await firstRequest(auto, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "startup-failed-worker");
     });
     assert.match(stderr, /pi-orchestrator router disabled: classifier rung/);
-    assert.equal(registry.calls[0]?.model.id, "claude-haiku-4-5");
+    assert.equal(routed?.rung, `${HAIKU}:medium`);
     assert.deepEqual(h.records(), []);
   } finally { h.cleanup(); }
 });
@@ -936,8 +963,8 @@ test("the auto model reads the agent role from system prompt sections and text p
   const h = harness(LIVE);
   try {
     const classifier = answering("mechanical");
-    const stream = await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("ok") }]), { classifierCall: () => classifier.call });
-    await autoEvents(stream, [
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => classifier.call });
+    await firstRequest(auto, [
       { role: "system", content: [{ type: "text", text: "ordinary prompt" }], sections: { preamble: "instructions", addendum: '<active_agent name="reviewer"/>' }, timestamp: 0 },
       { role: "user", content: "Review README.md", timestamp: 0 },
     ], "sections-worker");
@@ -950,8 +977,8 @@ test("the auto model reads the agent role from system prompt sections and text p
 test("the auto model reads the agent role from system text parts", async () => {
   const h = harness(LIVE);
   try {
-    const stream = await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("ok") }]));
-    await autoEvents(stream, [
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]));
+    await firstRequest(auto, [
       { role: "system", content: [{ type: "text", text: '<active_agent name="worker"/>' }], timestamp: 0 },
       { role: "user", content: "Fix README.md", timestamp: 0 },
     ], "text-parts-worker");
@@ -960,54 +987,17 @@ test("the auto model reads the agent role from system text parts", async () => {
   } finally { h.cleanup(); }
 });
 
-// pi-subagents puts the agent's thinking level on the requested model, so
-// the caller passes `reasoning`; the rung's effort replaces it (ADR 0006).
-test("the auto model sends no reasoning option for an off rung, whatever the caller asked", async () => {
+// pi-subagents puts the agent's thinking level on the requested model; the
+// rung's effort replaces it (ADR 0006). pi clamps the returned level to the
+// physical model (docs/virtual-models.md, "Route requests").
+test("the auto model routes with the rung's effort, off included, whatever thinking level the worker selected", async () => {
   const h = harness({ ...LIVE, tiers: { ...TEST_TIERS, mechanical: [`${HAIKU}:off`] } });
   try {
-    const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-    const stream = await loadAutoProvider(h, registry);
-    await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "off-worker", { reasoning: "high" });
-    assert.equal(Object.hasOwn(registry.calls[0]?.options ?? {}, "reasoning"), false);
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]));
+    const routed = await auto.route("off-worker", [{ role: "user", content: "Fix README.md", timestamp: 0 }], { thinkingLevel: "high" });
+    assert.equal(routed.rung, `${HAIKU}:off`);
   } finally { h.cleanup(); }
 });
-
-test("the auto model clamps the rung's effort to the current model's supported levels", async () => {
-  const h = harness(LIVE);
-  try {
-    const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-    const currentRegistry: SessionModelRegistry = { ...registry, find(provider, id) {
-      const model = registry.find(provider, id);
-      return model?.id === "claude-haiku-4-5" ? { ...model, reasoning: false } : model;
-    } };
-    const stream = await loadAutoProvider(h, currentRegistry);
-    await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "clamped-worker", { reasoning: "low" });
-    assert.equal(Object.hasOwn(registry.calls[0]?.options ?? {}, "reasoning"), false);
-  } finally { h.cleanup(); }
-});
-
-async function autoScenario(h: Harness) {
-  const classifier = answering("mechanical");
-  const real = { provider: "anthropic", model: "claude-haiku-4-5", api: "anthropic-messages" };
-  const usage = { input: 12, output: 8, cacheRead: 1, cacheWrite: 0, totalTokens: 21, cost: { total: 0.007 } };
-  const registry = fakeSessionRegistry([
-    { events: [{ type: "start", partial: assistantMessage({ ...real, usage }) } as never, ...answerEvents("hello", { ...real, usage }).slice(1)] },
-    { events: errorEvents("rung failed") },
-  ], INSTALLED_MODEL_INFO.map((entry) => ({ ...entry, api: "anthropic-messages" })));
-  const stream = await loadAutoProvider(h, registry, { classifierCall: () => classifier.call });
-  const previous = { ...assistantMessage({ content: [{ type: "thinking", thinking: "old" }] }), ...AUTO_MODEL, model: "auto" };
-  const context = [{ role: "system", content: '<active_agent name="worker"/>', timestamp: 0 },
-    { role: "user", content: "Fix README.md", timestamp: 0 }];
-  const signal = new AbortController().signal;
-  const onPayload = () => {};
-  const onResponse = () => {};
-  const options = { sessionId: "worker-1", apiKey: "wrong", headers: { Authorization: "wrong" }, reasoning: "high" as const, signal, onPayload, onResponse };
-  const first = [];
-  for await (const event of stream(AUTO_MODEL, { messages: context } as unknown as Parameters<AutoStream>[1], options)) first.push(event);
-  const second = [];
-  for await (const event of stream(AUTO_MODEL, { messages: [...context, previous] } as unknown as Parameters<AutoStream>[1], options)) second.push(event);
-  return { classifier, real, usage, registry, previous, signal, onPayload, onResponse, options, first, second };
-}
 
 // ---------------------------------------------------------------------------
 // The main thread stays on the model picked in /model (ADR 0006): a user's
@@ -1156,30 +1146,135 @@ test("selecting any other model for the main thread is not affected", async () =
   } finally { h.cleanup(); }
 });
 
-test("a worker on the auto model forwards with the rung's effort and credentials", async () => {
+// ---------------------------------------------------------------------------
+// Request reasons (docs/virtual-models.md, "Route requests"): pi routes every
+// request of a worker on the auto model. The first is classified, recorded
+// and pinned in router state; the rest go to the pin by reason.
+// ---------------------------------------------------------------------------
+
+/** The session branch entry pi appends for router state the route returned. */
+function stateEntry(state: unknown) {
+  return { type: "custom", customType: "pi.virtual-model-state", id: "state", parentId: null, timestamp: NOW.toISOString(),
+    data: { provider: "orchestrator", modelId: "auto", state } };
+}
+
+test("a worker's first request is classified, recorded and pinned; steers, follow-ups and continuations stay on the pin without classifying again", async () => {
   const h = harness(LIVE);
   try {
-    const { registry, signal, onPayload, onResponse, options } = await autoScenario(h);
-    assert.equal(registry.calls[0]?.model.provider, "anthropic");
-    assert.equal(registry.calls[0]?.model.id, "claude-haiku-4-5");
-    assert.equal(registry.calls[0]?.options?.reasoning, "low");
-    assert.equal(registry.calls[0]?.options?.signal, signal);
-    assert.equal((registry.calls[0]?.options as typeof options).onPayload, onPayload);
-    assert.equal((registry.calls[0]?.options as typeof options).onResponse, onResponse);
-    assert.equal("apiKey" in (registry.calls[0]?.options ?? {}), false);
-    assert.equal("headers" in (registry.calls[0]?.options ?? {}), false);
+    const classifier = answering("mechanical");
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => classifier.call });
+    const worker = auto.worker("pinned-worker", [{ role: "system", content: '<active_agent name="worker"/>', timestamp: 0 }, ...FIX_README]);
+    const first = await worker.user();
+    assert.equal(first.rung, `${HAIKU}:low`);
+    assert.ok(first.state !== undefined, "the pin is returned as router state");
+    worker.answered();
+    // A new worker would now be balanced onto the other provider.
+    for (const request of [() => worker.continuation(), () => worker.user(), () => worker.continuation()]) {
+      const next = await request();
+      assert.equal(next.rung, `${HAIKU}:low`);
+      assert.equal(next.state, first.state, "the stored state is kept, not replaced");
+    }
+    assert.equal(classifier.prompts.length, 1);
+    assert.match(classifier.prompts[0]!, /Agent role: worker/);
+    const records = h.records();
+    assert.equal(records.length, 1);
+    const [record] = records;
+    assert.equal(record?.recordType, "decision");
+    assert.equal(record.schemaVersion, "decision-record/3");
+    assert.equal(record.delegationId, "pinned-worker");
+    assert.equal(record.recordType === "decision" && record.ranOn, `${HAIKU}:low`);
   } finally { h.cleanup(); }
 });
 
-test("later requests keep the session pin without classifying again", async () => {
+test("a pin in the branch's router state is kept in another process without classifying or recording, where routing would choose another rung", async () => {
   const h = harness(LIVE);
   try {
-    const { classifier, registry } = await autoScenario(h);
-    assert.equal(classifier.prompts.length, 1);
-    assert.match(classifier.prompts[0]!, /Agent role: worker/);
-    assert.equal(registry.calls.length, 2);
-    assert.deepEqual(registry.calls.map((call) => call.model.id), ["claude-haiku-4-5", "claude-haiku-4-5"]);
+    const state = (await (await loadAutoModel(h, fakeSessionRegistry([]))).worker("state-worker").user()).state;
+    const classifier = answering("critical");
+    const later = await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => classifier.call });
+    for (const reason of ["user", "continuation"] as const) {
+      const routed = await later.route("state-worker", FIX_README, { reason, state });
+      assert.equal(routed.rung, `${HAIKU}:low`, reason);
+    }
+    assert.equal(classifier.prompts.length, 0);
     assert.equal(h.records().length, 1);
+  } finally { h.cleanup(); }
+});
+
+test("router state that is not a pin is ignored and the request is routed as a first request", async () => {
+  const h = harness(LIVE);
+  try {
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]));
+    const routed = await auto.route("odd-state-worker", FIX_README, { state: { phase: "plan" } });
+    assert.equal(routed.rung, `${HAIKU}:low`);
+    assert.equal(h.records().length, 1);
+  } finally { h.cleanup(); }
+});
+
+test("a direct request goes to the model that answered last, else to the pin the branch stores, without classifying or recording", async () => {
+  const h = harness(LIVE);
+  try {
+    const classifier = answering("mechanical");
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => classifier.call });
+    const worker = auto.worker("direct-worker");
+    const first = await worker.user();
+    worker.answered();
+    // A compaction summary: pi passes no state, only the latest response.
+    const summary = await worker.direct();
+    assert.equal(summary.rung, first.rung);
+    assert.equal(summary.state, undefined);
+    // Before any answer, the branch's router state names the pin.
+    const early = await auto.route("direct-worker", FIX_README, { reason: "direct" }, [stateEntry(first.state)]);
+    assert.equal(early.rung, first.rung);
+    assert.equal(classifier.prompts.length, 1);
+    assert.equal(h.records().length, 1);
+  } finally { h.cleanup(); }
+});
+
+test("a direct request with no answer and no pin is routed as a first request and stores no state", async () => {
+  const h = harness(LIVE);
+  try {
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]));
+    const routed = await auto.route("direct-first", [{ role: "user", content: "Summarize the conversation above", timestamp: 0 }], { reason: "direct" });
+    assert.equal(routed.rung, `${HAIKU}:low`);
+    assert.equal(routed.state, undefined, "pi ignores a direct request's state, so none is returned");
+    assert.deepEqual(h.records().map((record) => record.delegationId), ["direct-first"]);
+  } finally { h.cleanup(); }
+});
+
+test("a retry after an error that is no limit stays on the failed model, before and after output", async () => {
+  const h = harness(LIVE);
+  try {
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]));
+    const worker = auto.worker("transient-worker");
+    const first = await worker.user();
+    assert.equal((await worker.retry("socket hang up")).rung, first.rung, "a first request that failed before output");
+    assert.equal((await worker.retry("503 service unavailable", "partial")).rung, first.rung);
+    worker.answered();
+    assert.equal((await worker.continuation()).rung, first.rung);
+    assert.equal((await worker.retry("overloaded")).rung, first.rung, "a later request");
+    assert.equal(h.records().length, 1);
+  } finally { h.cleanup(); }
+});
+
+test("a retry of a worker with no pin stored stays on the model its request failed on", async () => {
+  const h = harness({ ...LIVE, enabled: false });
+  try {
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]));
+    process.env.PI_ORCHESTRATOR_SESSION_MODEL = "anthropic/claude-sonnet-5:high";
+    const worker = auto.worker("unpinned-worker");
+    assert.equal((await worker.user()).rung, "anthropic/claude-sonnet-5:high");
+    process.env.PI_ORCHESTRATOR_SESSION_MODEL = "anthropic/claude-opus-5:low";
+    assert.equal((await worker.retry("429 too many requests")).rung, "anthropic/claude-sonnet-5:high");
+  } finally { h.cleanup(); }
+});
+
+test("an auto model request without a session id is refused with a clear error and records nothing", async () => {
+  const h = harness(LIVE);
+  try {
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]));
+    await assert.rejects(auto.route(undefined, [{ role: "user", content: "Fix README.md", timestamp: 0 }]), /no session id/);
+    assert.equal(h.records().length, 0);
   } finally { h.cleanup(); }
 });
 
@@ -1187,15 +1282,13 @@ test("shadow mode classifies rather than restoring an earlier live pin", async (
   const h = harness(LIVE);
   try {
     const messages = [{ role: "user", content: "Fix README.md", timestamp: 0 }];
-    await autoEvents(await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("live") }])), messages, "mode-changed-worker");
+    await firstRequest(await loadAutoModel(h, fakeSessionRegistry([{ events: answerEvents("live") }])), messages, "mode-changed-worker");
     writeFileSync(join(h.agentDir, "settings.json"), JSON.stringify({ orchestrator: { routing: SHADOW } }));
     const classifier = answering("standard");
-    const registry = fakeSessionRegistry([{ events: answerEvents("shadow") }]);
-    const stream = await loadAutoProvider(h, registry, { classifierCall: () => classifier.call });
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => classifier.call });
     process.env.PI_ORCHESTRATOR_SESSION_MODEL = "anthropic/claude-sonnet-5:high";
-    assert.equal((await autoEvents(stream, messages, "mode-changed-worker")).at(-1)?.type, "done");
+    assert.equal((await firstRequest(auto, messages, "mode-changed-worker")).model.id, "claude-sonnet-5");
     assert.equal(classifier.prompts.length, 1);
-    assert.equal(registry.calls[0]?.model.id, "claude-sonnet-5");
     assert.deepEqual(h.records().map((record) => record.recordType === "decision" && record.mode), ["live", "shadow"]);
   } finally { h.cleanup(); }
 });
@@ -1203,15 +1296,13 @@ test("shadow mode classifies rather than restoring an earlier live pin", async (
 test("a resumed worker reuses its recorded rung without classifying or writing a record", async () => {
   const h = harness(LIVE);
   try {
-    const first = await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("first") }]));
+    const first = await loadAutoModel(h, fakeSessionRegistry([{ events: answerEvents("first") }]));
     const messages = [{ role: "user", content: "Fix README.md", timestamp: 0 }];
-    await autoEvents(first, messages, "resumed-worker");
+    await firstRequest(first, messages, "resumed-worker");
     const classifier = answering("standard");
-    const registry = fakeSessionRegistry([{ events: answerEvents("resumed") }]);
-    const resumed = await loadAutoProvider(h, registry, { classifierCall: () => classifier.call });
-    await autoEvents(resumed, messages, "resumed-worker");
-    assert.equal(registry.calls[0]?.model.id, "claude-haiku-4-5");
-    assert.equal(registry.calls[0]?.options?.reasoning, "low");
+    const resumed = await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => classifier.call });
+    // A branch from before router state: the decision record restores the pin.
+    assert.equal((await firstRequest(resumed, messages, "resumed-worker")).rung, `${HAIKU}:low`);
     assert.equal(classifier.prompts.length, 0);
     assert.equal(h.records().length, 1);
   } finally { h.cleanup(); }
@@ -1221,14 +1312,12 @@ test("a resumed worker reuses a rung written in settings with different case", a
   const mixedCase = { ...TEST_TIERS, mechanical: ["Anthropic/Claude-Haiku-4-5:low", "openai-codex/gpt-6-luna:low"] };
   const h = harness({ ...LIVE, tiers: mixedCase });
   try {
-    const first = await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("first") }]));
+    const first = await loadAutoModel(h, fakeSessionRegistry([{ events: answerEvents("first") }]));
     const messages = [{ role: "user", content: "Fix README.md", timestamp: 0 }];
-    await autoEvents(first, messages, "mixed-case-worker");
+    await firstRequest(first, messages, "mixed-case-worker");
     const classifier = answering("standard");
-    const registry = fakeSessionRegistry([{ events: answerEvents("resumed") }]);
-    const resumed = await loadAutoProvider(h, registry, { classifierCall: () => classifier.call });
-    await autoEvents(resumed, messages, "mixed-case-worker");
-    assert.equal(registry.calls[0]?.model.id, "claude-haiku-4-5");
+    const resumed = await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => classifier.call });
+    assert.equal((await firstRequest(resumed, messages, "mixed-case-worker")).model.id, "claude-haiku-4-5");
     assert.equal(classifier.prompts.length, 0);
     assert.equal(h.records().length, 1);
   } finally { h.cleanup(); }
@@ -1241,12 +1330,10 @@ test("a damaged decision-record day file does not stop a new worker from classif
     mkdirSync(folder, { recursive: true });
     writeFileSync(join(folder, "2026-09-25.jsonl"), "{broken json\n");
     const classifier = answering("standard");
-    const registry = fakeSessionRegistry([{ events: answerEvents("classified") }]);
-    const stream = await loadAutoProvider(h, registry, { classifierCall: () => classifier.call });
-    const events = await autoEvents(stream, [{ role: "user", content: "Add a retry option", timestamp: 0 }], "damaged-record-worker");
-    assert.equal(events.at(-1)?.type, "done");
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => classifier.call });
+    const routed = await firstRequest(auto, [{ role: "user", content: "Add a retry option", timestamp: 0 }], "damaged-record-worker");
     assert.equal(classifier.prompts.length, 1);
-    assert.equal(registry.calls[0]?.model.id, "claude-sonnet-5");
+    assert.equal(routed.model.id, "claude-sonnet-5");
     const file = join(folder, "2026-09-26.jsonl");
     const record = JSON.parse(readFileSync(file, "utf8")) as { delegationId: string };
     assert.equal(record.delegationId, "damaged-record-worker");
@@ -1257,16 +1344,15 @@ test("a resumed worker accepts a legacy /2 decision record", async () => {
   const h = harness(LIVE);
   try {
     const messages = [{ role: "user", content: "Fix README.md", timestamp: 0 }];
-    await autoEvents(await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("first") }])), messages, "legacy-worker");
+    await firstRequest(await loadAutoModel(h, fakeSessionRegistry([{ events: answerEvents("first") }])), messages, "legacy-worker");
     const file = join(h.stateDir, "routing", "2026-09-26.jsonl");
     const record = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
     record.schemaVersion = "decision-record/2";
     delete record.ranOn;
     writeFileSync(file, `${JSON.stringify(record)}\n`);
     const classifier = answering("standard");
-    const registry = fakeSessionRegistry([{ events: answerEvents("resumed") }]);
-    await autoEvents(await loadAutoProvider(h, registry, { classifierCall: () => classifier.call }), messages, "legacy-worker");
-    assert.equal(registry.calls[0]?.model.id, "claude-haiku-4-5");
+    const routed = await firstRequest(await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => classifier.call }), messages, "legacy-worker");
+    assert.equal(routed.model.id, "claude-haiku-4-5");
     assert.equal(classifier.prompts.length, 0);
     assert.equal(h.records().length, 1);
   } finally { h.cleanup(); }
@@ -1276,7 +1362,7 @@ test("a shadow decision cannot pin a resumed worker to its hypothetical rung", a
   const h = harness(LIVE);
   try {
     const messages = [{ role: "user", content: "Fix README.md", timestamp: 0 }];
-    await autoEvents(await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("first") }])), messages, "shadow-worker");
+    await firstRequest(await loadAutoModel(h, fakeSessionRegistry([{ events: answerEvents("first") }])), messages, "shadow-worker");
     const file = join(h.stateDir, "routing", "2026-09-26.jsonl");
     const record = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
     record.mode = "shadow";
@@ -1285,10 +1371,9 @@ test("a shadow decision cannot pin a resumed worker to its hypothetical rung", a
     writeFileSync(file, `${JSON.stringify(record)}\n`);
     assert.equal(h.records()[0]?.recordType, "decision", "the shadow fixture must be readable");
     const classifier = answering("standard");
-    const registry = fakeSessionRegistry([{ events: answerEvents("resumed") }]);
-    await autoEvents(await loadAutoProvider(h, registry, { classifierCall: () => classifier.call }), messages, "shadow-worker");
+    const routed = await firstRequest(await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => classifier.call }), messages, "shadow-worker");
     assert.equal(classifier.prompts.length, 1);
-    assert.equal(registry.calls[0]?.model.id, "claude-sonnet-5");
+    assert.equal(routed.model.id, "claude-sonnet-5");
     assert.equal(h.records().length, 2);
   } finally { h.cleanup(); }
 });
@@ -1297,17 +1382,16 @@ test("a live decision whose ranOn differs from its rung cannot restore a pin", a
   const h = harness(LIVE);
   try {
     const messages = [{ role: "user", content: "Fix README.md", timestamp: 0 }];
-    await autoEvents(await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("first") }])), messages, "fallback-worker");
+    await firstRequest(await loadAutoModel(h, fakeSessionRegistry([{ events: answerEvents("first") }])), messages, "fallback-worker");
     const file = join(h.stateDir, "routing", "2026-09-26.jsonl");
     const record = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
     record.ranOn = HAIKU;
     writeFileSync(file, `${JSON.stringify(record)}\n`);
     assert.equal(h.records()[0]?.recordType, "decision", "the fallback fixture must be readable");
     const classifier = answering("standard");
-    const registry = fakeSessionRegistry([{ events: answerEvents("resumed") }]);
-    await autoEvents(await loadAutoProvider(h, registry, { classifierCall: () => classifier.call }), messages, "fallback-worker");
+    const routed = await firstRequest(await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => classifier.call }), messages, "fallback-worker");
     assert.equal(classifier.prompts.length, 1);
-    assert.equal(registry.calls[0]?.model.id, "claude-sonnet-5");
+    assert.equal(routed.model.id, "claude-sonnet-5");
     assert.equal(h.records().length, 2);
   } finally { h.cleanup(); }
 });
@@ -1316,17 +1400,16 @@ test("a resumed worker whose rung fails a hard filter is classified and recorded
   const h = harness(LIVE);
   try {
     const messages = [{ role: "user", content: "Fix README.md", timestamp: 0 }];
-    const first = await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("first") }]));
-    await autoEvents(first, messages, "filtered-worker");
+    const first = await loadAutoModel(h, fakeSessionRegistry([{ events: answerEvents("first") }]));
+    await firstRequest(first, messages, "filtered-worker");
     const classifier = answering("standard");
-    const registry = fakeSessionRegistry([{ events: answerEvents("new rung") }]);
-    const resumed = await loadAutoProvider(h, registry, {
+    const resumed = await loadAutoModel(h, fakeSessionRegistry([]), {
       classifierCall: () => classifier.call,
       evidence: () => () => evidenceOf({ authorization: approved("openai-codex") }),
     });
-    await autoEvents(resumed, messages, "filtered-worker");
+    const routed = await firstRequest(resumed, messages, "filtered-worker");
     assert.equal(classifier.prompts.length, 1);
-    assert.equal(registry.calls[0]?.model.id, "gpt-6-sol");
+    assert.equal(routed.model.id, "gpt-6-sol");
     assert.deepEqual(h.records().map((record) => record.recordType === "decision" && record.route.outcome === "chosen" && record.route.rung.rung),
       [`${HAIKU}:low`, "openai-codex/gpt-6-sol:medium"]);
   } finally { h.cleanup(); }
@@ -1336,11 +1419,10 @@ test("a worker without a recorded decision is classified as a first request", as
   const h = harness(LIVE);
   try {
     const classifier = answering("standard");
-    const registry = fakeSessionRegistry([{ events: answerEvents("first") }]);
-    const stream = await loadAutoProvider(h, registry, { classifierCall: () => classifier.call });
-    await autoEvents(stream, [{ role: "user", content: "Add a retry option", timestamp: 0 }], "unrecorded-worker");
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => classifier.call });
+    const routed = await firstRequest(auto, [{ role: "user", content: "Add a retry option", timestamp: 0 }], "unrecorded-worker");
     assert.equal(classifier.prompts.length, 1);
-    assert.equal(registry.calls[0]?.model.id, "claude-sonnet-5");
+    assert.equal(routed.model.id, "claude-sonnet-5");
     assert.equal(h.records().length, 1);
   } finally { h.cleanup(); }
 });
@@ -1349,89 +1431,37 @@ test("a resumed worker uses the latest decision for its delegation id", async ()
   const h = harness(LIVE);
   try {
     const messages = [{ role: "user", content: "Fix README.md", timestamp: 0 }];
-    await autoEvents(await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("first") }])), messages, "latest-worker");
-    await autoEvents(await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("second") }]), {
+    await firstRequest(await loadAutoModel(h, fakeSessionRegistry([{ events: answerEvents("first") }])), messages, "latest-worker");
+    await firstRequest(await loadAutoModel(h, fakeSessionRegistry([{ events: answerEvents("second") }]), {
       evidence: () => () => evidenceOf({ authorization: approved("openai-codex") }),
     }), messages, "latest-worker");
     const classifier = answering("critical");
-    const registry = fakeSessionRegistry([{ events: answerEvents("third") }]);
-    await autoEvents(await loadAutoProvider(h, registry, { classifierCall: () => classifier.call }), messages, "latest-worker");
-    assert.equal(registry.calls[0]?.model.id, "gpt-6-luna");
+    const routed = await firstRequest(await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => classifier.call }), messages, "latest-worker");
+    assert.equal(routed.model.id, "gpt-6-luna");
     assert.equal(classifier.prompts.length, 0);
     assert.equal(h.records().length, 2);
   } finally { h.cleanup(); }
 });
 
-test("auto model relabels earlier replies inward and streamed replies outward without losing usage", async () => {
+test("a resumed worker's router state on its branch wins over its resume pin, which holds while the branch has none", async () => {
   const h = harness(LIVE);
+  const clear = setResumePin("resume-pin-worker", { model: "anthropic/claude-sonnet-5", effort: "high" });
   try {
-    const { real, usage, registry, previous, first, second } = await autoScenario(h);
-    assert.deepEqual(registry.calls[1]?.context.messages[2], { ...previous, ...real });
-    assert.deepEqual((first[0] as { partial?: unknown }).partial, { ...assistantMessage({ ...real, usage }), provider: "orchestrator", model: "auto", api: "orchestrator-auto" });
-    assert.deepEqual(first.at(-1), { type: "done", reason: "stop", message: { ...assistantMessage({ ...real, usage, content: [{ type: "thinking", thinking: "hmm" }, { type: "text", text: "hello" }] }), provider: "orchestrator", model: "auto", api: "orchestrator-auto" } });
-    assert.deepEqual(second.at(-1), { type: "error", reason: "error", error: { ...assistantMessage({ stopReason: "error", errorMessage: "rung failed" }), provider: "orchestrator", model: "auto", api: "orchestrator-auto" } });
-  } finally { h.cleanup(); }
+    const classifier = answering("mechanical");
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => classifier.call });
+    // A branch from before router state: the checked resume pin.
+    const resumed = auto.worker("resume-pin-worker");
+    assert.equal((await resumed.user()).rung, "anthropic/claude-sonnet-5:high");
+    assert.equal((await resumed.continuation()).rung, "anthropic/claude-sonnet-5:high");
+    // A branch with router state: its pin.
+    const state = { rung: { model: HAIKU, effort: "low" }, tier: "mechanical", failedOver: false };
+    assert.equal((await auto.route("resume-pin-worker", FIX_README, { state })).rung, `${HAIKU}:low`);
+    assert.equal(classifier.prompts.length, 0);
+    assert.deepEqual(h.records(), [], "a resume writes no new record");
+  } finally { clear(); h.cleanup(); }
 });
 
-test("the classified session has one decision-record/3 with ranOn equal to its rung", async () => {
-  const h = harness(LIVE);
-  try {
-    await autoScenario(h);
-    const [record] = h.records();
-    assert.equal(h.records().length, 1);
-    assert.equal(record?.recordType, "decision");
-    assert.equal(record.schemaVersion, "decision-record/3");
-    assert.equal(record.delegationId, "worker-1");
-    assert.equal(record.recordType === "decision" && record.ranOn, `${HAIKU}:low`);
-  } finally { h.cleanup(); }
-});
-
-test("a registry exception is returned as an error labelled orchestrator/auto", async () => {
-  const h = harness(LIVE);
-  try {
-    const stream = await loadAutoProvider(h, fakeSessionRegistry([{ throws: "rung connection lost" }]));
-    const events = await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "throwing-worker");
-    const last = events.at(-1);
-    assert.equal(last?.type, "error");
-    if (last?.type === "error") {
-      assert.equal(last.error.errorMessage, "rung connection lost");
-      assert.deepEqual([last.error.provider, last.error.model, last.error.api], ["orchestrator", "auto", "orchestrator-auto"]);
-    }
-  } finally { h.cleanup(); }
-});
-
-test("an auto model request without a session id returns a clear labelled error", async () => {
-  const h = harness(LIVE);
-  try {
-    const registry = fakeSessionRegistry([]);
-    const stream = await loadAutoProvider(h, registry);
-    const events = await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }]);
-    const last = events.at(-1);
-    assert.equal(last?.type, "error");
-    if (last?.type === "error") {
-      assert.match(last.error.errorMessage ?? "", /no sessionId/);
-      assert.deepEqual([last.error.provider, last.error.model, last.error.api], ["orchestrator", "auto", "orchestrator-auto"]);
-    }
-    assert.equal(registry.calls.length, 0);
-    assert.equal(h.records().length, 0);
-  } finally { h.cleanup(); }
-});
-
-test("an inner stream without a final event returns a labelled error and settles result", async () => {
-  const h = harness(LIVE);
-  try {
-    const stream = await loadAutoProvider(h, fakeSessionRegistry([{ events: [{ type: "start" }] }]));
-    const request = stream(AUTO_MODEL, { messages: [{ role: "user", content: "Fix README.md", timestamp: 0 }] } as unknown as Parameters<AutoStream>[1], { sessionId: "unfinished-worker" });
-    const events = [];
-    for await (const event of request) events.push(event);
-    const final = await request.result();
-    assert.equal(events.at(-1)?.type, "error");
-    assert.match(final.errorMessage ?? "", /without a final message/);
-    assert.deepEqual([final.provider, final.model, final.api], ["orchestrator", "auto", "orchestrator-auto"]);
-  } finally { h.cleanup(); }
-});
-
-test("the auto model declares the largest context window and output limit among the tier map's rungs", async () => {
+test("the auto model is registered as a virtual model, not a provider, with the largest context window and output limit among the tier map's rungs", async () => {
   const h = harness(LIVE);
   try {
     const limits: Record<string, { contextWindow: number; maxTokens: number }> = {
@@ -1443,79 +1473,30 @@ test("the auto model declares the largest context window and output limit among 
       "anthropic/claude-fable-5": { contextWindow: 2_000_000, maxTokens: 256_000 },
     };
     const registry = fakeSessionRegistry([], INSTALLED_MODEL_INFO.map((entry) => ({ ...entry, ...limits[entry.fullId] })));
-    const registered: ProviderConfigInput[] = [];
-    const handlers = piHandlers();
-    createRouterExtension({ classifierCall: () => answering("mechanical").call, evidence: () => () => evidenceOf(), now: () => NOW })({
-      registerProvider(name: string, config: ProviderConfigInput) { assert.equal(name, "orchestrator"); registered.push(config); },
-      registerVirtualModel() {},
-      on(event: string, handler: Handler) { handlers.on(event, handler); },
-    } as unknown as ExtensionAPI);
-    await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, {
-      cwd: h.projectDir, hasUI: false, model: SESSION_MODEL, modelRegistry: registry, sessionManager: { getSessionId: () => "parent" },
-    });
-    const [auto] = registered.at(-1)?.models ?? [];
-    assert.equal(auto?.id, "auto");
-    // pi 0.99's model config is a union; the auto model is a chat model.
-    assert.ok(auto !== undefined && "maxTokens" in auto);
-    assert.deepEqual([auto.contextWindow, auto.maxTokens], [1_000_000, 128_000]);
+    const auto = await loadAutoModel(h, registry);
+    const [loaded, started, ...more] = auto.registered;
+    assert.deepEqual(more, []);
+    assert.deepEqual([loaded?.provider, loaded?.id, loaded?.name, loaded?.contextWindow, loaded?.maxTokens],
+      ["orchestrator", "auto", "Orchestrator auto", undefined, undefined], "at load no tier map is read yet");
+    assert.deepEqual(loaded?.thinkingLevels, ["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+    assert.deepEqual([started?.provider, started?.id, started?.contextWindow, started?.maxTokens], ["orchestrator", "auto", 1_000_000, 128_000]);
   } finally { h.cleanup(); }
 });
 
-test("an overflow error from the rung comes back labelled orchestrator/auto with its message unchanged, and the retry stays on the rung", async () => {
+test("a retry after compaction for a context overflow stays on the rung without classifying again", async () => {
   const h = harness(LIVE);
   try {
-    // pi compacts and retries only when the error matches pi-ai's overflow
-    // patterns (isContextOverflow, pi-ai 0.87.1 dist/utils/overflow.js) and
-    // the reply's provider and model equal the session model's
-    // (AgentSession._checkCompaction, pi-coding-agent 0.87.1). This is
-    // Anthropic's overflow message as pi-ai documents it.
+    // pi compacts on an overflow and retries with reason retry and the failed
+    // response (docs/virtual-models.md). This is Anthropic's overflow message.
     const overflow = "prompt is too long: 213462 tokens > 200000 maximum";
-    const real = { provider: "anthropic", model: "claude-haiku-4-5", api: "anthropic-messages" };
     const classifier = answering("mechanical");
-    const registry = fakeSessionRegistry([
-      { events: [{ type: "error", reason: "error", error: assistantMessage({ ...real, stopReason: "error", errorMessage: overflow }) } as never] },
-      { events: answerEvents("done after compaction") },
-    ]);
-    const stream = await loadAutoProvider(h, registry, { classifierCall: () => classifier.call });
-    const failed = await autoEvents(stream, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "long-worker");
-    assert.deepEqual(failed.at(-1), { type: "error", reason: "error", error: { ...assistantMessage({ stopReason: "error", errorMessage: overflow }), provider: "orchestrator", model: "auto", api: "orchestrator-auto" } });
-    await autoEvents(stream, [{ role: "user", content: "Fix README.md after compaction", timestamp: 0 }], "long-worker");
-    assert.deepEqual(registry.calls.map((call) => `${call.model.provider}/${call.model.id}:${call.options?.reasoning}`), [`${HAIKU}:low`, `${HAIKU}:low`]);
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => classifier.call });
+    const worker = auto.worker("long-worker");
+    const first = await worker.user();
+    assert.equal((await worker.retry(overflow)).rung, first.rung);
+    assert.deepEqual(worker.rungs, [`${HAIKU}:low`, `${HAIKU}:low`]);
     assert.equal(classifier.prompts.length, 1);
-  } finally { h.cleanup(); }
-});
-
-test("a compaction summary request with a new session id is classified and recorded as a first request", async () => {
-  const h = harness(LIVE);
-  try {
-    const classifier = answering("mechanical");
-    const registry = fakeSessionRegistry([{ events: answerEvents("working") }, { events: answerEvents("## Goal") }]);
-    const stream = await loadAutoProvider(h, registry, { classifierCall: () => classifier.call });
-    await autoEvents(stream, [
-      { role: "system", content: '<active_agent name="worker"/>', timestamp: 0 },
-      { role: "user", content: "Fix README.md", timestamp: 0 },
-    ], "worker-before-compaction");
-    // The request pi's compaction sends (generateSummaryWithRequest, pi-coding-agent
-    // 0.87.1): its own system prompt and one user message wrapping the conversation.
-    const summaryPrompt = "<conversation>\n[User]: Fix README.md\n[Assistant]: working\n</conversation>\n\n"
-      + "The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.";
-    const request = stream(AUTO_MODEL, {
-      systemPrompt: "You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.",
-      messages: [{ role: "user", content: [{ type: "text", text: summaryPrompt }], timestamp: 0 }],
-    } as unknown as Parameters<AutoStream>[1], { sessionId: "compaction-summary" });
-    for await (const _event of request) { /* consume */ }
-    assert.equal((await request.result()).stopReason, "stop");
-    assert.equal(classifier.prompts.length, 2);
-    assert.match(classifier.prompts[1]!, /conversation to summarize/);
-    const records = h.records();
-    assert.deepEqual(records.map((record) => record.delegationId), ["worker-before-compaction", "compaction-summary"]);
-    const summary = records[1];
-    assert.equal(summary?.recordType, "decision");
-    if (summary?.recordType === "decision") {
-      assert.equal(summary.agentRole, "unknown");
-      assert.ok(summaryPrompt.startsWith(summary.taskTextPrefix));
-      assert.equal(summary.ranOn, "openai-codex/gpt-6-luna:low");
-    }
+    assert.equal(h.records().length, 1);
   } finally { h.cleanup(); }
 });
 
@@ -1523,24 +1504,10 @@ test("the auto model probe reports the rung, pin and time for each request", asy
   const h = harness(LIVE);
   process.env.PI_ORCHESTRATOR_ROUTER_PROBE = "1";
   try {
-    const registry = fakeSessionRegistry([{ events: answerEvents("first") }, { events: answerEvents("second") }]);
-    let provider: ProviderConfigInput | undefined;
-    const handlers = piHandlers();
     const lines = await stderrOf(async () => {
-      createRouterExtension({ classifierCall: () => answering("mechanical").call, evidence: () => () => evidenceOf(), now: () => NOW })({
-        registerProvider(_name: string, config: ProviderConfigInput) { provider = config; },
-        registerVirtualModel() {},
-        on(event: string, handler: Handler) { handlers.on(event, handler); },
-      } as unknown as ExtensionAPI);
-      await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, {
-        cwd: h.projectDir, hasUI: false, model: SESSION_MODEL, modelRegistry: registry,
-        sessionManager: { getSessionId: () => "parent" },
-      });
-      const stream = provider?.streamSimple;
-      assert.ok(stream);
-      const model = { provider: "orchestrator", id: "auto", api: "orchestrator-auto" } as Parameters<typeof stream>[0];
-      const context = { messages: [{ role: "user", content: "Fix README.md", timestamp: 0 }] } as unknown as Parameters<typeof stream>[1];
-      for (let i = 0; i < 2; i++) for await (const _event of stream(model, context, { sessionId: "worker-probe" })) { /* consume */ }
+      const worker = (await loadAutoModel(h, fakeSessionRegistry([]))).worker("worker-probe");
+      await worker.user();
+      await worker.continuation();
     });
     const probes = lines.split("\n").filter((line) => line.includes("request worker-probe"));
     assert.equal(probes.length, 2, lines);
@@ -1552,15 +1519,16 @@ test("the auto model probe reports the rung, pin and time for each request", asy
 test("by default the router classifies through the session's model registry, not a pi child, and forwards to the chosen rung", async () => {
   const h = harness(LIVE);
   try {
-    const registry = fakeSessionRegistry([{ events: answerEvents(classifierAnswer("mechanical")) }, { events: answerEvents("fixed") }]);
+    const registry = fakeSessionRegistry([{ events: answerEvents(classifierAnswer("mechanical")) }]);
+    let routed: Routed | undefined;
     const stderr = await stderrOf(async () => {
-      const stream = await loadAutoProviderWith(h, registry, {});
-      assert.equal((await autoEvents(stream, FIX_README, "in-session-worker")).at(-1)?.type, "done");
+      const auto = await loadRouterWith(h, registry, {});
+      routed = await firstRequest(auto, FIX_README, "in-session-worker");
     });
     assert.doesNotMatch(stderr, /pi-orchestrator router disabled/, stderr);
-    assert.equal(registry.calls.length, 2, "one classifier request through the session registry, then the worker's request");
+    assert.equal(registry.calls.length, 1, "one classifier request through the session registry; pi sends the worker's");
     assert.deepEqual(registry.calls[0]?.context.messages.length, 1);
-    assert.equal(`${registry.calls[1]?.model.provider}/${registry.calls[1]?.model.id}:${registry.calls[1]?.options?.reasoning}`, `${HAIKU}:low`);
+    assert.equal(routed?.rung, `${HAIKU}:low`);
     const [record] = h.records();
     assert.equal(record?.recordType === "decision" && record.classification.cause, `model:${HAIKU}:low`);
     assert.deepEqual(record?.recordType === "decision" && record.classification.hops.map((hop) => [hop.hop, hop.outcome, hop.allowance?.settlement]), [[`${HAIKU}:low`, "decided", "settled"]]);
@@ -1572,14 +1540,12 @@ test("a failing in-session classifier request is a recorded hop failure: the rou
   try {
     const registry = fakeSessionRegistry([
       { events: errorEvents("You're out of extra usage.") },
-      { events: answerEvents("first") },
       { events: answerEvents(classifierAnswer("mechanical")) },
-      { events: answerEvents("second") },
     ]);
     const stderr = await stderrOf(async () => {
-      const stream = await loadAutoProviderWith(h, registry, {});
-      assert.equal((await autoEvents(stream, FIX_README, "worker-1")).at(-1)?.type, "done");
-      assert.equal((await autoEvents(stream, FIX_README, "worker-2")).at(-1)?.type, "done");
+      const auto = await loadRouterWith(h, registry, {});
+      await firstRequest(auto, FIX_README, "worker-1");
+      await firstRequest(auto, FIX_README, "worker-2");
     });
     assert.doesNotMatch(stderr, /pi-orchestrator router disabled/, stderr);
     const [first, second] = h.records();
@@ -1596,14 +1562,12 @@ test("under PI_ORCHESTRATOR_ROUTER_PROBE=1 the in-session classifier prints its 
     const usage = { input: 900, output: 80, cacheRead: 0, cacheWrite: 0, totalTokens: 980, cost: { total: 0.0012 } };
     const registry = fakeSessionRegistry([
       { events: answerEvents(classifierAnswer("mechanical"), { usage }) },
-      { events: answerEvents("first") },
       { events: errorEvents("socket hang up") },
-      { events: answerEvents("second") },
     ]);
     const stderr = await stderrOf(async () => {
-      const stream = await loadAutoProviderWith(h, registry, {});
-      await autoEvents(stream, FIX_README, "worker-1");
-      await autoEvents(stream, FIX_README, "worker-2");
+      const auto = await loadRouterWith(h, registry, {});
+      await firstRequest(auto, FIX_README, "worker-1");
+      await firstRequest(auto, FIX_README, "worker-2");
     });
     const classifierLines = stderr.split("\n").filter((line) => line.startsWith("pi-orchestrator router: classifier "));
     assert.equal(classifierLines.length, 2, stderr);
@@ -1626,10 +1590,9 @@ test("a minimum tier routes the worker at that tier, above its classified tier, 
   const h = harness(LIVE);
   const clear = setRoutingConstraints("min-tier-worker", { minimumTier: "elevated" });
   try {
-    const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-    const stream = await loadAutoProvider(h, registry);
-    assert.equal((await autoEvents(stream, FIX_README, "min-tier-worker")).at(-1)?.type, "done");
-    assert.deepEqual(registry.calls.map((call) => [call.model.id, call.options?.reasoning]), [["claude-opus-5", "high"]]);
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]));
+    const routed = await firstRequest(auto, FIX_README, "min-tier-worker");
+    assert.deepEqual([routed.model.id, routed.thinkingLevel], ["claude-opus-5", "high"]);
     const [record] = h.records();
     assert.ok(record?.recordType === "decision" && record.route.outcome === "chosen");
     assert.equal(record.classification.tier, "mechanical");
@@ -1644,10 +1607,9 @@ test("a classified tier above the minimum tier is kept", async () => {
   const h = harness(LIVE);
   const clear = setRoutingConstraints("above-min-worker", { minimumTier: "standard" });
   try {
-    const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-    const stream = await loadAutoProvider(h, registry, { classifierCall: () => answering("critical").call });
-    assert.equal((await autoEvents(stream, FIX_README, "above-min-worker")).at(-1)?.type, "done");
-    assert.deepEqual(registry.calls.map((call) => [call.model.id, call.options?.reasoning]), [["claude-opus-5", "xhigh"]]);
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => answering("critical").call });
+    const routed = await firstRequest(auto, FIX_README, "above-min-worker");
+    assert.deepEqual([routed.model.id, routed.thinkingLevel], ["claude-opus-5", "xhigh"]);
     const [record] = h.records();
     assert.ok(record?.recordType === "decision" && record.route.outcome === "chosen");
     assert.deepEqual([record.classification.tier, record.route.startedAtTier, record.route.tier], ["critical", "critical", "critical"]);
@@ -1660,10 +1622,9 @@ test("a minimum tier whose rungs the hard filters remove escalates as usual, nev
   const h = harness({ ...LIVE, tiers });
   const clear = setRoutingConstraints("min-tier-escalated", { minimumTier: "elevated" });
   try {
-    const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-    const stream = await loadAutoProvider(h, registry, { evidence: () => () => evidenceOf({ authorization: approved("anthropic") }) });
-    assert.equal((await autoEvents(stream, FIX_README, "min-tier-escalated")).at(-1)?.type, "done");
-    assert.deepEqual(registry.calls.map((call) => [call.model.id, call.options?.reasoning]), [["claude-opus-5", "xhigh"]]);
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]), { evidence: () => () => evidenceOf({ authorization: approved("anthropic") }) });
+    const routed = await firstRequest(auto, FIX_README, "min-tier-escalated");
+    assert.deepEqual([routed.model.id, routed.thinkingLevel], ["claude-opus-5", "xhigh"]);
     const [record] = h.records();
     assert.ok(record?.recordType === "decision" && record.route.outcome === "chosen");
     assert.equal(record.route.startedAtTier, "elevated");
@@ -1681,10 +1642,9 @@ test("an excluded rung is never chosen, in its own tier or after escalation, whi
   const h = harness({ ...LIVE, tiers });
   const clear = setRoutingConstraints("excluding-worker", { excludedRung: { model: "anthropic/claude-opus-5", effort: "high" } });
   try {
-    const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-    const stream = await loadAutoProvider(h, registry, { classifierCall: () => answering("elevated").call });
-    assert.equal((await autoEvents(stream, FIX_README, "excluding-worker")).at(-1)?.type, "done");
-    assert.deepEqual(registry.calls.map((call) => [call.model.id, call.options?.reasoning]), [["claude-opus-5", "xhigh"]]);
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => answering("elevated").call });
+    const routed = await firstRequest(auto, FIX_README, "excluding-worker");
+    assert.deepEqual([routed.model.id, routed.thinkingLevel], ["claude-opus-5", "xhigh"]);
     const [record] = h.records();
     assert.ok(record?.recordType === "decision" && record.route.outcome === "chosen");
     assert.equal(record.route.rung.rung, "anthropic/claude-opus-5:xhigh");
@@ -1704,10 +1664,11 @@ test("a forced rung that passes the hard filters is pinned without a tier choice
   const h = harness(LIVE);
   const clear = setRoutingConstraints("forced-worker", { forcedRung: FORCED_SONNET_HIGH });
   try {
-    const registry = fakeSessionRegistry([{ events: answerEvents("first") }, { events: answerEvents("second") }]);
-    const stream = await loadAutoProvider(h, registry);
-    for (let request = 0; request < 2; request++) assert.equal((await autoEvents(stream, FIX_README, "forced-worker")).at(-1)?.type, "done");
-    assert.deepEqual(registry.calls.map((call) => [call.model.id, call.options?.reasoning]), [["claude-sonnet-5", "high"], ["claude-sonnet-5", "high"]]);
+    const worker = (await loadAutoModel(h, fakeSessionRegistry([]))).worker("forced-worker");
+    await worker.user();
+    worker.answered();
+    await worker.continuation();
+    assert.deepEqual(worker.rungs, ["anthropic/claude-sonnet-5:high", "anthropic/claude-sonnet-5:high"]);
     const records = h.records();
     assert.equal(records.length, 1);
     const [record] = records;
@@ -1727,11 +1688,10 @@ test("a forced rung that fails a hard filter is a refusal with the reason: no ot
   const forced = { tier: "elevated", rung: { rung: "openai-codex/gpt-6-sol:high", model: "openai-codex/gpt-6-sol", effort: "high", origin: "personal" } } as const;
   const clear = setRoutingConstraints("refused-forced-worker", { forcedRung: forced });
   try {
-    const registry = fakeSessionRegistry([{ events: answerEvents("fallback") }]);
-    const stream = await loadAutoProvider(h, registry, { evidence: () => () => evidenceOf({ authorization: approved("anthropic") }) });
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]), { evidence: () => () => evidenceOf({ authorization: approved("anthropic") }) });
     process.env.PI_ORCHESTRATOR_SESSION_MODEL = "anthropic/claude-sonnet-5:medium";
-    assert.equal((await autoEvents(stream, FIX_README, "refused-forced-worker")).at(-1)?.type, "done");
-    assert.deepEqual(registry.calls.map((call) => [call.model.id, call.options?.reasoning]), [["claude-sonnet-5", "medium"]]);
+    const routed = await firstRequest(auto, FIX_README, "refused-forced-worker");
+    assert.deepEqual([routed.model.id, routed.thinkingLevel], ["claude-sonnet-5", "medium"]);
     const [record] = h.records();
     assert.ok(record?.recordType === "decision" && record.route.outcome === "refused");
     assert.match(record.route.message, /forced rung openai-codex\/gpt-6-sol:high \(elevated\) fails unapproved recipient: .*No other rung was tried/);
@@ -1746,12 +1706,11 @@ test("routing constraints bind only their worker's session id, and removing them
   const h = harness(LIVE);
   const clear = setRoutingConstraints("constrained-worker", { minimumTier: "critical" });
   try {
-    const registry = fakeSessionRegistry([{ events: answerEvents("other") }, { events: answerEvents("cleared") }]);
-    const stream = await loadAutoProvider(h, registry);
-    await autoEvents(stream, FIX_README, "other-worker");
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]));
+    const other = await firstRequest(auto, FIX_README, "other-worker");
     clear();
-    await autoEvents(stream, FIX_README, "constrained-worker");
-    assert.deepEqual(registry.calls.map((call) => [call.model.id, call.options?.reasoning]), [["claude-haiku-4-5", "low"], ["gpt-6-luna", "low"]]);
+    const cleared = await firstRequest(auto, FIX_README, "constrained-worker");
+    assert.deepEqual([other.rung, cleared.rung], [`${HAIKU}:low`, "openai-codex/gpt-6-luna:low"]);
     const records = h.records();
     assert.deepEqual(records.map((record) => record.delegationId), ["other-worker", "constrained-worker"]);
     for (const record of records) assert.equal("constraints" in record, false, "an unconstrained decision record has no constraints field");
@@ -1763,20 +1722,18 @@ test("a recorded decision pins a constrained worker again only when it was made 
   let clear = () => {};
   try {
     // Recorded without constraints, on a mechanical rung that still passes the hard filters.
-    await autoEvents(await loadAutoProvider(h, fakeSessionRegistry([{ events: answerEvents("first") }])), FIX_README, "restored-worker");
+    await firstRequest(await loadAutoModel(h, fakeSessionRegistry([{ events: answerEvents("first") }])), FIX_README, "restored-worker");
     clear = setRoutingConstraints("restored-worker", { minimumTier: "elevated" });
     const classifier = answering("mechanical");
-    const rerouted = fakeSessionRegistry([{ events: answerEvents("rerouted") }]);
-    await autoEvents(await loadAutoProvider(h, rerouted, { classifierCall: () => classifier.call }), FIX_README, "restored-worker");
+    const rerouted = await firstRequest(await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => classifier.call }), FIX_README, "restored-worker");
     assert.equal(classifier.prompts.length, 1, "classified again");
-    assert.deepEqual(rerouted.calls.map((call) => [call.model.id, call.options?.reasoning]), [["gpt-6-sol", "high"]]);
+    assert.equal(rerouted.rung, "openai-codex/gpt-6-sol:high");
 
     // Recorded under these constraints: restored without classifying.
     const again = answering("critical");
-    const restored = fakeSessionRegistry([{ events: answerEvents("restored") }]);
-    await autoEvents(await loadAutoProvider(h, restored, { classifierCall: () => again.call }), FIX_README, "restored-worker");
+    const restored = await firstRequest(await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => again.call }), FIX_README, "restored-worker");
     assert.equal(again.prompts.length, 0, "not classified");
-    assert.deepEqual(restored.calls.map((call) => [call.model.id, call.options?.reasoning]), [["gpt-6-sol", "high"]]);
+    assert.equal(restored.rung, "openai-codex/gpt-6-sol:high");
     assert.equal(h.records().length, 2);
   } finally { clear(); h.cleanup(); }
 });
@@ -1796,15 +1753,11 @@ test("a worker whose fallback would be the rung its constraints exclude fails wi
     const id = `excluded-fallback-${name}`;
     const clear = setRoutingConstraints(id, { minimumTier: "elevated", excludedRung: excluded });
     try {
-      const registry = fakeSessionRegistry([{ events: answerEvents("same rung") }, { events: answerEvents("other effort") }]);
-      const stream = await loadAutoProvider(h, registry, deps);
+      const auto = await loadAutoModel(h, fakeSessionRegistry([]), deps);
       process.env.PI_ORCHESTRATOR_SESSION_MODEL = "anthropic/claude-sonnet-5:high";
-      const events = await autoEvents(stream, FIX_README, id);
-      const final = events.at(-1);
       if (runs) {
         // A same-rung review (ADR 0010): no other rung can be chosen, so the reviewer runs on the excluded one.
-        assert.equal(final?.type, "done", name);
-        assert.deepEqual(registry.calls.map((call) => [call.model.id, call.options?.reasoning]), [["claude-sonnet-5", "high"]], name);
+        assert.equal((await firstRequest(auto, FIX_README, id)).rung, "anthropic/claude-sonnet-5:high", name);
         const records = h.records();
         if (name === "shadow") {
           const [record] = records;
@@ -1815,20 +1768,15 @@ test("a worker whose fallback would be the rung its constraints exclude fails wi
         } else assert.deepEqual(records, [], "routing off records nothing");
         continue;
       }
-      assert.equal(final?.type, "error", name);
-      if (final?.type === "error") {
-        assert.equal(final.error.errorMessage, "no other rung is left: this worker would fall back to the orchestrator session model " +
-          "anthropic/claude-sonnet-5:high, which its routing constraints exclude", name);
-      }
-      assert.equal(registry.calls.length, 0, `${name}: nothing is forwarded`);
+      await assert.rejects(firstRequest(auto, FIX_README, id), { message: "no other rung is left: this worker would fall back to the orchestrator session model " +
+        "anthropic/claude-sonnet-5:high, which its routing constraints exclude" }, name);
       assert.deepEqual(h.records(), [], `${name}: no decision is recorded for a worker that did not run`);
       // The same session model at another effort is not excluded.
       process.env.PI_ORCHESTRATOR_SESSION_MODEL = "anthropic/claude-sonnet-5:medium";
       const other = `${id}-other-effort`;
       const clearOther = setRoutingConstraints(other, { minimumTier: "elevated", excludedRung: excluded });
       try {
-        assert.equal((await autoEvents(stream, FIX_README, other)).at(-1)?.type, "done", name);
-        assert.deepEqual(registry.calls.map((call) => [call.model.id, call.options?.reasoning]), [["claude-sonnet-5", "medium"]], name);
+        assert.equal((await firstRequest(auto, FIX_README, other)).rung, "anthropic/claude-sonnet-5:medium", name);
       } finally { clearOther(); }
     } finally { clear(); h.cleanup(); }
   }
@@ -1838,22 +1786,18 @@ test("a worker whose fallback would be the rung its constraints exclude fails wi
 // Usage observations (PRD cml8, "Usage observations" and "Signals"): a
 // worker's usage-limit or rate-limit error marks the provider of its rung in
 // the usage store in the state folder, and every later routing, from any
-// session or project, reads it before the hard filters.
+// session or project, reads it before the hard filters. pi ends a failed
+// request with the failed response, which names the physical model it ran on,
+// and the router reads it in the worker's message_end.
 // ---------------------------------------------------------------------------
 
 const CODEX_FIRST = { ...TEST_TIERS, mechanical: ["openai-codex/gpt-6-luna:low", `${HAIKU}:low`] };
 const CODEX_USAGE_LIMIT = "You have hit your ChatGPT usage limit (plus plan). Try again in ~42 min.";
-
-/** A rung that answers with some output and then fails with `errorMessage`:
- *  a limit later in the run, which fails the worker instead of failing over. */
-function midRunErrorEvents(errorMessage: string) {
-  return [{ type: "start" }, { type: "text_delta", delta: "working" }, ...errorEvents(errorMessage)] as const;
-}
-
-/** The rungs a registry forwarded to, as `provider/model:effort`. */
-function forwardedRungs(registry: ReturnType<typeof fakeSessionRegistry>): string[] {
-  return registry.calls.map((call) => `${call.model.provider}/${call.model.id}:${call.options?.reasoning}`);
-}
+const CODEX_RATE_LIMIT = "Codex error: Rate limit reached. Please try again in 20s.";
+const ANTHROPIC_RATE_LIMIT = '429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed the rate limit"}}';
+/** pi never retries a quota or billing error, so route never sees one as a
+ *  retry; its failover through the worker runtime is ticket 5 (spec 23b3). */
+const QUOTA_FAILOVER = "restored in ticket pi-orchestrator-v1q3";
 
 /** The removed rungs of `delegationId`'s decision, with reason and detail. */
 function removedRungs(h: Harness, delegationId: string): [string, string, string][] {
@@ -1865,63 +1809,75 @@ function removedRungs(h: Harness, delegationId: string): [string, string, string
 test("a Codex usage-limit error marks openai-codex exhausted until the stated reset, and the next routing from another session and project avoids it", async () => {
   const h = harness({ ...LIVE, tiers: CODEX_FIRST });
   try {
-    const failing = fakeSessionRegistry([{ events: midRunErrorEvents(CODEX_USAGE_LIMIT) }]);
-    const failed = await autoEvents(await loadAutoProvider(h, failing), FIX_README, "limited-worker");
-    assert.deepEqual(forwardedRungs(failing), ["openai-codex/gpt-6-luna:low"]);
-    const final = failed.at(-1);
-    assert.ok(final?.type === "error");
-    assert.equal(final.error.errorMessage, CODEX_USAGE_LIMIT, "the worker still gets the provider's error");
+    const worker = (await loadAutoModel(h, fakeSessionRegistry([]))).worker("limited-worker");
+    assert.equal((await worker.user()).rung, "openai-codex/gpt-6-luna:low");
+    await worker.fail(CODEX_USAGE_LIMIT, "working");
 
     const otherProject = join(h.projectDir, "..", "other-project");
     mkdirSync(otherProject);
-    const next = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-    await autoEvents(await loadAutoProvider(h, next, {}, { cwd: otherProject }), FIX_README, "next-worker");
-    assert.deepEqual(forwardedRungs(next), [`${HAIKU}:low`]);
+    assert.equal((await firstRequest(await loadAutoModel(h, fakeSessionRegistry([]), {}, { cwd: otherProject }), FIX_README, "next-worker")).rung, `${HAIKU}:low`);
     const [removed] = removedRungs(h, "next-worker");
     assert.deepEqual(removed?.slice(0, 2), ["openai-codex/gpt-6-luna:low", "provider out of usage"]);
     assert.match(removed?.[2] ?? "", /exhausted until 2026-09-26T12:42:00\.000Z/);
 
-    const afterReset = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-    await autoEvents(await loadAutoProvider(h, afterReset, { now: () => new Date("2026-09-26T12:42:00.000Z") }), FIX_README, "after-reset-worker");
-    assert.deepEqual(forwardedRungs(afterReset), ["openai-codex/gpt-6-luna:low"]);
+    const afterReset = await loadAutoModel(h, fakeSessionRegistry([]), { now: () => new Date("2026-09-26T12:42:00.000Z") });
+    assert.equal((await firstRequest(afterReset, FIX_README, "after-reset-worker")).rung, "openai-codex/gpt-6-luna:low");
+  } finally { h.cleanup(); }
+});
+
+test("a failed response whose routing failed names the auto model and records no observation", async () => {
+  const h = harness({ ...LIVE, tiers: CODEX_FIRST });
+  try {
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]));
+    await auto.handlers.get("message_end")?.({ type: "message_end", message: { ...assistantMessage({ stopReason: "error", errorMessage: CODEX_USAGE_LIMIT }),
+      provider: "orchestrator", model: "auto" } }, workerContext(h, "unrouted-worker", fakeSessionRegistry([])));
+    // The orchestrator's own failed response is not a rung's.
+    await auto.handlers.get("message_end")?.({ type: "message_end", message: { ...assistantMessage({ stopReason: "error", errorMessage: CODEX_USAGE_LIMIT }),
+      provider: "openai-codex", model: "gpt-6-luna" } }, { ...workerContext(h, "parent", fakeSessionRegistry([])), model: SESSION_MODEL });
+    assert.deepEqual(readUsageObservations(usageObservationsPath(h.stateDir)), {});
   } finally { h.cleanup(); }
 });
 
 const LIMIT_ERROR_CASES = [
   { label: "a Codex usage limit without a reset", tiers: CODEX_FIRST, error: "You have hit your ChatGPT usage limit (pro plan).",
-    limited: "openai-codex/gpt-6-luna:low", other: `${HAIKU}:low`, reason: "provider out of usage", holdsUntil: "2026-09-26T17:00:00.000Z" },
+    limited: "openai-codex/gpt-6-luna:low", other: `${HAIKU}:low`, reason: "provider out of usage", holdsUntil: "2026-09-26T17:00:00.000Z", retried: false },
   // pi-ai prefixes a WebSocket error event with "Codex error: "; the message after it is a stand-in until the live check captures one.
   { label: "a Codex usage limit on the WebSocket path", tiers: CODEX_FIRST, error: "Codex error: The usage limit has been reached",
-    limited: "openai-codex/gpt-6-luna:low", other: `${HAIKU}:low`, reason: "provider out of usage", holdsUntil: "2026-09-26T17:00:00.000Z" },
+    limited: "openai-codex/gpt-6-luna:low", other: `${HAIKU}:low`, reason: "provider out of usage", holdsUntil: "2026-09-26T17:00:00.000Z", retried: false },
   { label: "Anthropic out of extra usage", tiers: TEST_TIERS, error: "You're out of extra usage.",
-    limited: `${HAIKU}:low`, other: "openai-codex/gpt-6-luna:low", reason: "provider out of usage", holdsUntil: "2026-09-26T17:00:00.000Z" },
-  { label: "an Anthropic 429 rate limit", tiers: TEST_TIERS,
-    error: '429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed the rate limit"}}',
-    limited: `${HAIKU}:low`, other: "openai-codex/gpt-6-luna:low", reason: "provider throttled", holdsUntil: "2026-09-26T12:05:00.000Z" },
+    limited: `${HAIKU}:low`, other: "openai-codex/gpt-6-luna:low", reason: "provider out of usage", holdsUntil: "2026-09-26T17:00:00.000Z", retried: false },
+  { label: "an Anthropic 429 rate limit", tiers: TEST_TIERS, error: ANTHROPIC_RATE_LIMIT,
+    limited: `${HAIKU}:low`, other: "openai-codex/gpt-6-luna:low", reason: "provider throttled", holdsUntil: "2026-09-26T12:05:00.000Z", retried: true },
   // A stand-in text too: pi-ai turns a Codex HTTP 429 into the usage-limit text above.
-  { label: "a rate limit that says when to try again", tiers: CODEX_FIRST, error: "Codex error: Rate limit reached. Please try again in 20s.",
-    limited: "openai-codex/gpt-6-luna:low", other: `${HAIKU}:low`, reason: "provider throttled", holdsUntil: "2026-09-26T12:00:20.000Z" },
+  { label: "a rate limit that says when to try again", tiers: CODEX_FIRST, error: CODEX_RATE_LIMIT,
+    limited: "openai-codex/gpt-6-luna:low", other: `${HAIKU}:low`, reason: "provider throttled", holdsUntil: "2026-09-26T12:00:20.000Z", retried: true },
 ] as const;
 
-for (const { label, tiers, error, limited, other, reason, holdsUntil } of LIMIT_ERROR_CASES) {
+for (const { label, tiers, error, limited, other, reason, holdsUntil, retried } of LIMIT_ERROR_CASES) {
   test(`${label} keeps the provider out of routing until ${holdsUntil}`, async () => {
     const h = harness({ ...LIVE, tiers });
     try {
-      // On the first request, before any output: the worker fails over.
-      const failing = fakeSessionRegistry([{ events: errorEvents(error) }, { events: answerEvents("failed over") }]);
-      assert.equal((await autoEvents(await loadAutoProvider(h, failing), FIX_README, "limited-worker")).at(-1)?.type, "done");
-      assert.deepEqual(forwardedRungs(failing), [limited, other]);
+      const worker = (await loadAutoModel(h, fakeSessionRegistry([]))).worker("limited-worker");
+      assert.equal((await worker.user()).rung, limited);
+      await worker.fail(error);
 
       const justBefore = new Date(Date.parse(holdsUntil) - 1_000);
-      const avoided = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-      await autoEvents(await loadAutoProvider(h, avoided, { now: () => justBefore }), FIX_README, "before-worker");
-      assert.deepEqual(forwardedRungs(avoided), [other]);
+      assert.equal((await firstRequest(await loadAutoModel(h, fakeSessionRegistry([]), { now: () => justBefore }), FIX_README, "before-worker")).rung, other);
       assert.deepEqual(removedRungs(h, "before-worker").map(([rung, why]) => [rung, why]), [[limited, reason]]);
       assert.match(removedRungs(h, "before-worker")[0]?.[2] ?? "", new RegExp(`until ${holdsUntil.replaceAll(".", "\\.")}`));
 
-      const back = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-      await autoEvents(await loadAutoProvider(h, back, { now: () => new Date(holdsUntil) }), FIX_README, "after-worker");
-      assert.deepEqual(forwardedRungs(back), [limited]);
+      const back = await loadAutoModel(h, fakeSessionRegistry([]), { now: () => new Date(holdsUntil) });
+      assert.equal((await firstRequest(back, FIX_README, "after-worker")).rung, limited);
+    } finally { h.cleanup(); }
+  });
+
+  test(`${label} on a first request before any output fails over to ${other}`, retried ? {} : { skip: QUOTA_FAILOVER }, async () => {
+    const h = harness({ ...LIVE, tiers });
+    try {
+      const worker = (await loadAutoModel(h, fakeSessionRegistry([]))).worker("limited-worker");
+      await worker.user();
+      assert.equal((await worker.retry(error)).rung, other);
+      assert.deepEqual(worker.rungs, [limited, other]);
     } finally { h.cleanup(); }
   });
 }
@@ -1929,11 +1885,10 @@ for (const { label, tiers, error, limited, other, reason, holdsUntil } of LIMIT_
 test("an error that is no limit leaves the provider in routing", async () => {
   const h = harness(LIVE);
   try {
-    const failing = fakeSessionRegistry([{ events: errorEvents('400 {"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long"}}') }]);
-    await autoEvents(await loadAutoProvider(h, failing), FIX_README, "failed-worker");
-    const next = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-    await autoEvents(await loadAutoProvider(h, next), FIX_README, "next-worker");
-    assert.deepEqual(forwardedRungs(next), ["openai-codex/gpt-6-luna:low"]);
+    const worker = (await loadAutoModel(h, fakeSessionRegistry([]))).worker("failed-worker");
+    await worker.user();
+    await worker.fail('400 {"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long"}}');
+    assert.equal((await firstRequest(await loadAutoModel(h, fakeSessionRegistry([])), FIX_README, "next-worker")).rung, "openai-codex/gpt-6-luna:low");
     assert.deepEqual(removedRungs(h, "next-worker"), []);
   } finally { h.cleanup(); }
 });
@@ -1947,16 +1902,16 @@ test("a usage observation the store cannot save warns once, keeps routing on, an
   const h = harness({ ...LIVE, tiers: CODEX_FIRST });
   try {
     blockUsageStore(h);
-    const registry = fakeSessionRegistry([{ events: midRunErrorEvents(CODEX_USAGE_LIMIT) }, { events: midRunErrorEvents(CODEX_USAGE_LIMIT) },
-      { events: answerEvents("ok") }]);
+    const rungs: string[] = [];
     const stderr = await stderrOf(async () => {
-      const stream = await loadAutoProvider(h, registry);
-      const failed = (await autoEvents(stream, FIX_README, "limited-worker")).at(-1);
-      assert.ok(failed?.type === "error");
-      assert.equal(failed.error.errorMessage, CODEX_USAGE_LIMIT, "the worker still gets the provider's error");
+      const auto = await loadAutoModel(h, fakeSessionRegistry([]));
+      const worker = auto.worker("limited-worker");
+      rungs.push((await worker.user()).rung);
+      await worker.fail(CODEX_USAGE_LIMIT, "working");
       // The pinned worker's next request hits the limit again: a second failed write, no second line.
-      await autoEvents(stream, [...FIX_README, { role: "user", content: "try again", timestamp: 1 }], "limited-worker");
-      await autoEvents(stream, FIX_README, "next-worker");
+      rungs.push((await worker.user()).rung);
+      await worker.fail(CODEX_USAGE_LIMIT, "working");
+      rungs.push((await firstRequest(auto, FIX_README, "next-worker")).rung);
     });
     const lines = stderr.split("\n").filter(Boolean);
     assert.equal(lines.length, 1, stderr);
@@ -1964,7 +1919,7 @@ test("a usage observation the store cannot save warns once, keeps routing on, an
       "pi-orchestrator router warning: could not save the usage observation for openai-codex (exhausted until 2026-09-26T12:42:00.000Z) " +
       `in ${join(h.stateDir, "usage-observations.json")}: <error>. Routing in this process still avoids openai-codex; ` +
       "other sessions don't see it until a later write succeeds.");
-    assert.deepEqual(forwardedRungs(registry), ["openai-codex/gpt-6-luna:low", "openai-codex/gpt-6-luna:low", `${HAIKU}:low`],
+    assert.deepEqual(rungs, ["openai-codex/gpt-6-luna:low", "openai-codex/gpt-6-luna:low", `${HAIKU}:low`],
       "the unsaved observation still removes openai-codex from the next routing");
     const record = h.records().find((entry) => entry.delegationId === "next-worker");
     assert.ok(record?.recordType === "decision" && record.mode === "live" && record.route.outcome === "chosen", "routing stays on");
@@ -1972,15 +1927,29 @@ test("a usage observation the store cannot save warns once, keeps routing on, an
   } finally { h.cleanup(); }
 });
 
-test("a first-request limit whose observation the store cannot save still fails over", async () => {
+test("a first-request quota error whose observation the store cannot save still fails over", { skip: QUOTA_FAILOVER }, async () => {
   const h = harness({ ...LIVE, tiers: CODEX_FIRST });
   try {
     blockUsageStore(h);
-    const registry = fakeSessionRegistry([{ events: errorEvents(CODEX_USAGE_LIMIT) }, { events: answerEvents("done on haiku") }]);
-    let events: Awaited<ReturnType<typeof autoEvents>> = [];
-    const stderr = await stderrOf(async () => { events = await autoEvents(await loadAutoProvider(h, registry), FIX_README, "failover-worker"); });
-    assert.deepEqual(forwardedRungs(registry), ["openai-codex/gpt-6-luna:low", `${HAIKU}:low`]);
-    assert.equal(events.at(-1)?.type, "done");
+    const worker = (await loadAutoModel(h, fakeSessionRegistry([]))).worker("failover-worker");
+    await worker.user();
+    await worker.retry(CODEX_USAGE_LIMIT);
+    assert.deepEqual(worker.rungs, ["openai-codex/gpt-6-luna:low", `${HAIKU}:low`]);
+  } finally { h.cleanup(); }
+});
+
+test("a first-request rate limit whose observation the store cannot save still fails over", async () => {
+  const h = harness({ ...LIVE, tiers: CODEX_FIRST });
+  try {
+    blockUsageStore(h);
+    let rungs: readonly string[] = [];
+    const stderr = await stderrOf(async () => {
+      const worker = (await loadAutoModel(h, fakeSessionRegistry([]))).worker("failover-worker");
+      await worker.user();
+      await worker.retry(CODEX_RATE_LIMIT);
+      rungs = worker.rungs;
+    });
+    assert.deepEqual(rungs, ["openai-codex/gpt-6-luna:low", `${HAIKU}:low`]);
     assert.deepEqual(recordsOf(h, "failover-worker").map((record) => record.recordType), ["decision", "failover", "decision"]);
     assert.match(stderr, /^pi-orchestrator router warning: could not save the usage observation for openai-codex /);
     assert.doesNotMatch(stderr, /router disabled/);
@@ -2000,25 +1969,19 @@ const BOTH_EXHAUSTED = "anthropic: exhausted until 2026-09-26T17:00:00.000Z (no 
 
 /** Two sessions in two projects hit a usage limit at once, each on its own provider. */
 async function exhaustBothProviders(h: Harness): Promise<void> {
-  const codex = fakeSessionRegistry([{ events: midRunErrorEvents(CODEX_USAGE_LIMIT) }]);
-  const anthropic = fakeSessionRegistry([{ events: midRunErrorEvents("You're out of extra usage.") }]);
-  const codexStream = await loadAutoProvider(h, codex, {}, { cwd: projectWithMechanicalTier(h, "codex-project", ["openai-codex/gpt-6-luna:low"]) });
-  const anthropicStream = await loadAutoProvider(h, anthropic, {}, { cwd: projectWithMechanicalTier(h, "anthropic-project", [`${HAIKU}:low`]) });
-  await Promise.all([autoEvents(codexStream, FIX_README, "codex-worker"), autoEvents(anthropicStream, FIX_README, "anthropic-worker")]);
-  assert.deepEqual([...forwardedRungs(codex), ...forwardedRungs(anthropic)], ["openai-codex/gpt-6-luna:low", `${HAIKU}:low`]);
+  const codex = (await loadAutoModel(h, fakeSessionRegistry([]), {}, { cwd: projectWithMechanicalTier(h, "codex-project", ["openai-codex/gpt-6-luna:low"]) })).worker("codex-worker");
+  const anthropic = (await loadAutoModel(h, fakeSessionRegistry([]), {}, { cwd: projectWithMechanicalTier(h, "anthropic-project", [`${HAIKU}:low`]) })).worker("anthropic-worker");
+  assert.deepEqual((await Promise.all([codex.user(), anthropic.user()])).map((routed) => routed.rung), ["openai-codex/gpt-6-luna:low", `${HAIKU}:low`]);
+  await Promise.all([codex.fail(CODEX_USAGE_LIMIT, "working"), anthropic.fail("You're out of extra usage.", "working")]);
 }
 
-test("with every provider exhausted a worker is refused with the reset times, and nothing is forwarded or recorded for it", async () => {
+test("with every provider exhausted a worker is refused with the reset times, and nothing is routed or recorded for it", async () => {
   const h = harness(LIVE);
   try {
     await exhaustBothProviders(h);
-    const nothing = fakeSessionRegistry([]);
-    const refused = await autoEvents(await loadAutoProvider(h, nothing), FIX_README, "refused-worker");
-    const final = refused.at(-1);
-    assert.ok(final?.type === "error");
-    assert.equal(final.error.errorMessage, "routing refused this worker, and its fallback, the orchestrator session model " +
-      `anthropic/claude-haiku-4-5:medium, is on anthropic, which is out of usage. Usage limits: ${BOTH_EXHAUSTED}. No worker request was sent.`);
-    assert.equal(nothing.calls.length, 0);
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]));
+    await assert.rejects(firstRequest(auto, FIX_README, "refused-worker"), { message: "routing refused this worker, and its fallback, the orchestrator session model " +
+      `anthropic/claude-haiku-4-5:medium, is on anthropic, which is out of usage. Usage limits: ${BOTH_EXHAUSTED}. No worker request was sent.` });
     assert.equal(h.records().some((record) => record.delegationId === "refused-worker"), false);
   } finally { h.cleanup(); }
 });
@@ -2028,33 +1991,31 @@ test("after a refusal the session-model fallback runs only while its provider is
     elevated: ["openai-codex/gpt-6-sol:high"], critical: ["openai-codex/gpt-6-sol:xhigh"] };
   const h = harness({ ...LIVE, tiers: codexOnly });
   try {
-    await autoEvents(await loadAutoProvider(h, fakeSessionRegistry([{ events: errorEvents(CODEX_USAGE_LIMIT) }])), FIX_README, "codex-worker");
+    const codex = (await loadAutoModel(h, fakeSessionRegistry([]))).worker("codex-worker");
+    await codex.user();
+    await codex.fail(CODEX_USAGE_LIMIT);
 
-    const fallback = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-    assert.equal((await autoEvents(await loadAutoProvider(h, fallback), FIX_README, "fallback-worker")).at(-1)?.type, "done");
-    assert.deepEqual(forwardedRungs(fallback), [`${HAIKU}:medium`], "the anthropic session model still has usage");
+    assert.equal((await firstRequest(await loadAutoModel(h, fakeSessionRegistry([])), FIX_README, "fallback-worker")).rung, `${HAIKU}:medium`,
+      "the anthropic session model still has usage");
     const record = h.records().find((entry) => entry.delegationId === "fallback-worker");
     assert.ok(record?.recordType === "decision" && record.route.outcome === "refused");
     assert.deepEqual([...new Set(record.route.removed.map((removed) => removed.reason))], ["provider out of usage"]);
     assert.equal(record.ranOn, `${HAIKU}:medium`);
 
-    const nothing = fakeSessionRegistry([]);
-    const stream = await loadAutoProvider(h, nothing);
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]));
     process.env.PI_ORCHESTRATOR_SESSION_MODEL = "openai-codex/gpt-6-sol:medium";
-    const final = (await autoEvents(stream, FIX_README, "skipped-fallback-worker")).at(-1);
-    assert.ok(final?.type === "error");
-    assert.equal(final.error.errorMessage, "routing refused this worker, and its fallback, the orchestrator session model openai-codex/gpt-6-sol:medium, " +
-      "is on openai-codex, which is out of usage. Usage limits: openai-codex: exhausted until 2026-09-26T12:42:00.000Z, " +
-      "from a limit error at 2026-09-26T12:00:00.000Z. No worker request was sent.");
-    assert.equal(nothing.calls.length, 0);
+    await assert.rejects(firstRequest(auto, FIX_README, "skipped-fallback-worker"), { message: "routing refused this worker, and its fallback, the orchestrator " +
+      "session model openai-codex/gpt-6-sol:medium, is on openai-codex, which is out of usage. Usage limits: openai-codex: exhausted until " +
+      "2026-09-26T12:42:00.000Z, from a limit error at 2026-09-26T12:00:00.000Z. No worker request was sent." });
   } finally { h.cleanup(); }
 });
 
 // ---------------------------------------------------------------------------
-// Failover on the first request (PRD cml8, "Failover"): a limit error on a
-// worker's first request, before the rung produced anything, pins the worker
-// again to the next surviving rung, on another provider. A limit later in the
-// run fails the worker. Both record a usage observation.
+// Failover on the first request (PRD cml8, "Failover"; spec 23b3): a limit
+// error on a worker's first request, before the rung produced anything,
+// reaches route as pi's retry, which pins the worker again to the next
+// surviving rung on another provider, once. A limit later in the run stays on
+// the pin, where pi retries it. Both record a usage observation.
 // ---------------------------------------------------------------------------
 
 /** The records of `delegationId`, in file order. */
@@ -2062,18 +2023,15 @@ function recordsOf(h: Harness, delegationId: string): RoutingRecord[] {
   return h.records().filter((record) => record.delegationId === delegationId);
 }
 
-test("a first request answered with a usage-limit error pins the worker again to the other provider, records the failover linked to the refused attempt, and later routing avoids the provider", async () => {
+test("a first request answered with a rate limit pins the worker again to the other provider, records the failover linked to the refused attempt, and later routing avoids the provider", async () => {
   const h = harness({ ...LIVE, tiers: CODEX_FIRST });
   try {
-    const registry = fakeSessionRegistry([{ events: errorEvents(CODEX_USAGE_LIMIT) }, { events: answerEvents("done on haiku") },
-      { events: answerEvents("second turn") }]);
-    const stream = await loadAutoProvider(h, registry);
-    const events = await autoEvents(stream, FIX_README, "failover-worker");
-    assert.deepEqual(forwardedRungs(registry), ["openai-codex/gpt-6-luna:low", `${HAIKU}:low`]);
-    assert.deepEqual(events.map((event) => event.type), ["start", "thinking_delta", "text_delta", "done"], "the worker sees one answer and no error");
-    const final = events.at(-1);
-    assert.ok(final?.type === "done");
-    assert.deepEqual([final.message.provider, final.message.model], ["orchestrator", "auto"]);
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]));
+    const worker = auto.worker("failover-worker");
+    const refusedRoute = await worker.user();
+    const failedOver = await worker.retry(CODEX_RATE_LIMIT);
+    assert.deepEqual(worker.rungs, ["openai-codex/gpt-6-luna:low", `${HAIKU}:low`]);
+    assert.notEqual(failedOver.state, refusedRoute.state, "the new pin is stored in router state");
 
     const [refused, failover, chosen, ...rest] = recordsOf(h, "failover-worker");
     assert.deepEqual(rest, []);
@@ -2082,105 +2040,147 @@ test("a first request answered with a usage-limit error pins the worker again to
     assert.equal(refused.ranOn, "openai-codex/gpt-6-luna:low");
     assert.ok(failover?.recordType === "failover");
     assert.deepEqual(failover.refusedAttempt, { timestamp: refused.timestamp, rung: "openai-codex/gpt-6-luna:low" });
-    assert.equal(failover.limit, "exhausted");
-    assert.equal(failover.resetsAt, "2026-09-26T12:42:00.000Z");
-    assert.equal(failover.detail, CODEX_USAGE_LIMIT);
+    assert.equal(failover.limit, "throttled");
+    assert.equal(failover.resetsAt, "2026-09-26T12:00:20.000Z");
+    assert.equal(failover.detail, CODEX_RATE_LIMIT);
     assert.equal(failover.rung, `${HAIKU}:low`);
     assert.ok(chosen?.recordType === "decision" && chosen.route.outcome === "chosen");
     assert.equal(chosen.route.rung.rung, `${HAIKU}:low`);
     assert.equal(chosen.ranOn, `${HAIKU}:low`);
-    assert.deepEqual(chosen.route.removed.map((removed) => [removed.rung, removed.reason]), [["openai-codex/gpt-6-luna:low", "provider out of usage"]]);
+    assert.deepEqual(chosen.route.removed.map((removed) => [removed.rung, removed.reason]), [["openai-codex/gpt-6-luna:low", "provider throttled"]]);
     // The routing report reads the failover and counts one delegation, on the rung it ran on.
     const report = buildRoutingReport(join(h.stateDir, "routing"));
     assert.equal(report.totals.decisions, 1);
     assert.deepEqual(report.rows.map((row) => [row.tier, row.rung, row.decisions]), [["mechanical", `${HAIKU}:low`, 1]]);
 
     // Later requests of the same worker stay on the rung it failed over to.
-    await autoEvents(stream, [...FIX_README, assistantMessage({ content: [{ type: "text", text: "done on haiku" }] }), { role: "user", content: "and more", timestamp: 1 }], "failover-worker");
-    assert.deepEqual(forwardedRungs(registry).at(-1), `${HAIKU}:low`);
+    worker.answered();
+    assert.equal((await worker.continuation()).rung, `${HAIKU}:low`);
+    assert.equal((await worker.user()).rung, `${HAIKU}:low`);
 
-    // The exhausted observation steers the next routing, from another session.
-    const next = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-    await autoEvents(await loadAutoProvider(h, next), FIX_README, "next-worker");
-    assert.deepEqual(forwardedRungs(next), [`${HAIKU}:low`]);
+    // The throttled observation steers the next routing, from another session.
+    assert.equal((await firstRequest(await loadAutoModel(h, fakeSessionRegistry([])), FIX_README, "next-worker")).rung, `${HAIKU}:low`);
     const [removed] = removedRungs(h, "next-worker");
-    assert.deepEqual(removed?.slice(0, 2), ["openai-codex/gpt-6-luna:low", "provider out of usage"]);
-    assert.match(removed?.[2] ?? "", /exhausted until 2026-09-26T12:42:00\.000Z/);
+    assert.deepEqual(removed?.slice(0, 2), ["openai-codex/gpt-6-luna:low", "provider throttled"]);
+    assert.match(removed?.[2] ?? "", /throttled until 2026-09-26T12:00:20\.000Z/);
   } finally { h.cleanup(); }
 });
 
-test("a first request that starts and then hits a rate limit fails over without a second start, and balancing counts the delegation on the provider it ran on", async () => {
+test("a first request answered with a usage-limit error pins the worker again to the other provider and records the failover", { skip: QUOTA_FAILOVER }, async () => {
   const h = harness({ ...LIVE, tiers: CODEX_FIRST });
   try {
-    const throttled = "Codex error: Rate limit reached. Please try again in 20s.";
-    const registry = fakeSessionRegistry([{ events: [{ type: "start" }, ...errorEvents(throttled)] }, { events: answerEvents("done on haiku") }]);
-    const events = await autoEvents(await loadAutoProvider(h, registry), FIX_README, "throttled-worker");
-    assert.deepEqual(forwardedRungs(registry), ["openai-codex/gpt-6-luna:low", `${HAIKU}:low`]);
-    assert.deepEqual(events.map((event) => event.type), ["start", "thinking_delta", "text_delta", "done"]);
+    const worker = (await loadAutoModel(h, fakeSessionRegistry([]))).worker("failover-worker");
+    await worker.user();
+    await worker.retry(CODEX_USAGE_LIMIT);
+    assert.deepEqual(worker.rungs, ["openai-codex/gpt-6-luna:low", `${HAIKU}:low`]);
+    const failover = recordsOf(h, "failover-worker").find((record) => record.recordType === "failover");
+    assert.ok(failover?.recordType === "failover");
+    assert.deepEqual([failover.limit, failover.resetsAt], ["exhausted", "2026-09-26T12:42:00.000Z"]);
+  } finally { h.cleanup(); }
+});
+
+test("a failed-over worker's delegation counts for the provider it ran on once the throttle lifts", async () => {
+  const h = harness({ ...LIVE, tiers: CODEX_FIRST });
+  try {
+    const worker = (await loadAutoModel(h, fakeSessionRegistry([]))).worker("throttled-worker");
+    await worker.user();
+    await worker.retry(CODEX_RATE_LIMIT);
     const failover = recordsOf(h, "throttled-worker").find((record) => record.recordType === "failover");
     assert.ok(failover?.recordType === "failover");
     assert.deepEqual([failover.limit, failover.resetsAt, failover.rung], ["throttled", "2026-09-26T12:00:20.000Z", `${HAIKU}:low`]);
 
     // Once the throttle lifts, both providers survive: the failed-over
     // delegation counts for anthropic, where it ran, so codex is chosen.
-    const next = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-    await autoEvents(await loadAutoProvider(h, next, { now: () => new Date("2026-09-26T12:00:20.000Z") }), FIX_README, "after-throttle-worker");
-    assert.deepEqual(forwardedRungs(next), ["openai-codex/gpt-6-luna:low"]);
+    const next = await loadAutoModel(h, fakeSessionRegistry([]), { now: () => new Date("2026-09-26T12:00:20.000Z") });
+    assert.equal((await firstRequest(next, FIX_README, "after-throttle-worker")).rung, "openai-codex/gpt-6-luna:low");
     const [record] = recordsOf(h, "after-throttle-worker");
     assert.ok(record?.recordType === "decision" && record.route.outcome === "chosen");
     assert.deepEqual(record.route.providerCounts, { "openai-codex": 0, anthropic: 1 });
   } finally { h.cleanup(); }
 });
 
-test("a limit after the rung's first output, or on a later request, fails the worker without failing over and still records the observation", async () => {
+test("a limit after the rung's first output, on a later request, or on the rung a worker failed over to stays on the pin for pi's retry, records no failover and still records the observation", async () => {
   const h = harness({ ...LIVE, tiers: CODEX_FIRST });
   try {
     // After output on the first request.
-    const midStream = fakeSessionRegistry([{ events: midRunErrorEvents(CODEX_USAGE_LIMIT) }, { events: answerEvents("never") }]);
-    const events = await autoEvents(await loadAutoProvider(h, midStream), FIX_README, "mid-stream-worker");
-    assert.deepEqual(forwardedRungs(midStream), ["openai-codex/gpt-6-luna:low"]);
-    assert.deepEqual(events.map((event) => event.type), ["start", "text_delta", "error"], "the output is forwarded once, then the error");
-    const final = events.at(-1);
-    assert.ok(final?.type === "error");
-    assert.equal(final.error.errorMessage, CODEX_USAGE_LIMIT);
+    const midStream = (await loadAutoModel(h, fakeSessionRegistry([]))).worker("mid-stream-worker");
+    await midStream.user();
+    assert.equal((await midStream.retry(CODEX_RATE_LIMIT, "working")).rung, "openai-codex/gpt-6-luna:low");
     assert.deepEqual(recordsOf(h, "mid-stream-worker").map((record) => record.recordType), ["decision"]);
 
     // On a later request of a pinned worker.
-    const later = fakeSessionRegistry([{ events: answerEvents("first turn") }, { events: errorEvents("You're out of extra usage.") }, { events: answerEvents("never") }]);
-    const stream = await loadAutoProvider(h, later);
-    assert.equal((await autoEvents(stream, FIX_README, "later-worker")).at(-1)?.type, "done");
-    const second = await autoEvents(stream, [...FIX_README, assistantMessage({ content: [{ type: "text", text: "first turn" }] }), { role: "user", content: "go on", timestamp: 1 }], "later-worker");
-    assert.deepEqual(forwardedRungs(later), [`${HAIKU}:low`, `${HAIKU}:low`], "the second request stays on the pinned rung");
-    assert.deepEqual(second.map((event) => event.type), ["error"]);
+    const later = (await loadAutoModel(h, fakeSessionRegistry([]))).worker("later-worker");
+    assert.equal((await later.user()).rung, `${HAIKU}:low`);
+    later.answered();
+    await later.continuation();
+    assert.equal((await later.retry(ANTHROPIC_RATE_LIMIT)).rung, `${HAIKU}:low`, "the retry stays on the pinned rung");
+    assert.equal((await later.retry(ANTHROPIC_RATE_LIMIT)).rung, `${HAIKU}:low`, "and so do pi's further retries");
     assert.deepEqual(recordsOf(h, "later-worker").map((record) => record.recordType), ["decision"]);
 
     // Both limits are observations the next routing reads: with both
-    // providers exhausted it is refused before any request.
-    const next = fakeSessionRegistry([]);
-    const refused = (await autoEvents(await loadAutoProvider(h, next), FIX_README, "next-worker")).at(-1);
-    assert.ok(refused?.type === "error");
-    assert.match(refused.error.errorMessage ?? "", /Usage limits: anthropic: exhausted until .*; openai-codex: exhausted until 2026-09-26T12:42:00\.000Z/);
-    assert.equal(next.calls.length, 0);
+    // providers throttled it refuses and falls back to the session model.
+    assert.equal((await firstRequest(await loadAutoModel(h, fakeSessionRegistry([])), FIX_README, "next-worker")).rung, `${HAIKU}:medium`);
+    const [record] = recordsOf(h, "next-worker");
+    assert.ok(record?.recordType === "decision" && record.route.outcome === "refused");
+    assert.deepEqual([...new Set(record.route.removed.map((removed) => removed.reason))], ["provider throttled"]);
   } finally { h.cleanup(); }
 });
 
-test("a first-request limit with no other provider's rung left fails the worker with the limit error and records no failover", async () => {
+test("a worker fails over once: a limit on the first request of the rung it failed over to stays there", async () => {
+  const tiers = { ...TEST_TIERS, mechanical: ["openai-codex/gpt-6-luna:low", `${HAIKU}:low`, "openai-codex/gpt-6-sol:medium"] };
+  const h = harness({ ...LIVE, tiers });
+  try {
+    const worker = (await loadAutoModel(h, fakeSessionRegistry([]))).worker("twice-limited-worker");
+    await worker.user();
+    await worker.retry(CODEX_RATE_LIMIT);
+    assert.equal((await worker.retry(ANTHROPIC_RATE_LIMIT)).rung, `${HAIKU}:low`);
+    assert.deepEqual(worker.rungs, ["openai-codex/gpt-6-luna:low", `${HAIKU}:low`, `${HAIKU}:low`]);
+    assert.deepEqual(recordsOf(h, "twice-limited-worker").map((record) => record.recordType), ["decision", "failover", "decision"]);
+  } finally { h.cleanup(); }
+});
+
+test("a first-request quota error with no other provider's rung left fails the worker with the limit error and records no failover", { skip: QUOTA_FAILOVER }, async () => {
   const codexOnly = { mechanical: ["openai-codex/gpt-6-luna:low", "openai-codex/gpt-6-sol:medium"], standard: ["openai-codex/gpt-6-sol:medium"],
     elevated: ["openai-codex/gpt-6-sol:high"], critical: ["openai-codex/gpt-6-sol:xhigh"] };
   const h = harness({ ...LIVE, tiers: codexOnly });
   try {
-    const registry = fakeSessionRegistry([{ events: errorEvents(CODEX_USAGE_LIMIT) }, { events: answerEvents("never") }]);
-    const events = await autoEvents(await loadAutoProvider(h, registry), FIX_README, "stuck-worker");
-    assert.deepEqual(forwardedRungs(registry), ["openai-codex/gpt-6-luna:low"], "the same provider's next rung is not tried");
-    assert.deepEqual(events.map((event) => event.type), ["error"]);
-    const final = events.at(-1);
-    assert.ok(final?.type === "error");
-    assert.equal(final.error.errorMessage, CODEX_USAGE_LIMIT);
+    const worker = (await loadAutoModel(h, fakeSessionRegistry([]))).worker("stuck-worker");
+    await worker.user();
+    await worker.retry(CODEX_USAGE_LIMIT);
+    assert.deepEqual(recordsOf(h, "stuck-worker").map((record) => record.recordType), ["decision"]);
+  } finally { h.cleanup(); }
+});
+
+test("a first-request rate limit with no other provider's rung left stays on the pin for pi's retries and records no failover", async () => {
+  const codexOnly = { mechanical: ["openai-codex/gpt-6-luna:low", "openai-codex/gpt-6-sol:medium"], standard: ["openai-codex/gpt-6-sol:medium"],
+    elevated: ["openai-codex/gpt-6-sol:high"], critical: ["openai-codex/gpt-6-sol:xhigh"] };
+  const h = harness({ ...LIVE, tiers: codexOnly });
+  try {
+    const worker = (await loadAutoModel(h, fakeSessionRegistry([]))).worker("stuck-worker");
+    await worker.user();
+    await worker.retry(CODEX_RATE_LIMIT);
+    await worker.retry(CODEX_RATE_LIMIT);
+    assert.deepEqual(worker.rungs, ["openai-codex/gpt-6-luna:low", "openai-codex/gpt-6-luna:low", "openai-codex/gpt-6-luna:low"],
+      "the same provider's next rung is not tried");
     const records = recordsOf(h, "stuck-worker");
     assert.deepEqual(records.map((record) => record.recordType), ["decision"]);
     assert.ok(records[0]?.recordType === "decision");
     assert.equal(records[0].ranOn, "openai-codex/gpt-6-luna:low");
   } finally { h.cleanup(); }
+});
+
+test("shadow mode and a restored pin never fail over", async () => {
+  for (const [name, routing] of [["shadow", { ...SHADOW, tiers: CODEX_FIRST }], ["restored", { ...LIVE, tiers: CODEX_FIRST }]] as const) {
+    const h = harness(routing);
+    try {
+      if (name === "restored") await firstRequest(await loadAutoModel(h, fakeSessionRegistry([])), FIX_README, "no-failover-worker");
+      process.env.PI_ORCHESTRATOR_SESSION_MODEL = "openai-codex/gpt-6-sol:medium";
+      const worker = (await loadAutoModel(h, fakeSessionRegistry([]))).worker("no-failover-worker");
+      const first = await worker.user();
+      assert.equal((await worker.retry(CODEX_RATE_LIMIT)).rung, first.rung, name);
+      assert.equal(h.records().filter((record) => record.recordType === "failover").length, 0, name);
+    } finally { h.cleanup(); }
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -2200,9 +2200,8 @@ test("a stored low percentage shifts a balanced choice to the other provider and
   try {
     await seedDecision(h, "earlier-anthropic", NOW, "live");
     await observe(h, "openai-codex", CODEX_LOW);
-    const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-    await autoEvents(await loadAutoProvider(h, registry), FIX_README, "weighted-worker");
-    assert.deepEqual(forwardedRungs(registry), [`${HAIKU}:low`], "codex counts 0 + 5 against anthropic's 1");
+    assert.equal((await firstRequest(await loadAutoModel(h, fakeSessionRegistry([])), FIX_README, "weighted-worker")).rung, `${HAIKU}:low`,
+      "codex counts 0 + 5 against anthropic's 1");
     const [record] = recordsOf(h, "weighted-worker");
     assert.ok(record?.recordType === "decision" && record.route.outcome === "chosen");
     assert.deepEqual(record.route.providerCounts, { "openai-codex": 0, anthropic: 1 });
@@ -2216,17 +2215,15 @@ test("a low provider is still chosen when the other is used far more, and the we
   try {
     for (let index = 0; index < 6; index += 1) await seedDecision(h, `anthropic-${index}`, NOW, "live");
     await observe(h, "openai-codex", CODEX_LOW);
-    const busy = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-    await autoEvents(await loadAutoProvider(h, busy), FIX_README, "busy-worker");
-    assert.deepEqual(forwardedRungs(busy), ["openai-codex/gpt-6-luna:low"], "codex 0 + 5 is still below anthropic's 6");
+    assert.equal((await firstRequest(await loadAutoModel(h, fakeSessionRegistry([])), FIX_README, "busy-worker")).rung, "openai-codex/gpt-6-luna:low",
+      "codex 0 + 5 is still below anthropic's 6");
 
     const h2 = harness({ ...LIVE, tiers: CODEX_FIRST });
     try {
       await seedDecision(h2, "earlier-anthropic", NOW, "live");
       await observe(h2, "openai-codex", CODEX_LOW);
-      const afterReset = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-      await autoEvents(await loadAutoProvider(h2, afterReset, { now: () => new Date(CODEX_LOW.resetsAt) }), FIX_README, "after-reset-worker");
-      assert.deepEqual(forwardedRungs(afterReset), ["openai-codex/gpt-6-luna:low"]);
+      const afterReset = await loadAutoModel(h2, fakeSessionRegistry([]), { now: () => new Date(CODEX_LOW.resetsAt) });
+      assert.equal((await firstRequest(afterReset, FIX_README, "after-reset-worker")).rung, "openai-codex/gpt-6-luna:low");
       const [record] = recordsOf(h2, "after-reset-worker");
       assert.ok(record?.recordType === "decision" && record.route.outcome === "chosen");
       assert.equal(record.route.lowUsageProviders, undefined);
@@ -2238,8 +2235,9 @@ test("a low provider is still chosen when the other is used far more, and the we
 // Quota headers (PRD cml8, story 50): pi hands every provider response's
 // status and headers to the session's after_provider_response handlers,
 // which do not say which provider answered. The router attributes them to the
-// request in flight: a worker's rung on the auto model, or the model of the
-// session's own request. They add a percentage left to the usage store.
+// request in flight: the physical model a worker's request on the auto model
+// was routed to, or the model of the session's own request. They add a
+// percentage left to the usage store.
 //
 // The first tests replay the sanitized captures of ticket 12
 // (src/fixtures/usage, bean pi-orchestrator-ugoi): every `response` record's
@@ -2263,19 +2261,16 @@ function capturedResponses(file: string): { status: number; headers: Record<stri
     .map((record) => ({ status: record.status!, headers: record.headers! }));
 }
 
-/** A worker's session as its after_provider_response handlers see it: its
- *  session model is the auto model, which names no provider that answered. */
-function workerContext(h: Harness, sessionId: string, registry: SessionModelRegistry): ExtensionContext {
-  return { cwd: h.projectDir, hasUI: false, model: { provider: "orchestrator", id: "auto" }, modelRegistry: registry, thinkingLevel: "medium",
-    sessionManager: { getSessionId: () => sessionId } } as unknown as ExtensionContext;
-}
-
-/** The request options pi's agent gives a worker's auto-model request: its
- *  onResponse emits after_provider_response in the worker's session. */
-function responsesTo(handlers: ReturnType<typeof piHandlers>, ctx: ExtensionContext) {
-  return { onResponse: async (response: { status: number; headers: Record<string, string> }) => {
-    await handlers.get("after_provider_response")?.({ type: "after_provider_response", status: response.status, headers: response.headers }, ctx);
-  } } as Partial<Parameters<AutoStream>[2]>;
+/** A worker's request on the auto model as pi runs it: routed, then sent,
+ *  with before_provider_request and, when the provider answered with
+ *  `response`, after_provider_response in the worker's session. */
+async function workerRequest(auto: AutoModel, h: Harness, sessionId: string, registry: SessionModelRegistry,
+  response?: { status: number; headers: Record<string, string> }): Promise<Routed> {
+  const routed = await firstRequest(auto, FIX_README, sessionId);
+  const ctx = workerContext(h, sessionId, registry);
+  await auto.handlers.get("before_provider_request")?.({ type: "before_provider_request", payload: {} }, ctx);
+  if (response !== undefined) await auto.handlers.get("after_provider_response")?.({ type: "after_provider_response", ...response }, ctx);
+  return routed;
 }
 
 function storedObservations(h: Harness) {
@@ -2287,10 +2282,9 @@ test("captured Anthropic shaped-path headers on a worker's rung store anthropic'
   try {
     const [response, ...more] = capturedResponses("anthropic/shaped-ok.jsonl");
     assert.equal(more.length, 0, "the capture has one response record");
-    const registry = fakeSessionRegistry([{ events: answerEvents("ok"), response: response! }]);
-    const { stream, handlers } = await loadRouterWith(h, registry, { classifierCall: () => answering("mechanical").call });
-    await autoEvents(stream, FIX_README, "anthropic-worker", responsesTo(handlers, workerContext(h, "anthropic-worker", registry)));
-    assert.deepEqual(forwardedRungs(registry), [`${HAIKU}:low`]);
+    const registry = fakeSessionRegistry([]);
+    const auto = await loadRouterWith(h, registry, { classifierCall: () => answering("mechanical").call });
+    assert.equal((await workerRequest(auto, h, "anthropic-worker", registry, response)).rung, `${HAIKU}:low`);
     // 5h utilization 0.05 is 95% left, 7d 0.39 is 61% left; the 7d window resets 2026-10-04T04:00:00Z.
     assert.deepEqual(storedObservations(h), { anthropic: { state: "available", percentLeft: 61, resetsAt: "2026-10-04T04:00:00.000Z",
       observedAt: NOW.toISOString(), source: "header" } });
@@ -2302,10 +2296,9 @@ test("captured Codex SSE headers on a worker's rung store openai-codex's percent
   try {
     const [response, ...more] = capturedResponses("openai-codex/sse-ok.jsonl");
     assert.equal(more.length, 0, "the capture has one response record");
-    const registry = fakeSessionRegistry([{ events: answerEvents("ok"), response: response! }]);
-    const { stream, handlers } = await loadRouterWith(h, registry, { classifierCall: () => answering("mechanical").call });
-    await autoEvents(stream, FIX_README, "codex-worker", responsesTo(handlers, workerContext(h, "codex-worker", registry)));
-    assert.deepEqual(forwardedRungs(registry), ["openai-codex/gpt-6-luna:low"]);
+    const registry = fakeSessionRegistry([]);
+    const auto = await loadRouterWith(h, registry, { classifierCall: () => answering("mechanical").call });
+    assert.equal((await workerRequest(auto, h, "codex-worker", registry, response)).rung, "openai-codex/gpt-6-luna:low");
     // Primary (300 min) 2% used is 98% left, secondary (10080 min) 37% used is 63% left, resetting 2026-10-05T09:47:17Z.
     assert.deepEqual(storedObservations(h), { "openai-codex": { state: "available", percentLeft: 63, resetsAt: "2026-10-05T09:47:17.000Z",
       observedAt: NOW.toISOString(), source: "header" } });
@@ -2317,9 +2310,9 @@ test("the captured Codex WebSocket case has no response record, so a worker on i
   try {
     const records = capturedRecords("openai-codex/websocket-ok.jsonl");
     assert.deepEqual(records.map((record) => record.kind), ["session", "request", "result"]);
-    const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-    const { stream, handlers } = await loadRouterWith(h, registry, { classifierCall: () => answering("mechanical").call });
-    await autoEvents(stream, FIX_README, "websocket-worker", responsesTo(handlers, workerContext(h, "websocket-worker", registry)));
+    const registry = fakeSessionRegistry([]);
+    const auto = await loadRouterWith(h, registry, { classifierCall: () => answering("mechanical").call });
+    await workerRequest(auto, h, "websocket-worker", registry);
     assert.deepEqual(storedObservations(h), {});
   } finally { h.cleanup(); }
 });
@@ -2338,6 +2331,20 @@ test("captured headers of the session's own request are attributed to the model 
     await handlers.get("after_provider_response")?.({ type: "after_provider_response", ...response! }, switched);
     assert.deepEqual(Object.keys(storedObservations(h)), ["anthropic"]);
     assert.equal(storedObservations(h).anthropic?.percentLeft, 61);
+  } finally { h.cleanup(); }
+});
+
+test("a session that leaves the auto model for a physical one attributes its own response to that model, not its last routed rung", async () => {
+  const h = harness({ ...LIVE, tiers: CODEX_FIRST });
+  try {
+    const [response] = capturedResponses("anthropic/shaped-ok.jsonl");
+    const registry = fakeSessionRegistry([]);
+    const auto = await loadRouterWith(h, registry, { classifierCall: () => answering("mechanical").call });
+    assert.equal((await workerRequest(auto, h, "switching-worker", registry)).rung, "openai-codex/gpt-6-luna:low");
+    const own = { ...workerContext(h, "switching-worker", registry), model: SESSION_MODEL } as unknown as ExtensionContext;
+    await auto.handlers.get("before_provider_request")?.({ type: "before_provider_request", payload: {} }, own);
+    await auto.handlers.get("after_provider_response")?.({ type: "after_provider_response", ...response! }, own);
+    assert.deepEqual(Object.keys(storedObservations(h)), ["anthropic"]);
   } finally { h.cleanup(); }
 });
 
@@ -2364,10 +2371,10 @@ function codexHeaders(overrides: Record<string, string | undefined>): Record<str
 /** Runs one worker whose rung answers with `response`, at `now`, and returns the store. */
 async function workerWithResponse(h: Harness, sessionId: string, response: { status: number; headers: Record<string, string> },
   now: Date = NOW) {
-  const registry = fakeSessionRegistry([{ events: answerEvents("ok"), response }]);
-  const { stream, handlers } = await loadRouterWith(h, registry, { classifierCall: () => answering("mechanical").call, now: () => now });
-  await autoEvents(stream, FIX_README, sessionId, responsesTo(handlers, workerContext(h, sessionId, registry)));
-  return { registry, observations: storedObservations(h) };
+  const registry = fakeSessionRegistry([]);
+  const auto = await loadRouterWith(h, registry, { classifierCall: () => answering("mechanical").call, now: () => now });
+  await workerRequest(auto, h, sessionId, registry, response);
+  return { observations: storedObservations(h) };
 }
 
 test("synthetic: a Codex window under 10% left is stored low, and the next routing weighs openai-codex", async () => {
@@ -2377,9 +2384,7 @@ test("synthetic: a Codex window under 10% left is stored low, and the next routi
     assert.deepEqual(observations["openai-codex"], { state: "low", percentLeft: 7, resetsAt: "2026-09-29T13:14:09.000Z",
       observedAt: NOW.toISOString(), source: "header" });
     // codex has 1 pinned delegation + 5 for low usage; anthropic none.
-    const next = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-    await autoEvents(await loadAutoProvider(h, next), FIX_README, "next-worker");
-    assert.deepEqual(forwardedRungs(next), [`${HAIKU}:low`]);
+    assert.equal((await firstRequest(await loadAutoModel(h, fakeSessionRegistry([])), FIX_README, "next-worker")).rung, `${HAIKU}:low`);
     const [record] = recordsOf(h, "next-worker");
     assert.ok(record?.recordType === "decision" && record.route.outcome === "chosen");
     assert.deepEqual(record.route.lowUsageProviders, ["openai-codex"]);

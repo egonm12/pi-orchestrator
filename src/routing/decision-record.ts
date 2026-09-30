@@ -26,7 +26,7 @@
 //
 // Every record is validated on write and on read: a missing or unknown field,
 // at the top level or inside the classification, tier map or route, fails
-// with the field named. The auto provider (../router/auto-provider.ts) writes
+// with the field named. The auto model (../router/auto-model.ts) writes
 // one decision record per worker's first request, and when that request fails
 // over (PRD cml8, "Failover") a failover record and a decision record for the
 // rung it moved to.

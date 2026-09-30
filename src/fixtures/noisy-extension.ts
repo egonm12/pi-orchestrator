@@ -4,7 +4,7 @@ import { join } from "node:path";
 // A stand-in for an extension like context-mode (bean 5he0): it appends a
 // plain `{role: "user"}` message via pi's `context` hook, after the delegated
 // prompt and before a worker's first reply. `firstTaskAndRole`
-// (router/auto-provider.ts) reads only the first user message, so this noise
+// (router/auto-model.ts) reads only the first user message, so this noise
 // must set no keyword floor and must not appear in a decision record's task
 // text. `PI_NOISY_EXTENSION_LOG`, when set in the worker's environment, gets
 // one line per `context` event, so a live test can confirm the noise really

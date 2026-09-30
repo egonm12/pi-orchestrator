@@ -15,7 +15,7 @@ import { readRoutingRecords, readUsableRoutingRecordEntries } from "../routing/d
 import { attachVerdict } from "../routing/verdicts.ts";
 import { buildRoutingReport } from "../routing/routing-report.ts";
 import { createTempRepo } from "../fixtures/temp-repo.ts";
-import { autoStream } from "../router/auto-stream.ts";
+import { providerStream } from "../fixtures/provider-stream.ts";
 import { createRouterExtension } from "../router/extension.ts";
 import personalGuard from "../guard/extension.ts";
 import { recordUsageObservation, usageObservationsPath, type UsageObservation } from "../router/usage-observations.ts";
@@ -122,7 +122,7 @@ function fakeAnthropic(reply: string, onRequest?: (finish: () => void) => void, 
       }
       requests.push({ sessionId: options?.sessionId, model: `${model.provider}/${model.id}`, tools: [...tools], systemText: systemText.join("\n"), thinkingLevel: options?.reasoning,
         messages: context.messages.filter((message) => message.role !== "system").map((message) => JSON.stringify(message)) });
-      const { stream, push, end } = autoStream();
+      const { stream, push, end } = providerStream();
       const message = {
         role: "assistant", content: [{ type: "text", text: reply }], api: model.api, provider: model.provider, model: model.id,
         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
@@ -1236,7 +1236,7 @@ function probeCallingAnthropic(): InlineExtension {
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200_000, maxTokens: 64_000 }],
     streamSimple(model, context) {
       const probed = context.messages.some((message) => message.role === "toolResult");
-      const { stream, push, end } = autoStream();
+      const { stream, push, end } = providerStream();
       const message = {
         role: "assistant", api: model.api, provider: model.provider, model: model.id,
         content: probed ? [{ type: "text", text: "done" }] : [{ type: "toolCall", id: "probe-1", name: "probe", arguments: {} }],
@@ -1490,7 +1490,7 @@ function scriptedAnthropic(script: (request: ScriptedRequest) => ScriptedReply, 
       };
       requests.push(request);
       const reply = script(request);
-      const { stream, push, end } = autoStream();
+      const { stream, push, end } = providerStream();
       const message = {
         role: "assistant", api: model.api, provider: model.provider, model: model.id,
         content: [...(reply.text === undefined ? [] : [{ type: "text", text: reply.text }]),
@@ -4079,4 +4079,211 @@ test("the protocol tells the orchestrator to judge an editing delegation's Resul
     "still waiting for a verdict", "tell the user"]) {
     assert.ok(paragraph.includes(phrase), `${phrase}: ${paragraph}`);
   }
+});
+
+// The auto model as a pi virtual model (ticket x6ik), seen through the
+// subagents tool: which physical model each of a worker's requests reached,
+// and what the decision record holds.
+
+const LUNA = "openai-codex/gpt-6-luna";
+const TWO_PROVIDER_ROUTING = {
+  ...ROUTING,
+  tiers: { mechanical: { order: "ordered", rungs: [RUNG, `${LUNA}:low`] }, standard: [RUNG], elevated: [RUNG], critical: [RUNG] },
+};
+/** pi's own retry waits two seconds by default; the throwaway agent dir's settings shorten it. */
+const FAST_RETRY = { retry: { baseDelayMs: 1 } };
+
+/** One request a physical model got. */
+interface PhysicalRequest {
+  readonly model: string;
+  readonly thinkingLevel: string | undefined;
+  readonly tools: readonly string[];
+  readonly toolResults: number;
+  readonly userMessages: readonly string[];
+}
+
+type PhysicalReply = { readonly text: string } | { readonly toolCall: { readonly name: string; readonly arguments: Record<string, unknown> } } | { readonly error: string };
+
+/** Fake `anthropic` (claude-haiku-4-5) and `openai-codex` (gpt-6-luna)
+ *  providers offline, answering each request with what `script` returns for
+ *  it: a text, a tool call, or an error before any output. Every reply costs 0.01. */
+function physicalProviders(script: (request: PhysicalRequest, index: number) => PhysicalReply, inputTokens = 10) {
+  const requests: PhysicalRequest[] = [];
+  const text = (content: string | readonly { type: string; text?: string }[]) =>
+    typeof content === "string" ? content : content.map((part) => part.type === "text" ? part.text ?? "" : "").join("");
+  const config = (name: string, modelId: string): ProviderConfig => ({
+    name, baseUrl: "http://localhost/unused", apiKey: "unused", api: "fake-physical" as never,
+    models: [{ id: modelId, name: modelId, reasoning: true, input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200_000, maxTokens: 64_000 }],
+    streamSimple(model, context, options) {
+      const tools = new Set<string>();
+      for (const message of context.messages) {
+        if (message.role !== "system") continue;
+        for (const tool of message.toolsRemoved ?? []) tools.delete(tool.name);
+        for (const tool of message.toolsAdded ?? []) tools.add(tool.name);
+      }
+      const request: PhysicalRequest = { model: `${model.provider}/${model.id}`, thinkingLevel: options?.reasoning, tools: [...tools],
+        toolResults: context.messages.filter((message) => message.role === "toolResult").length,
+        userMessages: context.messages.flatMap((message) => message.role === "user" ? [text(message.content)] : []) };
+      requests.push(request);
+      const reply = script(request, requests.length - 1);
+      const { stream, push, end } = providerStream();
+      const usage = { input: inputTokens, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: inputTokens + 5, cost: { input: 0.006, output: 0.004, cacheRead: 0, cacheWrite: 0, total: 0.01 } };
+      const base = { role: "assistant", api: model.api, provider: model.provider, model: model.id, usage, timestamp: Date.now() };
+      if ("error" in reply) {
+        push({ type: "error", reason: "error", error: { ...base, content: [], stopReason: "error", errorMessage: reply.error } } as never);
+      } else {
+        const message = { ...base,
+          content: "text" in reply ? [{ type: "text", text: reply.text }] : [{ type: "toolCall", id: `call-${requests.length}`, name: reply.toolCall.name, arguments: reply.toolCall.arguments }],
+          stopReason: "text" in reply ? "stop" : "toolUse" };
+        push({ type: "start", partial: { ...message, content: [] } } as never);
+        push({ type: "done", reason: message.stopReason, message } as never);
+      }
+      end({ api: model.api, provider: model.provider, model: model.id });
+      return stream;
+    },
+  });
+  const extension: InlineExtension = { name: "fake-physical", factory: (pi) => {
+    pi.registerProvider("anthropic", config("Fake Anthropic", "claude-haiku-4-5"));
+    pi.registerProvider("openai-codex", config("Fake Codex", "gpt-6-luna"));
+  } };
+  return { extension, requests };
+}
+
+/** The router extension with both fake providers installed and approved. */
+function twoProviderRouter(): InlineExtension {
+  const classifierAnswer = JSON.stringify({ tier: "mechanical", risk: { level: "none", reasons: [] }, ambiguity: "clear", complexity: "low", kindOfWork: "implement", why: "fake classifier says mechanical" });
+  let authorization = approvedAnthropic();
+  authorization = authorizeRecipient(authorization, "openai-codex",
+    grantOwnerApproval({ approvedBy: "owner", scope: "data-recipient", acknowledgement: "send delegation data to openai-codex" }));
+  return {
+    name: "router",
+    factory: createRouterExtension({
+      classifierCall: () => async () => classifierAnswer,
+      evidence: () => () => ({ catalog: buildCatalog({ modelIds: [HAIKU, LUNA], now: NOW }), refreshState: emptyRefreshState(), authorization }),
+      now: () => NOW,
+    }),
+  };
+}
+
+const RATE_LIMITED = `429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit. Please try again later."}}`;
+
+test("a routed worker keeps its pin through a tool call, a compaction and its summary, and its session names the physical model and cost", async () => {
+  const h = harness({ orchestrator: { routing: TWO_PROVIDER_ROUTING }, compaction: { keepRecentTokens: 1 } });
+  try {
+    // Every reply reports a context near the rung's window, so pi compacts.
+    const provider = physicalProviders((request, index) => {
+      if (request.tools.length === 0) return { text: "summary of the work so far" };
+      if (index === 0) return { toolCall: { name: "probe", arguments: {} } };
+      return { text: "all done" };
+    }, 195_000);
+    const tool = loadSubagentsTool([twoProviderRouter(), provider.extension, PROBE_TOOL_EXTENSION]);
+    const { worker } = await callSubagents(tool, orchestrator(h).ctx, "Use probe, then finish");
+
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.equal(worker.finalText, "all done", JSON.stringify(provider.requests));
+    assert.ok(sessionLines(worker.sessionFile!).some((line) => line.type === "compaction"), "the worker's session was compacted");
+    assert.ok(provider.requests.some((request) => request.tools.length === 0), "the compaction summary, a direct request, reached a physical model");
+    assert.deepEqual([...new Set(provider.requests.map((request) => `${request.model}:${request.thinkingLevel}`))], [RUNG],
+      "the first request, the continuation and the summary all ran on the pin");
+    const records = readRoutingRecords(join(h.stateDir, "routing"));
+    assert.deepEqual(records.map((record) => record.recordType), ["decision"], "one classification, no failover");
+
+    // /session reads cost per physical model from the saved assistant messages.
+    const answered = sessionLines(worker.sessionFile!).filter((line) => line.type === "message" && line.message?.role === "assistant")
+      .map((line) => line.message as unknown as { provider: string; model: string; usage: { cost: { total: number } } });
+    assert.ok(answered.length >= 2, JSON.stringify(answered));
+    for (const message of answered) {
+      assert.equal(`${message.provider}/${message.model}`, HAIKU);
+      assert.equal(message.usage.cost.total, 0.01);
+    }
+  } finally { h.cleanup(); }
+});
+
+test("a steer and a follow-up to a running worker stay on its pin without classifying again", async () => {
+  const h = harness({ orchestrator: { routing: TWO_PROVIDER_ROUTING } });
+  let releaseTool!: () => void;
+  let toolStarted!: () => void;
+  const toolRunning = new Promise<void>((resolve) => { toolStarted = resolve; });
+  const toolFinished = new Promise<void>((resolve) => { releaseTool = resolve; });
+  try {
+    const probe: InlineExtension = { name: "blocking-probe", factory: (pi) => pi.registerTool({
+      name: "probe", label: "Probe", description: "Wait for release", parameters: { type: "object", properties: {} } as Tool["parameters"],
+      async execute() { toolStarted(); await toolFinished; return { content: [{ type: "text", text: "tool finished" }], details: undefined }; },
+    }) };
+    const provider = physicalProviders((request) => request.toolResults === 0 ? { toolCall: { name: "probe", arguments: {} } } : { text: "handled" });
+    const subagents = loadSubagents([twoProviderRouter(), provider.extension, probe]);
+    const ctx = orchestrator(h).ctx;
+    const start = (await subagents.tool().execute("call", { items: [{ task: "Use probe" }], background: true } as never,
+      undefined, undefined, ctx)).details as BackgroundStart;
+    await toolRunning;
+    const send = (text: string, mode: string) => subagents.tool("subagents_message").execute(`send-${mode}`,
+      { id: start.delegationIds[0], text, mode } as never, undefined, undefined, ctx);
+    await send("steer now", "steer");
+    await send("follow later", "followUp");
+    releaseTool();
+    await waitFor(() => subagents.messages.length === 1, "the worker processes both messages");
+
+    assert.ok(provider.requests.some((request) => request.userMessages.includes("steer now")));
+    assert.ok(provider.requests.some((request) => request.userMessages.includes("follow later")));
+    assert.deepEqual([...new Set(provider.requests.map((request) => request.model))], [HAIKU]);
+    assert.equal(readRoutingRecords(join(h.stateDir, "routing")).length, 1, "the steer and the follow-up were not classified");
+  } finally {
+    releaseTool();
+    h.cleanup();
+  }
+});
+
+test("a rate limit on a worker's first request before any output fails over to the other provider's rung", async () => {
+  const h = harness({ orchestrator: { routing: TWO_PROVIDER_ROUTING }, ...FAST_RETRY });
+  try {
+    const provider = physicalProviders((request) => request.model === HAIKU ? { error: RATE_LIMITED } : { text: "done on luna" });
+    const tool = loadSubagentsTool([twoProviderRouter(), provider.extension]);
+    const { worker } = await callSubagents(tool, orchestrator(h).ctx, "Fix the typo in README.md");
+
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.equal(worker.finalText, "done on luna");
+    assert.deepEqual(provider.requests.map((request) => request.model), [HAIKU, LUNA]);
+    const records = readRoutingRecords(join(h.stateDir, "routing"));
+    assert.deepEqual(records.map((record) => record.recordType), ["decision", "failover", "decision"]);
+    const [refused, failover, moved] = records;
+    assert.ok(refused?.recordType === "decision" && failover?.recordType === "failover" && moved?.recordType === "decision");
+    assert.equal(refused.ranOn, RUNG);
+    assert.equal(failover.refusedAttempt.rung, RUNG);
+    assert.equal(failover.rung, `${LUNA}:low`);
+    assert.equal(moved.ranOn, `${LUNA}:low`);
+  } finally { h.cleanup(); }
+});
+
+test("a rate limit later in a worker's run is retried on its pin", async () => {
+  const h = harness({ orchestrator: { routing: TWO_PROVIDER_ROUTING }, ...FAST_RETRY });
+  try {
+    const provider = physicalProviders((_request, index) =>
+      index === 0 ? { toolCall: { name: "probe", arguments: {} } } : index === 1 ? { error: RATE_LIMITED } : { text: "done after the retry" });
+    const tool = loadSubagentsTool([twoProviderRouter(), provider.extension, PROBE_TOOL_EXTENSION]);
+    const { worker } = await callSubagents(tool, orchestrator(h).ctx, "Use probe, then finish");
+
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.equal(worker.finalText, "done after the retry");
+    assert.deepEqual(provider.requests.map((request) => request.model), [HAIKU, HAIKU, HAIKU]);
+    assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")).map((record) => record.recordType), ["decision"]);
+  } finally { h.cleanup(); }
+});
+
+test("in shadow mode a worker runs on the orchestrator's physical session model and records the rung live routing would choose", async () => {
+  const shadow = { ...TWO_PROVIDER_ROUTING, mode: "shadow", tiers: { ...TWO_PROVIDER_ROUTING.tiers, mechanical: [`${LUNA}:low`] } };
+  const h = harness({ orchestrator: { routing: shadow } });
+  try {
+    const provider = physicalProviders(() => ({ text: "shadow done" }));
+    const tool = loadSubagentsTool([twoProviderRouter(), provider.extension]);
+    const { worker } = await callSubagents(tool, orchestrator(h).ctx, "Fix the typo in README.md");
+
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.deepEqual(provider.requests.map((request) => `${request.model}:${request.thinkingLevel}`), [`${HAIKU}:medium`]);
+    const [record] = readRoutingRecords(join(h.stateDir, "routing"));
+    assert.ok(record?.recordType === "decision");
+    assert.equal(record.mode, "shadow");
+    assert.equal(record.route.outcome === "chosen" && record.route.rung.rung, `${LUNA}:low`);
+    assert.equal(record.ranOn, `${HAIKU}:medium`);
+  } finally { h.cleanup(); }
 });

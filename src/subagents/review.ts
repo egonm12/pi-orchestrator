@@ -14,7 +14,7 @@ import { workerSessionDir } from "./worker.ts";
 // delegation of this orchestrator session. The reviewer is routed through the
 // auto model at the delegation's tier or higher, elevated for a delegation
 // without a tier, and never on the rung the delegation ran on: its routing
-// constraints (../router/auto-provider.ts) say so. They also name the
+// constraints (../router/auto-model.ts) say so. They also name the
 // provider of that rung to avoid, a preference and not a hard filter (ADR
 // 0012): within the tier routing settles on, the reviewer runs on another
 // provider's surviving rung, and on that provider's only when none is left.

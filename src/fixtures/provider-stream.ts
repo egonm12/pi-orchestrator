@@ -4,11 +4,12 @@ type ProviderStream = ReturnType<NonNullable<NonNullable<Parameters<ExtensionAPI
 type StreamEvent = Awaited<ReturnType<ReturnType<ProviderStream[typeof Symbol.asyncIterator]>["next"]>>["value"];
 type Message = Extract<StreamEvent, { type: "done" }> extends { message: infer T } ? T : never;
 
-/** Pi's provider contract requires both an async iterable and a result promise.
+/** A provider stream for the fake providers tests register. Pi's provider
+ * contract requires both an async iterable and a result promise.
  * Mirrors pi-ai's EventStream (dist/utils/event-stream.js, pi-ai 0.87.1):
  * terminal events settle result(), and consumers can iterate independently.
  * pi-ai does not resolve as a direct dependency from this package. */
-export function autoStream(): { stream: ProviderStream; push: (event: StreamEvent) => void; end: (model: { api: string; provider: string; model: string }) => void } {
+export function providerStream(): { stream: ProviderStream; push: (event: StreamEvent) => void; end: (model: { api: string; provider: string; model: string }) => void } {
   const events: StreamEvent[] = [];
   const waiting: ((result: IteratorResult<StreamEvent>) => void)[] = [];
   let ended = false;
@@ -29,7 +30,7 @@ export function autoStream(): { stream: ProviderStream; push: (event: StreamEven
     end(model: { api: string; provider: string; model: string }) {
       if (!ended) this.push({ type: "error", reason: "error", error: {
         role: "assistant", content: [], ...model, stopReason: "error", timestamp: Date.now(),
-        errorMessage: "auto model rung stream ended without a final message",
+        errorMessage: "fake provider stream ended without a final message",
         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
       } });

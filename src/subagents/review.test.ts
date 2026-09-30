@@ -9,7 +9,7 @@ import { emptyRefreshState } from "../catalog/refresh-lifecycle.ts";
 import { resetBanLists } from "../policy/ban-lists.ts";
 import { authorizeRecipient, emptyAuthorization, grantOwnerApproval, saveAuthorization } from "../recipients/authorization.ts";
 import { readRoutingRecords, readUsableRoutingRecords, type DecisionRecord } from "../routing/decision-record.ts";
-import { autoStream } from "../router/auto-stream.ts";
+import { providerStream } from "../fixtures/provider-stream.ts";
 import { createRouterExtension } from "../router/extension.ts";
 import { createSubagentsExtension, type SubagentResult, type SubagentsDetails } from "./extension.ts";
 import { orchestratorProtocol } from "./orchestrator-protocol.ts";
@@ -134,7 +134,7 @@ function anthropic() {
       const reply: { readonly text: string } | { readonly toolCall: { readonly name: string; readonly arguments: Record<string, unknown> } } = run >= 0 && toolResults < users.filter((text) => text.includes("Run:")).length
         ? { toolCall: JSON.parse(latest.slice(run + "Run:".length)) as { name: string; arguments: Record<string, unknown> } }
         : { text: run >= 0 ? "ran" : systemPrompt.includes("# Review rules") ? "## Confirmed\nAnswer: accept" : "done" };
-      const { stream, push, end } = autoStream();
+      const { stream, push, end } = providerStream();
       const message = {
         role: "assistant", api: model.api, provider: model.provider, model: model.id,
         content: "toolCall" in reply ? [{ type: "toolCall", id: `call-${requests.length}`, name: reply.toolCall.name, arguments: reply.toolCall.arguments }]

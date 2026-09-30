@@ -8,7 +8,7 @@ import type { ResumeWorker } from "./resume.ts";
 import type { BackgroundMessageMode } from "./background.ts";
 import { REPORT_TOOL, reportExtension, type WorkerReports } from "./report.ts";
 import { missingResultSections, REPORTING_RULES, type ResultSection } from "./result-format.ts";
-import { setResumePin, setRoutingConstraints } from "../router/auto-provider.ts";
+import { AUTO_MODEL_ID, AUTO_PROVIDER, setResumePin, setRoutingConstraints } from "../router/auto-model.ts";
 import type { RoutingConstraints } from "../routing/tier-router.ts";
 import type { ThinkingLevel } from "../models/model-info.ts";
 import type { WorkerSession } from "./worker-board.ts";
@@ -27,12 +27,10 @@ import {
 // private, so the worker cannot reuse the orchestrator's. It gets its own
 // model runtime instead, which pi builds from the same agent dir's auth.json
 // and models.json, and it loads the same installed extensions. The router
-// extension then registers `orchestrator/auto` in the worker's runtime and
-// routes the worker as ADR 0006 describes.
+// extension then registers `orchestrator/auto` in the worker's runtime as a
+// virtual model and routes the worker as ADR 0006 and ADR 0014 describe.
 
 export const SUBAGENTS_TOOL = "subagents";
-const AUTO_PROVIDER = "orchestrator";
-const AUTO_MODEL_ID = "auto";
 
 export type WorkerStatus = "completed" | "failed" | "aborted";
 
@@ -86,7 +84,7 @@ export interface WorkerSetup {
   readonly tools?: readonly string[];
   /** The delegation id of the worker that makes this delegation, if a worker does. */
   readonly parentDelegationId?: string;
-  /** Routing constraints for the worker's first request (../router/auto-provider.ts).
+  /** Routing constraints for the worker's first request (../router/auto-model.ts).
    *  Only a routed worker takes them: one with a fork, a named model or a resume fails. */
   readonly routingConstraints?: RoutingConstraints;
   /** The delegation this worker reviews (ADR 0010): its decision record links
