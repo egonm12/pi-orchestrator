@@ -1,8 +1,8 @@
 import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { toModelInfo, splitKnownThinkingSuffix, type ModelInfo } from "../models/model-info.ts";
-import { AUTO_MODEL_ID, AUTO_MODEL_THINKING_LEVELS, AUTO_PROVIDER, createAutoModelRouter, isAutoModel, recordLimitError, recordQuotaHeaders,
-  type AutoModelDependencies, type AutoModelState } from "./auto-model.ts";
+import { AUTO_MODEL_ID, AUTO_MODEL_THINKING_LEVELS, AUTO_PROVIDER, createAutoModelRouter, isAutoModel, isVirtualModel, recordLimitError, recordQuotaHeaders,
+  SESSION_MODEL_ENV, SESSION_VIRTUAL_MODEL_ENV, type AutoModelDependencies, type AutoModelState } from "./auto-model.ts";
 import { autoModelLimits, type AutoModelLimits } from "./auto-model-limits.ts";
 import { refuseAutoModelForMainThread } from "./main-thread.ts";
 import type { ActiveRouter } from "./route-task.ts";
@@ -154,6 +154,30 @@ function startRouting(ctx: ExtensionContext, deps: RouterDependencies): ActiveRo
   };
 }
 
+/** A successful response's physical model and thinking level, as
+ *  `provider/id:level`. A failed or aborted response, including one whose
+ *  routing failed and so names the virtual model, answered nothing. A
+ *  response without a thinking level ran outside pi's agent loop, unmanaged:
+ *  its level is taken as off. */
+function physicalAnswerOf(message: unknown): string | undefined {
+  const { role, stopReason, api, provider, model, thinkingLevel } = (message ?? {}) as
+    { role?: string; stopReason?: string; api?: string; provider?: unknown; model?: unknown; thinkingLevel?: unknown };
+  if (role !== "assistant" || stopReason === "error" || stopReason === "aborted" || isVirtualModel({ api })) return undefined;
+  if (typeof provider !== "string" || typeof model !== "string" || provider === "" || model === "") return undefined;
+  return `${provider}/${model}:${typeof thinkingLevel === "string" ? thinkingLevel : "off"}`;
+}
+
+/** The latest physical answer on a session branch, as pi's own latest response. */
+function latestPhysicalAnswer(branch: readonly unknown[]): string | undefined {
+  for (let index = branch.length - 1; index >= 0; index--) {
+    const entry = branch[index] as { type?: string; message?: unknown };
+    if (entry.type !== "message") continue;
+    const answered = physicalAnswerOf(entry.message);
+    if (answered) return answered;
+  }
+  return undefined;
+}
+
 export function createRouterExtension(overrides: Partial<RouterDependencies> = {}) {
   const deps: RouterDependencies = { ...DEFAULT_DEPENDENCIES, ...overrides };
   return function router(pi: ExtensionAPI): void {
@@ -212,12 +236,28 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
     if (typeof pi.registerCommand === "function") registerSubcommands(pi, subcommands);
 
     // The orchestrator's session model, for workers to fall back to. A
-    // worker's or a child process's session model is not remembered.
-    const rememberSessionModel = (model: { provider: string; id: string } | undefined, effort: string, ctx: ExtensionContext) => {
+    // worker's or a child process's session model is not remembered. A
+    // worker's route cannot return a virtual model, so while the orchestrator
+    // runs on one (another extension's router) its session model is the
+    // physical model that last answered it, and none before one has.
+    const rememberSessionModel = (model: { provider: string; id: string; api?: string } | undefined, effort: string, ctx: ExtensionContext) => {
       if (!isOrchestratorSession(ctx)) return;
       if (isAutoModel(model)) return;
-      if (model) process.env.PI_ORCHESTRATOR_SESSION_MODEL = `${model.provider}/${model.id}:${effort}`;
-      else delete process.env.PI_ORCHESTRATOR_SESSION_MODEL;
+      if (model && isVirtualModel(model)) {
+        process.env[SESSION_VIRTUAL_MODEL_ENV] = `${model.provider}/${model.id}`;
+        const answered = latestPhysicalAnswer(ctx.sessionManager?.getBranch?.() ?? []);
+        if (answered) process.env[SESSION_MODEL_ENV] = answered;
+        else delete process.env[SESSION_MODEL_ENV];
+        return;
+      }
+      delete process.env[SESSION_VIRTUAL_MODEL_ENV];
+      if (model) process.env[SESSION_MODEL_ENV] = `${model.provider}/${model.id}:${effort}`;
+      else delete process.env[SESSION_MODEL_ENV];
+    };
+    const rememberPhysicalAnswer = (message: unknown, ctx: ExtensionContext) => {
+      if (!isOrchestratorSession(ctx) || isAutoModel(ctx.model) || !isVirtualModel(ctx.model)) return;
+      const answered = physicalAnswerOf(message);
+      if (answered) process.env[SESSION_MODEL_ENV] = answered;
     };
     let noticeShown = false;
     pi.on("session_start", (_event, ctx) => {
@@ -284,6 +324,7 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
     // model's provider in the usage store before the worker or pi's retry
     // goes on. A response whose routing failed names the auto model: no rung answered.
     pi.on("message_end", async (event, ctx) => {
+      rememberPhysicalAnswer(event.message, ctx);
       const message = event.message as { role?: string; stopReason?: string; errorMessage?: string; provider?: string };
       if (message.role !== "assistant" || message.stopReason !== "error" || !isAutoModel(ctx.model)) return undefined;
       if (message.provider === undefined || message.provider === AUTO_PROVIDER) return undefined;

@@ -34,6 +34,23 @@ export function isAutoModel(model: { readonly provider?: string; readonly id?: s
   return model?.provider === AUTO_PROVIDER && model.id === AUTO_MODEL_ID;
 }
 
+/** The api of pi's virtual catalog entries (pi's `VIRTUAL_MODEL_API`, which
+ *  pi's package index does not export at runtime). */
+const VIRTUAL_MODEL_API = "pi-virtual";
+
+/** Whether `model` is a pi virtual model, such as another extension's router.
+ *  A virtual model's route cannot return another virtual model. */
+export function isVirtualModel(model: { readonly api?: string } | undefined): boolean {
+  return model?.api === VIRTUAL_MODEL_API;
+}
+
+/** The orchestrator's session model a worker falls back to, as `provider/id:level`. */
+export const SESSION_MODEL_ENV = "PI_ORCHESTRATOR_SESSION_MODEL";
+/** Set to `provider/id` while the orchestrator runs on a virtual model. The
+ *  session model is then the physical model that last answered it, and is
+ *  unset until one has. */
+export const SESSION_VIRTUAL_MODEL_ENV = "PI_ORCHESTRATOR_SESSION_VIRTUAL_MODEL";
+
 const ROUTING_CONSTRAINTS = Symbol.for("pi-orchestrator.router.routing-constraints");
 const FAILOVER_REQUESTS = Symbol.for("pi-orchestrator.router.failover-requests");
 type Pin = { readonly model: string; readonly effort: ThinkingLevel };
@@ -154,8 +171,16 @@ function producedOutput(message: { readonly content?: readonly Part[] | string }
 class SessionModelError extends Error {}
 class MissingRungError extends Error {}
 
-function sessionPin(banLists: BanLists): Pin {
-  const value = process.env.PI_ORCHESTRATOR_SESSION_MODEL;
+/** What the session model is needed for, in a refusal's reason. */
+type SessionModelUse = "shadow mode" | "the fallback";
+
+function sessionPin(banLists: BanLists, use: SessionModelUse): Pin {
+  const value = process.env[SESSION_MODEL_ENV];
+  const virtual = process.env[SESSION_VIRTUAL_MODEL_ENV];
+  if (!value && virtual) {
+    throw new SessionModelError(`the orchestrator runs on virtual model ${virtual}, which has not answered yet; ` +
+      `${use} needs a physical model to run this worker on`);
+  }
   if (!value) throw new SessionModelError("PI_ORCHESTRATOR_SESSION_MODEL is missing; no orchestrator session model is known");
   const { baseModel, thinkingSuffix } = splitKnownThinkingSuffix(value);
   if (!thinkingSuffix || !/^[^/]+\/.+$/.test(baseModel) || baseModel === `${AUTO_PROVIDER}/${AUTO_MODEL_ID}`) {
@@ -188,8 +213,8 @@ function usageLimitsText(providerUsage: Readonly<Record<string, ProviderUsage>>)
  *  reviewer on the reviewed delegation's rung (ADR 0010), or when the
  *  session model's provider is out of usage in `providerUsage`. */
 function fallbackPin(banLists: BanLists, constraints: RoutingConstraints | undefined, excludedFallback: ExcludedFallback,
-  providerUsage: Readonly<Record<string, ProviderUsage>> = {}): Pin {
-  const pin = sessionPin(banLists);
+  providerUsage: Readonly<Record<string, ProviderUsage>> = {}, use: SessionModelUse = "the fallback"): Pin {
+  const pin = sessionPin(banLists, use);
   if (excludedFallback === "allowed") return pin;
   const excluded = constraints?.excludedRung;
   if (excluded?.model === pin.model && excluded.effort === pin.effort) {
@@ -366,7 +391,7 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
         // not before classification.
         const at = deps.now();
         const { route, providerUsage } = routeTask(router, taskText, classification, at, constraints);
-        const pin: ServedPin = router.mode === "shadow" ? fallbackPin(router.banLists, constraints, "allowed")
+        const pin: ServedPin = router.mode === "shadow" ? fallbackPin(router.banLists, constraints, "allowed", {}, "shadow mode")
           : !route.ok ? fallbackPin(router.banLists, constraints, "refused", providerUsage)
           : { model: route.rung.model, effort: route.rung.effort as ThinkingLevel, ...escalationOf(route) };
         // A rung pi cannot send to fails the worker before it counts as pinned.

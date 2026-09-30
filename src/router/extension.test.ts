@@ -53,6 +53,7 @@ const originalEnv = {
   PI_ORCHESTRATOR_STATE_DIR: process.env.PI_ORCHESTRATOR_STATE_DIR,
   PI_ORCHESTRATOR_ROUTER_PROBE: process.env.PI_ORCHESTRATOR_ROUTER_PROBE,
   PI_ORCHESTRATOR_SESSION_MODEL: process.env.PI_ORCHESTRATOR_SESSION_MODEL,
+  PI_ORCHESTRATOR_SESSION_VIRTUAL_MODEL: process.env.PI_ORCHESTRATOR_SESSION_VIRTUAL_MODEL,
   PI_SUBAGENT_CHILD: process.env.PI_SUBAGENT_CHILD,
   PI_SUBAGENTS_HERDR_BRIDGE: process.env.PI_SUBAGENTS_HERDR_BRIDGE,
 };
@@ -123,6 +124,7 @@ function harness(routing: unknown, extra: Record<string, unknown> = {}): Harness
   process.env.HOME = home;
   process.env.PI_CODING_AGENT_DIR = agentDir;
   process.env.PI_ORCHESTRATOR_STATE_DIR = stateDir;
+  delete process.env.PI_ORCHESTRATOR_SESSION_VIRTUAL_MODEL;
   return {
     agentDir,
     projectDir,
@@ -679,6 +681,92 @@ test("shadow mode runs on the orchestrator's physical session model, records the
     assert.equal(record?.recordType === "decision" && record.route.outcome === "chosen" && record.route.rung.rung, `${HAIKU}:low`);
     assert.equal(record?.recordType === "decision" && record.handPickedModel, "anthropic/claude-sonnet-5");
     assert.equal(record?.recordType === "decision" && record.ranOn, "anthropic/claude-sonnet-5:high");
+  } finally { h.cleanup(); }
+});
+
+// Another extension's router, such as pi's jev example: a virtual model the
+// orchestrator may run on. A worker's route cannot return it.
+const OTHER_VIRTUAL_MODEL = { provider: "jev", id: "auto", api: "pi-virtual" };
+
+/** The orchestrator's context on another extension's virtual model, with the session branch `branch`. */
+function virtualOrchestrator(h: Harness, registry: SessionModelRegistry, branch: readonly unknown[] = []): ExtensionContext {
+  return { cwd: h.projectDir, hasUI: false, model: OTHER_VIRTUAL_MODEL, thinkingLevel: "medium", modelRegistry: registry,
+    sessionManager: { getSessionId: () => "parent", getBranch: () => branch } } as unknown as ExtensionContext;
+}
+
+/** A response the orchestrator got from a physical model its virtual model routed to. */
+function physicalAnswer(model: string, thinkingLevel: string, stopReason = "stop") {
+  const slash = model.indexOf("/");
+  return { ...assistantMessage({ stopReason, ...(stopReason === "error" ? { errorMessage: "overloaded" } : {}) }),
+    api: "fake-physical", provider: model.slice(0, slash), model: model.slice(slash + 1), thinkingLevel };
+}
+
+test("shadow mode with the orchestrator on another virtual model that has not answered yet refuses the worker with the reason", async () => {
+  const h = harness(SHADOW);
+  try {
+    const registry = fakeSessionRegistry([]);
+    const auto = await loadAutoModel(h, registry);
+    assert.equal(process.env.PI_ORCHESTRATOR_SESSION_MODEL, `${HAIKU}:medium`);
+    const orchestrator = virtualOrchestrator(h, registry);
+    await auto.handlers.get("model_select")?.({ type: "model_select", model: OTHER_VIRTUAL_MODEL, source: "set" }, orchestrator);
+    // A failed response names no physical model that answered.
+    await auto.handlers.get("message_end")?.({ type: "message_end", message: physicalAnswer("anthropic/claude-sonnet-5", "high", "error") }, orchestrator);
+    await assert.rejects(auto.worker("virtual-shadow-worker").user(), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.message, "the orchestrator runs on virtual model jev/auto, which has not answered yet; shadow mode needs a physical model to run this worker on");
+      return true;
+    });
+    assert.deepEqual(h.records(), [], "no worker request was sent, so no decision is recorded");
+  } finally { h.cleanup(); }
+});
+
+test("shadow mode with the orchestrator on another virtual model runs the worker on the physical model that last answered it and records the rung live routing would choose", async () => {
+  const h = harness(SHADOW);
+  try {
+    const registry = fakeSessionRegistry([]);
+    const auto = await loadAutoModel(h, registry);
+    const orchestrator = virtualOrchestrator(h, registry);
+    await auto.handlers.get("model_select")?.({ type: "model_select", model: OTHER_VIRTUAL_MODEL, source: "set" }, orchestrator);
+    await auto.handlers.get("message_end")?.({ type: "message_end", message: physicalAnswer("openai-codex/gpt-6-sol", "medium") }, orchestrator);
+    await auto.handlers.get("message_end")?.({ type: "message_end", message: physicalAnswer("anthropic/claude-sonnet-5", "high") }, orchestrator);
+    const worker = auto.worker("virtual-shadow-worker");
+    assert.equal((await worker.user()).rung, "anthropic/claude-sonnet-5:high", "the worker runs on the latest answer's physical model and level");
+    const [record] = h.records();
+    assert.ok(record?.recordType === "decision");
+    assert.equal(record.mode, "shadow");
+    assert.equal(record.route.outcome === "chosen" && record.route.rung.rung, `${HAIKU}:low`);
+    assert.equal(record.handPickedModel, "anthropic/claude-sonnet-5");
+    assert.equal(record.ranOn, "anthropic/claude-sonnet-5:high");
+  } finally { h.cleanup(); }
+});
+
+test("a refused live route with the orchestrator on another virtual model that has not answered yet refuses the worker with the reason", async () => {
+  const h = harness(LIVE);
+  try {
+    const registry = fakeSessionRegistry([]);
+    const auto = await loadAutoModel(h, registry, { evidence: () => () => evidenceOf({ authorization: emptyAuthorization() }) });
+    await auto.handlers.get("model_select")?.({ type: "model_select", model: OTHER_VIRTUAL_MODEL, source: "set" }, virtualOrchestrator(h, registry));
+    await assert.rejects(auto.worker("refused-virtual-worker").user(),
+      { message: "the orchestrator runs on virtual model jev/auto, which has not answered yet; the fallback needs a physical model to run this worker on" });
+  } finally { h.cleanup(); }
+});
+
+test("an orchestrator resumed on another virtual model takes the physical model that last answered on its branch", async () => {
+  const h = harness(SHADOW);
+  try {
+    const registry = fakeSessionRegistry([]);
+    const auto = await loadAutoModel(h, registry);
+    const branch = [
+      { type: "message", message: physicalAnswer("anthropic/claude-sonnet-5", "low") },
+      { type: "message", message: physicalAnswer("openai-codex/gpt-6-sol", "high", "error") },
+    ];
+    await auto.handlers.get("session_start")?.({ type: "session_start", reason: "resume" }, virtualOrchestrator(h, registry, branch));
+    assert.equal(process.env.PI_ORCHESTRATOR_SESSION_MODEL, "anthropic/claude-sonnet-5:low");
+    assert.equal((await auto.worker("resumed-virtual-worker").user()).rung, "anthropic/claude-sonnet-5:low");
+    // Back on a physical model, the orchestrator's selection is the session model again.
+    await auto.handlers.get("model_select")?.({ type: "model_select", model: SESSION_MODEL, source: "set" },
+      { ...virtualOrchestrator(h, registry, branch), model: SESSION_MODEL, thinkingLevel: "high" } as ExtensionContext);
+    assert.equal((await auto.worker("physical-worker").user()).rung, `${HAIKU}:high`);
   } finally { h.cleanup(); }
 });
 

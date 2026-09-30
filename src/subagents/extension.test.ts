@@ -44,6 +44,7 @@ const originalEnv = {
   PI_ORCHESTRATOR_STATE_DIR: process.env.PI_ORCHESTRATOR_STATE_DIR,
   PI_ORCHESTRATOR_ROUTER_PROBE: process.env.PI_ORCHESTRATOR_ROUTER_PROBE,
   PI_ORCHESTRATOR_SESSION_MODEL: process.env.PI_ORCHESTRATOR_SESSION_MODEL,
+  PI_ORCHESTRATOR_SESSION_VIRTUAL_MODEL: process.env.PI_ORCHESTRATOR_SESSION_VIRTUAL_MODEL,
   PI_SUBAGENT_CHILD: process.env.PI_SUBAGENT_CHILD,
 };
 delete process.env.PI_ORCHESTRATOR_ROUTER_PROBE;
@@ -85,6 +86,7 @@ function harness(settings: Record<string, unknown> = { orchestrator: { routing: 
   process.env.PI_CODING_AGENT_DIR = agentDir;
   process.env.PI_ORCHESTRATOR_STATE_DIR = stateDir;
   process.env.PI_ORCHESTRATOR_SESSION_MODEL = `${HAIKU}:medium`;
+  delete process.env.PI_ORCHESTRATOR_SESSION_VIRTUAL_MODEL;
   return { agentDir, projectDir, stateDir, cleanup: () => rmSync(home, { recursive: true, force: true }) };
 }
 
@@ -4385,5 +4387,32 @@ test("in shadow mode a worker runs on the orchestrator's physical session model 
     assert.equal(record.mode, "shadow");
     assert.equal(record.route.outcome === "chosen" && record.route.rung.rung, `${LUNA}:low`);
     assert.equal(record.ranOn, `${HAIKU}:medium`);
+  } finally { h.cleanup(); }
+});
+
+test("in shadow mode a worker of an orchestrator on another extension's virtual model runs on the physical model that last answered the orchestrator", async () => {
+  const h = harness({ orchestrator: { routing: { ...TWO_PROVIDER_ROUTING, mode: "shadow" } } });
+  try {
+    // The router extension in the orchestrator's own session, as pi loads it there.
+    const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
+    createRouterExtension()({ registerVirtualModel() {}, on(event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) { handlers.set(event, handler); } } as unknown as ExtensionAPI);
+    const main = orchestrator(h);
+    const onJev = { ...main.ctx, model: { provider: "jev", id: "auto", api: "pi-virtual" }, thinkingLevel: "medium" } as unknown as ExtensionContext;
+    await handlers.get("model_select")!({ type: "model_select", model: onJev.model, source: "set" }, onJev);
+    // jev/auto routed the orchestrator's latest turn to luna at high.
+    await handlers.get("message_end")!({ type: "message_end", message: { role: "assistant", api: "fake-physical", provider: "openai-codex", model: "gpt-6-luna",
+      thinkingLevel: "high", stopReason: "stop", content: [{ type: "text", text: "planned" }], usage: {}, timestamp: 0 } }, onJev);
+
+    const provider = physicalProviders(() => ({ text: "shadow done" }));
+    const tool = loadSubagentsTool([twoProviderRouter(), provider.extension]);
+    const { worker } = await callSubagents(tool, main.ctx, "Fix the typo in README.md");
+
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.deepEqual(provider.requests.map((request) => `${request.model}:${request.thinkingLevel}`), [`${LUNA}:high`]);
+    const [record] = readRoutingRecords(join(h.stateDir, "routing"));
+    assert.ok(record?.recordType === "decision");
+    assert.equal(record.mode, "shadow");
+    assert.equal(record.route.outcome === "chosen" && record.route.rung.rung, RUNG, "the rung live routing would choose");
+    assert.equal(record.ranOn, `${LUNA}:high`);
   } finally { h.cleanup(); }
 });
