@@ -316,7 +316,8 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
     if (setup.signal?.aborted) return { status: "aborted", sessionId, sessionFile: saved(), finalText: "" };
     unregisterMessage = setup.onMessageReady?.((text, mode) => {
       if (!session.isStreaming) throw new Error("subagents_message: the background worker is no longer running");
-      return session[mode](text);
+      // pi 0.99 answers with a disposition (handled or queued); the caller needs none.
+      return session[mode](text).then(() => undefined);
     });
     await session.prompt(setup.task);
     const replies = session.messages.filter((message) => (message as Reply).role === "assistant") as Reply[];

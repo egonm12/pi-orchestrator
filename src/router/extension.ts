@@ -37,6 +37,11 @@ export const ROUTER_DISABLED_PREFIX = "pi-orchestrator router disabled:";
  *  so the once-per-process disabled line is kept on the process's global object. */
 export const DISABLED_LINE_REPORTED = Symbol.for("pi-orchestrator.router.disabled-line-reported");
 export const ROUTER_WARNING_PREFIX = "pi-orchestrator router warning:";
+/** The oldest pi the router loads on: the first with `registerVirtualModel` (ADR 0014). */
+export const REQUIRED_PI_VERSION = "0.99";
+/** The load error on a pi host without `registerVirtualModel`. pi reports a
+ *  throwing extension factory as a failed extension load. */
+export const PI_TOO_OLD_MESSAGE = `pi-orchestrator requires pi v${REQUIRED_PI_VERSION} or later: this pi has no registerVirtualModel. Upgrade pi to v${REQUIRED_PI_VERSION} or later.`;
 /** The keys of the warnings this process printed, each once, like the disabled line. */
 const WARNINGS_REPORTED = Symbol.for("pi-orchestrator.router.warnings-reported");
 type ProcessGlobal = typeof globalThis & { [DISABLED_LINE_REPORTED]?: boolean; [WARNINGS_REPORTED]?: Set<string> };
@@ -151,6 +156,7 @@ function startRouting(ctx: ExtensionContext, deps: RouterDependencies): ActiveRo
 export function createRouterExtension(overrides: Partial<RouterDependencies> = {}) {
   const deps: RouterDependencies = { ...DEFAULT_DEPENDENCIES, ...overrides };
   return function router(pi: ExtensionAPI): void {
+    if (typeof (pi as Partial<ExtensionAPI>).registerVirtualModel !== "function") throw new Error(PI_TOO_OLD_MESSAGE);
     // Fail open, as the guard does: the first failure anywhere prints one
     // line and stops routing for the rest of the session; workers then run
     // on the orchestrator's model.

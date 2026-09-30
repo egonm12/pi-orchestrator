@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
-import { SessionManager, type ExtensionAPI, type ExtensionContext, type InlineExtension } from "@earendil-works/pi-coding-agent";
+import { SessionManager, type ExtensionAPI, type ExtensionToolContext as ExtensionContext, type InlineExtension } from "@earendil-works/pi-coding-agent";
 import { buildCatalog } from "../catalog/model-catalog.ts";
 import { emptyRefreshState } from "../catalog/refresh-lifecycle.ts";
 import { INSTALLED_MODEL_INFO } from "../fixtures/installed-model-info.ts";
@@ -163,7 +163,7 @@ async function orchestrator(h: Harness, approved = true): Promise<Orchestrator> 
   const tools: Tool[] = [];
   const handlers = new Map<string, Handler[]>();
   const pi = {
-    registerTool(tool: Tool) { tools.push(tool); }, registerProvider() {}, registerCommand() {}, registerShortcut() {}, sendMessage() {},
+    registerTool(tool: Tool) { tools.push(tool); }, registerProvider() {}, registerVirtualModel() {}, registerCommand() {}, registerShortcut() {}, sendMessage() {},
     on(event: string, handler: Handler) { handlers.set(event, [...handlers.get(event) ?? [], handler]); },
     getActiveTools: () => ["read", "bash", "edit", "write", "subagents", "subagents_status", "subagents_message"],
   } as unknown as ExtensionAPI;

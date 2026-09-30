@@ -204,6 +204,7 @@ async function loadRouterWith(h: Harness, registry: SessionModelRegistry, deps: 
   const createIsolatedRouterExtension = await isolatedRouterExtension();
   createIsolatedRouterExtension({ evidence: () => () => evidenceOf(), now: () => NOW, ...deps })({
     registerProvider(name: string, config: ProviderConfigInput) { assert.equal(name, "orchestrator"); provider = config; },
+    registerVirtualModel() {},
     on(event: string, handler: Handler) { handlers.on(event, handler); },
   } as unknown as ExtensionAPI);
   await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, {
@@ -242,6 +243,23 @@ test("text another extension appends after the delegated prompt sets no keyword 
   } finally { h.cleanup(); }
 });
 
+test("on a pi host without registerVirtualModel the router extension fails to load with an error naming pi v0.99", () => {
+  const registered: string[] = [];
+  const handlers = piHandlers();
+  assert.throws(() => createRouterExtension()({
+    registerProvider(name: string) { registered.push(name); },
+    on(event: string, handler: Handler) { handlers.on(event, handler); },
+  } as unknown as ExtensionAPI), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.match(error.message, /requires pi v0\.99 or later/);
+    assert.match(error.message, /registerVirtualModel/);
+    return true;
+  });
+  // It fails before it registers anything.
+  assert.deepEqual(registered, []);
+  assert.equal(handlers.get("session_start"), undefined);
+});
+
 test("the router extension's fresh-install notice names what is missing", async () => {
   const h = harness(undefined);
   try {
@@ -249,6 +267,7 @@ test("the router extension's fresh-install notice names what is missing", async 
     const handlers = piHandlers();
     createRouterExtension()({
       registerProvider() {},
+      registerVirtualModel() {},
       on(event: string, handler: Handler) { handlers.on(event, handler); },
     } as unknown as ExtensionAPI);
     await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, {
@@ -270,6 +289,7 @@ for (const marker of ["PI_SUBAGENT_CHILD", "PI_SUBAGENTS_HERDR_BRIDGE"]) {
       const handlers = piHandlers();
       createRouterExtension()({
         registerProvider() {},
+        registerVirtualModel() {},
         on(event: string, handler: Handler) { handlers.on(event, handler); },
       } as unknown as ExtensionAPI);
       await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, {
@@ -288,6 +308,7 @@ function orchestratorCommand(): Command {
   const commands = new Map<string, Command>();
   createRouterExtension()({
     registerProvider() {},
+    registerVirtualModel() {},
     registerCommand(name: string, command: Command) { commands.set(name, command); },
     on() {},
   } as unknown as ExtensionAPI);
@@ -329,6 +350,7 @@ test("the router extension registers no tool_call handler", async () => {
     const createIsolatedRouterExtension = await isolatedRouterExtension();
     createIsolatedRouterExtension({ classifierCall: () => answering("mechanical").call, evidence: () => () => evidenceOf(), now: () => NOW })({
       registerProvider() {},
+      registerVirtualModel() {},
       on(event: string) { events.push(event); },
     } as unknown as ExtensionAPI);
     assert.ok(events.includes("session_start"), JSON.stringify(events));
@@ -498,7 +520,7 @@ test("model selections update the session model, but auto and delegated sessions
   const h = harness(LIVE);
   try {
     const handlers = piHandlers();
-    createRouterExtension()({ on(event: string, handler: Handler) { handlers.on(event, handler); } } as unknown as ExtensionAPI);
+    createRouterExtension()({ registerVirtualModel() {}, on(event: string, handler: Handler) { handlers.on(event, handler); } } as unknown as ExtensionAPI);
     const ctx = { cwd: h.projectDir, hasUI: false, model: SESSION_MODEL, thinkingLevel: "low" as const, modelRegistry: fakeSessionRegistry([]) };
     const select = handlers.get("model_select");
     assert.ok(select);
@@ -876,6 +898,7 @@ test("provider and startup failures across extension instances print one disable
         evidence: () => () => { if (failure !== "startup") throw new Error(`${failure} evidence exploded`); return evidenceOf(); }, now: () => NOW })({
         on(event: string, handler: Handler) { handlers.on(event, handler); },
         registerProvider(_name: string, config: ProviderConfigInput) { provider = config; },
+        registerVirtualModel() {},
       } as unknown as ExtensionAPI);
       await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, {
         cwd: h.projectDir, hasUI: false, model: SESSION_MODEL, thinkingLevel: "medium", modelRegistry: fakeSessionRegistry([{ events: answerEvents("ok") }]),
@@ -1000,6 +1023,7 @@ async function loadMainThread(h: Harness, hasUI: boolean) {
   const notices: string[] = [];
   createRouterExtension({ classifierCall: () => answering("mechanical").call, evidence: () => () => evidenceOf(), now: () => NOW })({
     registerProvider() {},
+    registerVirtualModel() {},
     on(event: string, handler: Handler) { handlers.on(event, handler); },
     // pi's setModel emits its own model_select, source set (agent-session.js).
     async setModel(model: unknown) {
@@ -1423,6 +1447,7 @@ test("the auto model declares the largest context window and output limit among 
     const handlers = piHandlers();
     createRouterExtension({ classifierCall: () => answering("mechanical").call, evidence: () => () => evidenceOf(), now: () => NOW })({
       registerProvider(name: string, config: ProviderConfigInput) { assert.equal(name, "orchestrator"); registered.push(config); },
+      registerVirtualModel() {},
       on(event: string, handler: Handler) { handlers.on(event, handler); },
     } as unknown as ExtensionAPI);
     await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, {
@@ -1430,7 +1455,9 @@ test("the auto model declares the largest context window and output limit among 
     });
     const [auto] = registered.at(-1)?.models ?? [];
     assert.equal(auto?.id, "auto");
-    assert.deepEqual([auto?.contextWindow, auto?.maxTokens], [1_000_000, 128_000]);
+    // pi 0.99's model config is a union; the auto model is a chat model.
+    assert.ok(auto !== undefined && "maxTokens" in auto);
+    assert.deepEqual([auto.contextWindow, auto.maxTokens], [1_000_000, 128_000]);
   } finally { h.cleanup(); }
 });
 
@@ -1502,6 +1529,7 @@ test("the auto model probe reports the rung, pin and time for each request", asy
     const lines = await stderrOf(async () => {
       createRouterExtension({ classifierCall: () => answering("mechanical").call, evidence: () => () => evidenceOf(), now: () => NOW })({
         registerProvider(_name: string, config: ProviderConfigInput) { provider = config; },
+        registerVirtualModel() {},
         on(event: string, handler: Handler) { handlers.on(event, handler); },
       } as unknown as ExtensionAPI);
       await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, {

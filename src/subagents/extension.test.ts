@@ -4,7 +4,7 @@ import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFile
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { after, test } from "node:test";
-import { createAgentSessionFromServices, createAgentSessionServices, createEventBus, DefaultPackageManager, initTheme, SessionManager, SettingsManager, type ExtensionAPI, type ExtensionContext, type InlineExtension, type Theme } from "@earendil-works/pi-coding-agent";
+import { createAgentSessionFromServices, createAgentSessionServices, createEventBus, DefaultPackageManager, initTheme, SessionManager, SettingsManager, type ExtensionAPI, type ExtensionToolContext as ExtensionContext, type InlineExtension, type Theme } from "@earendil-works/pi-coding-agent";
 // pi's own keybindings manager, which pi hands a ctx.ui.custom factory; its public entry exports only the type.
 import { KeybindingsManager } from "../../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js";
 import { buildCatalog } from "../catalog/model-catalog.ts";
