@@ -11,8 +11,7 @@ import type { LadderChoice } from "../routing/effort-ladder.ts";
 import type { ResolvedTierMap, TierRung } from "../routing/tier-map.ts";
 import type { RoutingConstraints } from "../routing/tier-router.ts";
 import type { RiskTier } from "../routing/classifier.ts";
-import { climbEffortLadder, type ActiveRouter } from "../router/route-task.ts";
-import { orchestratorRouter } from "../router/orchestrator-router.ts";
+import { orchestratorRouter, type OrchestratorRouter } from "../router/orchestrator-router.ts";
 import { editingDelegationProblem } from "./quality-gate.ts";
 import { readWorkerOutcome } from "./resume.ts";
 import { delegationMaterial, type ReviewMaterial } from "./review.ts";
@@ -41,10 +40,12 @@ import { workerBoard } from "./worker-board.ts";
 // shadow mode, a retry's forced rung. An attempt the ladder cannot place is
 // retried unplaced: routing is off at the retry (no tier map is loaded then),
 // it has no decision record (it ran with routing off, it is a fork, or its
-// agent definition names its model), its route refused, or its rung has left
-// the tier map. An unplaced retry runs without a forced rung: routed as usual,
-// or on the session model with routing off. Its record names no rung, says
-// why, and counts as a climb.
+// agent definition names its model), its route refused, its rung has left
+// the tier map, or the climb failed (its record says with what error). The
+// climb runs in the router extension's module copy, through the router it
+// published (../router/orchestrator-router.ts). An unplaced retry runs
+// without a forced rung: routed as usual, or on the session model with
+// routing off. Its record names no rung, says why, and counts as a climb.
 //
 // A task climbs at most twice. The climbs of one task are the ladder records
 // that lead back to the same first attempt, a retry of a retry and a second
@@ -93,7 +94,7 @@ function climbsOf(records: readonly RoutingRecord[], id: string): { readonly cha
 /** What a retry of a failed attempt would do now, or why it may not start. */
 export type RetryPlan =
   | { readonly kind: "refused"; readonly why: string }
-  | { readonly kind: "placed"; readonly mode: ActiveRouter["mode"]; readonly climb: number; readonly choice: LadderChoice; readonly kindOfWork: string;
+  | { readonly kind: "placed"; readonly mode: OrchestratorRouter["mode"]; readonly climb: number; readonly choice: LadderChoice; readonly kindOfWork: string;
       readonly tierMap: ResolvedTierMap }
   | { readonly kind: "unplaced"; readonly mode: LadderMode; readonly climb: number; readonly why: string };
 
@@ -112,8 +113,12 @@ export function planRetry(sessionId: string, id: string, records: readonly Routi
   if (!position.placed) return { kind: "unplaced", mode: router.mode, climb, why: position.why };
   let decision;
   try {
-    decision = climbEffortLadder(router, { delegationId: id, tier: position.tier, rung: position.rung }, taskText, at);
-  } catch {
+    decision = router.climbEffortLadder({ delegationId: id, tier: position.tier, rung: position.rung }, taskText, at);
+  } catch (error) {
+    // The verdict is recorded before its reply plans the retry, so a failed climb is reported, not thrown.
+    return { kind: "unplaced", mode: router.mode, climb, why: `the effort ladder failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  if (decision.step === "no-position") {
     return { kind: "unplaced", mode: router.mode, climb, why: `its rung ${position.rung.rung} has no position in the ${position.tier} tier of the tier map` };
   }
   if (decision.step === "blocker") {
