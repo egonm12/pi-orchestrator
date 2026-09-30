@@ -8,7 +8,8 @@ import type { ResumeWorker } from "./resume.ts";
 import type { BackgroundMessageMode } from "./background.ts";
 import { REPORT_TOOL, reportExtension, type WorkerReports } from "./report.ts";
 import { missingResultSections, REPORTING_RULES, type ResultSection } from "./result-format.ts";
-import { AUTO_MODEL_ID, AUTO_PROVIDER, setRoutingConstraints } from "../router/auto-model.ts";
+import { AUTO_MODEL_ID, AUTO_PROVIDER, requestFailover, setRoutingConstraints } from "../router/auto-model.ts";
+import { limitErrorObservation } from "../router/limit-errors.ts";
 import type { RoutingConstraints } from "../routing/tier-router.ts";
 import type { ThinkingLevel } from "../models/model-info.ts";
 import type { WorkerSession } from "./worker-board.ts";
@@ -159,6 +160,60 @@ function assistantText(message: AssistantText): string {
   return message.content.map((part) => part.type === "text" ? part.text ?? "" : "").join("");
 }
 
+type WorkerAgentSession = Awaited<ReturnType<typeof createAgentSessionFromServices>>["session"];
+
+interface FailedReply {
+  readonly role?: string;
+  readonly stopReason?: string;
+  readonly errorMessage?: string;
+  readonly provider?: string;
+  readonly model?: string;
+  readonly timestamp?: number;
+  readonly content?: string | readonly { readonly type: string; readonly text?: string; readonly thinking?: string }[];
+}
+
+/** Whether a reply produced anything before it ended. */
+function producedOutput(reply: FailedReply): boolean {
+  const { content } = reply;
+  if (content === undefined) return false;
+  if (typeof content === "string") return content !== "";
+  return content.some((part) => part.type === "toolCall" || (part.type === "text" && (part.text ?? "") !== "") ||
+    (part.type === "thinking" && (part.thinking ?? "") !== ""));
+}
+
+/** Fails a routed worker over when its first request ended in a limit
+ *  error pi does not retry, such as a quota or billing error, before any
+ *  output (spec 23b3, ticket v1q3). The router's message_end handler has
+ *  already recorded the usage observation. The worker asks the auto model
+ *  for a failover, leaves the failed attempt out of the context with a
+ *  context edit, as pi's own retry does, and continues the session once: pi
+ *  routes that request with reason user and the old router state, and the
+ *  route moves the worker to a surviving rung on another provider or refuses
+ *  it. That continued turn runs outside pi's post-run loop, with no
+ *  auto-retry or compaction after it (owner decision on the ticket).
+ *  Returns an error when the continue itself failed, else `undefined`. */
+async function failOverFirstRequest(session: WorkerAgentSession, sessionId: string): Promise<string | undefined> {
+  const replies = session.messages.filter((message) => (message as FailedReply).role === "assistant") as FailedReply[];
+  const [failed] = replies;
+  if (replies.length !== 1 || failed === undefined || failed.stopReason !== "error" || failed.errorMessage === undefined || producedOutput(failed)) return undefined;
+  // A failure whose routing failed names the auto model: no rung answered.
+  if (failed.provider === undefined || failed.provider === AUTO_PROVIDER || failed.model === undefined) return undefined;
+  if (limitErrorObservation(failed.errorMessage, new Date()) === undefined) return undefined;
+  const branch = session.sessionManager.getBranch();
+  const entry = [...branch].reverse().find((candidate) => candidate.type === "message");
+  const saved = entry?.type === "message" ? entry.message as FailedReply : undefined;
+  if (entry === undefined || saved?.role !== "assistant" || saved.stopReason !== "error" || saved.timestamp !== failed.timestamp) return undefined;
+  const withdraw = requestFailover(sessionId, { model: `${failed.provider}/${failed.model}`, errorMessage: failed.errorMessage });
+  try {
+    session.sessionManager.appendContextEdit(entry.id, null);
+    session.agent.state.messages = session.sessionManager.buildSessionProjection().messages as typeof session.agent.state.messages;
+    await session.agent.continue();
+    return undefined;
+  } catch (error) {
+    return `${failed.errorMessage} (the failover could not continue the worker: ${errorText(error)})`;
+  } finally { withdraw(); }
+}
+
 /** A running worker's activity so far, which `runWorkerSession` moves on. */
 interface ActivitySoFar {
   sessionFile: string | undefined;
@@ -228,7 +283,9 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
   const tools = setup.tools === undefined || reports === undefined ? setup.tools : [...setup.tools, REPORT_TOOL];
   const reviewed = review?.delegationId ?? setup.resume?.review?.delegationId;
   const readOnly = isReadOnly(setup);
-  let session: Awaited<ReturnType<typeof createAgentSessionFromServices>>["session"];
+  let session: WorkerAgentSession;
+  /** A new worker on the auto model, not a fork, a named model or a resume. */
+  let routed = false;
   try {
     const services = await createAgentSessionServices({
       cwd: setup.cwd,
@@ -248,6 +305,7 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
     const selectedModel = fork?.model ?? namedModel?.model ?? resumedFork?.model;
     const slash = selectedModel?.indexOf("/") ?? -1;
     const [provider, modelId] = selectedModel ? [selectedModel.slice(0, slash), selectedModel.slice(slash + 1)] : [AUTO_PROVIDER, AUTO_MODEL_ID];
+    routed = selectedModel === undefined && setup.resume === undefined;
     const model = services.modelRuntime.getModel(provider, modelId);
     if (model === undefined) {
       const loadErrors = services.diagnostics.filter((diagnostic) => diagnostic.type === "error").map((diagnostic) => diagnostic.message);
@@ -285,7 +343,13 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
   } catch { /* An observer must not fail the worker. */ }
   const abort = () => { void session.abort(); };
   const runningTools = new Map<string, string>();
+  // pi retried a failed request itself: its retry routed any failover.
+  let retried = false;
   const unsubscribe = session.subscribe((event) => {
+    if (event.type === "auto_retry_start") {
+      retried = true;
+      return;
+    }
     if (event.type === "turn_start") {
       activity.turns++;
       report();
@@ -320,6 +384,11 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
       return session[mode](text).then(() => undefined);
     });
     await session.prompt(setup.task);
+    // Only a newly routed worker on the auto model fails over.
+    if (routed && !retried && !setup.signal?.aborted) {
+      const continueError = await failOverFirstRequest(session, sessionId);
+      if (continueError !== undefined) return failed(continueError);
+    }
     const replies = session.messages.filter((message) => (message as Reply).role === "assistant") as Reply[];
     const last = replies.at(-1);
     const finalText = session.getLastAssistantText() ?? "";

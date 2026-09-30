@@ -24,7 +24,7 @@ import { SettingsManager, type ExtensionAPI } from "@earendil-works/pi-coding-ag
 import type { TestContext as ExtensionContext } from "../fixtures/extension-context.ts";
 import type { SessionModelRegistry } from "../routing/model-stream.ts";
 import { createRouterExtension, type RouterDependencies, type RoutingEvidence } from "./extension.ts";
-import { setRoutingConstraints } from "./auto-model.ts";
+import { requestFailover, setRoutingConstraints } from "./auto-model.ts";
 import { readUsageObservations, recordUsageObservation, usageObservationsPath, type UsageObservation } from "./usage-observations.ts";
 import { useOwnerBanLists } from "../fixtures/owner-ban-lists.ts";
 
@@ -211,6 +211,10 @@ interface WorkerRequests {
   fail(errorMessage: string, output?: string): Promise<void>;
   /** The latest request fails as `fail` says, and pi retries it automatically. */
   retry(errorMessage: string, output?: string): Promise<Routed>;
+  /** The latest request fails as `fail` says with an error pi does not
+   *  retry, and the worker runtime asks for a failover and continues the
+   *  session once: the next request is reason user with the same state. */
+  continueAfter(errorMessage: string): Promise<Routed>;
   /** A request outside the agent loop, such as a compaction summary: no state. */
   direct(): Promise<Routed>;
   /** The latest request answered: later requests carry it as `previous`. */
@@ -303,6 +307,11 @@ async function loadRouterWith(h: Harness, registry: SessionModelRegistry, deps: 
         await fail(errorMessage, output);
         const message = failure(errorMessage, output);
         return send("retry", { failed: { model: latest!.model, thinkingLevel: latest!.thinkingLevel, message } } as Partial<RouteRequest>);
+      },
+      async continueAfter(errorMessage) {
+        await fail(errorMessage);
+        const withdraw = requestFailover(sessionId, { model: `${latest!.model.provider}/${latest!.model.id}`, errorMessage });
+        try { return await send("user"); } finally { withdraw(); }
       },
       answered() {
         assert.ok(latest, "an answer follows a request");
@@ -1648,9 +1657,6 @@ const CODEX_FIRST = { ...TEST_TIERS, mechanical: ["openai-codex/gpt-6-luna:low",
 const CODEX_USAGE_LIMIT = "You have hit your ChatGPT usage limit (plus plan). Try again in ~42 min.";
 const CODEX_RATE_LIMIT = "Codex error: Rate limit reached. Please try again in 20s.";
 const ANTHROPIC_RATE_LIMIT = '429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed the rate limit"}}';
-/** pi never retries a quota or billing error, so route never sees one as a
- *  retry; its failover through the worker runtime is ticket 5 (spec 23b3). */
-const QUOTA_FAILOVER = "restored in ticket pi-orchestrator-v1q3";
 
 /** The removed rungs of `delegationId`'s decision, with reason and detail. */
 function removedRungs(h: Harness, delegationId: string): [string, string, string][] {
@@ -1724,12 +1730,13 @@ for (const { label, tiers, error, limited, other, reason, holdsUntil, retried } 
     } finally { h.cleanup(); }
   });
 
-  test(`${label} on a first request before any output fails over to ${other}`, retried ? {} : { skip: QUOTA_FAILOVER }, async () => {
+  // pi retries a rate limit; a usage limit it never retries fails over through the worker runtime's continue.
+  test(`${label} on a first request before any output fails over to ${other}`, async () => {
     const h = harness({ ...LIVE, tiers });
     try {
       const worker = (await loadAutoModel(h, fakeSessionRegistry([]))).worker("limited-worker");
       await worker.user();
-      assert.equal((await worker.retry(error)).rung, other);
+      assert.equal((retried ? await worker.retry(error) : await worker.continueAfter(error)).rung, other);
       assert.deepEqual(worker.rungs, [limited, other]);
     } finally { h.cleanup(); }
   });
@@ -1780,13 +1787,13 @@ test("a usage observation the store cannot save warns once, keeps routing on, an
   } finally { h.cleanup(); }
 });
 
-test("a first-request quota error whose observation the store cannot save still fails over", { skip: QUOTA_FAILOVER }, async () => {
+test("a first-request quota error whose observation the store cannot save still fails over", async () => {
   const h = harness({ ...LIVE, tiers: CODEX_FIRST });
   try {
     blockUsageStore(h);
     const worker = (await loadAutoModel(h, fakeSessionRegistry([]))).worker("failover-worker");
     await worker.user();
-    await worker.retry(CODEX_USAGE_LIMIT);
+    await stderrOf(() => worker.continueAfter(CODEX_USAGE_LIMIT));
     assert.deepEqual(worker.rungs, ["openai-codex/gpt-6-luna:low", `${HAIKU}:low`]);
   } finally { h.cleanup(); }
 });
@@ -1919,17 +1926,58 @@ test("a first request answered with a rate limit pins the worker again to the ot
   } finally { h.cleanup(); }
 });
 
-test("a first request answered with a usage-limit error pins the worker again to the other provider and records the failover", { skip: QUOTA_FAILOVER }, async () => {
+test("a first request answered with a usage-limit error pins the worker again to the other provider and records the failover", async () => {
   const h = harness({ ...LIVE, tiers: CODEX_FIRST });
   try {
     const worker = (await loadAutoModel(h, fakeSessionRegistry([]))).worker("failover-worker");
-    await worker.user();
-    await worker.retry(CODEX_USAGE_LIMIT);
+    const refusedRoute = await worker.user();
+    const moved = await worker.continueAfter(CODEX_USAGE_LIMIT);
     assert.deepEqual(worker.rungs, ["openai-codex/gpt-6-luna:low", `${HAIKU}:low`]);
-    const failover = recordsOf(h, "failover-worker").find((record) => record.recordType === "failover");
+    assert.notEqual(moved.state, refusedRoute.state, "the new pin is stored in router state");
+    assert.equal((moved.state as { failedOver?: boolean }).failedOver, true);
+    const records = recordsOf(h, "failover-worker");
+    assert.deepEqual(records.map((record) => record.recordType), ["decision", "failover", "decision"]);
+    const failover = records.find((record) => record.recordType === "failover");
     assert.ok(failover?.recordType === "failover");
-    assert.deepEqual([failover.limit, failover.resetsAt], ["exhausted", "2026-09-26T12:42:00.000Z"]);
+    assert.deepEqual([failover.limit, failover.resetsAt, failover.detail], ["exhausted", "2026-09-26T12:42:00.000Z", CODEX_USAGE_LIMIT]);
+    assert.deepEqual(failover.refusedAttempt, { timestamp: records[0]!.timestamp, rung: "openai-codex/gpt-6-luna:low" });
+    // Later requests stay on the new pin, and the observation steers other workers.
+    worker.answered();
+    assert.equal((await worker.continuation()).rung, `${HAIKU}:low`);
+    assert.equal(readUsageObservations(usageObservationsPath(h.stateDir))["openai-codex"]?.state, "exhausted");
   } finally { h.cleanup(); }
+});
+
+test("a worker fails over after a quota error only once, and a failover request after its first answer or for another rung than its pin sends nothing", async () => {
+  const tiers = { ...TEST_TIERS, mechanical: ["openai-codex/gpt-6-luna:low", `${HAIKU}:low`, "openai-codex/gpt-6-sol:medium"] };
+  const h = harness({ ...LIVE, tiers });
+  try {
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]));
+    const twice = auto.worker("twice-limited-worker");
+    await twice.user();
+    await twice.continueAfter(CODEX_USAGE_LIMIT);
+    await assert.rejects(twice.continueAfter("You're out of extra usage."), /no other provider's rung is left.*out of extra usage/);
+    assert.deepEqual(twice.rungs, ["openai-codex/gpt-6-luna:low", `${HAIKU}:low`]);
+    assert.deepEqual(recordsOf(h, "twice-limited-worker").map((record) => record.recordType), ["decision", "failover", "decision"]);
+  } finally { h.cleanup(); }
+  // A fresh usage store: the first worker left both providers exhausted.
+  const h2 = harness({ ...LIVE, tiers });
+  try {
+    const auto = await loadAutoModel(h2, fakeSessionRegistry([]));
+    const answered = auto.worker("answered-worker");
+    await answered.user();
+    answered.answered();
+    await answered.continuation();
+    await assert.rejects(answered.continueAfter(CODEX_USAGE_LIMIT), /no other provider's rung is left/);
+    assert.deepEqual(recordsOf(h2, "answered-worker").map((record) => record.recordType), ["decision"]);
+
+    // A request for another rung than the pin is not the pin's failure.
+    const other = auto.worker("mismatched-worker");
+    await other.user();
+    const withdraw = requestFailover("mismatched-worker", { model: "openai-codex/gpt-6-not-the-pin", errorMessage: CODEX_USAGE_LIMIT });
+    try { await assert.rejects(other.user(), /no other provider's rung is left/); } finally { withdraw(); }
+    assert.deepEqual(recordsOf(h2, "mismatched-worker").map((record) => record.recordType), ["decision"]);
+  } finally { h2.cleanup(); }
 });
 
 test("a failed-over worker's delegation counts for the provider it ran on once the throttle lifts", async () => {
@@ -1992,15 +2040,17 @@ test("a worker fails over once: a limit on the first request of the rung it fail
   } finally { h.cleanup(); }
 });
 
-test("a first-request quota error with no other provider's rung left fails the worker with the limit error and records no failover", { skip: QUOTA_FAILOVER }, async () => {
+test("a first-request quota error with no other provider's rung left fails the worker with the limit error and records no failover", async () => {
   const codexOnly = { mechanical: ["openai-codex/gpt-6-luna:low", "openai-codex/gpt-6-sol:medium"], standard: ["openai-codex/gpt-6-sol:medium"],
     elevated: ["openai-codex/gpt-6-sol:high"], critical: ["openai-codex/gpt-6-sol:xhigh"] };
   const h = harness({ ...LIVE, tiers: codexOnly });
   try {
     const worker = (await loadAutoModel(h, fakeSessionRegistry([]))).worker("stuck-worker");
     await worker.user();
-    await worker.retry(CODEX_USAGE_LIMIT);
+    await assert.rejects(worker.continueAfter(CODEX_USAGE_LIMIT), { message: `no other provider's rung is left to fail over to: ${CODEX_USAGE_LIMIT}` });
+    assert.deepEqual(worker.rungs, ["openai-codex/gpt-6-luna:low"], "no request goes to the exhausted provider again");
     assert.deepEqual(recordsOf(h, "stuck-worker").map((record) => record.recordType), ["decision"]);
+    assert.equal(readUsageObservations(usageObservationsPath(h.stateDir))["openai-codex"]?.state, "exhausted");
   } finally { h.cleanup(); }
 });
 

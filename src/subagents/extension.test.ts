@@ -18,7 +18,7 @@ import { createTempRepo } from "../fixtures/temp-repo.ts";
 import { providerStream } from "../fixtures/provider-stream.ts";
 import { createRouterExtension } from "../router/extension.ts";
 import personalGuard from "../guard/extension.ts";
-import { recordUsageObservation, usageObservationsPath, type UsageObservation } from "../router/usage-observations.ts";
+import { readUsageObservations, recordUsageObservation, usageObservationsPath, type UsageObservation } from "../router/usage-observations.ts";
 import { createSubagentsExtension, MAX_TEXT_BYTES, type SubagentResult, type SubagentsDependencies, type SubagentsDetails, type SubagentsProgressDetails } from "./extension.ts";
 import { markWorkerSession } from "./worker-sessions.ts";
 import { isOrchestratorSession } from "./orchestrator-session.ts";
@@ -4304,6 +4304,68 @@ test("a rate limit later in a worker's run is retried on its pin", async () => {
     assert.equal(worker.status, "completed", JSON.stringify(worker));
     assert.equal(worker.finalText, "done after the retry");
     assert.deepEqual(provider.requests.map((request) => request.model), [HAIKU, HAIKU, HAIKU]);
+    assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")).map((record) => record.recordType), ["decision"]);
+  } finally { h.cleanup(); }
+});
+
+const INSUFFICIENT_QUOTA = "insufficient_quota: You exceeded your current quota, please check your plan and billing details.";
+
+test("a quota error on a worker's first request before any output fails over to the other provider's rung, and the worker sees only its answer", async () => {
+  const h = harness({ orchestrator: { routing: TWO_PROVIDER_ROUTING }, ...FAST_RETRY });
+  try {
+    const provider = physicalProviders((request) => request.model === HAIKU ? { error: INSUFFICIENT_QUOTA } : { text: "done on luna" });
+    const tool = loadSubagentsTool([twoProviderRouter(), provider.extension]);
+    const { worker } = await callSubagents(tool, orchestrator(h).ctx, "Fix the typo in README.md");
+
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.equal(worker.finalText, "done on luna");
+    assert.deepEqual(provider.requests.map((request) => `${request.model}:${request.thinkingLevel}`), [RUNG, `${LUNA}:low`],
+      "pi does not retry the quota error; the worker runtime continues once");
+    assert.deepEqual(provider.requests[1]?.userMessages, ["Fix the typo in README.md"], "the continued request carries no extra user message");
+    const records = readRoutingRecords(join(h.stateDir, "routing"));
+    assert.deepEqual(records.map((record) => record.recordType), ["decision", "failover", "decision"]);
+    const [refused, failover, moved] = records;
+    assert.ok(refused?.recordType === "decision" && failover?.recordType === "failover" && moved?.recordType === "decision");
+    assert.equal(refused.ranOn, RUNG);
+    assert.deepEqual(failover.refusedAttempt, { timestamp: refused.timestamp, rung: RUNG });
+    assert.deepEqual([failover.limit, failover.detail, failover.rung], ["exhausted", INSUFFICIENT_QUOTA, `${LUNA}:low`]);
+    assert.equal(moved.ranOn, `${LUNA}:low`);
+    assert.equal(readUsageObservations(usageObservationsPath(h.stateDir), NOW).anthropic?.state, "exhausted", "later workers skip anthropic");
+    // The refused attempt stays in the saved session, left out of the context by a context edit.
+    const lines = sessionLines(worker.sessionFile!);
+    const failed = lines.find((line) => line.type === "message" && line.message?.role === "assistant" &&
+      (line.message as { stopReason?: string }).stopReason === "error");
+    assert.ok(failed, "the failed attempt is kept in the session file");
+    assert.ok(lines.some((line) => line.type === "context_edit" && (line as { targetId?: string }).targetId === failed.id));
+  } finally { h.cleanup(); }
+});
+
+test("a quota error on a worker's first request with no other provider's rung left fails the worker with the quota error", async () => {
+  const single = { ...TWO_PROVIDER_ROUTING, tiers: { ...TWO_PROVIDER_ROUTING.tiers, mechanical: [RUNG] } };
+  const h = harness({ orchestrator: { routing: single }, ...FAST_RETRY });
+  try {
+    const provider = physicalProviders(() => ({ error: INSUFFICIENT_QUOTA }));
+    const tool = loadSubagentsTool([twoProviderRouter(), provider.extension]);
+    const { worker } = await callSubagents(tool, orchestrator(h).ctx, "Fix the typo in README.md");
+
+    assert.equal(worker.status, "failed", JSON.stringify(worker));
+    assert.equal(worker.error, `no other provider's rung is left to fail over to: ${INSUFFICIENT_QUOTA}`);
+    assert.deepEqual(provider.requests.map((request) => request.model), [HAIKU], "the exhausted provider is not asked again");
+    assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")).map((record) => record.recordType), ["decision"]);
+    assert.equal(readUsageObservations(usageObservationsPath(h.stateDir), NOW).anthropic?.state, "exhausted");
+  } finally { h.cleanup(); }
+});
+
+test("a quota error later in a worker's run fails the worker without a failover", async () => {
+  const h = harness({ orchestrator: { routing: TWO_PROVIDER_ROUTING }, ...FAST_RETRY });
+  try {
+    const provider = physicalProviders((_request, index) => index === 0 ? { toolCall: { name: "probe", arguments: {} } } : { error: INSUFFICIENT_QUOTA });
+    const tool = loadSubagentsTool([twoProviderRouter(), provider.extension, PROBE_TOOL_EXTENSION]);
+    const { worker } = await callSubagents(tool, orchestrator(h).ctx, "Use probe, then finish");
+
+    assert.equal(worker.status, "failed", JSON.stringify(worker));
+    assert.match(worker.error ?? "", /insufficient_quota/);
+    assert.deepEqual(provider.requests.map((request) => request.model), [HAIKU, HAIKU]);
     assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")).map((record) => record.recordType), ["decision"]);
   } finally { h.cleanup(); }
 });

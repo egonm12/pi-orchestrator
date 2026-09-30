@@ -42,3 +42,11 @@ test("every session-error fixture names its provenance and redacts the request i
     assert.doesNotMatch(error.errorMessage, /req_[A-Za-z0-9]/, file);
   }
 });
+
+test("the quota and billing errors pi never retries are classified exhausted", () => {
+  const at = new Date("2026-09-26T12:00:00.000Z");
+  for (const text of ["insufficient_quota: You exceeded your current quota", "429 Quota exceeded for this project", "Your credit balance is too low to access the API. Please go to Plans & Billing",
+    "You are out of budget", "Monthly usage limit reached. Enable available balance usage", "GoUsageLimitError", "subscription_sharing_usage_limit_exceeded"]) {
+    assert.deepEqual(limitErrorObservation(text, at), { state: "exhausted", observedAt: at.toISOString(), source: "error" }, text);
+  }
+});

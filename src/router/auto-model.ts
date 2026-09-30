@@ -35,8 +35,9 @@ export function isAutoModel(model: { readonly provider?: string; readonly id?: s
 }
 
 const ROUTING_CONSTRAINTS = Symbol.for("pi-orchestrator.router.routing-constraints");
+const FAILOVER_REQUESTS = Symbol.for("pi-orchestrator.router.failover-requests");
 type Pin = { readonly model: string; readonly effort: ThinkingLevel };
-type ProcessGlobal = typeof globalThis & { [ROUTING_CONSTRAINTS]?: Map<string, RoutingConstraints> };
+type ProcessGlobal = typeof globalThis & { [ROUTING_CONSTRAINTS]?: Map<string, RoutingConstraints>; [FAILOVER_REQUESTS]?: Map<string, FailedFirstRequest> };
 
 // Constraints are set by the orchestrator's extension copy and read by the
 // worker's, so they are kept on the process's global object.
@@ -46,6 +47,35 @@ function routingConstraints(): Map<string, RoutingConstraints> { return (globalT
 export function setRoutingConstraints(id: string, constraints: RoutingConstraints): () => void {
   routingConstraints().set(id, constraints);
   return () => { routingConstraints().delete(id); };
+}
+
+/** A worker's first request that ended in a limit error pi does not retry,
+ *  such as a quota or billing error, before any output: the physical model
+ *  it ran on (`provider/id`) and its error text. */
+export interface FailedFirstRequest {
+  readonly model: string;
+  readonly errorMessage: string;
+}
+
+function failoverRequests(): Map<string, FailedFirstRequest> { return (globalThis as ProcessGlobal)[FAILOVER_REQUESTS] ??= new Map(); }
+
+/** Asks the auto model to fail over the next request of the worker with
+ *  session id `id`, which the worker runtime sends by continuing the session
+ *  once after `failed` (spec 23b3, ticket v1q3). pi routes that request with
+ *  reason user and the old router state, never as a retry. The route takes
+ *  the request at most once. Returns the function that withdraws it. Set by
+ *  the worker's module copy and read by the router's, so it is kept on the
+ *  process's global object, like routing constraints. */
+export function requestFailover(id: string, failed: FailedFirstRequest): () => void {
+  failoverRequests().set(id, failed);
+  return () => { if (failoverRequests().get(id) === failed) failoverRequests().delete(id); };
+}
+
+/** Takes session `id`'s failover request, if the worker runtime made one. */
+function takeFailoverRequest(id: string): FailedFirstRequest | undefined {
+  const failed = failoverRequests().get(id);
+  failoverRequests().delete(id);
+  return failed;
 }
 
 /** A worker's pin as the auto model's router state (JSON). `decisionId` is
@@ -365,14 +395,16 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
    *  answered with a limit error before any output: records the usage
    *  observation, routes the task once more, now that the usage store holds
    *  the refused provider's limit, and writes the failover record linked to
-   *  the refused decision and the new decision. `undefined` when the request
-   *  cannot fail over or routing has no other provider's rung left. */
-  async function failOver(sessionId: string, state: AutoModelState, request: Request, registry: Registry): Promise<FirstRoute | undefined> {
-    const failed = request.failed;
+   *  the refused decision and the new decision. The failure comes as pi's
+   *  retry's `failed`, or as the worker runtime's failover request for an
+   *  error pi does not retry. `undefined` when the request cannot fail over
+   *  or routing has no other provider's rung left. */
+  async function failOver(sessionId: string, state: AutoModelState, request: Request,
+    failure: { readonly errorText: string | undefined; readonly producedOutput: boolean }, registry: Registry): Promise<FirstRoute | undefined> {
     const context = failovers.get(sessionId);
-    if (failed === undefined || context === undefined || state.failedOver || state.decisionId === undefined || request.previous !== undefined ||
-      deps.disabled() || producedOutput(failed.message as { content?: readonly Part[] })) return undefined;
-    const errorText = failed.message.errorMessage;
+    if (context === undefined || state.failedOver || state.decisionId === undefined || request.previous !== undefined ||
+      deps.disabled() || failure.producedOutput) return undefined;
+    const { errorText } = failure;
     const limit = errorText === undefined ? undefined : limitErrorObservation(errorText, deps.now());
     if (errorText === undefined || limit === undefined) return undefined;
     // One attempt: a later retry of this request stays on the pin.
@@ -451,9 +483,22 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
       }
 
       const state = storedPin(request.state);
+      // The worker runtime continued the session after a first-request limit
+      // error pi does not retry. The request goes to a surviving rung on
+      // another provider, or nowhere: resending it to the pin's provider
+      // would meet the same limit.
+      const requested = takeFailoverRequest(sessionId);
+      if (requested !== undefined) {
+        const next = state === undefined || requested.model !== state.rung.model ? undefined
+          : await failOver(sessionId, state, request, { errorText: requested.errorMessage, producedOutput: false }, registry);
+        if (next) return to(next.pin, next.state, "new");
+        throw new Error(`no other provider's rung is left to fail over to: ${requested.errorMessage}`);
+      }
       if (state) {
         if (request.reason === "retry" && request.failed) {
-          const next = await failOver(sessionId, state, request, registry);
+          const failed = request.failed.message;
+          const next = await failOver(sessionId, state, request, { errorText: failed.errorMessage,
+            producedOutput: producedOutput(failed as { content?: readonly Part[] }) }, registry);
           if (next) return to(next.pin, next.state, "new");
           return back(request.failed, state.rung.effort);
         }

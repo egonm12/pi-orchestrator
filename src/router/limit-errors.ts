@@ -17,7 +17,11 @@ import type { UsageObservation } from "./usage-observations.ts";
 //                 {"type":"rate_limit_error","message":"This request would
 //                 exceed the rate limit"}}` (src/routing/session-classifier-call.test.ts).
 
-const USAGE_LIMIT = /usage.?limit|usage_not_included|out of extra usage/i;
+//   quota and billing  the texts pi-ai never retries (retry.ts,
+//                 NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN), such as OpenAI's
+//                 insufficient_quota: the allowance is used up, so exhausted.
+
+const USAGE_LIMIT = /usage.?limit|usage_not_included|out of extra usage|insufficient_quota|quota.?exceeded|out of budget|billing|available balance/i;
 const RATE_LIMIT = /rate.?limit|too many requests|\b429\b/i;
 /** "Try again in ~42 min.", "try again in 20s". */
 const TRY_AGAIN_IN = /try again in\s*~?\s*(\d+(?:\.\d+)?)\s*(s|sec|secs|seconds?|m|min|mins|minutes?|h|hr|hrs|hours?)\b/i;
