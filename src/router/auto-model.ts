@@ -1,12 +1,11 @@
 import { VIRTUAL_MODEL_STATE_ENTRY, type ExtensionContext, type ModelRoute, type ModelRouteRequest } from "@earendil-works/pi-coding-agent";
 import { mkdirSync } from "node:fs";
-import { appendRoutingRecord, buildDecisionRecord, buildFailoverRecord, madeUnderConstraints, readRoutingRecords, RoutingRecordError,
-  type DecisionRecord } from "../routing/decision-record.ts";
+import { appendRoutingRecord, buildDecisionRecord, buildFailoverRecord } from "../routing/decision-record.ts";
 import type { TierClassification } from "../routing/tier-classifier.ts";
 import { splitKnownThinkingSuffix, THINKING_LEVELS, type ThinkingLevel } from "../models/model-info.ts";
 import { subagentBanListEntry, type BanLists } from "../policy/ban-lists.ts";
 import { ROUTER_PREFIX } from "./prefix.ts";
-import { classifyTask, recordedRungPassesHardFilters, routeTask, type ActiveRouter } from "./route-task.ts";
+import { classifyTask, routeTask, type ActiveRouter } from "./route-task.ts";
 import { withRoutingChoice } from "./routing-choice-lock.ts";
 import { parentDelegationOf, reviewedDelegationOf } from "../subagents/worker-sessions.ts";
 import { publishServedRung, type RungEscalation } from "./served-rungs.ts";
@@ -35,20 +34,12 @@ export function isAutoModel(model: { readonly provider?: string; readonly id?: s
   return model?.provider === AUTO_PROVIDER && model.id === AUTO_MODEL_ID;
 }
 
-const RESUME_PINS = Symbol.for("pi-orchestrator.subagents.resume-pins");
 const ROUTING_CONSTRAINTS = Symbol.for("pi-orchestrator.router.routing-constraints");
 type Pin = { readonly model: string; readonly effort: ThinkingLevel };
-type ProcessGlobal = typeof globalThis & { [RESUME_PINS]?: Map<string, Pin>; [ROUTING_CONSTRAINTS]?: Map<string, RoutingConstraints> };
-function resumePins(): Map<string, Pin> { return (globalThis as ProcessGlobal)[RESUME_PINS] ??= new Map(); }
-/** A checked resume keeps its original pin without making a new routing
- *  decision. Router state on the resumed branch wins over it. */
-export function setResumePin(id: string, pin: Pin): () => void {
-  resumePins().set(id, pin);
-  return () => { resumePins().delete(id); };
-}
+type ProcessGlobal = typeof globalThis & { [ROUTING_CONSTRAINTS]?: Map<string, RoutingConstraints> };
 
-// Like resume pins, constraints are set by the orchestrator's extension copy
-// and read by the worker's, so they are kept on the process's global object.
+// Constraints are set by the orchestrator's extension copy and read by the
+// worker's, so they are kept on the process's global object.
 function routingConstraints(): Map<string, RoutingConstraints> { return (globalThis as ProcessGlobal)[ROUTING_CONSTRAINTS] ??= new Map(); }
 /** Routing constraints for the worker with session id `id`, read at its
  *  first request. Returns the function that removes them. */
@@ -128,24 +119,6 @@ function producedOutput(message: { readonly content?: readonly Part[] | string }
   if (typeof content === "string") return content !== "";
   return content.some((part) => part.type === "toolCall" || (part.type === "text" && (part.text ?? "") !== "") ||
     (part.type === "thinking" && (part.thinking ?? "") !== ""));
-}
-
-function latestDecision(dir: string, sessionId: string): DecisionRecord | undefined {
-  try {
-    return readRoutingRecords(dir).filter((record): record is DecisionRecord =>
-      record.recordType === "decision" && record.delegationId === sessionId).at(-1);
-  } catch (error) {
-    if (error instanceof RoutingRecordError) return undefined;
-    throw error;
-  }
-}
-
-function canRestoreDecision(router: ActiveRouter, decision: DecisionRecord | undefined, sessionId: string,
-  constraints: RoutingConstraints | undefined, taskText: string, at: Date): boolean {
-  return decision?.mode === "live" && decision.delegationId === sessionId && decision.route.outcome === "chosen" &&
-    (decision.ranOn === undefined || decision.ranOn === `${decision.route.rung.model}:${decision.route.rung.effort}`) &&
-    madeUnderConstraints(decision, constraints) &&
-    recordedRungPassesHardFilters(router, decision.route.rung, taskText, at, constraints);
 }
 
 class SessionModelError extends Error {}
@@ -281,7 +254,14 @@ function stateOf(pin: ServedPin, extra: { tier?: RiskTier; decisionId?: string; 
 
 /** The pin the session branch stores, for a direct request, which carries no state. */
 function branchPin(ctx: RouteContext): AutoModelState | undefined {
-  const branch = ctx.sessionManager?.getBranch?.() ?? [];
+  return savedAutoModelPin(ctx.sessionManager?.getBranch?.() ?? []);
+}
+
+/** The pin the latest auto model router state on `branch` holds, as pi reads
+ *  it for the next request: how a resumed worker's saved session keeps its
+ *  pin. `undefined` when the branch stores none, as in a worker session saved
+ *  before the pin was router state, or the state is not a pin. */
+export function savedAutoModelPin(branch: readonly unknown[]): AutoModelState | undefined {
   for (let index = branch.length - 1; index >= 0; index--) {
     const entry = branch[index] as { type?: string; customType?: string; data?: { provider?: unknown; modelId?: unknown; state?: unknown } };
     if (entry.type !== "custom" || entry.customType !== VIRTUAL_MODEL_STATE_ENTRY) continue;
@@ -343,19 +323,11 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
     const { taskText, agentRole } = firstTaskAndRole(messages);
     // Classification may call a provider. Do it before taking the shared
     // queue; only choice and record must be serialized.
-    let existing: DecisionRecord | undefined;
-    try { existing = router.mode === "live" ? latestDecision(router.recordDir, sessionId) : undefined; }
+    let classification: TierClassification;
+    try { classification = await classifyTask(router, taskText, agentRole); }
     catch (error) {
       deps.disable(error);
       return { pin: fallbackPin(deps.banLists(), constraints, "allowed") };
-    }
-    let classification: TierClassification | undefined;
-    if (!canRestoreDecision(router, existing, sessionId, constraints, taskText, deps.now())) {
-      try { classification = await classifyTask(router, taskText, agentRole); }
-      catch (error) {
-        deps.disable(error);
-        return { pin: fallbackPin(deps.banLists(), constraints, "allowed") };
-      }
     }
     return withRoutingChoice(router.recordDir, async (): Promise<FirstRoute> => {
       try {
@@ -363,14 +335,6 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
         // timestamp when choosing, after prior decisions have been written,
         // not before classification.
         const at = deps.now();
-        const latest = router.mode === "live" ? latestDecision(router.recordDir, sessionId) : undefined;
-        // A decision made under other constraints could restore a rung these exclude.
-        if (canRestoreDecision(router, latest, sessionId, constraints, taskText, at) && latest?.route.outcome === "chosen") {
-          const pin: ServedPin = { model: latest.route.rung.model, effort: latest.route.rung.effort as ThinkingLevel, ...escalationOf(latest.route) };
-          physical(registry, pin);
-          return { pin, state: stateOf(pin, { tier: latest.route.tier, decisionId: latest.timestamp, failedOver: false }) };
-        }
-        classification ??= await classifyTask(router, taskText, agentRole);
         const { route, providerUsage } = routeTask(router, taskText, classification, at, constraints);
         const pin: ServedPin = router.mode === "shadow" ? fallbackPin(router.banLists, constraints, "allowed")
           : !route.ok ? fallbackPin(router.banLists, constraints, "refused", providerUsage)
@@ -499,8 +463,6 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
       }
       // pi retries a failed request that has no pin stored on the model it failed on.
       if (request.reason === "retry" && request.failed) return back(request.failed, request.thinkingLevel);
-      const resumed = resumePins().get(sessionId);
-      if (resumed) return to(resumed, stateOf(resumed, { failedOver: false }), "reused");
       const first = await firstRoute(sessionId, messages, registry);
       return to(first.pin, first.state, "new");
     },

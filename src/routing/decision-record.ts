@@ -927,15 +927,6 @@ function recordedConstraints(constraints: RoutingConstraints | undefined): Recor
   return Object.keys(recorded).length === 0 ? undefined : recorded;
 }
 
-/** Whether `record` was made under exactly `constraints`; a record without
- *  constraints matches a worker without any. */
-export function madeUnderConstraints(record: DecisionRecord, constraints: RoutingConstraints | undefined): boolean {
-  const recorded = record.constraints;
-  const wanted = recordedConstraints(constraints);
-  return recorded?.minimumTier === wanted?.minimumTier && recorded?.excludedRung === wanted?.excludedRung &&
-    recorded?.forcedRung?.tier === wanted?.forcedRung?.tier && recorded?.forcedRung?.rung === wanted?.forcedRung?.rung;
-}
-
 export function buildEffortLadderRecord(input: {
   readonly delegationId: string;
   readonly at: Date;

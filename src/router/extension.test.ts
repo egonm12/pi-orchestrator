@@ -24,7 +24,7 @@ import { SettingsManager, type ExtensionAPI } from "@earendil-works/pi-coding-ag
 import type { TestContext as ExtensionContext } from "../fixtures/extension-context.ts";
 import type { SessionModelRegistry } from "../routing/model-stream.ts";
 import { createRouterExtension, type RouterDependencies, type RoutingEvidence } from "./extension.ts";
-import { setResumePin, setRoutingConstraints } from "./auto-model.ts";
+import { setRoutingConstraints } from "./auto-model.ts";
 import { readUsageObservations, recordUsageObservation, usageObservationsPath, type UsageObservation } from "./usage-observations.ts";
 import { useOwnerBanLists } from "../fixtures/owner-ban-lists.ts";
 
@@ -231,8 +231,9 @@ interface AutoModel {
    *  unless `request` says otherwise. `branch` is the session branch route's
    *  context exposes. */
   route(sessionId: string | undefined, messages?: readonly unknown[], request?: Partial<RouteRequest>, branch?: readonly unknown[]): Promise<Routed>;
-  /** A worker session on the auto model, whose requests carry state and previous as pi passes them. */
-  worker(sessionId: string, messages?: readonly unknown[]): WorkerRequests;
+  /** A worker session on the auto model, whose requests carry state and previous as pi passes them.
+   *  `state` is the router state its branch already holds, as in a resumed session. */
+  worker(sessionId: string, messages?: readonly unknown[], state?: unknown): WorkerRequests;
 }
 
 async function loadAutoModel(h: Harness, registry: SessionModelRegistry, deps: Partial<RouterDependencies> = {},
@@ -271,8 +272,8 @@ async function loadRouterWith(h: Harness, registry: SessionModelRegistry, deps: 
     return { rung: `${routed.model.provider}/${routed.model.id}:${routed.thinkingLevel}`, model: routed.model, thinkingLevel: routed.thinkingLevel,
       state: routed.state };
   };
-  const worker = (sessionId: string, messages: readonly unknown[] = FIX_README): WorkerRequests => {
-    let state: unknown;
+  const worker = (sessionId: string, messages: readonly unknown[] = FIX_README, saved?: unknown): WorkerRequests => {
+    let state: unknown = saved;
     let previous: RouteRequest["previous"];
     let latest: Routed | undefined;
     const rungs: string[] = [];
@@ -1278,51 +1279,6 @@ test("an auto model request without a session id is refused with a clear error a
   } finally { h.cleanup(); }
 });
 
-test("shadow mode classifies rather than restoring an earlier live pin", async () => {
-  const h = harness(LIVE);
-  try {
-    const messages = [{ role: "user", content: "Fix README.md", timestamp: 0 }];
-    await firstRequest(await loadAutoModel(h, fakeSessionRegistry([{ events: answerEvents("live") }])), messages, "mode-changed-worker");
-    writeFileSync(join(h.agentDir, "settings.json"), JSON.stringify({ orchestrator: { routing: SHADOW } }));
-    const classifier = answering("standard");
-    const auto = await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => classifier.call });
-    process.env.PI_ORCHESTRATOR_SESSION_MODEL = "anthropic/claude-sonnet-5:high";
-    assert.equal((await firstRequest(auto, messages, "mode-changed-worker")).model.id, "claude-sonnet-5");
-    assert.equal(classifier.prompts.length, 1);
-    assert.deepEqual(h.records().map((record) => record.recordType === "decision" && record.mode), ["live", "shadow"]);
-  } finally { h.cleanup(); }
-});
-
-test("a resumed worker reuses its recorded rung without classifying or writing a record", async () => {
-  const h = harness(LIVE);
-  try {
-    const first = await loadAutoModel(h, fakeSessionRegistry([{ events: answerEvents("first") }]));
-    const messages = [{ role: "user", content: "Fix README.md", timestamp: 0 }];
-    await firstRequest(first, messages, "resumed-worker");
-    const classifier = answering("standard");
-    const resumed = await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => classifier.call });
-    // A branch from before router state: the decision record restores the pin.
-    assert.equal((await firstRequest(resumed, messages, "resumed-worker")).rung, `${HAIKU}:low`);
-    assert.equal(classifier.prompts.length, 0);
-    assert.equal(h.records().length, 1);
-  } finally { h.cleanup(); }
-});
-
-test("a resumed worker reuses a rung written in settings with different case", async () => {
-  const mixedCase = { ...TEST_TIERS, mechanical: ["Anthropic/Claude-Haiku-4-5:low", "openai-codex/gpt-6-luna:low"] };
-  const h = harness({ ...LIVE, tiers: mixedCase });
-  try {
-    const first = await loadAutoModel(h, fakeSessionRegistry([{ events: answerEvents("first") }]));
-    const messages = [{ role: "user", content: "Fix README.md", timestamp: 0 }];
-    await firstRequest(first, messages, "mixed-case-worker");
-    const classifier = answering("standard");
-    const resumed = await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => classifier.call });
-    assert.equal((await firstRequest(resumed, messages, "mixed-case-worker")).model.id, "claude-haiku-4-5");
-    assert.equal(classifier.prompts.length, 0);
-    assert.equal(h.records().length, 1);
-  } finally { h.cleanup(); }
-});
-
 test("a damaged decision-record day file does not stop a new worker from classifying", async () => {
   const h = harness(LIVE);
   try {
@@ -1340,81 +1296,6 @@ test("a damaged decision-record day file does not stop a new worker from classif
   } finally { h.cleanup(); }
 });
 
-test("a resumed worker accepts a legacy /2 decision record", async () => {
-  const h = harness(LIVE);
-  try {
-    const messages = [{ role: "user", content: "Fix README.md", timestamp: 0 }];
-    await firstRequest(await loadAutoModel(h, fakeSessionRegistry([{ events: answerEvents("first") }])), messages, "legacy-worker");
-    const file = join(h.stateDir, "routing", "2026-09-26.jsonl");
-    const record = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
-    record.schemaVersion = "decision-record/2";
-    delete record.ranOn;
-    writeFileSync(file, `${JSON.stringify(record)}\n`);
-    const classifier = answering("standard");
-    const routed = await firstRequest(await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => classifier.call }), messages, "legacy-worker");
-    assert.equal(routed.model.id, "claude-haiku-4-5");
-    assert.equal(classifier.prompts.length, 0);
-    assert.equal(h.records().length, 1);
-  } finally { h.cleanup(); }
-});
-
-test("a shadow decision cannot pin a resumed worker to its hypothetical rung", async () => {
-  const h = harness(LIVE);
-  try {
-    const messages = [{ role: "user", content: "Fix README.md", timestamp: 0 }];
-    await firstRequest(await loadAutoModel(h, fakeSessionRegistry([{ events: answerEvents("first") }])), messages, "shadow-worker");
-    const file = join(h.stateDir, "routing", "2026-09-26.jsonl");
-    const record = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
-    record.mode = "shadow";
-    record.ranOn = HAIKU;
-    record.handPickedModel = HAIKU;
-    writeFileSync(file, `${JSON.stringify(record)}\n`);
-    assert.equal(h.records()[0]?.recordType, "decision", "the shadow fixture must be readable");
-    const classifier = answering("standard");
-    const routed = await firstRequest(await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => classifier.call }), messages, "shadow-worker");
-    assert.equal(classifier.prompts.length, 1);
-    assert.equal(routed.model.id, "claude-sonnet-5");
-    assert.equal(h.records().length, 2);
-  } finally { h.cleanup(); }
-});
-
-test("a live decision whose ranOn differs from its rung cannot restore a pin", async () => {
-  const h = harness(LIVE);
-  try {
-    const messages = [{ role: "user", content: "Fix README.md", timestamp: 0 }];
-    await firstRequest(await loadAutoModel(h, fakeSessionRegistry([{ events: answerEvents("first") }])), messages, "fallback-worker");
-    const file = join(h.stateDir, "routing", "2026-09-26.jsonl");
-    const record = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
-    record.ranOn = HAIKU;
-    writeFileSync(file, `${JSON.stringify(record)}\n`);
-    assert.equal(h.records()[0]?.recordType, "decision", "the fallback fixture must be readable");
-    const classifier = answering("standard");
-    const routed = await firstRequest(await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => classifier.call }), messages, "fallback-worker");
-    assert.equal(classifier.prompts.length, 1);
-    assert.equal(routed.model.id, "claude-sonnet-5");
-    assert.equal(h.records().length, 2);
-  } finally { h.cleanup(); }
-});
-
-test("a resumed worker whose rung fails a hard filter is classified and recorded again", async () => {
-  const h = harness(LIVE);
-  try {
-    const messages = [{ role: "user", content: "Fix README.md", timestamp: 0 }];
-    const first = await loadAutoModel(h, fakeSessionRegistry([{ events: answerEvents("first") }]));
-    await firstRequest(first, messages, "filtered-worker");
-    const classifier = answering("standard");
-    const resumed = await loadAutoModel(h, fakeSessionRegistry([]), {
-      classifierCall: () => classifier.call,
-      evidence: () => () => evidenceOf({ authorization: approved("openai-codex") }),
-    });
-    const routed = await firstRequest(resumed, messages, "filtered-worker");
-    assert.equal(classifier.prompts.length, 1);
-    assert.equal(routed.model.id, "gpt-6-sol");
-    assert.deepEqual(h.records().map((record) => record.recordType === "decision" && record.route.outcome === "chosen" && record.route.rung.rung),
-      [`${HAIKU}:low`, "openai-codex/gpt-6-sol:medium"]);
-  } finally { h.cleanup(); }
-});
-
 test("a worker without a recorded decision is classified as a first request", async () => {
   const h = harness(LIVE);
   try {
@@ -1427,38 +1308,31 @@ test("a worker without a recorded decision is classified as a first request", as
   } finally { h.cleanup(); }
 });
 
-test("a resumed worker uses the latest decision for its delegation id", async () => {
+test("a resumed worker in a new process runs on the pin its branch's router state holds, without classifying or writing a record", async () => {
   const h = harness(LIVE);
   try {
-    const messages = [{ role: "user", content: "Fix README.md", timestamp: 0 }];
-    await firstRequest(await loadAutoModel(h, fakeSessionRegistry([{ events: answerEvents("first") }])), messages, "latest-worker");
-    await firstRequest(await loadAutoModel(h, fakeSessionRegistry([{ events: answerEvents("second") }]), {
-      evidence: () => () => evidenceOf({ authorization: approved("openai-codex") }),
-    }), messages, "latest-worker");
+    const first = await firstRequest(await loadAutoModel(h, fakeSessionRegistry([])), FIX_README, "resumed-worker");
+    assert.equal(first.rung, `${HAIKU}:low`);
     const classifier = answering("critical");
-    const routed = await firstRequest(await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => classifier.call }), messages, "latest-worker");
-    assert.equal(routed.model.id, "gpt-6-luna");
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => classifier.call });
+    const resumed = auto.worker("resumed-worker", FIX_README, first.state);
+    assert.equal((await resumed.user()).rung, `${HAIKU}:low`);
+    assert.equal((await resumed.continuation()).rung, `${HAIKU}:low`);
     assert.equal(classifier.prompts.length, 0);
-    assert.equal(h.records().length, 2);
+    assert.equal(h.records().length, 1, "a resume writes no new record");
   } finally { h.cleanup(); }
 });
 
-test("a resumed worker's router state on its branch wins over its resume pin, which holds while the branch has none", async () => {
+test("a worker with a decision record but no router state on its branch is classified as a first request", async () => {
   const h = harness(LIVE);
-  const clear = setResumePin("resume-pin-worker", { model: "anthropic/claude-sonnet-5", effort: "high" });
   try {
-    const classifier = answering("mechanical");
-    const auto = await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => classifier.call });
-    // A branch from before router state: the checked resume pin.
-    const resumed = auto.worker("resume-pin-worker");
-    assert.equal((await resumed.user()).rung, "anthropic/claude-sonnet-5:high");
-    assert.equal((await resumed.continuation()).rung, "anthropic/claude-sonnet-5:high");
-    // A branch with router state: its pin.
-    const state = { rung: { model: HAIKU, effort: "low" }, tier: "mechanical", failedOver: false };
-    assert.equal((await auto.route("resume-pin-worker", FIX_README, { state })).rung, `${HAIKU}:low`);
-    assert.equal(classifier.prompts.length, 0);
-    assert.deepEqual(h.records(), [], "a resume writes no new record");
-  } finally { clear(); h.cleanup(); }
+    await firstRequest(await loadAutoModel(h, fakeSessionRegistry([])), FIX_README, "stateless-worker");
+    const classifier = answering("critical");
+    const routed = await firstRequest(await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => classifier.call }), FIX_README, "stateless-worker");
+    assert.equal(classifier.prompts.length, 1, "the decision record is the audit trail, not the pin");
+    assert.equal(routed.rung, "openai-codex/gpt-6-sol:xhigh", "a critical rung, not the recorded mechanical one");
+    assert.equal(h.records().length, 2);
+  } finally { h.cleanup(); }
 });
 
 test("the auto model is registered as a virtual model, not a provider, with the largest context window and output limit among the tier map's rungs", async () => {
@@ -1714,27 +1588,6 @@ test("routing constraints bind only their worker's session id, and removing them
     const records = h.records();
     assert.deepEqual(records.map((record) => record.delegationId), ["other-worker", "constrained-worker"]);
     for (const record of records) assert.equal("constraints" in record, false, "an unconstrained decision record has no constraints field");
-  } finally { clear(); h.cleanup(); }
-});
-
-test("a recorded decision pins a constrained worker again only when it was made under the same constraints", async () => {
-  const h = harness(LIVE);
-  let clear = () => {};
-  try {
-    // Recorded without constraints, on a mechanical rung that still passes the hard filters.
-    await firstRequest(await loadAutoModel(h, fakeSessionRegistry([{ events: answerEvents("first") }])), FIX_README, "restored-worker");
-    clear = setRoutingConstraints("restored-worker", { minimumTier: "elevated" });
-    const classifier = answering("mechanical");
-    const rerouted = await firstRequest(await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => classifier.call }), FIX_README, "restored-worker");
-    assert.equal(classifier.prompts.length, 1, "classified again");
-    assert.equal(rerouted.rung, "openai-codex/gpt-6-sol:high");
-
-    // Recorded under these constraints: restored without classifying.
-    const again = answering("critical");
-    const restored = await firstRequest(await loadAutoModel(h, fakeSessionRegistry([]), { classifierCall: () => again.call }), FIX_README, "restored-worker");
-    assert.equal(again.prompts.length, 0, "not classified");
-    assert.equal(restored.rung, "openai-codex/gpt-6-sol:high");
-    assert.equal(h.records().length, 2);
   } finally { clear(); h.cleanup(); }
 });
 
@@ -2169,13 +2022,14 @@ test("a first-request rate limit with no other provider's rung left stays on the
   } finally { h.cleanup(); }
 });
 
-test("shadow mode and a restored pin never fail over", async () => {
-  for (const [name, routing] of [["shadow", { ...SHADOW, tiers: CODEX_FIRST }], ["restored", { ...LIVE, tiers: CODEX_FIRST }]] as const) {
+test("shadow mode and a resumed pin never fail over", async () => {
+  for (const [name, routing] of [["shadow", { ...SHADOW, tiers: CODEX_FIRST }], ["resumed", { ...LIVE, tiers: CODEX_FIRST }]] as const) {
     const h = harness(routing);
     try {
-      if (name === "restored") await firstRequest(await loadAutoModel(h, fakeSessionRegistry([])), FIX_README, "no-failover-worker");
+      // A resumed worker's branch holds the pin its first request stored, in an earlier process.
+      const saved = name === "resumed" ? (await firstRequest(await loadAutoModel(h, fakeSessionRegistry([])), FIX_README, "no-failover-worker")).state : undefined;
       process.env.PI_ORCHESTRATOR_SESSION_MODEL = "openai-codex/gpt-6-sol:medium";
-      const worker = (await loadAutoModel(h, fakeSessionRegistry([]))).worker("no-failover-worker");
+      const worker = (await loadAutoModel(h, fakeSessionRegistry([]))).worker("no-failover-worker", FIX_README, saved);
       const first = await worker.user();
       assert.equal((await worker.retry(CODEX_RATE_LIMIT)).rung, first.rung, name);
       assert.equal(h.records().filter((record) => record.recordType === "failover").length, 0, name);

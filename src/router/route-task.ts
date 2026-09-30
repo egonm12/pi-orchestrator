@@ -3,7 +3,7 @@ import type { ModelInfo } from "../models/model-info.ts";
 import type { BanLists } from "../policy/ban-lists.ts";
 import { classifyTier, type ClassifierModelCall, type LoadedClassifierChain, type TierClassification } from "../routing/tier-classifier.ts";
 import type { ResolvedTierMap } from "../routing/tier-map.ts";
-import { failedHardFilter, routeForcedRung, routeTier, type ConstraintRung, type ProviderUsage, type RouterEvidence, type RoutingConstraints } from "../routing/tier-router.ts";
+import { routeForcedRung, routeTier, type ProviderUsage, type RouterEvidence, type RoutingConstraints } from "../routing/tier-router.ts";
 import { nextRungAfterFailure, type FailedDecision, type LadderDecision } from "../routing/effort-ladder.ts";
 import { isAtLeastTier } from "../routing/classifier.ts";
 import { deriveProviderUsage, type RoutingEvidence, type RoutingEvidenceSource } from "./evidence.ts";
@@ -90,11 +90,6 @@ function hardFilterEvidence(router: ActiveRouter, taskText: string, at: Date, ev
     ...(constraints.excludedRung === undefined ? {} : { excludedRung: constraints.excludedRung }),
     ...(constraints.avoidedProvider === undefined ? {} : { avoidedProvider: constraints.avoidedProvider }),
   };
-}
-
-export function recordedRungPassesHardFilters(router: ActiveRouter, rung: ConstraintRung, taskText: string, at: Date,
-  constraints: RoutingConstraints = {}): boolean {
-  return failedHardFilter(rung, hardFilterEvidence(router, taskText, at, router.evidence(), constraints)) === undefined;
 }
 
 /** Classify the worker's task before entering the shared choice queue. */

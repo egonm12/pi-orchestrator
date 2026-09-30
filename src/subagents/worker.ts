@@ -8,7 +8,7 @@ import type { ResumeWorker } from "./resume.ts";
 import type { BackgroundMessageMode } from "./background.ts";
 import { REPORT_TOOL, reportExtension, type WorkerReports } from "./report.ts";
 import { missingResultSections, REPORTING_RULES, type ResultSection } from "./result-format.ts";
-import { AUTO_MODEL_ID, AUTO_PROVIDER, setResumePin, setRoutingConstraints } from "../router/auto-model.ts";
+import { AUTO_MODEL_ID, AUTO_PROVIDER, setRoutingConstraints } from "../router/auto-model.ts";
 import type { RoutingConstraints } from "../routing/tier-router.ts";
 import type { ThinkingLevel } from "../models/model-info.ts";
 import type { WorkerSession } from "./worker-board.ts";
@@ -242,8 +242,10 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
     });
     const { fork } = setup;
     const namedModel = setup.resume?.namedModel ?? setup.namedModel;
+    // A resumed fork is not routed either: it runs on the model it forked on (ADR 0008).
+    const resumedFork = setup.resume?.fork ? setup.resume.pin : undefined;
     // The provider ends at the first slash; a model id may hold more.
-    const selectedModel = fork?.model ?? namedModel?.model;
+    const selectedModel = fork?.model ?? namedModel?.model ?? resumedFork?.model;
     const slash = selectedModel?.indexOf("/") ?? -1;
     const [provider, modelId] = selectedModel ? [selectedModel.slice(0, slash), selectedModel.slice(slash + 1)] : [AUTO_PROVIDER, AUTO_MODEL_ID];
     const model = services.modelRuntime.getModel(provider, modelId);
@@ -252,7 +254,8 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
       return failed([`${selectedModel ?? "orchestrator/auto"} is not in the worker's model runtime${selectedModel ? "" : "; is the router extension installed?"}`, ...loadErrors].join(" "));
     }
     session = (await createAgentSessionFromServices({
-      services, sessionManager, model, ...((fork?.effort ?? namedModel?.effort) === undefined ? {} : { thinkingLevel: fork?.effort ?? namedModel?.effort }),
+      services, sessionManager, model, ...((fork?.effort ?? namedModel?.effort ?? resumedFork?.effort) === undefined ? {}
+        : { thinkingLevel: fork?.effort ?? namedModel?.effort ?? resumedFork?.effort }),
       ...(tools === undefined ? {} : { tools: [...tools] }),
     })).session;
     // A resume writes no new record: the delegation keeps its original one.
@@ -303,7 +306,6 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
   });
   // Before binding, so the extensions see the mark at session_start.
   const unmarkWorkerSession = markWorkerSession(sessionId, setup.parentDelegationId, reviewed);
-  const unsetResumePin = setup.resume && !setup.resume.namedModel ? setResumePin(sessionId, setup.resume.pin) : undefined;
   const unsetConstraints = setup.routingConstraints === undefined ? undefined : setRoutingConstraints(sessionId, setup.routingConstraints);
   let unregisterMessage: (() => void) | undefined;
   try {
@@ -333,7 +335,6 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
     setup.signal?.removeEventListener("abort", abort);
     unsubscribe();
     session.dispose();
-    unsetResumePin?.();
     unsetConstraints?.();
     unmarkWorkerSession();
   }

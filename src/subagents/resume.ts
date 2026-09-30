@@ -11,7 +11,8 @@ import { readRoutingRecords } from "../routing/decision-record.ts";
 import { failedHardFilter } from "../routing/tier-router.ts";
 import { deriveProviderUsage } from "../router/evidence.ts";
 import { stateDir } from "../router/extension.ts";
-import { splitKnownThinkingSuffix, THINKING_LEVELS, type ThinkingLevel } from "../models/model-info.ts";
+import { savedAutoModelPin } from "../router/auto-model.ts";
+import { THINKING_LEVELS, type ThinkingLevel } from "../models/model-info.ts";
 import { isRunningWorkerSession } from "./worker-sessions.ts";
 import { loadSubagentsSettings } from "./settings.ts";
 import { workerSessionDir, type WorkerSetup, type WorkerStatus } from "./worker.ts";
@@ -90,23 +91,26 @@ function lastStatus(file: string): WorkerStatus | undefined {
     last.message.stopReason === "stop" ? "completed" : undefined;
 }
 
-/** The record is the authority for the real pin, not the hypothetical shadow rung. */
-function savedPin(id: string): { model: string; effort: ThinkingLevel; namedModel?: WorkerSetup["namedModel"]; fork?: boolean } | undefined {
+type SavedPin = { model: string; effort: ThinkingLevel; namedModel?: WorkerSetup["namedModel"]; fork?: boolean };
+
+/** The pin a saved worker resumes on. A forked worker and one on a preserved
+ *  agent model are not routed: their record names their model. A routed
+ *  worker's pin is the router state its saved session's branch holds, the
+ *  rung that ran (in shadow mode the session model, not the hypothetical
+ *  rung); its decision record is the audit trail, not the pin. */
+function savedPin(id: string, file: string): SavedPin | undefined {
   const records = readRoutingRecords(join(stateDir(), "routing"));
   const record = records.filter((entry) => entry.delegationId === id &&
-    (entry.recordType === "decision" || entry.recordType === "agent-model" || (entry as { recordType: string }).recordType === "fork")).at(-1);
-  if (!record) return undefined;
+    (entry.recordType === "agent-model" || (entry as { recordType: string }).recordType === "fork")).at(-1);
+  if (!record) {
+    const state = savedAutoModelPin(SessionManager.open(file).getBranch());
+    return state === undefined ? undefined : { model: state.rung.model, effort: state.rung.effort };
+  }
   if (record.recordType === "agent-model") {
     return { model: record.model, effort: record.effort as ThinkingLevel, namedModel: {
       model: record.model, effort: record.effort as ThinkingLevel, agent: record.agent, definitionFile: record.definitionFile,
       ...(record.banListException ? { banListException: true } : {}),
     } };
-  }
-  if (record.recordType === "decision") {
-    const ranOn = record.ranOn ?? (record.mode === "live" && record.route.outcome === "chosen" ? record.route.rung.rung : undefined);
-    if (!ranOn) return undefined;
-    const { baseModel, thinkingSuffix } = splitKnownThinkingSuffix(ranOn);
-    return thinkingSuffix ? { model: baseModel, effort: thinkingSuffix.slice(1) as ThinkingLevel } : undefined;
   }
   // ADR 0008's fork record is introduced on the parallel forked-worker branch.
   const fork = record as unknown as { model?: string; effort?: string };
@@ -121,8 +125,11 @@ export function prepareResume(id: string, task: string, setup: Pick<WorkerSetup,
   const file = SessionManager.findById(setup.cwd, id, dir);
   if (!file) return refuse("unknown delegation id under this orchestrator session");
   if (!lastStatus(file)) refuse("worker is not finished or was not started");
-  const pin = savedPin(id);
-  if (!pin || !THINKING_LEVELS.includes(pin.effort)) return refuse("no recoverable pin");
+  const pin = savedPin(id, file);
+  if (!pin || !THINKING_LEVELS.includes(pin.effort)) {
+    return refuse("no recoverable pin: neither a fork or agent-model record nor router state in its saved session names one " +
+      "(a worker saved before its pin was router state cannot be resumed; delegate the task again)");
+  }
   const personal = readSettingsFile(join(setup.agentDir, "settings.json")) ?? {};
   const banLists = banListsFromSettings(personal).banLists;
   const banned = subagentBanListEntry(pin.model, banLists);

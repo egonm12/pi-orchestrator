@@ -332,6 +332,19 @@ function sessionLines(file: string): SessionLine[] {
   return readFileSync(file, "utf8").split("\n").filter((line) => line.trim() !== "").map((line) => JSON.parse(line) as SessionLine);
 }
 
+/** Rewrites a saved worker session as one saved before router state: its
+ *  `pi.virtual-model-state` entries are gone, their children re-linked. */
+function dropRouterState(file: string): void {
+  type Line = { type: string; id?: string; parentId?: string | null; customType?: string };
+  const lines = readFileSync(file, "utf8").split("\n").filter((line) => line.trim() !== "").map((line) => JSON.parse(line) as Line);
+  const parents = new Map<string, string | null | undefined>();
+  for (const line of lines) if (line.type === "custom" && line.customType === "pi.virtual-model-state" && line.id) parents.set(line.id, line.parentId);
+  assert.ok(parents.size > 0, "the saved session has router state to drop");
+  const parentOf = (id: string | null | undefined): string | null | undefined => id != null && parents.has(id) ? parentOf(parents.get(id)) : id;
+  const kept = lines.filter((line) => !(line.id && parents.has(line.id))).map((line) => ({ ...line, ...("parentId" in line ? { parentId: parentOf(line.parentId) } : {}) }));
+  writeFileSync(file, `${kept.map((line) => JSON.stringify(line)).join("\n")}\n`);
+}
+
 test("a labelled subagents item appears on the routed worker board with its tier", async () => {
   const h = harness();
   try {
@@ -376,6 +389,30 @@ test("a completed worker resumes its saved session with the same delegation and 
     attachVerdict({ recordDir, delegationId: first.worker.sessionId, verdict: "accept", refreshStatePath });
     assert.equal(buildRoutingReport(recordDir).totals.decisions, 1);
     assert.deepEqual(buildRoutingReport(recordDir).totals.verdicts, { accept: 1, request_changes: 0 });
+  } finally { h.cleanup(); }
+});
+
+test("a resumed worker runs on the pin its session's router state holds, not on what routing would choose now or the decision record", async () => {
+  const h = harness();
+  try {
+    mkdirSync(h.stateDir);
+    saveAuthorization(join(h.stateDir, "authorized-recipients.json"), approvedAnthropic());
+    const SONNET = "anthropic/claude-sonnet-5";
+    const provider = fakeAnthropic("Done", undefined, ["claude-haiku-4-5", "claude-sonnet-5"]);
+    const tool = loadSubagentsTool([routerExtension([HAIKU, SONNET]), provider.extension]);
+    const main = orchestrator(h);
+    const first = await callSubagents(tool, main.ctx, "First task");
+    assert.equal(first.worker.status, "completed", JSON.stringify(first.worker));
+    // Routing now would choose another rung, and the decision record is gone.
+    const moved = { mechanical: [`${SONNET}:high`], standard: [`${SONNET}:high`], elevated: [`${SONNET}:high`], critical: [`${SONNET}:high`] };
+    writeFileSync(join(h.agentDir, "settings.json"), JSON.stringify({ orchestrator: { routing: { ...ROUTING, tiers: moved } } }));
+    rmSync(join(h.stateDir, "routing"), { recursive: true });
+    const resumed = await tool.execute("call-2", { items: [{ resume: first.worker.sessionId, task: "Second task" }] } as never, undefined, undefined, main.ctx);
+    const worker = (resumed.details as SubagentsDetails).results[0]!;
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.deepEqual(provider.requests.map((request) => [request.sessionId, request.model, request.thinkingLevel]),
+      [[first.worker.sessionId, HAIKU, "low"], [first.worker.sessionId, HAIKU, "low"]]);
+    assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")), [], "a resume writes no record");
   } finally { h.cleanup(); }
 });
 
@@ -540,7 +577,8 @@ test("resume refuses a saved worker without a recoverable pin and a pin now bloc
     const refused = await tool.execute("resume", { items: [{ resume: first.worker.sessionId, task: "Second task" }] } as never, undefined, undefined, main.ctx);
     assert.match((refused.details as SubagentsDetails).results[0]!.error ?? "", /pin .*subagent ban list/);
     writeFileSync(join(h.agentDir, "settings.json"), JSON.stringify({ orchestrator: { routing: ROUTING } }));
-    rmSync(join(h.stateDir, "routing"), { recursive: true });
+    // A worker session saved before router state held the pin.
+    dropRouterState(first.worker.sessionFile!);
     const missing = await tool.execute("resume", { items: [{ resume: first.worker.sessionId, task: "Second task" }] } as never, undefined, undefined, main.ctx);
     assert.match((missing.details as SubagentsDetails).results[0]!.error ?? "", /no recoverable pin/);
     assert.equal(provider.requests.length, 1);
