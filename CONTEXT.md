@@ -93,7 +93,7 @@ One of four levels of care a task demands: mechanical, standard, elevated or cri
 _Avoid_: Complexity level, SIMPLE/MEDIUM/COMPLEX/REASONING
 
 **Rung**:
-One model at one effort level, written `provider/model:effort`. The unit the router chooses.
+One model at one effort level, written `provider/model:effort`. The unit the router chooses. In pi's terms, a rung names a physical model and its thinking level.
 _Avoid_: Model (alone), deployment
 
 **Tier map**:
@@ -170,7 +170,7 @@ The part of pi-orchestrator that serves the auto model: it classifies a worker's
 _Avoid_: Router (alone, when the extension is meant), proxy
 
 **Auto model**:
-The virtual model `orchestrator/auto` that workers run on. Each request to it goes to the rung the router extension chose for that worker. The orchestrator's own session never runs on it.
+The virtual model `orchestrator/auto` that workers run on. Each request to it goes to the rung the router extension chose for that worker. The orchestrator's own session never runs on it. In pi's terms, it is pi-orchestrator's virtual model, and the rung it routes to is the physical model.
 _Avoid_: Smart router, proxy model, auto-routing model
 
 **Pin**:
@@ -178,5 +178,5 @@ The rung a worker keeps for all of its requests, chosen at its first request. A 
 _Avoid_: Session affinity, sticky model
 
 **Failover**:
-Pinning a worker again when its first request fails on a limit error before the rung produced anything: the worker is routed once more, now that the limit error's usage observation removes that provider, and runs on the next surviving rung, on another provider. The worker sees only the new rung's answer. A limit later in the run fails the worker, and so does a limit with no other provider's rung left. The decision record keeps the refused attempt's decision, a failover record linked to it by its time and rung, and the decision for the rung the worker moved to.
+Pinning a worker again when its first request fails on a limit error before the rung produced anything: the worker is routed once more, now that the limit error's usage observation removes that provider, and runs on the next surviving rung, on another provider. The worker sees only the new rung's answer. A limit later in the run is retried on the pin by pi; when those retries run out, the worker fails. A limit with no other provider's rung left fails the worker too. The decision record keeps the refused attempt's decision, a failover record linked to it by its time and rung, and the decision for the rung the worker moved to.
 _Avoid_: Retry (that is the effort ladder's new delegation), fallback (the session model after a refusal)
