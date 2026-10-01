@@ -44,7 +44,7 @@ const TIERS = {
   critical: [RUNG.critical],
 };
 
-// Reuses routing-acceptance.test.ts's "mechanical 1"/"mechanical 2" wording:
+// The wording of the retired pi-subagents routing gate's mechanical tasks:
 // known to classify mechanical on this live route, with no destructive
 // keyword of its own.
 const TASK_A = "Reformat src/report.ts with prettier: fix the indentation and add the missing trailing commas. No behaviour change.";
@@ -173,7 +173,7 @@ test(`live ${HAIKU} session: two parallel workers through the built-in subagents
     const run = spawnSync(
       "pi",
       // The allowlist names the built-in tool, `subagents`; pi-subagents'
-      // `subagent` (routing-acceptance.test.ts) would leave no tool active.
+      // `subagent` would leave no tool active.
       ["-p", prompt, "--mode", "json", "-t", SUBAGENTS_TOOL, "--model", HAIKU, "--thinking", "off"],
       {
         cwd: project.dir,

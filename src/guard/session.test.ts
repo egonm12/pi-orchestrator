@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { liveTest as test } from "../fixtures/live.ts";
-import { createGuardedAgentDir, credentialsAvailable, liveAuthExtensionPath, realAgentDirPath } from "../fixtures/guarded-agent-dir.ts";
+import { createGuardedAgentDir, credentialsAvailable, liveAuthExtensionPath } from "../fixtures/guarded-agent-dir.ts";
 import { createTempRepo } from "../fixtures/temp-repo.ts";
 import { livePiModelAvailability, PI_LIST_MODELS_TIMEOUT_MS, selectedLivePiModel } from "../policy/live-model.ts";
 import { guardEntryContent, guardEntryPath, GUARD_SOURCE } from "../fixtures/extension-entry.ts";
@@ -62,23 +62,21 @@ test("a broken imported guard logs one disabled line and pi still starts", (t) =
   } finally { agent.cleanup(); repo.cleanup(); }
 });
 
-test(`live guard handles six tool calls in one Haiku session (live route: ${MODEL})`, (t) => {
+test(`live guard handles five tool calls in one Haiku session (live route: ${MODEL})`, (t) => {
   const agent = createGuardedAgentDir({ withCredentials: true }), repo = createTempRepo();
   try {
     if (!credentialsAvailable() || !liveAuthExtensionPath()) return t.skip("live credentials/auth extension unavailable");
     const available = livePiModelAvailability(MODEL, () => spawnSync("pi", ["--list-models"], { encoding: "utf8", env: agent.env(), timeout: PI_LIST_MODELS_TIMEOUT_MS }));
     if (available.status !== "available") return t.skip(`live route ${MODEL} unavailable`);
     const plainCommand = `pi -p hi --no-session --model anthropic/claude-haiku-4-5 -e ${liveAuthExtensionPath()!}`;
-    const prompt = `Perform these six independent tool calls, in order. A blocked call is expected; continue to the next call regardless. Do not invent results.\n` +
+    const prompt = `Perform these five independent tool calls, in order. A blocked call is expected; continue to the next call regardless. Do not invent results.\n` +
       `1. write path ${join(agent.dir, "allowed.txt")} content YES.\n` +
-      `2. subagent agent worker, task say hello, model anthropic/claude-fable-5, context fresh.\n` +
-      `3. bash command pi -ne -p hi.\n` +
-      `4. bash command echo 'pi -ne'.\n` +
-      `5. bash command ps aux | head -1.\n` +
-      `6. bash command ${plainCommand}.\n` +
+      `2. bash command pi -ne -p hi.\n` +
+      `3. bash command echo 'pi -ne'.\n` +
+      `4. bash command ps aux | head -1.\n` +
+      `5. bash command ${plainCommand}.\n` +
       `Finally reply DONE.`;
-    const subagents = join(realAgentDirPath(), "npm", "node_modules", "pi-subagents", "index.js");
-    const run = runPi(["-p", prompt, "--mode", "json", "-t", "write,bash,subagent", "-e", liveAuthExtensionPath()!, "-e", subagents, "--model", MODEL, "--no-session"], repo.dir, agent.env({ PI_ORCHESTRATOR_GUARD_PROBE: "1" }), 240_000);
+    const run = runPi(["-p", prompt, "--mode", "json", "-t", "write,bash", "-e", liveAuthExtensionPath()!, "--model", MODEL, "--no-session"], repo.dir, agent.env({ PI_ORCHESTRATOR_GUARD_PROBE: "1" }), 240_000);
     if (/"message":"[^"]*(?:usage|quota|rate limit|credit)[^"]*"/i.test(run.output)) return t.skip(`live provider refused: ${run.output.slice(-300)}`);
     assert.equal(run.status, 0, run.output.slice(-1500));
     assert.match(run.output, new RegExp(`${GUARD_PREFIX} loaded`));
@@ -95,7 +93,6 @@ test(`live guard handles six tool calls in one Haiku session (live route: ${MODE
       return { error: end.isError, text: end.result?.content?.map((item) => item.text ?? "").join("\n") ?? "" };
     };
     assert.equal(completed("write").error, false);
-    assert.match(completed("subagent").text, /prohibited model: anthropic\/claude-fable-5/);
     assert.match(completed("bash", "pi -ne -p hi").text, /nested pi with extensions disabled/);
     const echo = completed("bash", "echo 'pi -ne'");
     assert.equal(echo.error, false);
