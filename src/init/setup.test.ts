@@ -51,6 +51,17 @@ test("the starter tier map loads through the router's own loader and skips banne
   assert.deepEqual(map.drops, []);
 });
 
+test("the orchestrator auto model is ineligible for routing and starter picks", () => {
+  const auto = { provider: "orchestrator", id: "auto", fullId: "orchestrator/auto", api: "pi-virtual", reasoning: true };
+  const installed = [...INSTALLED_MODEL_INFO, auto];
+  const eligible = eligibleRoutingModels(installed, NO_BANS);
+  assert.equal(eligible.models.some((model) => model.fullId === auto.fullId), false);
+  assert.ok(eligible.skipped.includes("orchestrator/auto: orchestrator auto model"));
+  const starter = starterTierMap(installed, NO_BANS)!;
+  assert.equal(starter.classifier.startsWith("orchestrator/auto:"), false);
+  assert.equal(Object.values(starter.tiers).flat().some((rung) => rung.startsWith("orchestrator/auto:")), false);
+});
+
 test("eligible routing models include unpriced models but starter selection excludes them", () => {
   const unpriced = { provider: "anthropic", id: "claude-sonnet-5-5", fullId: "anthropic/claude-sonnet-5-5", reasoning: true };
   const priced = INSTALLED_MODEL_INFO.find((model) => model.fullId === "anthropic/claude-haiku-4-5")!;

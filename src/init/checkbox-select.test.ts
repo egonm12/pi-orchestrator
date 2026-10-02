@@ -6,6 +6,7 @@ import {
   checkboxSelect,
   checkboxSelectedValues,
   createCheckboxSelectState,
+  MIN_SELECTED_MESSAGE,
   type CheckboxSelectUi,
 } from "./checkbox-select.ts";
 
@@ -29,6 +30,20 @@ test("checkbox key handling moves, toggles, confirms and cancels", () => {
   assert.deepEqual(checkboxSelectedValues(state), ["c"]);
   assert.equal(applyCheckboxInput(state, "\r").outcome, "confirm");
   assert.equal(applyCheckboxInput(state, "\x1B").outcome, "cancel");
+});
+
+test("minimum selection blocks Enter, clears warning on toggle, and leaves Escape available", () => {
+  const empty = createCheckboxSelectState(["a"], []);
+  const blocked = applyCheckboxInput(empty, "\r", { minSelected: 1 });
+  assert.equal(blocked.outcome, undefined);
+  assert.equal(blocked.state.validationMessage, MIN_SELECTED_MESSAGE);
+  assert.equal(applyCheckboxInput(blocked.state, "\x1B", { minSelected: 1 }).outcome, "cancel");
+  assert.equal(applyCheckboxInput(empty, "\r").outcome, "confirm", "ban list may be empty");
+  const checked = applyCheckboxInput(blocked.state, " ", { minSelected: 1 }).state;
+  assert.equal(checked.validationMessage, undefined);
+  assert.equal(applyCheckboxInput(checked, "\r", { minSelected: 1 }).outcome, "confirm");
+  const unchecked = applyCheckboxInput(checked, " ", { minSelected: 1 }).state;
+  assert.equal(applyCheckboxInput(unchecked, "\r", { minSelected: 1 }).outcome, undefined);
 });
 
 test("checkbox row value cycling wraps and does not change selection", () => {
@@ -72,6 +87,20 @@ test("checkbox select falls back to the select loop without custom UI", async ()
   assert.match(calls[0]!.title, /Pick models: b\. Hint text/);
   assert.deepEqual(calls[0]!.options, ["a", "c", "Remove an entry…", "Done"]);
   assert.deepEqual(calls[2]!.options, ["b", "c", "Back, remove nothing"]);
+});
+
+test("fallback refuses Done without tier models and re-prompts, but Escape keeps defaults", async () => {
+  const notes: string[] = [];
+  const answers = ["Done", "a", "Done"];
+  const ui: CheckboxSelectUi = {
+    notify: (message) => { notes.push(message); },
+    select: async () => answers.shift(),
+  };
+  assert.deepEqual(await checkboxSelect(ui, "Tier models", ["a"], [], undefined, { minSelected: 1 }), ["a"]);
+  assert.deepEqual(notes, [MIN_SELECTED_MESSAGE]);
+  assert.equal(answers.length, 0);
+  assert.equal(await checkboxSelect({ ...ui, select: async () => undefined }, "Tier models", ["a"], [], undefined, { minSelected: 1 }), undefined);
+  assert.deepEqual(await checkboxSelect({ select: async () => "Done" }, "Ban list", ["a"], []), []);
 });
 
 test("checkbox select falls back in non-tui modes even when custom exists", async () => {

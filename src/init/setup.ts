@@ -15,6 +15,7 @@ import { RISK_TIERS, type RiskTier } from "../routing/tiers.ts";
 import { tierMapFromSettings } from "../routing/tier-map.ts";
 import { checkModelScope } from "../models/model-scope.ts";
 import { getSupportedThinkingLevels, type ModelInfo, type ThinkingLevel } from "../models/model-info.ts";
+import { isAutoModel } from "../router/auto-model.ts";
 
 // Fresh-install support: what is missing at session start, and the pieces
 // `/pi-orchestrator init` writes. The package ships no tier map, no ban list
@@ -111,6 +112,7 @@ export function eligibleRoutingModels(installed: readonly ModelInfo[], banLists:
   const skipped: string[] = [];
   const eligible: ModelInfo[] = [];
   for (const model of installed) {
+    if (isAutoModel(model)) { skipped.push(`${model.fullId}: orchestrator auto model`); continue; }
     if (isProhibitedModel(model.fullId, banLists)) { skipped.push(`${model.fullId}: subagent ban list`); continue; }
     if (checkModelScope(model.fullId, HARNESS_MODEL_SCOPE, "explicit")?.severity === "error") { skipped.push(`${model.fullId}: allowed-model list`); continue; }
     eligible.push(model);

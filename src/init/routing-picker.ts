@@ -182,6 +182,7 @@ async function pickTierModelIds(ui: PickerUi, tier: RiskTier, eligible: readonly
     modelDisplayOptions(eligible),
     defaultIds.map((id) => modelOptionLabel(modelByFullId(eligible, id)!)),
     `${TIER_HINTS[tier]} ${TIER_MODEL_USAGE_HINT}`,
+    { minSelected: 1 },
   );
   return picked?.map(modelIdFromOption);
 }
@@ -194,6 +195,7 @@ async function pickTierRungsInline(ui: PickerUi, defaults: RoutingPickerDefaults
     defaultIds.map((id) => modelOptionLabel(modelByFullId(eligible, id)!)),
     tierThinkingValueConfig(defaults, tier, eligible),
     `${TIER_HINTS[tier]} ${TIER_MODEL_USAGE_HINT} ${THINKING_LEVEL_HINT}`,
+    { minSelected: 1 },
   );
   // Escape at a tier keeps that tier's current picks when they exist, else the
   // starter picks. Changing an unchecked row's thinking level is kept if the row

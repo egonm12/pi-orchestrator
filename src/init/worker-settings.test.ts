@@ -21,7 +21,7 @@ import {
 } from "./worker-settings.ts";
 
 type Answer = string | boolean | undefined;
-interface Call { kind: "select" | "input" | "confirm" | "notify"; title: string; options?: string[] }
+interface Call { kind: "select" | "input" | "confirm" | "notify"; title: string; options?: string[]; message?: string }
 
 /** A fake pi UI answering select, input and confirm calls from a script, in
  *  order. `undefined` is Escape. Recipient approvals are answered no
@@ -38,8 +38,8 @@ function scriptedUi(script: Answer[]) {
     notify: (message) => { calls.push({ kind: "notify", title: message }); },
     select: async (title, options) => { calls.push({ kind: "select", title, options: [...options] }); return next("select", title) as string | undefined; },
     input: async (title) => { calls.push({ kind: "input", title }); return next("input", title) as string | undefined; },
-    confirm: async (title) => {
-      calls.push({ kind: "confirm", title });
+    confirm: async (title, message) => {
+      calls.push({ kind: "confirm", title, message });
       if (title.startsWith("Approve ")) return false;
       return next("confirm", title) === true;
     },
@@ -252,7 +252,8 @@ test("an existing tier map is rebuilt only after a yes, and Escape at the routin
   const yes = dirs({ personal, marker: "none" });
   try {
     const run = await init(yes, [...BAN_STEP, undefined, undefined, true], yes.cwd);
-    assert.ok(run.calls.some((call) => call.kind === "confirm" && call.title === "Rebuild the tier map from installed models?"));
+    assert.ok(run.calls.some((call) => call.kind === "confirm" && call.title === "Edit the routing map?"
+      && call.message === "Yes opens the classifier and tier pickers with your current picks. No keeps the current map."));
     const routing = yes.personal().orchestrator.routing;
     assert.deepEqual(routing.tiers, TIERS);
     assert.deepEqual(routing.classifier, classifier);

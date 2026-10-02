@@ -183,6 +183,22 @@ function initCtx(ui: ReturnType<typeof scriptedUi>["ui"]): InitContext {
   return { hasUI: true, modelRegistry: { getAvailable: () => [...INSTALLED_MODEL_INFO] }, ui };
 }
 
+test("init excludes its registry auto model from ban families and routing choices", async () => {
+  const auto = { provider: "orchestrator", id: "auto", api: "pi-virtual", reasoning: true };
+  assert.equal(modelFamily(auto.id), "auto");
+  const dirs = initDirs();
+  try {
+    const { ui, calls } = scriptedUi([DONE, undefined, undefined, undefined]);
+    await runInit("init", { hasUI: true, modelRegistry: { getAvailable: () => [...INSTALLED_MODEL_INFO, auto] }, ui }, { stateDir: dirs.stateDir, agentDir: dirs.agentDir });
+    const selects = calls.filter((call) => call.kind === "select");
+    assert.equal(selects[0]!.options!.includes("auto"), false);
+    const classifier = selects.find((call) => call.title === "Classifier model")!;
+    assert.ok(classifier.options!.every((option) => !option.includes("orchestrator/auto")));
+    const settings = JSON.parse(readFileSync(dirs.settingsPath, "utf8"));
+    assert.ok(Object.values(settings.orchestrator.routing.tiers).flat().every((rung) => !String(rung).startsWith("orchestrator/auto:")));
+  } finally { dirs.cleanup(); }
+});
+
 test("init replaces an existing ban list with the picked one and leaves an existing tier map alone", async () => {
   const rung = ["anthropic/claude-haiku-4-5:low"];
   const tiers = { mechanical: rung, standard: rung, elevated: rung, critical: rung };

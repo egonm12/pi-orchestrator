@@ -22,6 +22,7 @@ export interface CheckboxSelectState {
   readonly selected: readonly string[];
   readonly rowValues: Readonly<Record<string, string>>;
   readonly rowValueChoices: Readonly<Record<string, readonly string[]>>;
+  readonly validationMessage?: string;
 }
 
 export type CheckboxSelectOutcome = "confirm" | "cancel";
@@ -39,6 +40,11 @@ export interface CheckboxSelectWithValuesResult {
 const FALLBACK_REMOVE = "Remove an entry…";
 const FALLBACK_DONE = "Done";
 const MAX_VISIBLE_OPTIONS = 12;
+export const MIN_SELECTED_MESSAGE = "Tick at least one model";
+
+export interface CheckboxSelectOptions {
+  readonly minSelected?: number;
+}
 
 function orderedSelection(options: readonly string[], selected: Iterable<string>): string[] {
   const selectedSet = new Set(selected);
@@ -100,7 +106,7 @@ function toggleCursor(state: CheckboxSelectState): CheckboxSelectState {
   const selected = new Set(state.selected);
   if (selected.has(value)) selected.delete(value);
   else selected.add(value);
-  return { ...state, selected: orderedSelection(state.options, selected) };
+  return { ...state, selected: orderedSelection(state.options, selected), validationMessage: undefined };
 }
 
 function cycleCursorValue(state: CheckboxSelectState, delta: number): CheckboxSelectState {
@@ -114,13 +120,17 @@ function cycleCursorValue(state: CheckboxSelectState, delta: number): CheckboxSe
   return { ...state, rowValues: { ...state.rowValues, [option]: choices[nextIndex]! } };
 }
 
-export function applyCheckboxInput(state: CheckboxSelectState, data: string): CheckboxInputResult {
+export function applyCheckboxInput(state: CheckboxSelectState, data: string, options: CheckboxSelectOptions = {}): CheckboxInputResult {
   if (matchesKey(data, Key.down)) return { state: moveCursor(state, 1) };
   if (matchesKey(data, Key.up)) return { state: moveCursor(state, -1) };
   if (matchesKey(data, Key.left)) return { state: cycleCursorValue(state, -1) };
   if (matchesKey(data, Key.right)) return { state: cycleCursorValue(state, 1) };
   if (matchesKey(data, Key.space)) return { state: toggleCursor(state) };
-  if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) return { state, outcome: "confirm" };
+  if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) {
+    return state.selected.length < (options.minSelected ?? 0)
+      ? { state: { ...state, validationMessage: MIN_SELECTED_MESSAGE } }
+      : { state, outcome: "confirm" };
+  }
   if (matchesKey(data, Key.escape) || matchesKey(data, Key.esc)) return { state, outcome: "cancel" };
   return { state };
 }
@@ -169,6 +179,7 @@ function renderCheckboxSelect(
   if (end < state.options.length) lines.push(theme.fg("dim", `  … ${state.options.length - end} more below`));
   const valueHint = hasRowValues(state) ? " • ←/→ thinking level" : "";
   lines.push(theme.fg("dim", `↑↓ move • space toggle${valueHint} • enter confirm • esc cancel`));
+  if (state.validationMessage) lines.push(theme.fg("warning", state.validationMessage));
   return lines;
 }
 
@@ -181,6 +192,7 @@ function makeCheckboxComponent(
   preselected: readonly string[],
   hint?: string,
   rowValueConfig?: CheckboxRowValueConfig,
+  selectOptions: CheckboxSelectOptions = {},
 ): Component {
   let state = createCheckboxSelectState(options, preselected, rowValueConfig);
   return {
@@ -189,7 +201,7 @@ function makeCheckboxComponent(
     },
     invalidate() {},
     handleInput(data: string) {
-      const result = applyCheckboxInput(state, data);
+      const result = applyCheckboxInput(state, data, selectOptions);
       state = result.state;
       if (result.outcome === "confirm") done({ selected: checkboxSelectedValues(state), values: checkboxRowValues(state) });
       else if (result.outcome === "cancel") done(undefined);
@@ -204,6 +216,7 @@ async function fallbackCheckboxSelect(
   options: readonly string[],
   preselected: readonly string[],
   hint?: string,
+  selectOptions: CheckboxSelectOptions = {},
 ): Promise<string[] | undefined> {
   const chosen = orderedSelection(options, preselected);
   for (;;) {
@@ -213,7 +226,13 @@ async function fallbackCheckboxSelect(
       [...remaining, ...(chosen.length > 0 ? [FALLBACK_REMOVE] : []), FALLBACK_DONE],
     );
     if (choice === undefined) return undefined;
-    if (choice === FALLBACK_DONE) return orderedSelection(options, chosen);
+    if (choice === FALLBACK_DONE) {
+      if (chosen.length < (selectOptions.minSelected ?? 0)) {
+        ui.notify?.(MIN_SELECTED_MESSAGE, "warning");
+        continue;
+      }
+      return orderedSelection(options, chosen);
+    }
     if (choice === FALLBACK_REMOVE) {
       const removed = await ui.select("Remove which entry?", [...chosen, "Back, remove nothing"]);
       if (removed === undefined) return undefined;
@@ -235,18 +254,19 @@ export async function checkboxSelectWithValues(
   preselected: readonly string[],
   rowValueConfig: CheckboxRowValueConfig,
   hint?: string,
+  selectOptions: CheckboxSelectOptions = {},
 ): Promise<CheckboxSelectWithValuesResult | undefined> {
   const optionList = [...options];
   const selected = orderedSelection(optionList, preselected);
   const custom = ui.custom;
   if (!canUseCustomCheckbox(ui) || custom === undefined) {
-    const picked = await fallbackCheckboxSelect(ui, title, optionList, selected, hint);
+    const picked = await fallbackCheckboxSelect(ui, title, optionList, selected, hint, selectOptions);
     if (picked === undefined) return undefined;
     const state = createCheckboxSelectState(optionList, selected, rowValueConfig);
     return { selected: picked, values: checkboxRowValues(state) };
   }
   return custom<CheckboxSelectWithValuesResult | undefined>((tui, theme, _keybindings, done) => (
-    makeCheckboxComponent(tui, theme, done, title, optionList, selected, hint, rowValueConfig)
+    makeCheckboxComponent(tui, theme, done, title, optionList, selected, hint, rowValueConfig, selectOptions)
   ));
 }
 
@@ -256,8 +276,9 @@ export async function checkboxSelect(
   options: readonly string[],
   preselected: readonly string[],
   hint?: string,
+  selectOptions: CheckboxSelectOptions = {},
 ): Promise<string[] | undefined> {
-  const result = await checkboxSelectWithValues(ui, title, options, preselected, { choices: {}, initial: {} }, hint);
+  const result = await checkboxSelectWithValues(ui, title, options, preselected, { choices: {}, initial: {} }, hint, selectOptions);
   if (Array.isArray(result)) return [...result];
   return result ? [...result.selected] : undefined;
 }

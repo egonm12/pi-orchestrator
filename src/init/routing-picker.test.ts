@@ -124,6 +124,20 @@ test("routing picker uses inline tier thinking levels in TUI mode", async () => 
   assert.equal(calls.some((call) => call.title.startsWith("Thinking level for mechanical model")), false);
 });
 
+test("fallback tier picker refuses an empty tier and keeps asking", async () => {
+  const { ui, calls, remaining } = scriptedUi([
+    optionFor("p/cheap"), "low",
+    REMOVE_ENTRY, optionFor("p/cheap"), REMOVE_ENTRY, optionFor("p/middle"), DONE,
+    optionFor("p/top"), DONE, "high",
+    undefined, undefined, undefined,
+  ]);
+  const picked = await pickRoutingMap(ui, MODELS, { starter: STARTER });
+  assert.equal(remaining(), 0);
+  assert.deepEqual(picked.tiers.mechanical, ["p/top:high"]);
+  assert.ok(calls.some((call) => call.kind === "notify" && call.title === "Tick at least one model"));
+  assert.equal(calls.filter((call) => call.kind === "select" && call.title.startsWith("mechanical tier models")).length, 5);
+});
+
 test("tier inline thinking config lists only supported levels with starter defaults", () => {
   const config = tierThinkingValueConfig({ starter: STARTER }, "critical", MODELS);
   assert.deepEqual(config.choices[optionFor("p/middle")], ["off"]);

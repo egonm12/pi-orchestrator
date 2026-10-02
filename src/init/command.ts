@@ -2,6 +2,7 @@ import { join } from "node:path";
 import { personalAgentDir } from "../policy/ban-lists.ts";
 import { tierMapFromSettings } from "../routing/tier-map.ts";
 import { toModelInfo, type ModelInfo, type RegistryModelLike } from "../models/model-info.ts";
+import { isAutoModel } from "../router/auto-model.ts";
 import { RISK_TIERS, type RiskTier } from "../routing/tiers.ts";
 import {
   approveRecipients,
@@ -38,7 +39,7 @@ import {
 // `/pi-orchestrator init`: asks for the subagent ban list with a picker
 // that starts from the current list (ban-list-picker.ts), then the gate
 // level and worker limit for personal settings or this project
-// (worker-settings.ts), then, when a tier map exists, whether to rebuild it.
+// (worker-settings.ts), then, when a tier map exists, whether to edit it.
 // It writes the ban list and the picked tier map into personal settings,
 // then asks the owner to approve each provider the map would send task text
 // to. The ban list, tier map, classifier and recipients are always
@@ -82,7 +83,9 @@ export async function runInit(args: string, ctx: InitContext, options: InitOptio
   }
   const settingsPath = join(options.agentDir ?? personalAgentDir(), "settings.json");
   const personal = readPersonalSettings(settingsPath);
-  const installed: ModelInfo[] = (ctx.modelRegistry?.getAvailable() ?? []).map((model) => toModelInfo(model));
+  const installed: ModelInfo[] = (ctx.modelRegistry?.getAvailable() ?? [])
+    .filter((model) => !isAutoModel(model))
+    .map((model) => toModelInfo(model));
   const pickerUi: PickerUi & { confirm(title: string, message: string): Promise<boolean> } = { ...ctx.ui, mode: ctx.mode };
 
   const hasTierMap = !setupStatus(personal, options.stateDir).tiersMissing;
@@ -140,12 +143,11 @@ export async function runInit(args: string, ctx: InitContext, options: InitOptio
     : undefined;
   const routingDefaults = starter ?? existingAsDefault;
   if (!starter) say("pi-orchestrator: no installed model qualifies for an automatic starter tier map (allowed-model list, ban list, published price).", "warning");
-  // Escape at the rebuild question is no: the map stays. When the owner says
-  // yes, init asks for classifier and tier choices too. The existing
-  // classifier is preselected when it is still eligible, because rebuild is a
-  // chance to revisit routing while keeping the previous classifier on Enter.
+  // No or Escape at the edit question keeps the map. Yes opens the classifier
+  // and tier pickers with eligible current picks preselected, so the owner can
+  // change them or keep them on Enter.
   const rebuildTiers = hasTierMap && routingDefaults !== undefined
-    && await ctx.ui.confirm("Rebuild the tier map from installed models?", `This replaces orchestrator.routing.tiers and classifier in ${settingsPath} with your picked map. Mode and other routing keys stay. No keeps the current map.`);
+    && await ctx.ui.confirm("Edit the routing map?", "Yes opens the classifier and tier pickers with your current picks. No keeps the current map.");
   const picked = routingDefaults && (!hasTierMap || rebuildTiers)
     ? await pickRoutingMap(pickerUi, eligible, { starter: routingDefaults, ...(hasTierMap ? { tiers: existingTiers, classifier: existingClassifier } : {}) })
     : starter;
