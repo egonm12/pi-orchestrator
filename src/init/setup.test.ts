@@ -6,6 +6,7 @@ import { test } from "node:test";
 import { INSTALLED_MODEL_INFO } from "../fixtures/installed-model-info.ts";
 import { loadAuthorization } from "../recipients/authorization.ts";
 import { tierMapFromSettings } from "../routing/tier-map.ts";
+import { DONE, SAVE_LIST, TYPE_OWN } from "./ban-list-picker.ts";
 import { runInit, type InitContext } from "./command.ts";
 import { planSettings, recipientProviders, RECIPIENTS_FILE, setupNotice, setupStatus, starterTierMap } from "./setup.ts";
 
@@ -50,7 +51,7 @@ test("the starter tier map loads through the router's own loader and skips banne
   assert.deepEqual(map.drops, []);
 });
 
-test("planSettings adds what is missing, starts in shadow mode and never replaces an existing map or list", () => {
+test("planSettings adds what is missing, starts in shadow mode, never replaces an existing map and replaces a changed ban list", () => {
   const starter = starterTierMap(INSTALLED_MODEL_INFO, NO_BANS)!;
   const fresh = planSettings({ theme: "dark" }, starter, ["fable"]);
   const orchestrator = fresh.settings.orchestrator as Record<string, any>;
@@ -60,18 +61,26 @@ test("planSettings adds what is missing, starts in shadow mode and never replace
   assert.deepEqual(orchestrator.subagentBanList, ["fable"]);
   assert.deepEqual(orchestrator.sessionBanList, []);
   const kept = { orchestrator: { subagentBanList: ["astra"], sessionBanList: [], routing: { tiers: { mechanical: ["x/y:low"] } } } };
-  const again = planSettings(kept, starter, ["fable"]);
+  const again = planSettings(kept, starter, ["astra"]);
   assert.deepEqual(again.changes, []);
   assert.equal(again.settings, kept);
+  const replaced = planSettings(kept, starter, ["fable"]);
+  assert.deepEqual(replaced.changes, ["orchestrator.subagentBanList = [fable]"]);
+  assert.deepEqual((replaced.settings.orchestrator as Record<string, any>).subagentBanList, ["fable"]);
+  assert.deepEqual((replaced.settings.orchestrator as Record<string, any>).routing, kept.orchestrator.routing);
 });
 
+/** The ban list step is answered by typing `banList` (when not empty),
+ *  then Done, then Save. */
 function fakeCtx(answers: { banList: string; approve: Record<string, boolean> }, notes: string[]): InitContext {
+  const selects = [...(answers.banList ? [TYPE_OWN] : []), DONE, SAVE_LIST];
   return {
     hasUI: true,
     modelRegistry: { getAvailable: () => [...INSTALLED_MODEL_INFO] },
     ui: {
       notify: (message) => { notes.push(message); },
       input: async () => answers.banList,
+      select: async () => selects.shift(),
       confirm: async (title) => answers.approve[/Approve (\S+) as/.exec(title)![1]!] ?? false,
     },
   };

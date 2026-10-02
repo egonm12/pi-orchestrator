@@ -179,9 +179,18 @@ interface PersonalTiers {
   readonly drops: readonly TierMapDrop[];
 }
 
-/** The personal map, every rung checked and failing rungs dropped;
- *  `undefined` when there is none and routing is not enabled. */
-function personalTiers(personal: unknown, inputs: Required<TierMapInputs>): PersonalTiers | undefined {
+/** A personal tier's rungs after the load-time checks: those kept and
+ *  those dropped, each dropped one with its canonical model. */
+interface CheckedTier {
+  readonly order: TierOrder;
+  readonly kept: readonly TierRung[];
+  readonly dropped: readonly { readonly rung: string; readonly model: string; readonly reason: RungDropReason }[];
+}
+
+/** The personal map with every rung checked, an emptied tier left empty;
+ *  `undefined` when there is none and routing is not enabled. Throws, naming
+ *  the key, on a malformed map. */
+function checkedPersonalTiers(personal: unknown, inputs: Required<TierMapInputs>): Record<RiskTier, CheckedTier> | undefined {
   const orchestrator = personalOrchestrator(personal);
   const routing = orchestrator?.routing;
   if (routing !== undefined && !isPlainObject(routing)) {
@@ -204,33 +213,66 @@ function personalTiers(personal: unknown, inputs: Required<TierMapInputs>): Pers
       throw keyError("personal", `${TIERS_KEY}.${name}`, `is not a tier; the tiers are ${RISK_TIERS.join(", ")}.`);
     }
   }
-  const resolved = {} as Record<RiskTier, readonly TierRung[]>;
-  const orders = {} as Record<RiskTier, TierOrder>;
-  const drops: TierMapDrop[] = [];
+  const checked = {} as Record<RiskTier, CheckedTier>;
   for (const tier of RISK_TIERS) {
     if (!Object.hasOwn(tiers, tier)) {
       throw keyError("personal", `${TIERS_KEY}.${tier}`, `is missing; the personal tier map lists all four tiers (${RISK_TIERS.join(", ")}).`);
     }
     const kept: TierRung[] = [];
-    const reasons: RungDropReason[] = [];
+    const dropped: { rung: string; model: string; reason: RungDropReason }[] = [];
     const parsed = parsedTier("personal", tier, tiers[tier], inputs.installedModels);
-    orders[tier] = parsed.order;
     for (const rung of parsed.rungs) {
       const failed = failedHardFilter(rung.model, inputs);
-      if (failed === undefined) {
-        kept.push(frozenRung(rung, "personal"));
-        continue;
-      }
-      reasons.push(failed);
-      drops.push(Object.freeze({ tier, rung: rung.rung, origin: "personal", reason: failed }));
+      if (failed === undefined) kept.push(frozenRung(rung, "personal"));
+      else dropped.push({ rung: rung.rung, model: rung.model, reason: failed });
     }
+    checked[tier] = { order: parsed.order, kept, dropped };
+  }
+  return checked;
+}
+
+/** The personal map, every rung checked and failing rungs dropped;
+ *  `undefined` when there is none and routing is not enabled. */
+function personalTiers(personal: unknown, inputs: Required<TierMapInputs>): PersonalTiers | undefined {
+  const checked = checkedPersonalTiers(personal, inputs);
+  if (checked === undefined) return undefined;
+  const resolved = {} as Record<RiskTier, readonly TierRung[]>;
+  const orders = {} as Record<RiskTier, TierOrder>;
+  const drops: TierMapDrop[] = [];
+  for (const tier of RISK_TIERS) {
+    const { order, kept, dropped } = checked[tier];
+    orders[tier] = order;
+    for (const drop of dropped) drops.push(Object.freeze({ tier, rung: drop.rung, origin: "personal", reason: drop.reason }));
     // A personal tier has nothing to inherit, so emptying it is an error.
     if (kept.length === 0) {
-      throw keyError("personal", `${TIERS_KEY}.${tier}`, `has every rung dropped (${reasons.join(", ")}); a personal tier has nothing to inherit.`);
+      throw keyError("personal", `${TIERS_KEY}.${tier}`, `has every rung dropped (${dropped.map((drop) => drop.reason).join(", ")}); a personal tier has nothing to inherit.`);
     }
-    resolved[tier] = Object.freeze(kept);
+    resolved[tier] = Object.freeze([...kept]);
   }
   return { tiers: resolved, orders, drops };
+}
+
+export interface EmptiedTier {
+  readonly tier: RiskTier;
+  /** Every rung of the tier, with its canonical model and why it drops. */
+  readonly dropped: readonly { readonly rung: string; readonly model: string; readonly reason: RungDropReason }[];
+}
+
+/** The personal tiers the loader's own checks would leave with no rungs,
+ *  for which `tierMapFromSettings` throws. `[]` when there is no personal
+ *  map. Throws, as the loader does, on a malformed map. */
+export function emptiedPersonalTiers(personal: unknown, inputs: TierMapInputs): EmptiedTier[] {
+  const checked = checkedPersonalTiers(personal, completeInputs(personal, inputs));
+  if (checked === undefined) return [];
+  return RISK_TIERS.filter((tier) => checked[tier].kept.length === 0).map((tier) => ({ tier, dropped: checked[tier].dropped }));
+}
+
+function completeInputs(personal: unknown, inputs: TierMapInputs): Required<TierMapInputs> {
+  return {
+    installedModels: inputs.installedModels,
+    modelScope: inputs.modelScope ?? HARNESS_MODEL_SCOPE,
+    banLists: inputs.banLists ?? banListsFromSettings(personal).banLists,
+  };
 }
 
 interface ProjectOverride {
@@ -270,11 +312,7 @@ function projectOverride(project: unknown): ProjectOverride {
  *  settings. Throws, naming the key, on a malformed map. Returns `undefined`
  *  when the personal file has no tiers and routing is not enabled. */
 export function tierMapFromSettings(personal: unknown, project: unknown, inputs: TierMapInputs): ResolvedTierMap | undefined {
-  const complete: Required<TierMapInputs> = {
-    installedModels: inputs.installedModels,
-    modelScope: inputs.modelScope ?? HARNESS_MODEL_SCOPE,
-    banLists: inputs.banLists ?? banListsFromSettings(personal).banLists,
-  };
+  const complete = completeInputs(personal, inputs);
   const personalMap = personalTiers(personal, complete);
   if (personalMap === undefined) return undefined;
 

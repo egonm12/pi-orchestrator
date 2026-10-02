@@ -19,7 +19,7 @@ pi install git:github.com/egonm12/pi-orchestrator
 
 ## Set up
 
-Run `/pi-orchestrator init` in an interactive session. It asks for your worker ban list, writes a starter tier map from your installed models in shadow mode, and asks which providers may receive task text. Review the result in `~/.pi/agent/settings.json` and start a new session.
+Run `/pi-orchestrator init` in an interactive session. It asks for your worker ban list (pick installed model families or type your own, starting from your current list, with a preview of the models each entry blocks), writes a starter tier map from your installed models in shadow mode, and asks which providers may receive task text. Review the result in `~/.pi/agent/settings.json` and start a new session.
 
 Use `/pi-orchestrator gate [off|low|medium|high|max]` to change the gate level for the current session, and `/pi-orchestrator workers [1-32]` to change how many workers run at once in the current session.
 

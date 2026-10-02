@@ -134,14 +134,23 @@ export function readPersonalSettings(path: string): Record<string, unknown> {
   return parsed;
 }
 
+/** The subagent ban list in personal settings, or `[]` when there is none.
+ *  Non-string items are left out. */
+export function currentSubagentBanList(personal: unknown): string[] {
+  const list = orchestratorOf(personal).subagentBanList;
+  return Array.isArray(list) ? list.filter((entry): entry is string => typeof entry === "string") : [];
+}
+
 export interface SettingsPlan {
   /** The settings after init; equal to the input when nothing changes. */
   readonly settings: Record<string, unknown>;
   readonly changes: readonly string[];
 }
 
-/** Add what is missing and keep what is there: an existing tier map,
- *  classifier or ban list is never replaced. A new tier map starts in shadow
+/** Add what is missing and keep what is there: an existing tier map or
+ *  classifier is never replaced. The subagent ban list is the exception:
+ *  init's picker starts from the current list, so the picked list replaces
+ *  it when it differs. A new tier map starts in shadow
  *  mode, which records decisions while workers run on the session model. */
 export function planSettings(personal: Record<string, unknown>, starter: StarterTierMap | undefined, subagentBanList: readonly string[]): SettingsPlan {
   const changes: string[] = [];
@@ -157,7 +166,9 @@ export function planSettings(personal: Record<string, unknown>, starter: Starter
       changes.push(`orchestrator.routing.classifier.model = ${starter.classifier}`);
     }
   }
-  if (orchestrator.subagentBanList === undefined) {
+  const existing = orchestrator.subagentBanList;
+  const unchanged = Array.isArray(existing) && existing.length === subagentBanList.length && existing.every((entry, index) => entry === subagentBanList[index]);
+  if (!unchanged) {
     orchestrator.subagentBanList = [...subagentBanList];
     changes.push(`orchestrator.subagentBanList = [${subagentBanList.join(", ")}]`);
   }
