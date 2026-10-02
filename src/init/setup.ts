@@ -147,16 +147,30 @@ export interface SettingsPlan {
   readonly changes: readonly string[];
 }
 
-/** Add what is missing and keep what is there: an existing tier map or
- *  classifier is never replaced. The subagent ban list is the exception:
+export interface PlanOptions {
+  /** Replace an existing tier map with the starter; the owner confirmed it. */
+  readonly rebuildTiers?: boolean;
+}
+
+/** Add what is missing and keep what is there: an existing tier map is
+ *  replaced only with `rebuildTiers`, and an existing classifier never.
+ *  The subagent ban list is the exception:
  *  init's picker starts from the current list, so the picked list replaces
  *  it when it differs. A new tier map starts in shadow
- *  mode, which records decisions while workers run on the session model. */
-export function planSettings(personal: Record<string, unknown>, starter: StarterTierMap | undefined, subagentBanList: readonly string[]): SettingsPlan {
+ *  mode, which records decisions while workers run on the session model;
+ *  a rebuilt one keeps the mode and switch already set. */
+export function planSettings(personal: Record<string, unknown>, starter: StarterTierMap | undefined, subagentBanList: readonly string[], options: PlanOptions = {}): SettingsPlan {
   const changes: string[] = [];
   const orchestrator = { ...orchestratorOf(personal) };
   const routing = { ...routingOf(personal) };
-  if (routing.tiers === undefined && starter) {
+  if (routing.tiers !== undefined && starter && options.rebuildTiers) {
+    routing.tiers = starter.tiers;
+    changes.push("orchestrator.routing.tiers (rebuilt from installed models)");
+    if (routing.classifier === undefined) {
+      routing.classifier = { model: starter.classifier };
+      changes.push(`orchestrator.routing.classifier.model = ${starter.classifier}`);
+    }
+  } else if (routing.tiers === undefined && starter) {
     routing.tiers = starter.tiers;
     if (routing.enabled === undefined) routing.enabled = true;
     if (routing.mode === undefined) routing.mode = "shadow";

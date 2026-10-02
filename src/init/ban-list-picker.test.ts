@@ -171,7 +171,7 @@ test("init replaces an existing ban list with the picked one and leaves an exist
   const tiers = { mechanical: rung, standard: rung, elevated: rung, critical: rung };
   const dirs = initDirs({ orchestrator: { subagentBanList: ["fable"], sessionBanList: [], routing: { tiers } } });
   try {
-    const { ui, calls } = scriptedUi([REMOVE_ENTRY, "fable", "gpt-6", DONE, SAVE_LIST]);
+    const { ui, calls } = scriptedUi([REMOVE_ENTRY, "fable", "gpt-6", DONE, SAVE_LIST, undefined, undefined]);
     await runInit("init", initCtx(ui), { stateDir: dirs.stateDir, agentDir: dirs.agentDir });
     const settings = JSON.parse(readFileSync(dirs.settingsPath, "utf8"));
     assert.deepEqual(settings.orchestrator.subagentBanList, ["gpt-6"]);
@@ -200,7 +200,7 @@ test("init does not save a list that empties a tier of the existing map; Escape 
 test("init saves a list that removes only some rungs of a tier of the existing map", async () => {
   const dirs = initDirs(OPUS_ELEVATED);
   try {
-    const { ui } = scriptedUi([TYPE_OWN, "opus-5", DONE, SAVE_LIST]);
+    const { ui } = scriptedUi([TYPE_OWN, "opus-5", DONE, SAVE_LIST, undefined, undefined]);
     await runInit("init", initCtx(ui), { stateDir: dirs.stateDir, agentDir: dirs.agentDir });
     const settings = JSON.parse(readFileSync(dirs.settingsPath, "utf8"));
     assert.deepEqual(settings.orchestrator.subagentBanList, ["opus-5"]);
@@ -212,7 +212,7 @@ test("an existing tier map that does not load is named as the existing map, and 
   const dirs = initDirs({ orchestrator: { subagentBanList: [], sessionBanList: [], routing: { tiers: { mechanical: ["anthropic/claude-haiku-4-5:low"] } } } });
   try {
     const before = readFileSync(dirs.settingsPath, "utf8");
-    const { ui } = scriptedUi(["gpt-6", DONE, SAVE_LIST]);
+    const { ui } = scriptedUi(["gpt-6", DONE, SAVE_LIST, undefined, undefined]);
     const lines = (await runInit("init", initCtx(ui), { stateDir: dirs.stateDir, agentDir: dirs.agentDir })).join("\n");
     assert.equal(readFileSync(dirs.settingsPath, "utf8"), before);
     assert.match(lines, new RegExp(`the existing tier map in ${dirs.settingsPath.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")} does not load \\(.*standard.*is missing`));
