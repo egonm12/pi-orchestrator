@@ -98,14 +98,26 @@ export type AgentResolution =
   | { readonly ok: true; readonly instructions?: string; readonly tools?: readonly string[]; readonly definition?: AgentDefinition }
   | { readonly ok: false; readonly error: string };
 
+/** The tools that reach tools pi does not declare to the model: MCP tools
+ *  with `codemode`, `codemode-deferred` or `deferred` exposure. */
+export const DISCOVERY_TOOLS: readonly string[] = ["codemode", "tool_search"];
+
 /** Resolve a task item's `agent` against the definitions. No agent gives the
  *  worker no instructions and the default tools. A definition's `tools:` list
  *  keeps only tools in `orchestratorTools`, and the subagents tool only when
  *  `mayDelegate` (ADR 0008: the orchestrator's workers, not theirs). It never
  *  keeps `subagents_status`, `subagents_message` or `subagents_verdict`, which
- *  are the orchestrator's alone. */
+ *  are the orchestrator's alone.
+ *
+ *  `undeclaredTools` are the orchestrator's registered tools pi does not
+ *  declare on registration, which codemode or tool_search reach: MCP tools with
+ *  `codemode`, `codemode-deferred` or `deferred` exposure. The list keeps one
+ *  of them while the orchestrator has codemode or tool_search active, even
+ *  when it is not active itself, and then adds the active discovery tools when
+ *  it names neither, so the worker can still call the tool. */
 export function resolveAgent(
   agent: string | undefined, definitions: readonly AgentDefinition[], orchestratorTools: readonly string[], mayDelegate = false,
+  undeclaredTools: readonly string[] = [],
 ): AgentResolution {
   if (agent === undefined) return { ok: true };
   const definition = definitions.find((candidate) => candidate.name === agent);
@@ -113,9 +125,13 @@ export function resolveAgent(
     const known = definitions.length === 0 ? "there are none" : `known agents: ${definitions.map((candidate) => candidate.name).join(", ")}`;
     return { ok: false, error: `unknown agent "${agent}"; ${known}` };
   }
-  const tools = definition.tools?.filter((tool) => (mayDelegate || tool !== SUBAGENTS_TOOL) && tool !== SUBAGENTS_STATUS_TOOL && tool !== "subagents_message" &&
+  const discovery = DISCOVERY_TOOLS.filter((tool) => orchestratorTools.includes(tool));
+  const kept = definition.tools?.filter((tool) => (mayDelegate || tool !== SUBAGENTS_TOOL) && tool !== SUBAGENTS_STATUS_TOOL && tool !== "subagents_message" &&
     tool !== SUBAGENTS_VERDICT_TOOL &&
-    orchestratorTools.includes(tool));
+    (orchestratorTools.includes(tool) || (discovery.length > 0 && undeclaredTools.includes(tool))));
+  const needsDiscovery = kept !== undefined && kept.some((tool) => undeclaredTools.includes(tool)) &&
+    !kept.some((tool) => DISCOVERY_TOOLS.includes(tool));
+  const tools = needsDiscovery ? [...kept, ...discovery] : kept;
   return {
     ok: true,
     definition,

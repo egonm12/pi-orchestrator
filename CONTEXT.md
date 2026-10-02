@@ -48,7 +48,7 @@ Where a worker is in its life: *queued* (held back until a parallel slot frees),
 _Avoid_: Status (that is the tool that reports worker states), waiting
 
 **Agent definition**:
-A named, owner-written description of a kind of worker: its instructions and the tools it may use. Read from the owner's and the project's agent folders; pi-orchestrator ships none.
+A named, owner-written description of a kind of worker: its instructions and the tools it may use. Read from the owner's and the project's agent folders; pi-orchestrator ships none. Its tools list names MCP tools, `codemode` and `tool_search` like any other tool; a worker without one gets them as the orchestrator does.
 _Avoid_: Role (that is the orchestrator/worker split), persona
 
 **Delegation**:

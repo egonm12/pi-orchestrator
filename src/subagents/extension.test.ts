@@ -217,8 +217,15 @@ type TextPart = { type: string; text?: string };
 type Command = Parameters<ExtensionAPI["registerCommand"]>[1];
 type Shortcut = Parameters<ExtensionAPI["registerShortcut"]>[1];
 
+/** The orchestrator's tools when a test gives more than ORCHESTRATOR_TOOLS: its active
+ *  tools, and every registered tool with its exposure, as pi's getAllTools gives them. */
+interface OrchestratorToolSet {
+  readonly active: readonly string[];
+  readonly all: readonly { readonly name: string; readonly exposure: string }[];
+}
+
 /** The subagents extension as pi loads it in the orchestrator's session. */
-function loadSubagents(workerExtensions: readonly InlineExtension[]): LoadedSubagents {
+function loadSubagents(workerExtensions: readonly InlineExtension[], orchestratorTools?: OrchestratorToolSet): LoadedSubagents {
   const tools: Tool[] = [];
   const handlers = new Map<string, ((event: unknown, ctx: ExtensionContext) => unknown)[]>();
   const commands = new Map<string, Command>();
@@ -230,7 +237,8 @@ function loadSubagents(workerExtensions: readonly InlineExtension[]): LoadedSuba
     registerShortcut(key: string, shortcut: Shortcut) { shortcuts.set(key, shortcut); },
     on(event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) { handlers.set(event, [...handlers.get(event) ?? [], handler]); },
     sendMessage(message: SentMessage["message"], options: SentMessage["options"]) { messages.push({ message, options }); },
-    getActiveTools: () => [...ORCHESTRATOR_TOOLS],
+    getActiveTools: () => [...orchestratorTools?.active ?? ORCHESTRATOR_TOOLS],
+    getAllTools: () => [...orchestratorTools?.all ?? []],
     // As pi gives each session's extensions one bus, on which pi-orchestrator's subcommands join one command.
     events: createEventBus(),
   } as unknown as ExtensionAPI);
@@ -653,6 +661,66 @@ test("the worker loads the installed extensions' tools but not the subagents too
     assert.ok(tools.includes("read"), JSON.stringify(tools));
     assert.ok(tools.includes("probe"), `another extension's tool reaches the worker: ${JSON.stringify(tools)}`);
     assert.equal(tools.includes("subagents"), false, JSON.stringify(tools));
+  } finally { h.cleanup(); }
+});
+
+/** The fake MCP server (../fixtures/fake-mcp-server.mjs): tools `lookup` and the read-only `peek`, over stdio, offline. */
+const FAKE_MCP_SERVER = join(CHECKOUT, "src", "fixtures", "fake-mcp-server.mjs");
+
+/** Writes an mcp.json into `dir` with one fake MCP server per name, at the exposure given. */
+function writeMcpConfig(dir: string, servers: Readonly<Record<string, string>>): void {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "mcp.json"), JSON.stringify({ mcpServers: Object.fromEntries(Object.entries(servers).map(([name, exposure]) =>
+    [name, { command: process.execPath, args: [FAKE_MCP_SERVER], exposure }])) }));
+}
+
+test("a worker gets the orchestrator's MCP tools, codemode and tool_search, as pi's CLI wires them, and still not the subagents tool", async () => {
+  const h = harness();
+  try {
+    // A direct server's tools are declared; a codemode server's need codemode and a deferred server's tool_search, which the MCP extension activates.
+    writeMcpConfig(h.agentDir, { jira: "direct", docs: "codemode", wiki: "deferred" });
+    const provider = fakeAnthropic("done");
+    const tool = loadSubagentsTool([routerExtension(), provider.extension, createSubagentsExtension()]);
+    const { worker } = await callSubagents(tool, orchestrator(h).ctx, "Say done.");
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    const tools = provider.requests[0]?.tools ?? [];
+    for (const name of ["read", "mcp__jira__lookup", "mcp__jira__peek", "codemode", "tool_search"]) assert.ok(tools.includes(name), `${name}: ${JSON.stringify(tools)}`);
+    for (const name of ["mcp__docs__lookup", "mcp__wiki__lookup", "subagents"]) assert.equal(tools.includes(name), false, `${name}: ${JSON.stringify(tools)}`);
+  } finally { h.cleanup(); }
+});
+
+test("a worker reads the project's mcp.json only when the orchestrator trusts the project", async () => {
+  const h = harness();
+  try {
+    writeMcpConfig(join(h.projectDir, ".pi"), { local: "direct" });
+    for (const trusted of [true, false]) {
+      const provider = fakeAnthropic("done");
+      const tool = loadSubagentsTool([routerExtension(), provider.extension]);
+      const main = orchestrator(h);
+      const ctx = { ...main.ctx, isProjectTrusted: () => trusted } as unknown as ExtensionContext;
+      const { worker } = await callSubagents(tool, ctx, "Say done.");
+      assert.equal(worker.status, "completed", JSON.stringify(worker));
+      assert.equal(provider.requests[0]?.tools.includes("mcp__local__lookup"), trusted, JSON.stringify(provider.requests[0]?.tools));
+    }
+  } finally { h.cleanup(); }
+});
+
+test("an agent definition's tools list keeps the MCP tools the orchestrator reaches and adds the discovery tool a codemode-only one needs", async () => {
+  const h = harness();
+  try {
+    writeMcpConfig(h.agentDir, { jira: "direct", docs: "codemode" });
+    writeAgentDefinition(join(h.agentDir, "agents"), "ticketer.md",
+      { name: "ticketer", description: "Files tickets", tools: "read, mcp__jira__lookup, mcp__docs__lookup, mcp__wiki__lookup" }, "File it.");
+    const provider = fakeAnthropic("done");
+    // The orchestrator declares jira's tool and codemode; docs' tool is reachable from codemode only; it has no wiki server.
+    const subagents = loadSubagents([routerExtension(), provider.extension], {
+      active: [...ORCHESTRATOR_TOOLS, "mcp__jira__lookup", "codemode"],
+      all: [{ name: "mcp__jira__lookup", exposure: "direct" }, { name: "mcp__docs__lookup", exposure: "codemode" }, { name: "codemode", exposure: "direct" }],
+    });
+    const { worker } = await callSubagents(subagents.tool(), orchestrator(h).ctx, "Say done.", "ticketer");
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    // codemode is added so docs' tool, which is not declared, stays callable from scripts.
+    assert.deepEqual([...provider.requests[0]?.tools ?? []].sort(), ["codemode", "mcp__jira__lookup", "read", "report"]);
   } finally { h.cleanup(); }
 });
 

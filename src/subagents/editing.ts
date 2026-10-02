@@ -43,12 +43,33 @@ export function isEditingToolCall(toolName: string, input: unknown): boolean {
 export const REVIEWER_EDIT_DENIED = "pi-orchestrator: a reviewer changes nothing, and this call would edit. " +
   "Name the shortfall in your Result instead; reading, searching, building and testing stay allowed.";
 
+/** Why a reviewer's call to an MCP tool that does not say it is read-only is denied. */
+export const REVIEWER_MCP_DENIED = "pi-orchestrator: a reviewer changes nothing, and this MCP tool does not declare itself read-only " +
+  "(readOnlyHint), so it may change files or other systems. Name what you needed from it in your Result instead.";
+
+/** Whether `toolName` is an MCP server's tool, as pi's MCP extension names them. */
+export function isMcpTool(toolName: string): boolean {
+  return toolName.startsWith("mcp__");
+}
+
 /** The extension that denies every editing call in a reviewer's session, and
  *  in a worker a reviewer started, so a reviewer never becomes an editing
- *  delegation. A denied call runs nothing, so it writes no edit record. */
+ *  delegation. A denied call runs nothing, so it writes no edit record.
+ *  Calls a codemode script makes run through the same tool_call hook, so a
+ *  script's edit, write or editing bash is denied like a direct one. An MCP
+ *  tool may change files or other systems, so a reviewer may only call one
+ *  whose server marks it read-only (`readOnlyHint`). */
 export const READ_ONLY_REVIEWER: InlineExtension = {
   name: "pi-orchestrator-read-only-reviewer",
-  factory: (pi) => { pi.on("tool_call", (event) => isEditingToolCall(event.toolName, event.input) ? { block: true, reason: REVIEWER_EDIT_DENIED } : undefined); },
+  factory: (pi) => {
+    pi.on("tool_call", (event) => {
+      if (isEditingToolCall(event.toolName, event.input)) return { block: true, reason: REVIEWER_EDIT_DENIED };
+      if (isMcpTool(event.toolName) && pi.getAllTools().find((tool) => tool.name === event.toolName)?.annotations?.readOnlyHint !== true) {
+        return { block: true, reason: REVIEWER_MCP_DENIED };
+      }
+      return undefined;
+    });
+  },
 };
 
 /** The tool name a working-tree edit record carries. */

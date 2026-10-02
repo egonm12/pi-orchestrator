@@ -358,6 +358,12 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
         const definitionDirs = agentDefinitionDirs(agentDir, ctx.cwd);
         const definitions = loadAgentDefinitions(definitionDirs);
         const orchestratorTools = pi.getActiveTools();
+        // MCP tools codemode or tool_search reach without pi declaring them; a test's fake pi may have no getAllTools.
+        const undeclaredTools = typeof pi.getAllTools === "function"
+          ? pi.getAllTools().filter((info) => info.exposure === "codemode" || info.exposure === "deferred").map((info) => info.name) : [];
+        // Workers see the project as trusted or not as the orchestrator does: an untrusted project's .pi/mcp.json starts no server.
+        const projectTrusted = typeof ctx.isProjectTrusted === "function" ? ctx.isProjectTrusted() : undefined;
+        const workerTrust = projectTrusted === undefined ? {} : { projectTrusted };
         const results: SubagentResult[] = new Array(items.length);
         // Snapshot every fork before the queue runs: a later model switch or
         // parent turn cannot change a queued fork's pin or branch.
@@ -504,7 +510,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               showProgress(index, { ...item, status: "running" });
               feeds[index]!.started(prepared.namedModel ? preservedModel(prepared.namedModel)
                 : prepared.fork ? { kind: "fork", ...prepared.pin } : { kind: "routed", pin: prepared.pin });
-              const worker = await runWorker({ task, resume: prepared, cwd: ctx.cwd, agentDir, orchestratorSession: ctx.sessionManager,
+              const worker = await runWorker({ task, resume: prepared, cwd: ctx.cwd, agentDir, ...workerTrust, orchestratorSession: ctx.sessionManager,
                 signal: itemSignals[index], extensionFactories: deps.workerExtensions, instructions: prepared.instructions, tools: prepared.tools,
                 onActivity: backgroundCall?.onActivity[index], reports, onSession: feeds[index]!.session,
                 onTool: (tool) => showProgress(index, { ...item, status: "running", ...(tool === undefined ? {} : { tool }) }),
@@ -548,7 +554,8 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
             return;
           }
           // Forked workers never delegate (ADR 0008), whatever their definition lists.
-          const resolution = resolveAgent(retried?.agent ?? agent, definitions, orchestratorTools, parentDelegationId === undefined && !preparedFork);
+          const resolution = resolveAgent(retried?.agent ?? agent, definitions, orchestratorTools, parentDelegationId === undefined && !preparedFork,
+            undeclaredTools);
           if (!resolution.ok) {
             results[index] = { ...item, status: "failed", finalText: "", error: resolution.error };
             showProgress(index, results[index]);
@@ -611,7 +618,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
             prompt: reviewerPrompt({ ...target, material: { ...target.material, result: cutText(target.material.result, target.material.sessionFile) } },
               gateLevels.inForce(ctx).level) };
           const worker = await runWorker({
-            task: retried?.task ?? task, cwd: ctx.cwd, agentDir, orchestratorSession: ctx.sessionManager, signal: itemSignals[index],
+            task: retried?.task ?? task, cwd: ctx.cwd, agentDir, ...workerTrust, orchestratorSession: ctx.sessionManager, signal: itemSignals[index],
             ...(climb !== undefined ? { sessionId: climb.delegationId } : backgroundCall === undefined ? {} : { sessionId: backgroundCall.delegationIds[index]! }),
             extensionFactories: deps.workerExtensions, instructions: resolution.instructions, tools: resolution.tools,
             ...(namedModel === undefined ? {} : { namedModel }),

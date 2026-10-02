@@ -17,7 +17,11 @@ import type { WorkerSession } from "./worker-board.ts";
 import {
   createAgentSessionFromServices,
   createAgentSessionServices,
+  createCodemodeExtension,
+  createMcpExtension,
+  createToolSearchExtension,
   SessionManager,
+  SettingsManager,
   type ExtensionContext,
   type InlineExtension,
   type LoadExtensionsResult,
@@ -33,6 +37,32 @@ import {
 // virtual model and routes the worker as ADR 0006 and ADR 0014 describe.
 
 export const SUBAGENTS_TOOL = "subagents";
+
+/** The built-in extensions pi's CLI loads for its own sessions besides the
+ *  installed ones, which an SDK session only gets when its resource loader is
+ *  given them: codemode, tool_search and MCP, in the CLI's order and with its
+ *  flags. As `builtin:<name>` resources they load after project trust and obey
+ *  the `extensions` setting (`-builtin:mcp` turns one off), and as replaceable
+ *  ones they give way to an installed extension that registers the same tool or
+ *  command, as a third-party MCP extension does. The tools register inactive;
+ *  pi's `defaultTools` setting, an agent definition's tools list, or the MCP
+ *  extension, which activates codemode or tool_search for the MCP tools that
+ *  need it, activates them, as in the orchestrator. pi's llama.cpp built-in is
+ *  not exported, so a worker goes without it. */
+export function workerBuiltinExtensions(): InlineExtension[] {
+  return [
+    { name: "codemode", factory: createCodemodeExtension(), replaceable: true, builtin: true },
+    { name: "tool-search", factory: createToolSearchExtension(), replaceable: true, builtin: true },
+    { name: "mcp", factory: createMcpExtension(), replaceable: true, builtin: true },
+  ];
+}
+
+/** The built-in extensions a worker adds to `given`: those `given` does not
+ *  already supply under the same built-in name. */
+function builtinExtensionsBesides(given: readonly InlineExtension[]): InlineExtension[] {
+  const named = new Set(given.flatMap((extension) => typeof extension === "function" || !extension.builtin ? [] : [extension.name]));
+  return workerBuiltinExtensions().filter((extension) => typeof extension === "function" || !named.has(extension.name));
+}
 
 export type WorkerStatus = "completed" | "failed" | "aborted";
 
@@ -59,9 +89,13 @@ export interface WorkerSetup {
   readonly task: string;
   readonly resume?: ResumeWorker;
   readonly cwd: string;
-  /** The orchestrator's agent dir: its auth.json, models.json, settings and
-   *  installed extensions. */
+  /** The orchestrator's agent dir: its auth.json, models.json, settings,
+   *  mcp.json and installed extensions. */
   readonly agentDir: string;
+  /** Whether the orchestrator trusts the project; without it the worker
+   *  trusts it, as pi's SDK does. An untrusted project's settings, extensions
+   *  and .pi/mcp.json are left out, as they are for the orchestrator. */
+  readonly projectTrusted?: boolean;
   readonly orchestratorSession: Pick<ExtensionContext["sessionManager"], "getSessionDir" | "getSessionId" | "getSessionFile">;
   readonly fork?: {
     readonly sessionManager: SessionManager;
@@ -293,11 +327,15 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
   /** A new worker on the auto model, not a fork, a named model or a resume. */
   let routed = false;
   try {
+    const given = setup.extensionFactories ?? [];
     const services = await createAgentSessionServices({
       cwd: setup.cwd,
       agentDir: setup.agentDir,
+      ...(setup.projectTrusted === undefined ? {}
+        : { settingsManager: SettingsManager.create(setup.cwd, setup.agentDir, { projectTrusted: setup.projectTrusted }) }),
       resourceLoaderOptions: {
-        extensionFactories: [...(setup.extensionFactories ?? []), ...(readOnly ? [READ_ONLY_REVIEWER] : []), editTracking,
+        // A tools list also narrows the built-ins' tools: MCP tools it does not name are not registered (ADR 0007).
+        extensionFactories: [...builtinExtensionsBesides(given), ...given, ...(readOnly ? [READ_ONLY_REVIEWER] : []), editTracking,
           ...(reports === undefined ? [] : [reportExtension(reports)])],
         ...(setup.tools?.includes(SUBAGENTS_TOOL) ? {} : { extensionsOverride: withoutSubagentsTool }),
         ...(appendedPrompt.length === 0 ? {} : { appendSystemPromptOverride: (base: string[]) => [...base, ...appendedPrompt] }),
@@ -410,6 +448,9 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
     unregisterMessage?.();
     setup.signal?.removeEventListener("abort", abort);
     unsubscribe();
+    // The session ends as pi ends one: its extensions get session_shutdown, so
+    // the MCP extension closes the servers it started for this worker.
+    try { await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); } catch { /* The worker's result stands. */ }
     session.dispose();
     unsetConstraints?.();
     unsetClassification?.();

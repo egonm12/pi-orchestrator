@@ -14,7 +14,7 @@ import { createRouterExtension } from "../router/extension.ts";
 import { createSubagentsExtension, type SubagentResult, type SubagentsDetails } from "./extension.ts";
 import { orchestratorProtocol } from "./orchestrator-protocol.ts";
 import { reviewRules } from "./review.ts";
-import { REVIEWER_EDIT_DENIED } from "./editing.ts";
+import { REVIEWER_EDIT_DENIED, REVIEWER_MCP_DENIED } from "./editing.ts";
 import { markWorkerSession } from "./worker-sessions.ts";
 import { workerBoard } from "./worker-board.ts";
 import { compactLines, workerRows } from "./worker-widget.ts";
@@ -522,6 +522,41 @@ test("a reviewer's editing calls are denied with the reason, its reads, searches
     assert.equal(existsSync(join(h.projectDir, "review.md")), false);
     const edits = readRoutingRecords(join(h.stateDir, "routing")).flatMap((record) => record.recordType === "edit" ? [record.delegationId] : []);
     assert.deepEqual(edits, [id], "only the implementer has an edit record");
+  } finally { h.cleanup(); }
+});
+
+test("a reviewer may call only MCP tools marked read-only, and a codemode script's editing or MCP calls are denied like direct ones", async () => {
+  const h = harness();
+  try {
+    // The fake MCP server's `lookup` says nothing about changes and its `peek` is read-only; docs' tools need codemode, which the MCP extension activates.
+    const server = { command: process.execPath, args: [join(import.meta.dirname, "..", "fixtures", "fake-mcp-server.mjs")] };
+    writeFileSync(join(h.agentDir, "mcp.json"), JSON.stringify({ mcpServers: { jira: { ...server, exposure: "direct" }, docs: { ...server, exposure: "codemode" } } }));
+    const provider = anthropic();
+    const tools = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h);
+    const implementer = await one(tools, ctx, { task: `[elevated] ${WRITE_NOTES}` });
+    const id = implementer.sessionId!;
+    const calls = [
+      [runTask("mcp__jira__lookup", {}), REVIEWER_MCP_DENIED, undefined],
+      [runTask("mcp__jira__peek", {}), undefined, "called peek"],
+      [runTask("codemode", { code: "return await tools.write({ path: 'review.md', content: 'x' });" }), REVIEWER_EDIT_DENIED, undefined],
+      [runTask("codemode", { code: "return await tools.mcp__docs__lookup({});" }), REVIEWER_MCP_DENIED, undefined],
+      [runTask("codemode", { code: "return await tools.mcp__docs__peek({});" }), undefined, "called peek"],
+      [runTask("codemode", { code: "return await tools.read({ path: 'facts.txt' });" }), undefined, "fact-42"],
+    ] as const;
+    writeFileSync(join(h.projectDir, "facts.txt"), "fact-42\n");
+    for (const [task, reason, ran] of calls) {
+      const reviewer = await one(tools, ctx, { task, review: id });
+      assert.equal(reviewer.status, "completed", JSON.stringify(reviewer));
+      assert.equal(reviewer.edited, undefined, task);
+      const session = readFileSync(reviewer.sessionFile!, "utf8");
+      for (const denial of [REVIEWER_EDIT_DENIED, REVIEWER_MCP_DENIED]) {
+        assert.equal(session.includes(JSON.stringify(denial).slice(1, -1)), denial === reason, `${task}: ${denial}`);
+      }
+      // The call's result, not the task, holds what it ran: the task names no result.
+      if (ran !== undefined) assert.ok(session.split("\n").some((line) => line.includes('"toolResult"') && line.includes(ran)), `${task}: ${ran}`);
+    }
+    assert.equal(existsSync(join(h.projectDir, "review.md")), false, "the reviewer's script wrote nothing");
   } finally { h.cleanup(); }
 });
 
