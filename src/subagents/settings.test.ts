@@ -8,6 +8,7 @@ test("without personal settings the defaults apply and allowProjectOverrides is 
     allowProjectOverrides: false,
     ignoredProjectKeys: [],
     warnings: [],
+    workerLimitSource: "default",
   });
 });
 
@@ -19,6 +20,7 @@ test("with allowProjectOverrides a project key replaces the personal value and t
     allowProjectOverrides: true,
     ignoredProjectKeys: ["orchestrator.subagents.allowProjectOverrides"],
     warnings: [],
+    workerLimitSource: "project",
   });
 });
 
@@ -92,6 +94,19 @@ test("a project that sets any worker limit key wins over every personal one, by 
   assert.throws(() => limit({ workerLimit: 10 }, { maxParallel: 0 }), /maxParallel must be a positive integer/);
   assert.equal(subagentsSettingsFromSettings({ orchestrator: { subagents: { workerLimit: 10 } } }, { orchestrator: { subagents: { maxParallel: 2 } } })
     .settings.workerLimit, 10, "without allowProjectOverrides the personal limit stays");
+});
+
+test("workerLimitSource names where the worker limit comes from: project, personal or default", () => {
+  const source = (personal: Record<string, unknown>, project?: Record<string, unknown>) => subagentsSettingsFromSettings(
+    { orchestrator: { subagents: personal } }, project === undefined ? undefined : { orchestrator: { subagents: project } }).workerLimitSource;
+  assert.equal(source({}), "default");
+  assert.equal(source({ gateLevel: "low" }), "default");
+  assert.equal(source({ workerLimit: 6 }), "personal");
+  assert.equal(source({ maxBackgroundWorkers: 6 }), "personal", "a deprecated key counts as set");
+  assert.equal(source({ allowProjectOverrides: true, workerLimit: 6 }, { maxParallel: 2 }), "project");
+  assert.equal(source({ allowProjectOverrides: true }, { gateLevel: "low" }), "default", "a project without a worker limit key");
+  assert.equal(source({ workerLimit: 6 }, { workerLimit: 2 }), "personal", "without allowProjectOverrides the project is ignored");
+  assert.equal(source({}, { workerLimit: 2 }), "default");
 });
 
 test("explorationNudge defaults to 3, takes a positive integer, and a project may replace it only with allowProjectOverrides", () => {

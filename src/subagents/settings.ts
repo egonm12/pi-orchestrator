@@ -36,7 +36,12 @@ export interface LoadedSubagentsSettings {
   readonly ignoredProjectKeys: readonly string[];
   /** Warnings about values the loader changed, for the extension to log once. */
   readonly warnings: readonly string[];
+  /** Where `settings.workerLimit` comes from: a project allowed to override, personal settings, or neither. */
+  readonly workerLimitSource: WorkerLimitSource;
 }
+
+/** The settings a worker limit comes from. */
+export type WorkerLimitSource = "project" | "personal" | "default";
 
 const SUBAGENTS_KEY = "orchestrator.subagents";
 /** `explorationNudge` when the owner sets none. */
@@ -93,7 +98,9 @@ export function subagentsSettingsFromSettings(personal: unknown, project?: unkno
   // `maxParallel` and `maxBackgroundWorkers` are deprecated aliases from before the
   // worker limit; the first key set counts, each checked under its own name.
   const warnings: string[] = [];
-  const limitKey = WORKER_LIMIT_KEYS.find((key) => limitOptions[key] !== undefined) ?? "workerLimit";
+  const setKey = WORKER_LIMIT_KEYS.find((key) => limitOptions[key] !== undefined);
+  const limitKey = setKey ?? "workerLimit";
+  const workerLimitSource: WorkerLimitSource = setKey === undefined ? "default" : limitOptions === projectOptions ? "project" : "personal";
   const setLimit = limitOptions[limitKey] ?? DEFAULT_WORKER_LIMIT;
   if (typeof setLimit !== "number" || !Number.isInteger(setLimit) || setLimit < 1) {
     throw new Error(`${SUBAGENTS_KEY}.${limitKey} must be a positive integer`);
@@ -124,6 +131,7 @@ export function subagentsSettingsFromSettings(personal: unknown, project?: unkno
     allowProjectOverrides,
     ignoredProjectKeys,
     warnings,
+    workerLimitSource,
   };
 }
 

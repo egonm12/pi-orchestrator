@@ -28,6 +28,7 @@ import { registerCommitGate } from "./commit-gate.ts";
 import { registerExplorationNudge } from "./exploration-nudge.ts";
 import { registerSubagentsVerdictTool } from "./verdict.ts";
 import { registerGateLevel } from "./gate-level.ts";
+import { registerWorkerLimit } from "./worker-limit.ts";
 import { reviewerPrompt, reviewTarget, servedOnRung, type ReviewTarget } from "./review.ts";
 import { retrySetup, startRetry, type RetrySetup, type StartedRetry } from "./retry.ts";
 import { delegationRouting, gateAction, hasQualityGate, recordGateRequirement, type GateLevel } from "./quality-gate.ts";
@@ -282,6 +283,8 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
     };
     // The gate level in force, and `/pi-orchestrator gate` to set it for the session (gate-level.ts).
     const gateLevels = registerGateLevel(pi, logOnce);
+    // The worker limit in force, and `/pi-orchestrator workers` to set it for the session (worker-limit.ts).
+    const workerLimits = registerWorkerLimit(pi, logOnce);
     const sendNotice = ({ text, details }: CompletionNotice, startTurn: boolean) => pi.sendMessage(
       { customType: COMPLETION_NOTICE, content: text, display: true, details },
       startTurn ? { triggerTurn: true, deliverAs: "followUp" } : { triggerTurn: false },
@@ -321,7 +324,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
     pi.on("agent_settled", () => sendHeld(true));
     // The worker limit's slots for the orchestrator's calls, foreground and background (worker-slots.ts).
     const sessionSlots = new WorkerSlots(DEFAULT_WORKER_LIMIT);
-    // The schema's maxItems is the worker limit read at session start; before one starts, the ceiling.
+    // The schema's maxItems is the worker limit read at session start, or set for the session since; before one starts, the ceiling.
     const registerSubagentsTool = (toolDescription: string, maxItems: number) => pi.registerTool({
       name: SUBAGENTS_TOOL,
       label: "Subagents",
@@ -344,8 +347,10 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
         for (const warning of warnings) logOnce(warning);
         // The orchestrator's calls share the session's slots, at the limit read for this call. A worker's call has its own:
         // its workers never wait on slots held by the orchestrator's workers, among them the worker making the call.
-        const slots = parentDelegationId === undefined ? sessionSlots : new WorkerSlots(settings.workerLimit);
-        slots.setLimit(settings.workerLimit);
+        // The orchestrator's limit is the one `/pi-orchestrator workers` set for its session, if any.
+        const workerLimit = parentDelegationId === undefined ? workerLimits.session(ctx) ?? settings.workerLimit : settings.workerLimit;
+        const slots = parentDelegationId === undefined ? sessionSlots : new WorkerSlots(workerLimit);
+        slots.setLimit(workerLimit);
         const modelSettings = { ...settings.agentDefinitionModel, banned: personalSubagentBanList(agentDir) };
         if (modelSettings.use === "route" && modelSettings.allowBanned) {
           warnOnce(ctx, "pi-orchestrator subagents: agentDefinitionModel.allowBanned has no effect under route mode");
@@ -749,6 +754,11 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
       // Ctrl+C leaves background workers running; the session's end stops them, and pi waits for that.
       return backgroundCalls.shutdown();
     });
+    /** Registers the tool with the session's worker limit and the agent definitions in `cwd`. */
+    const registerForSession = (cwd: string, limit: number) => {
+      const definitions = loadAgentDefinitions(agentDefinitionDirs(personalAgentDir(), cwd));
+      registerSubagentsTool(`${description(limit)}\n\n${agentDefinitionListing(definitions)}`, limit);
+    };
     pi.on("session_start", (_event, ctx) => {
       // A worker's own copy of this extension shares the orchestrator's board, and shows no widget.
       if (!isWorkerSession(ctx)) {
@@ -764,10 +774,10 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
           return { consume: true };
         });
       }
-      const definitions = loadAgentDefinitions(agentDefinitionDirs(personalAgentDir(), ctx.cwd));
-      const limit = sessionWorkerLimit(ctx.cwd);
-      registerSubagentsTool(`${description(limit)}\n\n${agentDefinitionListing(definitions)}`, limit);
+      registerForSession(ctx.cwd, sessionWorkerLimit(ctx.cwd));
     });
+    // A limit set for the session holds for its schema and description too: pi checks a call against the schema's maxItems.
+    workerLimits.onSet((ctx, limit) => registerForSession(ctx.cwd, limit));
     // The transcript view's bar shows whether the orchestrator is running. A
     // worker's own copy of this extension hears its worker's runs, which are
     // not the orchestrator's. agent_settled, not agent_end: a retry, a

@@ -824,6 +824,50 @@ test("the worker limit counts a foreground and a background call's workers toget
   }
 });
 
+test("/pi-orchestrator workers sets the session's worker limit for the next call, over the settings, until the next session start", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { workerLimit: 1 } } });
+  const pending: (() => void)[] = [];
+  try {
+    const provider = fakeAnthropic("done", (finish) => { pending.push(finish); });
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h).ctx;
+    await subagents.startSession(ctx);
+    const usage = "usage: /pi-orchestrator workers [1-32]";
+    const listing = await subagents.runCommand("pi-orchestrator", "", ctx);
+    assert.ok(listing.some((line) => line.includes("  workers: ")), listing.join("\n"));
+    assert.deepEqual(await subagents.runCommand("pi-orchestrator", "workers", ctx), [`pi-orchestrator: worker limit 1, from personal settings.\n${usage}`]);
+    assert.deepEqual(await subagents.runCommand("pi-orchestrator", "workers many", ctx), [usage]);
+    const maxItems = () => (subagents.tool().parameters as { properties: { items: { maxItems: number } } }).properties.items.maxItems;
+    assert.equal(maxItems(), 1);
+    assert.deepEqual(await subagents.runCommand("pi-orchestrator", "workers 3", ctx), ["pi-orchestrator: worker limit 3 for this session (personal settings 1)."]);
+    assert.equal(maxItems(), 3, "pi validates a call against the schema, so the tool is registered again with the session's limit");
+    assert.match(subagents.tool().description, /^Hand 1 to 3 tasks to workers\. At most 3 workers run at once/);
+    /** Runs a foreground call of four items, and returns how many ran at once before the first ended. */
+    const run = async (callId: string, limit: number) => {
+      const call = subagents.tool().execute(callId, { items: [1, 2, 3, 4].map((n) => ({ task: `${callId} item ${n}` })), background: false } as never,
+        undefined, undefined, ctx);
+      await waitFor(() => pending.length === limit, `${limit} workers run`);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const atOnce = pending.length;
+      while (provider.requests.filter((request) => request.messages.some((message) => message.includes(`${callId} item`))).length < 4 || pending.length > 0) {
+        await waitFor(() => pending.length > 0, "a worker is waiting");
+        pending.shift()!();
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      await call;
+      return atOnce;
+    };
+    assert.equal(await run("call-1", 3), 3, "the next call's four workers run three at once");
+    await subagents.startSession(ctx);
+    assert.equal(maxItems(), 1, "a session start registers the tool with the settings' limit again");
+    assert.deepEqual(await subagents.runCommand("pi-orchestrator", "workers", ctx), [`pi-orchestrator: worker limit 1, from personal settings.\n${usage}`]);
+    assert.equal(await run("call-2", 1), 1, "a session start returns to the settings' limit");
+  } finally {
+    for (const finish of pending) finish();
+    h.cleanup();
+  }
+});
+
 test("abort stops running workers and marks queued items not started", async () => {
   const h = harness({ orchestrator: { routing: ROUTING, subagents: { maxParallel: 2 } } });
   const pending: (() => void)[] = [];

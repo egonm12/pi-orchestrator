@@ -38,11 +38,11 @@ Run `/pi-orchestrator init` in an interactive session. It:
 
 Review the written map in `~/.pi/agent/settings.json`, then start a new session. Workers started through the built-in `subagents` tool always run on `orchestrator/auto` already; nothing else needs setting up for them.
 
-`/pi-orchestrator` takes a subcommand as its first word: `init` comes with the router extension, `gate` with the subagents extension (see Gate level below). With one of them switched off, its subcommands are gone and the other's stay. Without a subcommand, or with one it does not know, it prints the usage with every subcommand.
+`/pi-orchestrator` takes a subcommand as its first word: `init` comes with the router extension, `gate` and `workers` with the subagents extension (see Gate level and Worker limit below). With one of them switched off, its subcommands are gone and the other's stay. Without a subcommand, or with one it does not know, it prints the usage with every subcommand.
 
 ## Subagents tool
 
-The `subagents` tool starts workers in the orchestrator's own process, by default on the auto model `orchestrator/auto`. The tool's schema lets a call hold at least one item and at most the worker limit read at session start (see Worker limit below). The call itself accepts up to 32 items:
+The `subagents` tool starts workers in the orchestrator's own process, by default on the auto model `orchestrator/auto`. The tool's schema lets a call hold at least one item and at most the worker limit read at session start, or set for the session with `/pi-orchestrator workers` (see Worker limit below). The call itself accepts up to 32 items:
 
 ```json
 { "items": [
@@ -74,6 +74,8 @@ A background call is never refused for its number of workers: those past the wor
 ### Worker limit
 
 `orchestrator.subagents.workerLimit` (default 4, at most 32) is how many workers run at the same time across the orchestrator's session, foreground and background calls together. Every worker takes a slot as it starts and gives it back when it ends. A worker without a free slot is queued, its worker state `queued` in `subagents_status`, the worker widget and the call's progress, until one frees: slots go first come first served, in item order within a call. No call is refused for its number of workers. A foreground call whose items wait behind background workers goes on as those finish; Ctrl+C drops its queued items. The limit is read on every call, so a changed setting holds from the next call: a higher one starts queued workers, a lower one lets running workers finish. A worker's own calls have slots of their own (see Nested delegation below).
+
+`/pi-orchestrator workers <n>` sets the worker limit for the current session, over the settings, until the next session start: a new session, a resumed one or a reload starts from the settings again. `n` is a whole number from 1 to 32; a higher one is cut to 32 with a notice, as in settings. Anything else prints `usage: /pi-orchestrator workers [1-32]` and changes nothing. The limit holds from the next `subagents` call, and the tool is registered again with it, so its `maxItems` and description follow it. A worker's own calls keep the limit from settings. `/pi-orchestrator workers` without a number shows the limit in force and where it comes from: set for this session, project settings, personal settings or the default.
 
 A background worker that asks a `report` question gives up its slot while it waits for the answer, since the answer only comes after the orchestrator's turn, which a foreground call waiting for a slot holds. A queued worker can take the freed slot. Once answered, the worker queues for a slot again and goes on when it gets one; its worker state stays `running` meanwhile, its `report` call still open. A worker stopped while it queues again, by `/subagents stop`, stopping its call or ending the session, ends without a slot. So the limit counts the workers actually running, and a foreground call never waits on a worker that waits for the orchestrator.
 
@@ -424,7 +426,7 @@ A worker may start workers of its own only when its agent definition lists `suba
 
 | Key | Meaning |
 |-----|---------|
-| `subagents.workerLimit` | The worker limit: at most this many workers run at once across the orchestrator's session, foreground and background calls together (see Worker limit above). A positive integer, default 4, at most 32: a higher value is cut to 32, and a warning is logged once to stderr. A project's value, under `allowProjectOverrides`, may be higher or lower than the personal one. Read on every call; the tool's `maxItems` and description take the value at session start |
+| `subagents.workerLimit` | The worker limit: at most this many workers run at once across the orchestrator's session, foreground and background calls together (see Worker limit above). A positive integer, default 4, at most 32: a higher value is cut to 32, and a warning is logged once to stderr. A project's value, under `allowProjectOverrides`, may be higher or lower than the personal one. Read on every call; the tool's `maxItems` and description take the value at session start. `/pi-orchestrator workers <n>` overrides it for the session |
 | `subagents.maxParallel`, `subagents.maxBackgroundWorkers` | Deprecated aliases of `workerLimit`, still accepted without a warning. Without `workerLimit`, `maxParallel` is read, then `maxBackgroundWorkers`. Under `allowProjectOverrides`, a project that sets any of the three keys sets the limit by the same order, over every personal one. Each is checked under its own name: a value that is not a positive integer fails the call, as one of `workerLimit` does |
 | `subagents.agentDefinitionModel.use` | `"route"` (the default) ignores an agent definition's `model` and `thinking`, with one warning, and routes the worker as usual. `"preserve"` runs a worker whose definition names a model on that model and thinking, unrouted, and writes an agent-model record (delegation id, agent name, definition file, model, effort). A definition without a model is routed either way |
 | `subagents.agentDefinitionModel.allowBanned` | Default `false`. With `"preserve"`, a worker whose agent definition names a model on the subagent ban list runs on it; with `false`, that item fails before a worker starts. For a definition from the project's `.pi/agents/` this also needs `allowProjectOverrides` in personal settings. With that flag on, a project's `agentDefinitionModel` replaces the personal one, `allowBanned` included. When the exception lets a worker run, its agent-model record gets `banListException: true`, its item result gets `banListException: true`, and its line is marked `(ban-list exception)`. The guard and the router extension do not stop such a worker. Under `"route"`, a `true` value has no effect and warns once per session. Every other path still refuses a banned model: the tier map drops its rungs, and the guard refuses a tool call that names it |
@@ -524,7 +526,7 @@ Decision records keep the first 200 characters of the task text, with credential
   { "packages": [{ "source": "git:github.com/egonm12/pi-orchestrator", "extensions": ["!src/router/extension.ts"] }] }
   ```
 
-  Use `!src/guard/extension.ts` to keep the router and drop the guard, or `!src/subagents/extension.ts` to drop only the built-in `subagents` tool, and with it the orchestrator protocol, the exploration nudge, the gate level and `/pi-orchestrator gate`, `subagents_verdict` and the commit reminder on unjudged edits, and keep routing for other subagent extensions.
+  Use `!src/guard/extension.ts` to keep the router and drop the guard, or `!src/subagents/extension.ts` to drop only the built-in `subagents` tool, and with it the orchestrator protocol, the exploration nudge, the gate level and `/pi-orchestrator gate`, the worker limit and `/pi-orchestrator workers`, `subagents_verdict` and the commit reminder on unjudged edits, and keep routing for other subagent extensions.
 - **Everything, for one run**: `pi --no-extensions`.
 - **Uninstall**: `pi remove git:github.com/egonm12/pi-orchestrator`.
 
