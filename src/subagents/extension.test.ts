@@ -4720,7 +4720,7 @@ test("/pi-orchestrator gate sets the session's gate level: an ungated delegation
     const subagents = loadSubagents([routerExtension(), provider.extension]);
     const main = orchestrator(h);
     await subagents.startSession(main.ctx);
-    const usage = "usage: /pi-orchestrator gate [low|medium|high|max]";
+    const usage = "usage: /pi-orchestrator gate [off|low|medium|high|max]";
     assert.deepEqual(await subagents.runCommand("pi-orchestrator", "gate", main.ctx), [`pi-orchestrator: gate level medium, from settings.\n${usage}`]);
     for (const args of ["gate none", "gate high please"]) assert.deepEqual(await subagents.runCommand("pi-orchestrator", args, main.ctx), [usage], args);
     assert.deepEqual(await subagents.runCommand("pi-orchestrator", "gate low", main.ctx), ["pi-orchestrator: gate level low for this session (settings say medium)."]);
@@ -4749,6 +4749,72 @@ test("/pi-orchestrator gate sets the session's gate level: an ungated delegation
     // Another session starts from the settings' level.
     const other = orchestrator(h);
     assert.deepEqual(await subagents.runCommand("pi-orchestrator", "gate", other.ctx), [`pi-orchestrator: gate level medium, from settings.\n${usage}`]);
+  } finally { h.cleanup(); }
+});
+
+test("at gate level off the quality gate is gone: no subagents_verdict tool, no gate text in the protocol or the Result, no commit reminder or turn-end notice", async () => {
+  const h = routedHarness({ orchestrator: { routing: ROUTING, subagents: { gateLevel: "off" } } });
+  try {
+    execFileSync("git", ["init", "-q"], { cwd: h.projectDir });
+    const provider = plannedAnthropic(runningScript);
+    const session = await orchestratorSession(h, provider.extension, installedWithSubagents(provider.extension, 1), [routerExtension()]);
+    const mainRequests = () => provider.requests.filter((request) => request.sessionId === session.sessionId);
+    try {
+      provider.setOrchestrator(session.sessionId);
+      provider.plan.push(
+        { toolCall: { name: "subagents", arguments: { items: [{ task: runTask("write", { path: "notes.md", content: "x\n" }) }], background: false } } },
+        { toolCall: { name: "bash", arguments: { command: commit("at-off") } } },
+      );
+      await session.prompt("Write the notes and commit them");
+      const subagentsResult = (session.messages as { role: string; toolName?: string; details?: SubagentsDetails; content?: { text?: string }[] }[])
+        .find((message) => message.role === "toolResult" && message.toolName === "subagents")!;
+      const worker = subagentsResult.details!.results[0]!;
+      assert.equal(worker.edited, true, JSON.stringify(worker));
+      const resultText = subagentsResult.content!.map((part) => part.text ?? "").join("");
+      assert.doesNotMatch(resultText, /verdict|gate level|reviewer|ungated/, "the Result carries no gate line");
+      assert.deepEqual(bashResults(session), [{ ok: true }], "the commit's result carries no reminder");
+      assert.deepEqual(customTexts(session, "subagents-unjudged"), [], "nor does a turn end");
+      assert.deepEqual(gateRequirements(h), [[worker.sessionId, "off", "none"]], "the delegation is recorded as ungated");
+      assert.ok(mainRequests().length > 0);
+      for (const request of mainRequests()) {
+        assert.equal(request.tools.includes("subagents_verdict"), false, JSON.stringify(request.tools));
+        assert.ok(request.systemPrompt.includes(orchestratorProtocol(3, "off")), request.systemPrompt);
+        assert.doesNotMatch(request.systemPrompt, /Your gate level is/);
+      }
+
+      // The owner turns the gate back on for this session: the tool and the gate's protocol text return, and go again at off.
+      await session.prompt("/pi-orchestrator gate medium");
+      let from = mainRequests().length;
+      await session.prompt("Anything else?");
+      for (const request of mainRequests().slice(from)) {
+        assert.equal(request.tools.includes("subagents_verdict"), true, JSON.stringify(request.tools));
+        assert.match(request.systemPrompt, /Your gate level is medium\./);
+      }
+      await session.prompt("/pi-orchestrator gate off");
+      from = mainRequests().length;
+      await session.prompt("And now?");
+      assert.ok(mainRequests().length > from);
+      for (const request of mainRequests().slice(from)) {
+        assert.equal(request.tools.includes("subagents_verdict"), false, JSON.stringify(request.tools));
+        assert.doesNotMatch(request.systemPrompt, /Your gate level is/);
+      }
+    } finally { session.dispose(); }
+  } finally { h.cleanup(); }
+});
+
+test("at gate level off a commit's result says nothing of verdicts, even when the record folder cannot be read", async () => {
+  const h = routedHarness({ orchestrator: { routing: ROUTING, subagents: { gateLevel: "off" } } });
+  try {
+    mkdirSync(join(h.stateDir, "routing"));
+    writeFileSync(join(h.stateDir, "routing", "2026-09-28.jsonl"), "not json\n");
+    const subagents = loadSubagents([routerExtension()]);
+    const main = orchestrator(h);
+    await subagents.startSession(main.ctx);
+    assert.deepEqual(await subagents.toolResult("bash", { command: "git commit -m x" }, main.ctx), [{ type: "text", text: "(no output)" }]);
+    await subagents.agentEvent("turn_end", main.ctx);
+    assert.deepEqual(subagents.messages.filter(({ message }) => message.customType === "subagents-unjudged"), []);
+    assert.deepEqual(await subagents.runCommand("pi-orchestrator", "gate", main.ctx),
+      ["pi-orchestrator: gate level off, from settings.\nusage: /pi-orchestrator gate [off|low|medium|high|max]"]);
   } finally { h.cleanup(); }
 });
 

@@ -5,7 +5,7 @@ import { stateDir } from "../router/extension.ts";
 import { unjudgedDelegations, type UnjudgedDelegation } from "./editing.ts";
 import type { GateLevels } from "./gate-level.ts";
 import { isOrchestratorSession } from "./orchestrator-session.ts";
-import { delegationRouting, gateAction, type GateLevel } from "./quality-gate.ts";
+import { delegationRouting, gateAction, hasQualityGate, type GateLevel } from "./quality-gate.ts";
 import { gitSubcommands } from "./tool-call-kind.ts";
 import { hasEnded, workerBoard } from "./worker-board.ts";
 import { isRunningWorkerSession } from "./worker-sessions.ts";
@@ -33,6 +33,10 @@ import { isRunningWorkerSession } from "./worker-sessions.ts";
 // notice is sent only when the waiting delegations differ from the last one's,
 // and once more at the first turn end after each user prompt, so a notice
 // earlier in the context does not repeat on every turn.
+//
+// At gate level off there is no quality gate, so nothing waits: neither a
+// commit's result nor a turn end says anything of verdicts, even when the
+// record folder cannot be read.
 //
 // Like the exploration nudge, the gate binds only the orchestrator's own
 // session: a worker, a forked worker or a pi-subagents child loads this
@@ -128,7 +132,7 @@ function reminderFor(input: Record<string, unknown>, ctx: Pick<ExtensionContext,
   if (!isOrchestratorSession(ctx)) return undefined;
   const command = input.command;
   const action = typeof command === "string" ? gatedGitAction(command) : undefined;
-  if (action === undefined) return undefined;
+  if (action === undefined || !hasQualityGate(gateLevels.inForce(ctx).level)) return undefined;
   let unjudged: UnjudgedDelegation[];
   try {
     unjudged = waiting(ctx, gateLevels);
@@ -153,7 +157,7 @@ export function registerCommitGate(pi: ExtensionAPI, logOnce: (line: string) => 
     return text === undefined ? undefined : { content: [...event.content, { type: "text", text }] };
   });
   pi.on("turn_end", (_event, ctx) => {
-    if (!isOrchestratorSession(ctx)) return;
+    if (!isOrchestratorSession(ctx) || !hasQualityGate(gateLevels.inForce(ctx).level)) return;
     try {
       const unjudged = waiting(ctx, gateLevels);
       const notice = notices.atTurnEnd(unjudged, delegationLabel);

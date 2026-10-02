@@ -1,12 +1,12 @@
 import { join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { readRoutingRecordsJudging, UnreadableDelegationRecordError, VERDICTS, type SkippedRoutingRecordLine, type Verdict } from "../routing/decision-record.ts";
 import type { GateLevelRaise } from "../routing/decision-record.ts";
 import { attachVerdict } from "../routing/verdicts.ts";
 import { stateDir } from "../router/extension.ts";
 import type { GateLevels } from "./gate-level.ts";
 import { isOrchestratorSession } from "./orchestrator-session.ts";
-import { delegationRouting, editingDelegationProblem, gateAction, GATE_LEVELS, isGateLevel, isHigherGateLevel, type EditingDelegationProblem,
+import { delegationRouting, editingDelegationProblem, gateAction, hasQualityGate, isHigherGateLevel, RAISE_GATE_LEVELS, type EditingDelegationProblem,
   type GateLevel } from "./quality-gate.ts";
 import { isSameRungReview, reviewerProblem } from "./review.ts";
 import { planRetry, planText, retrySetup } from "./retry.ts";
@@ -32,6 +32,11 @@ import { planRetry, planText, retrySetup } from "./retry.ts";
 // verdict; a line of the judged delegation or its reviewer that it cannot
 // validate refuses the verdict, which cannot be judged without it
 // (pi-orchestrator-zb6t).
+//
+// At gate level off there is no quality gate, so the tool leaves the
+// orchestrator's active tools while that level is in force, and refuses a call
+// that reaches it anyway. The level is read as each prompt starts its run and
+// whenever `/pi-orchestrator gate` sets it (./gate-level.ts).
 
 export const SUBAGENTS_VERDICT_TOOL = "subagents_verdict";
 
@@ -55,15 +60,15 @@ function verdictInput(params: unknown): VerdictInput {
   if (reviewer !== undefined && (typeof reviewer !== "string" || reviewer.trim() === "")) {
     throw new Error(`${SUBAGENTS_VERDICT_TOOL}: a reviewer, when given, is the review delegation's id`);
   }
-  if (gateLevel !== undefined && !isGateLevel(gateLevel)) {
-    throw new Error(`${SUBAGENTS_VERDICT_TOOL}: a gateLevel, when given, is one of ${GATE_LEVELS.join(", ")}`);
+  if (gateLevel !== undefined && !RAISE_GATE_LEVELS.includes(gateLevel as GateLevel)) {
+    throw new Error(`${SUBAGENTS_VERDICT_TOOL}: a gateLevel, when given, is one of ${RAISE_GATE_LEVELS.join(", ")}`);
   }
   if ((gateLevel === undefined) !== (gateLevelReason === undefined) || (gateLevelReason !== undefined && (typeof gateLevelReason !== "string" || gateLevelReason.trim() === ""))) {
     throw new Error(`${SUBAGENTS_VERDICT_TOOL}: a raised gateLevel needs a gateLevelReason saying why, and a gateLevelReason needs a gateLevel`);
   }
   return { delegationId: delegationId.trim(), verdict: verdict as Verdict, reason: reason.trim(),
     ...(reviewer === undefined ? {} : { reviewer: reviewer.trim() }),
-    ...(gateLevel === undefined ? {} : { raise: { level: gateLevel, reason: (gateLevelReason as string).trim() } }) };
+    ...(gateLevel === undefined ? {} : { raise: { level: gateLevel as GateLevel, reason: (gateLevelReason as string).trim() } }) };
 }
 
 /** Why `id` takes no verdict. */
@@ -80,7 +85,7 @@ function problemText(id: string, problem: EditingDelegationProblem): string {
 /** Why the gate level `level` does not raise the level in force, `from`, or `undefined` when it does. */
 function raiseProblem(from: GateLevel, level: GateLevel): string | undefined {
   if (isHigherGateLevel(level, from)) return undefined;
-  const higher = GATE_LEVELS.filter((candidate) => isHigherGateLevel(candidate, from));
+  const higher = RAISE_GATE_LEVELS.filter((candidate) => isHigherGateLevel(candidate, from));
   return `the gate level is ${from}, and a verdict may only raise it for its delegation, never lower it` +
     (higher.length === 0 ? `: ${from} is the highest` : `: name ${higher.join(" or ")}, or leave gateLevel out`);
 }
@@ -111,8 +116,35 @@ function skippedNote(skipped: readonly SkippedRoutingRecordLine[]): string {
     `(${shown}${more}); /reload may be needed.`;
 }
 
-/** Registers `subagents_verdict` for the orchestrator's session. */
+/** Takes `subagents_verdict` out of `pi`'s active tools at gate level off and
+ *  puts it back at any other level, in the orchestrator's session only. It is
+ *  put back only when this switch took it out, so a loadout that never had it
+ *  stays as it is. */
+export class VerdictToolSwitch {
+  #removed = false;
+
+  sync(pi: Pick<ExtensionAPI, "getActiveTools" | "setActiveTools">, level: GateLevel): void {
+    const active = pi.getActiveTools();
+    const isActive = active.includes(SUBAGENTS_VERDICT_TOOL);
+    if (!hasQualityGate(level)) {
+      if (!isActive) return;
+      pi.setActiveTools(active.filter((name) => name !== SUBAGENTS_VERDICT_TOOL));
+      this.#removed = true;
+    } else if (this.#removed) {
+      this.#removed = false;
+      if (!isActive) pi.setActiveTools([...active, SUBAGENTS_VERDICT_TOOL]);
+    }
+  }
+}
+
+/** Registers `subagents_verdict` for the orchestrator's session, active only
+ *  while the gate level in force is not off. */
 export function registerSubagentsVerdictTool(pi: ExtensionAPI, gateLevels: GateLevels): void {
+  const toolSwitch = new VerdictToolSwitch();
+  const sync = (ctx: ExtensionContext) => { if (isOrchestratorSession(ctx)) toolSwitch.sync(pi, gateLevels.inForce(ctx).level); };
+  pi.on("session_start", (_event, ctx) => { sync(ctx); });
+  pi.on("before_agent_start", (_event, ctx) => { sync(ctx); });
+  gateLevels.onSet(sync);
   pi.registerTool({
     name: SUBAGENTS_VERDICT_TOOL,
     label: "Subagents verdict",
@@ -129,7 +161,7 @@ export function registerSubagentsVerdictTool(pi: ExtensionAPI, gateLevels: GateL
         verdict: { type: "string", enum: [...VERDICTS], description: "accept, or request_changes when the work falls short." },
         reason: { type: "string", description: "What you checked and what you found." },
         reviewer: { type: "string", description: "Optional: the delegation id of the completed review (a subagents item with review) this verdict rests on." },
-        gateLevel: { type: "string", enum: [...GATE_LEVELS], description: "Optional: a gate level above the one in force, for this delegation only." },
+        gateLevel: { type: "string", enum: [...RAISE_GATE_LEVELS], description: "Optional: a gate level above the one in force, for this delegation only." },
         gateLevelReason: { type: "string", description: "Why you raise the gate level; required with gateLevel." },
       },
       required: ["delegationId", "verdict", "reason"],
@@ -151,6 +183,7 @@ export function registerSubagentsVerdictTool(pi: ExtensionAPI, gateLevels: GateL
       if (checked.problem !== undefined) throw refusal(problemText(id, checked.problem));
       const { edits } = checked;
       const inForce = gateLevels.inForce(ctx).level;
+      if (!hasQualityGate(inForce)) throw refusal("the gate level is off, so there is no quality gate and no verdict to record");
       if (raise !== undefined) {
         const why = raiseProblem(inForce, raise.level);
         if (why !== undefined) throw refusal(why);

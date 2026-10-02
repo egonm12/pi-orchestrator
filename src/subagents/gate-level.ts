@@ -17,7 +17,9 @@ import { DEFAULT_GATE_LEVEL, loadSubagentsSettings } from "./settings.ts";
 //
 // Everything that asks which gate action a delegation has (./quality-gate.ts)
 // asks here for the level: the commit gate, subagents_verdict, an editing
-// delegation's Result, a reviewer's rules and the orchestrator protocol.
+// delegation's Result, a reviewer's rules and the orchestrator protocol. At
+// off there is no quality gate: subagents_verdict leaves the active tools
+// (it hears each level set here), and the others say nothing of verdicts.
 
 /** A gate level and where it comes from. */
 export interface GateLevelInForce {
@@ -34,9 +36,15 @@ export class GateLevels {
   readonly #fromSettings: (cwd: string) => GateLevel;
   /** The level the owner set, and the session it holds for. */
   #session: { readonly sessionId: string; readonly level: GateLevel } | undefined;
+  readonly #onSet: ((ctx: ExtensionContext) => void)[] = [];
 
   constructor(fromSettings: (cwd: string) => GateLevel) {
     this.#fromSettings = fromSettings;
+  }
+
+  /** Calls `listener` with the session's context each time `/pi-orchestrator gate <level>` sets a level. */
+  onSet(listener: (ctx: ExtensionContext) => void): void {
+    this.#onSet.push(listener);
   }
 
   /** A session starts: the settings' level is in force again. */
@@ -63,6 +71,14 @@ export class GateLevels {
     this.#session = { sessionId: ctx.sessionManager.getSessionId(), level: rest };
     return { line: `pi-orchestrator: gate level ${rest} for this session (settings say ${this.#fromSettings(ctx.cwd)}).`, type: "info" };
   }
+
+  /** `/pi-orchestrator gate [level]` as the owner runs it: `command`, then each
+   *  `onSet` listener hears a level it set. */
+  run(rest: string, ctx: ExtensionContext): { readonly line: string; readonly type: "info" | "warning" } {
+    const shown = this.command(rest, ctx);
+    if (rest !== "" && shown.type === "info") for (const listener of this.#onSet) listener(ctx);
+    return shown;
+  }
 }
 
 /** Adds `/pi-orchestrator gate` and returns the gate levels it sets. A
@@ -81,9 +97,9 @@ export function registerGateLevel(pi: ExtensionAPI, logOnce: (line: string) => v
   pi.on("session_start", () => { levels.reset(); });
   registerSubcommands(pi, [{
     name: "gate",
-    summary: "`gate <level>` sets the gate level (low, medium, high or max) for this session; `gate` shows it",
+    summary: "`gate <level>` sets the gate level (off, low, medium, high or max) for this session; `gate` shows it",
     run: (rest, ctx) => {
-      const { line, type } = levels.command(rest, ctx);
+      const { line, type } = levels.run(rest, ctx);
       showOwner(ctx, line, type);
     },
   }]);

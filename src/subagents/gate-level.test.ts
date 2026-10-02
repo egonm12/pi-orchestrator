@@ -44,6 +44,14 @@ test("an invalid level is refused with the usage and changes nothing", () => {
   for (const rest of ["strict", "High", "high now", "none"]) {
     assert.deepEqual(gate.command(rest, session("a")), { line: GATE_USAGE, type: "warning" }, rest);
   }
-  assert.equal(GATE_USAGE, "usage: /pi-orchestrator gate [low|medium|high|max]");
+  assert.equal(GATE_USAGE, "usage: /pi-orchestrator gate [off|low|medium|high|max]");
   assert.deepEqual(gate.inForce(session("a")), { level: "medium", source: "settings" });
+});
+
+test("gate off turns the quality gate off for this session, and the settings may say off too", () => {
+  const { gate, setSettings } = levels("medium");
+  assert.deepEqual(gate.command("off", session("a")), { line: "pi-orchestrator: gate level off for this session (settings say medium).", type: "info" });
+  assert.deepEqual(gate.inForce(session("a")), { level: "off", source: "session" });
+  setSettings("off");
+  assert.deepEqual(gate.inForce(session("b")), { level: "off", source: "settings" });
 });

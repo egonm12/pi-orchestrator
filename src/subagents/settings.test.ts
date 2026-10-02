@@ -82,6 +82,17 @@ test("gateLevel defaults to medium, takes low, medium, high or max, and a projec
   assert.deepEqual(subagentsSettingsFromSettings({}, project).ignoredProjectKeys, ["orchestrator.subagents.gateLevel"]);
   assert.equal(subagentsSettingsFromSettings({ orchestrator: { subagents: { allowProjectOverrides: true, gateLevel: "max" } } }, project).settings.gateLevel, "low");
   for (const value of ["strict", "Medium", 2]) {
-    assert.throws(() => subagentsSettingsFromSettings({ orchestrator: { subagents: { gateLevel: value } } }), /gateLevel must be low, medium, high or max/);
+    assert.throws(() => subagentsSettingsFromSettings({ orchestrator: { subagents: { gateLevel: value } } }), /gateLevel must be off, low, medium, high or max/);
   }
+});
+
+test("gateLevel takes off, and a project's level may be lower or higher than the personal one", () => {
+  assert.equal(subagentsSettingsFromSettings({ orchestrator: { subagents: { gateLevel: "off" } } }).settings.gateLevel, "off");
+  const personal = (gateLevel: string) => ({ orchestrator: { subagents: { allowProjectOverrides: true, gateLevel } } });
+  const project = (gateLevel: string) => ({ orchestrator: { subagents: { gateLevel } } });
+  assert.equal(subagentsSettingsFromSettings(personal("high"), project("off")).settings.gateLevel, "off", "lower, down to off");
+  assert.equal(subagentsSettingsFromSettings(personal("medium"), project("low")).settings.gateLevel, "low", "lower");
+  assert.equal(subagentsSettingsFromSettings(personal("off"), project("max")).settings.gateLevel, "max", "higher");
+  assert.equal(subagentsSettingsFromSettings({ orchestrator: { subagents: { gateLevel: "high" } } }, project("off")).settings.gateLevel, "high",
+    "without allowProjectOverrides the personal level stays");
 });

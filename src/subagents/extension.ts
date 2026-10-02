@@ -29,7 +29,7 @@ import { registerSubagentsVerdictTool } from "./verdict.ts";
 import { registerGateLevel } from "./gate-level.ts";
 import { reviewerPrompt, reviewTarget, servedOnRung, type ReviewTarget } from "./review.ts";
 import { retrySetup, startRetry, type RetrySetup, type StartedRetry } from "./retry.ts";
-import { delegationRouting, gateAction, recordGateRequirement, type GateLevel } from "./quality-gate.ts";
+import { delegationRouting, gateAction, hasQualityGate, recordGateRequirement, type GateLevel } from "./quality-gate.ts";
 import { readRoutingRecords, type RoutingRecord } from "../routing/decision-record.ts";
 import { stateDir } from "../router/extension.ts";
 import { readUsageObservations, usageObservationsPath } from "../router/usage-observations.ts";
@@ -188,7 +188,8 @@ function editedNote(id: string, level: GateLevel): string {
 }
 
 /** One item's text in the tool result, at the gate level `level`. `forOrchestrator` is false in a
- *  worker's own call, whose workers' edits count for the worker's delegation. */
+ *  worker's own call, whose workers' edits count for the worker's delegation. At off there is no
+ *  quality gate, so an editing delegation's Result gets no gate line. */
 function resultText(result: SubagentResult, forOrchestrator: boolean, level: GateLevel): string {
   if (result.status === "not-started") return `Worker not started: ${result.task}`;
   if (result.sessionId === undefined) return `No worker started: ${result.error}`;
@@ -197,7 +198,7 @@ function resultText(result: SubagentResult, forOrchestrator: boolean, level: Gat
     `Worker ${result.sessionId} ${outcome}`,
     `Session file: ${result.sessionFile ?? "none, the session was not saved"}`,
     ...(result.climb === undefined ? [] : [result.climb]),
-    ...(result.edited && forOrchestrator ? [editedNote(result.sessionId, level)] : []),
+    ...(result.edited && forOrchestrator && hasQualityGate(level) ? [editedNote(result.sessionId, level)] : []),
     "",
     result.finalText,
     // The runtime's Result check (ADR 0010) annotates and never rejects.

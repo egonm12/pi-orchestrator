@@ -464,7 +464,7 @@ test("a gate requirement record names the gate level in force and the gate actio
     ]);
     assert.equal(validateRoutingRecord({ ...ungated, gateAction: "spot-check" }).recordType, "gate-requirement");
     assert.throws(() => validateRoutingRecord({ ...ungated, gateAction: "spot check" }), /field 'gateAction' must be one of none, spot-check, reviewer/);
-    assert.throws(() => validateRoutingRecord({ ...ungated, gateLevel: "strict" }), /field 'gateLevel' must be one of low, medium, high, max/);
+    assert.throws(() => validateRoutingRecord({ ...ungated, gateLevel: "strict" }), /field 'gateLevel' must be one of off, low, medium, high, max/);
     const { gateLevel: _level, ...withoutLevel } = ungated;
     assert.throws(() => validateRoutingRecord(withoutLevel), /field 'gateLevel' is missing/);
     assert.throws(() => validateRoutingRecord({ ...ungated, tier: "standard" }), /field 'tier' is not a known field/);
@@ -585,7 +585,7 @@ test("a verdict record may name a gate level raise for its delegation: from a le
     const raise = (change: Record<string, unknown>) => ({ ...verdict, gateLevelRaise: { ...verdict.gateLevelRaise, ...change } });
     assert.throws(() => validateRoutingRecord(raise({ to: "medium" })), /field 'gateLevelRaise.to' must be a higher gate level than medium/);
     assert.throws(() => validateRoutingRecord(raise({ to: "low" })), /field 'gateLevelRaise.to' must be a higher gate level than medium/);
-    assert.throws(() => validateRoutingRecord(raise({ from: "strict" })), /field 'gateLevelRaise.from' must be one of low, medium, high, max/);
+    assert.throws(() => validateRoutingRecord(raise({ from: "strict" })), /field 'gateLevelRaise.from' must be one of off, low, medium, high, max/);
     assert.throws(() => validateRoutingRecord(raise({ reason: " " })), /field 'gateLevelRaise.reason'/);
     assert.throws(() => validateRoutingRecord(raise({ by: "owner" })), /field 'gateLevelRaise.by' is not a known field/);
   } finally { cleanup(); }

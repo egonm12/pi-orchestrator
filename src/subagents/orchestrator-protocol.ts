@@ -1,6 +1,6 @@
 import type { BeforeAgentStartEvent, BeforeAgentStartEventResult, ContextEventResult, ContextWithSystemEvent, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { isOrchestratorSession } from "./orchestrator-session.ts";
-import { tiersByGateAction, type GateAction, type GateLevel } from "./quality-gate.ts";
+import { hasQualityGate, tiersByGateAction, type GateAction, type GateLevel } from "./quality-gate.ts";
 
 // The orchestrator protocol: how the orchestrator's own session delegates and
 // judges (ADR 0010, ADR 0011, ADR 0013). It must be in the system prompt of
@@ -58,7 +58,9 @@ function gateLevelParagraph(level: GateLevel): string {
 
 // One entry per rule, in the order the orchestrator reads them. The exploration
 // nudge's entry names the owner's threshold (exploration-nudge.ts), and the
-// gate level's entry the level in force (gate-level.ts).
+// gate level's entry the level in force (gate-level.ts). At gate level off
+// there is no quality gate, and the protocol says nothing of verdicts,
+// reviewers or retries (qualityGateParagraphs).
 const paragraphs = (explorationNudge: number, gateLevel: GateLevel): readonly string[] => [
   "You are the orchestrator. You own clarification, task decomposition, delegation, synthesis and acceptance. " +
     "Your context window is the scarce resource: keep conclusions in it, not file dumps.",
@@ -80,9 +82,14 @@ const paragraphs = (explorationNudge: number, gateLevel: GateLevel): readonly st
     "lookups, ctx and MCP calls, and any bash command that is not a build, test run or commit. Checking a worker's Result counts too. " +
     "Edits, builds, test runs, commits and the subagents tools never count. No call is denied: a quick lookup, or a check of what a " +
     "worker changed, is yours to make. When the nudge appears, hand the rest of the research to a worker with `subagents`.",
-  "A worker's Result is evidence, not a verdict. Check it before you act on it: does every claim carry file:line evidence, " +
+  `A worker's Result is evidence, not ${hasQualityGate(gateLevel) ? "a verdict" : "proof"}. Check it before you act on it: does every claim carry file:line evidence, ` +
     "does it say what it could not verify, does anything contradict what you already know? Do not build on a claim without " +
     "evidence: check that claim yourself, or resume the worker with the `subagents` tool and ask for it.",
+  ...(hasQualityGate(gateLevel) ? qualityGateParagraphs(gateLevel) : []),
+];
+
+/** The quality gate's entries at `gateLevel`, which is not off: verdicts, the gate level, reviewers and retries. */
+const qualityGateParagraphs = (gateLevel: GateLevel): readonly string[] => [
   "A delegation that edited needs your verdict unless your gate level leaves it ungated; its Result says which. In a git repository " +
     "it edited when the working tree changed while its worker, or a worker it started, ran, or when one of them ran edit or write; " +
     "a command that changed nothing is research. Without a repository it edited when one of them ran edit, write, ctx_execute or a " +

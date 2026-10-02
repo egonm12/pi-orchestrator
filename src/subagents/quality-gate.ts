@@ -33,13 +33,22 @@ import { workerSessionDir } from "./worker.ts";
 export { GATE_ACTIONS, GATE_LEVELS, type GateAction, type GateLevel } from "../routing/decision-record.ts";
 
 /** ADR 0011's table: the gate action per tier and gate level. Critical needs
- *  a reviewer at every level, so low never means "gate nothing". */
+ *  a reviewer at every level from low up, so low never means "gate nothing";
+ *  off does: it removes the quality gate. */
 const GATE_TABLE: Readonly<Record<RiskTier, Readonly<Record<GateLevel, GateAction>>>> = {
-  mechanical: { low: "none", medium: "spot-check", high: "spot-check", max: "reviewer" },
-  standard: { low: "none", medium: "spot-check", high: "reviewer", max: "reviewer" },
-  elevated: { low: "spot-check", medium: "reviewer", high: "reviewer", max: "reviewer" },
-  critical: { low: "reviewer", medium: "reviewer", high: "reviewer", max: "reviewer" },
+  mechanical: { off: "none", low: "none", medium: "spot-check", high: "spot-check", max: "reviewer" },
+  standard: { off: "none", low: "none", medium: "spot-check", high: "reviewer", max: "reviewer" },
+  elevated: { off: "none", low: "spot-check", medium: "reviewer", high: "reviewer", max: "reviewer" },
+  critical: { off: "none", low: "reviewer", medium: "reviewer", high: "reviewer", max: "reviewer" },
 };
+
+/** The gate levels the orchestrator may raise a delegation to: all but off. */
+export const RAISE_GATE_LEVELS: readonly GateLevel[] = GATE_LEVELS.filter((level) => level !== "off");
+
+/** Whether the quality gate exists at `level`: everything but off. */
+export function hasQualityGate(level: GateLevel): boolean {
+  return level !== "off";
+}
 
 export function isGateLevel(value: unknown): value is GateLevel {
   return GATE_LEVELS.includes(value as GateLevel);

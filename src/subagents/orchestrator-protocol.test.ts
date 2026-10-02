@@ -124,3 +124,12 @@ test("the protocol says what makes a delegation editing: the working tree in a r
     assert.ok(paragraph.includes(phrase), `${phrase}: ${paragraph}`);
   }
 });
+
+test("at gate level off the protocol says nothing of verdicts, the gate or reviewers", () => {
+  const off = orchestratorProtocol(3, "off");
+  assert.ok(off.startsWith("# Orchestrator protocol\n\n"), off);
+  assert.ok(off.includes("After 3 exploratory calls in one user prompt"), off);
+  assert.ok(off.includes("Check it before you act on it"), off);
+  assert.doesNotMatch(off, /verdict|\bgate\b|reviewer|retry|request_changes|effort ladder/i);
+  assert.ok(orchestratorProtocol(3, "low").includes("Your gate level is low."), "every other level keeps the gate's entries");
+});

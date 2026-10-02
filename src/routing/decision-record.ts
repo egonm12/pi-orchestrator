@@ -177,8 +177,9 @@ export const LADDER_STEPS = ["effort", "same-tier", "next-tier"] as const;
 export const VERDICTS = ["accept", "request_changes"] as const;
 export type Verdict = (typeof VERDICTS)[number];
 
-/** How strictly the quality gate treats each tier (ADR 0011), lowest first. */
-export const GATE_LEVELS = ["low", "medium", "high", "max"] as const;
+/** How strictly the quality gate treats each tier (ADR 0011), lowest first.
+ *  At off there is no quality gate: every tier's gate action is none. */
+export const GATE_LEVELS = ["off", "low", "medium", "high", "max"] as const;
 export type GateLevel = (typeof GATE_LEVELS)[number];
 
 /** CONTEXT.md, Gate action: no verdict, the orchestrator's spot check, or an independent reviewer. */

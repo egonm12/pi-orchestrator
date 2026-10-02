@@ -22,11 +22,17 @@ test("every cell of the ADR 0011 table gives its gate action, and a delegation w
   for (const level of ["low", "medium", "high", "max"] as const) assert.equal(gateAction(undefined, level), table.elevated[level], `no tier at ${level}`);
 });
 
-test("gate levels are low, medium, high and max, in that order", () => {
-  assert.deepEqual(["low", "medium", "high", "max", "strict", ""].map(isGateLevel), [true, true, true, true, false, false]);
+test("gate levels are off, low, medium, high and max, in that order", () => {
+  assert.deepEqual(["off", "low", "medium", "high", "max", "strict", ""].map(isGateLevel), [true, true, true, true, true, false, false]);
+  assert.equal(isHigherGateLevel("low", "off"), true);
   assert.equal(isHigherGateLevel("high", "medium"), true);
   assert.equal(isHigherGateLevel("medium", "medium"), false);
   assert.equal(isHigherGateLevel("low", "max"), false);
+});
+
+test("at gate level off every tier's gate action is none, a delegation without a tier included", () => {
+  for (const tier of ["mechanical", "standard", "elevated", "critical", undefined] as const) assert.equal(gateAction(tier, "off"), "none", `${tier}`);
+  assert.deepEqual(tiersByGateAction("off"), { none: ["mechanical", "standard", "elevated", "critical"], "spot-check": [], reviewer: [] });
 });
 
 test("the tiers of each gate action at a level are listed in tier order", () => {
