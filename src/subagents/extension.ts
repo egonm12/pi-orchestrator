@@ -20,7 +20,7 @@ import { runWorker, SUBAGENTS_TOOL, type WorkerResult, type WorkerSetup } from "
 import { workerBoard, type BoardWorker, type WorkerModelSetup } from "./worker-board.ts";
 import { agentLabel, startWorkerWidget, type WorkerWidget } from "./worker-widget.ts";
 import { findWorker, pickWorker, workerListing } from "./worker-picker.ts";
-import { openTranscript } from "./transcript-view.ts";
+import { openTranscript, type TranscriptViewExit } from "./transcript-view.ts";
 import { isWorkerSession } from "./worker-sessions.ts";
 import { isOrchestratorSession } from "./orchestrator-session.ts";
 import { addOrchestratorProtocol, keepOrchestratorProtocol } from "./orchestrator-protocol.ts";
@@ -259,7 +259,7 @@ const description = (limit: number) => `Hand 1 to ${limit} tasks to workers. At 
 /** Opens `workerId`'s transcript with no header or bar options: the
  *  transcript view's own defaults (vo0z's fuller header and orchestrator bar)
  *  apply, so every opener (the picker, a direct jump, alt+a) gets them alike. */
-function openWorker(ctx: Pick<ExtensionContext, "ui">, workerId: string): Promise<void> {
+function openWorker(ctx: Pick<ExtensionContext, "ui">, workerId: string): Promise<TranscriptViewExit> {
   return openTranscript(ctx.ui, workerBoard(), workerId);
 }
 
@@ -692,8 +692,8 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
     let widget: WorkerWidget | undefined;
     /** Stops the Down arrow's way into the widget. */
     let stopDownEntry: (() => void) | undefined;
-    /** Focuses the widget, and after each transcript opened from it comes
-     *  back to the list with that worker selected, until the user leaves the list. */
+    /** Focuses the widget, and after each transcript opened from it returns
+     *  to the list with that worker selected. Selecting main exits to the editor. */
     const browseWidget = async (ctx: Pick<ExtensionContext, "ui">): Promise<void> => {
       // This session's widget only: a new session's widget has its own ctx.
       const browsed = widget;
@@ -701,7 +701,8 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
       while (browsed !== undefined && widget === browsed) {
         const result = await browsed.focus(ctx.ui, { select });
         if (result.workerId === undefined) return;
-        await openWorker(ctx, result.workerId);
+        const exit = await openWorker(ctx, result.workerId);
+        if (exit === "main") return;
         select = result.workerId;
       }
     };

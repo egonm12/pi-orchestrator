@@ -9,6 +9,7 @@ import { initTheme, SessionManager, type AgentSessionEvent, type Theme } from "@
 // matching the real binding ids is what keeps the view from trapping the user.
 import { KeybindingsManager } from "../../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js";
 import { WorkerBoard, type WorkerFeed, type WorkerSession } from "./worker-board.ts";
+import { LINGER_MS } from "./worker-widget.ts";
 import { openTranscript, TRANSCRIPT_OVERLAY, type TranscriptUI } from "./transcript-view.ts";
 import { formatCost, formatTokens } from "./transcript-header.ts";
 
@@ -80,7 +81,11 @@ function fakeUI(rows = 20, mode?: "fullscreen") {
     custom: (async (factory: (...args: unknown[]) => unknown, customOptions: unknown) => {
       options = customOptions;
       return new Promise<void>((resolve) => {
-        component = factory(tui, PLAIN, new KeybindingsManager(), () => { closed = true; component?.dispose(); resolve(); }) as typeof component;
+        component = factory(tui, PLAIN, new KeybindingsManager(), (result: unknown) => {
+          closed = true;
+          component?.dispose();
+          resolve(result as never);
+        }) as typeof component;
       });
     }) as TranscriptUI["custom"],
     getToolsExpanded: () => false,
@@ -104,15 +109,16 @@ function clock(start = new Date(2026, 8, 26, 12, 0, 0).getTime()) {
   return { now: () => now, advance: (ms: number) => { now += ms; } };
 }
 
-/** The nested workers' hint, and a nested worker's row: the cursor and a filled dot, or two spaces and a hollow dot. */
-const NESTED_HINT = "  ↑/↓ to select · Enter to open";
+/** The session picker's hint and rows: the cursor and a filled dot, or two spaces and a hollow dot. */
+const SESSION_PICKER_HINT = "  ↑/↓ to select · Enter to open · Esc to go back";
+const PICKER_ROW = /^(?:❯ ●|  ○) /;
 const NESTED_ROW = /^(?:❯ ●|  ○) └ /;
 
-/** The header's lines: after the orchestrator bar, up to the nested workers or the rule. */
+/** The header's lines: after the orchestrator bar, up to the session picker or the rule. */
 function header(view: ReturnType<typeof fakeUI>, width = WIDTH): string[] {
   const text = view.text(width);
   const start = text[0]!.startsWith("orchestrator ") ? 1 : 0;
-  const end = text.findIndex((line, index) => index > start && (line.startsWith("─") || line === NESTED_HINT));
+  const end = text.findIndex((line, index) => index > start && (line.startsWith("─") || line === SESSION_PICKER_HINT));
   return text.slice(start, end);
 }
 
@@ -122,7 +128,12 @@ function shownWorker(view: ReturnType<typeof fakeUI>): string {
   return [parts[0], parts[1], parts.at(-1)].join(" · ");
 }
 
-/** The shown worker's nested workers' lines, under the header. */
+/** The visible main-plus-workers picker rows. */
+function pickerLines(view: ReturnType<typeof fakeUI>, width = WIDTH): string[] {
+  return view.text(width).filter((line) => PICKER_ROW.test(line));
+}
+
+/** The visible nested worker rows. */
 function nestedLines(view: ReturnType<typeof fakeUI>, width = WIDTH): string[] {
   return view.text(width).filter((line) => NESTED_ROW.test(line));
 }
@@ -147,6 +158,7 @@ test("the view covers the whole screen, fits every line to it, and Esc or ctrl+c
   assert.equal(lines.length, 12, "exactly the terminal's height");
   assert.ok(lines.every((line) => plain(line).length <= 60), JSON.stringify(lines.map(plain)));
   assert.equal(shownWorker(view), "fixer · running · worker 1 of 1");
+  assert.deepEqual(pickerLines(view), ["  ○ main", "❯ ● fixer   routing… · 0s · running"], "the viewed worker is highlighted beside main");
   assert.ok(view.text().some((line) => line.includes("Fix the typo")));
   view.tui.terminal.rows = 30;
   assert.equal(view.lines().length, 30, "a resize redraws at the new size");
@@ -154,7 +166,7 @@ test("the view covers the whole screen, fits every line to it, and Esc or ctrl+c
   view.press("q", KEY.left, "z");
   assert.equal(view.closed, false, "other keys keep it open");
   view.press(KEY.kittyEscape);
-  await shown;
+  assert.equal(await shown, "back");
   assert.equal(view.closed, true, "Esc under the kitty keyboard protocol leaves");
   assert.equal(fake.listeners.size, 1, "the view stopped following the worker's session; only the board does");
   const renders = view.tui.renders;
@@ -171,6 +183,27 @@ test("the view covers the whole screen, fits every line to it, and Esc or ctrl+c
     assert.equal(again.closed, true, `${JSON.stringify(key)} leaves`);
   }
   await assert.rejects(openTranscript(fakeUI().ui, board, "no-such-worker"), /No worker on the board has the id no-such-worker/);
+});
+
+test("the session picker switches workers and Enter on main returns to the orchestrator editor", async () => {
+  const board = new WorkerBoard();
+  running(board, "Lead the work", "lead-1", { agent: "lead" });
+  const other = running(board, "Other work", "other-1", { agent: "other" });
+  const view = fakeUI(20);
+  const shown = openTranscript(view.ui, board, board.workers()[1]!.id);
+
+  assert.deepEqual(pickerLines(view), [
+    "  ○ main",
+    "  ○ lead    routing… · 0s · running",
+    "❯ ● other   routing… · 0s · running",
+  ]);
+  view.press(KEY.up, KEY.enter);
+  assert.equal(shownWorker(view), "lead · running · worker 1 of 2", "Enter opens the selected worker from the picker");
+  assert.equal(other.fake.listeners.size, 1, "the view stopped following the prior worker");
+  view.press(KEY.up, KEY.enter);
+  assert.equal(pickerLines(view)[0], "❯ ● main", "main is selected before it is opened");
+  assert.equal(await shown, "main", "Enter on main leaves the transcript view");
+  assert.equal(view.closed, true);
 });
 
 test("a live transcript follows the end until the user scrolls; PgUp, PgDn, Home and End scroll, and End follows again", async () => {
@@ -262,24 +295,26 @@ test("pi's message rendering shows tool calls with their results and the expand 
   await shown;
 });
 
-test("left and right switch to the previous or next worker in the board's order, and Enter on a nested worker's line opens it", async () => {
+test("left and right switch workers, and the session picker opens any worker or returns to main", async () => {
   const board = new WorkerBoard();
   const lead = running(board, "Lead the work", "lead-1", { agent: "lead" });
   running(board, "Other work", "other-1", { agent: "other" });
   const nested = running(board, "Nested work", "nested-1", { parentDelegationId: "lead-1" }, [user("Nested work"), reply("Nested reply")]);
   running(board, "Second nested", "nested-2", { parentDelegationId: "lead-1" });
   const view = fakeUI(20);
-  void openTranscript(view.ui, board, board.workers()[0]!.id);
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
 
   assert.equal(shownWorker(view), "lead · running · worker 1 of 4");
-  const text = view.text();
-  assert.equal(text[text.findIndex((line) => NESTED_ROW.test(line)) - 1], NESTED_HINT, "a hint with the keys the list takes, above it");
-  assert.match(nestedLines(view)[0]!, /^❯ ● └ worker   routing… · \d+s · running$/, "its nested workers as the worker widget's agent list, the first selected");
-  assert.match(nestedLines(view)[1]!, /^  ○ └ worker   routing… · \d+s · running$/);
-  assert.ok(view.text().at(-1)!.includes("↑↓ Enter nested worker"));
+  assert.equal(view.text().filter((line) => line === SESSION_PICKER_HINT).length, 1, "the session picker shows the same controls above the rows");
+  assert.equal(pickerLines(view).length, 5, "main and every worker have a row");
+  assert.equal(pickerLines(view)[0], "  ○ main");
+  assert.match(pickerLines(view)[1]!, /^❯ ● lead/);
+  assert.match(pickerLines(view)[2]!, /^  ○ └ worker/);
+  assert.match(pickerLines(view)[3]!, /^  ○ └ worker/);
+  assert.match(pickerLines(view)[4]!, /^  ○ other/);
 
   view.press(KEY.right);
-  assert.equal(shownWorker(view), "worker · running · worker 2 of 4", "the nested worker comes right after its parent");
+  assert.equal(shownWorker(view), "worker · running · worker 2 of 4", "right switches to the next worker");
   assert.equal(lead.fake.listeners.size, 1, "only the board follows the lead now, not the view");
   assert.ok(view.text().some((line) => line.includes("Nested reply")));
   view.press(KEY.right, KEY.right);
@@ -289,17 +324,54 @@ test("left and right switch to the previous or next worker in the board's order,
   view.press(KEY.left, KEY.left, KEY.left, KEY.left);
   assert.equal(shownWorker(view), "lead · running · worker 1 of 4", "the first worker stays");
 
-  view.press(KEY.down, KEY.down, KEY.up, KEY.enter);
+  view.press(KEY.down, KEY.enter);
   assert.equal(shownWorker(view), "worker · running · worker 2 of 4");
   assert.ok(view.text().some((line) => line.includes("Nested reply")), "Enter opened the selected nested worker");
   assert.equal(nested.fake.listeners.size, 2, "the board and the view follow it");
-  view.press(KEY.left, KEY.down, KEY.enter);
-  assert.equal(shownWorker(view), "worker · running · worker 3 of 4", "the second nested worker");
+  view.press(KEY.down, KEY.enter);
+  assert.equal(shownWorker(view), "worker · running · worker 3 of 4", "the next picker row opens the second nested worker");
   view.press(KEY.enter);
-  assert.equal(shownWorker(view), "worker · running · worker 3 of 4", "Enter without nested workers does nothing");
+  assert.equal(shownWorker(view), "worker · running · worker 3 of 4", "Enter keeps the selected worker open");
+  view.press(KEY.up, KEY.up, KEY.up, KEY.enter);
+  assert.equal(await shown, "main", "the main row returns to the orchestrator editor");
+  assert.equal(view.closed, true);
 });
 
-test("the nested workers' names share a column while their rows fit; a narrow terminal shortens the name first, then cuts the details from the end, never past the width", async () => {
+test("the session picker lists the workers the main widget lists: a finished worker only while it lingers or while viewed", () => {
+  const time = clock();
+  const board = new WorkerBoard({ now: time.now });
+  const done = running(board, "Done work", "done-1", { agent: "done" });
+  running(board, "Live work", "live-1", { agent: "live" });
+  done.feed.ended({ state: "completed" });
+  time.advance(LINGER_MS + 1);
+  const view = fakeUI(20);
+  void openTranscript(view.ui, board, board.workers()[1]!.id, { now: time.now });
+
+  assert.deepEqual(pickerLines(view).map((line) => line.slice(0, 10).trimEnd()), ["  ○ main", "❯ ● live"], "the finished worker is hidden, the running one listed");
+  assert.equal(shownWorker(view), "live · running · worker 2 of 2", "stepping and the count still cover every worker");
+  view.press(KEY.left);
+  assert.equal(shownWorker(view), "done · completed · worker 1 of 2", "left still steps onto the finished worker");
+  assert.deepEqual(pickerLines(view).map((line) => line.slice(0, 10).trimEnd()), ["  ○ main", "❯ ● done", "  ○ live"], "the viewed finished worker is listed and highlighted");
+  view.press(KEY.down);
+  view.press(KEY.right);
+  assert.deepEqual(pickerLines(view).map((line) => line.slice(0, 10).trimEnd()), ["  ○ main", "❯ ● live"], "it is hidden again once another worker is viewed");
+});
+
+test("the session picker lists a worker that finished moments ago", () => {
+  const time = clock();
+  const board = new WorkerBoard({ now: time.now });
+  const done = running(board, "Done work", "done-1", { agent: "done" });
+  running(board, "Live work", "live-1", { agent: "live" });
+  done.feed.ended({ state: "completed" });
+  time.advance(LINGER_MS - 1);
+  const view = fakeUI(20);
+  void openTranscript(view.ui, board, board.workers()[1]!.id, { now: time.now });
+  assert.equal(pickerLines(view).length, 3, "main, the lingering worker and the running worker");
+  time.advance(2);
+  assert.equal(pickerLines(view).length, 2, "the linger is over");
+});
+
+test("the picker keeps nested worker names in one column and fits narrow rows", async () => {
   const time = clock();
   const board = new WorkerBoard({ now: time.now });
   running(board, "Lead the work", "lead-1", { agent: "lead" });
@@ -311,15 +383,15 @@ test("the nested workers' names share a column while their rows fit; a narrow te
   void openTranscript(view.ui, board, board.workers()[0]!.id, { now: time.now });
 
   assert.deepEqual(nestedLines(view, 100), [
-    "❯ ● └ orchestrator:verifying-work   routing… · 8m08s · running",
+    "  ○ └ orchestrator:verifying-work   routing… · 8m08s · running",
     "  ○ └ tester                        routing… · 8m08s · running",
   ]);
   assert.deepEqual(nestedLines(view, 50), [
-    "❯ ● └ orchestrator:v…   routing… · 8m08s · running",
+    "  ○ └ orchestrator:v…   routing… · 8m08s · running",
     "  ○ └ tester            routing… · 8m08s · running",
   ], "the name takes the room the details leave");
-  assert.equal(nestedLines(view, 30)[0], "❯ ● └ orc…   routing… · 8m08s", "a short name, then the details cut from the end");
-  assert.equal(nestedLines(view, 12)[0], "❯ ● └ orc…", "only the name when no details fit");
+  assert.equal(nestedLines(view, 30)[0], "  ○ └ orc…   routing… · 8m08s", "a short name, then the details cut from the end");
+  assert.equal(nestedLines(view, 12)[0], "  ○ └ orc…", "only the name when no details fit");
   for (const width of [100, 72, 50, 40, 30, 20, 12, 8, 4, 1]) {
     for (const line of view.text(width)) assert.ok(line.length <= width, `${width}: ${line}`);
   }
@@ -371,7 +443,7 @@ test("a finished worker's transcript is read from its session file without chang
     const saved = board.add({ callId: "call-1", background: false, task: "Summarise the log", model: { kind: "routed" } });
     saved.started();
     saved.ended({ state: "completed", sessionFile: file });
-    const view = fakeUI(20);
+    const view = fakeUI(32);
     void openTranscript(view.ui, board, board.workers()[0]!.id);
     const text = view.text();
     assert.equal(shownWorker(view), "worker · completed · worker 1 of 1");
@@ -589,8 +661,13 @@ function regularUI(rows = 10) {
   const ui: TranscriptUI = {
     custom: (async (factory: (...args: unknown[]) => unknown, options: { overlay?: boolean; overlayOptions?: unknown }) => {
       assert.equal(options.overlay, true);
-      return new Promise<void>((resolve) => {
-        stub = factory(tui, PLAIN, new KeybindingsManager(), () => { childrenAtDone = [...tui.children]; closed = true; stub?.dispose(); resolve(); }) as typeof stub;
+      return new Promise<unknown>((resolve) => {
+        stub = factory(tui, PLAIN, new KeybindingsManager(), (result: unknown) => {
+          childrenAtDone = [...tui.children];
+          closed = true;
+          stub?.dispose();
+          resolve(result);
+        }) as typeof stub;
         overlayOptions = typeof options.overlayOptions === "function" ? options.overlayOptions() : options.overlayOptions;
       });
     }) as TranscriptUI["custom"],
@@ -627,9 +704,8 @@ test("in regular tuiMode the view replaces pi's whole view while open and puts i
   assert.ok(view.text().some((line) => line.includes("Other reply")), "→ switches worker");
   assert.equal(view.forced.at(-1), true, "switching reprints and lands at the bottom");
   view.press(KEY.left);
-
-  view.press(KEY.escape);
-  await shown;
+  view.press(KEY.up, KEY.enter);
+  assert.equal(await shown, "main", "Enter on main leaves the transcript view");
   assert.deepEqual(view.childrenAtDone, view.original, "pi's tree is back before pi's close restores the editor and its focus");
   assert.equal(view.forced.at(-1), true, "leaving reprints");
 });
@@ -685,15 +761,15 @@ test("the transcript's nested worker row is the widget's: label, tier, short run
   nested.fake.emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash" });
   const view = regularUI();
   void openTranscript(view.ui, board, board.workers()[0]!.id);
-  assert.match(view.text(160).find((line) => NESTED_ROW.test(line))!, /^❯ ● └ budget code   standard · opus-5-5:xhigh · \d+s · running · bash$/);
-  view.press(KEY.enter);
+  assert.match(view.text(160).find((line) => NESTED_ROW.test(line))!, /^  ○ └ budget code   standard · opus-5-5:xhigh · \d+s · running · bash$/);
+  view.press(KEY.down, KEY.enter);
   const text = view.text(160);
   assert.ok(text.some((line) => line.startsWith("anthropic/claude-opus-5-5:xhigh since ")), text.join("\n"));
   assert.ok(text.some((line) => /^running · \d+s · 0 turns · /.test(line)), text.join("\n"));
   view.press(KEY.escape);
 });
 
-test("in regular tuiMode the shown worker's nested workers are listed live above the stats line, at most 6, and ↑↓ Enter open one", async () => {
+test("in regular tuiMode the session picker stays live above the stats line and scrolls to the selected worker", async () => {
   const board = new WorkerBoard();
   running(board, "Lead the work", "lead-1", { agent: "lead" });
   const feeds: WorkerFeed[] = [];
@@ -705,31 +781,35 @@ test("in regular tuiMode the shown worker's nested workers are listed live above
   const live = () => {
     const text = view.text();
     const stats = text.findIndex((line) => line.startsWith("running · "));
-    return { nested: text.slice(stats - 6, stats), rest: text.slice(stats) };
+    const hint = text.findIndex((line) => line.startsWith(SESSION_PICKER_HINT));
+    return { picker: text.slice(hint + 2, stats), hint: text[hint], rest: text.slice(stats) };
   };
 
-  assert.equal(view.text().filter((line) => NESTED_ROW.test(line)).length, 6, "at most 6 rows");
-  assert.equal(view.text().filter((line) => line === NESTED_HINT).length, 1, "under one hint");
-  assert.match(live().nested[0]!, /^❯ ● └ nested 1   routing… · \d+s · running$/, "right above the stats line, the first selected");
-  assert.match(live().nested[5]!, /^  ○ └ nested 6   routing… · \d+s · running$/);
-  assert.equal(live().rest.at(-1), "←→ worker · ↑↓ Enter nested worker · x stop · ctrl+o tool output · Esc back");
+  assert.equal(live().picker.length, 7, "main stays visible above up to 6 worker rows");
+  assert.equal(live().hint, `${SESSION_PICKER_HINT} · 1–6 of 9`);
+  assert.match(live().picker[0]!, /^  ○ main$/);
+  assert.match(live().picker[1]!, /^❯ ● lead/);
+  assert.match(live().picker[2]!, /^  ○ └ nested 1/);
+  assert.match(live().picker[6]!, /^  ○ └ nested 5/);
+  assert.equal(live().rest.at(-1), "←→ worker · x stop · ctrl+o tool output · Esc back");
 
-  view.press(KEY.down, KEY.down, KEY.down, KEY.down, KEY.down, KEY.down, KEY.down);
-  assert.match(live().nested[5]!, /^❯ ● └ nested 8   routing… · \d+s · running$/, "scrolled to keep the selection in view");
-  assert.match(live().nested[0]!, /^  ○ └ nested 3   routing… · \d+s · running$/);
+  view.press(...Array.from({ length: 8 }, () => KEY.down));
+  assert.match(live().picker[6]!, /^❯ ● └ nested 8   routing… · \d+s · running$/, "the window scrolls to keep the selected worker visible");
+  assert.match(live().picker[1]!, /^  ○ └ nested 3   routing… · \d+s · running$/);
   view.press(KEY.up);
-  assert.match(live().nested[5]!, /^❯ ● └ nested 7   routing… · \d+s · running$/, "the window moves with the selection, as the overlay's does");
+  assert.match(live().picker[6]!, /^❯ ● └ nested 7   routing… · \d+s · running$/, "the window moves with the selection");
 
   feeds[7]!.ended({ state: "completed" });
   view.press(KEY.down);
-  assert.match(live().nested[5]!, /^❯ ● └ nested 8   routing… · \d+s · completed$/, "the list follows the board live");
+  assert.match(live().picker[6]!, /^❯ ● └ nested 8   routing… · \d+s · completed$/, "the list follows the board live");
   view.press(KEY.up);
   view.forced.length = 0;
   view.press(KEY.enter);
   assert.ok(view.text().some((line) => line.includes("Reply 7")), "Enter opens the selected worker in the same view");
   assert.equal(view.forced.at(-1), true, "and reprints");
-  assert.ok(!view.text().some((line) => NESTED_ROW.test(line) || line === NESTED_HINT), "a worker without nested workers lists none");
-  assert.equal(view.text().at(-1), "←→ worker · x stop · ctrl+o tool output · Esc back", "and no nested hint");
+  assert.match(live().picker[0]!, /^  ○ main$/, "the picker remains visible on a nested worker");
+  assert.match(live().picker[6]!, /^❯ ● └ nested 7/, "the viewed worker stays selected");
+  assert.equal(view.text().at(-1), "←→ worker · x stop · ctrl+o tool output · Esc back");
 });
 
 test("the header's token counts and cost read short, and a count never rounds up past its unit", () => {

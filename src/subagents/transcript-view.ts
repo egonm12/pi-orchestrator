@@ -2,7 +2,7 @@ import { truncateToVisualLines, type AgentSessionEvent, type ExtensionUIContext,
 import { readWorkerTranscript, Transcript, type TranscriptContext } from "./transcript.ts";
 import { liveStats, orchestratorBar, transcriptHeader, transcriptTop } from "./transcript-header.ts";
 import { hasEnded, type BoardWorker, type OrchestratorState, type WorkerBoard, type WorkerBoardView } from "./worker-board.ts";
-import { agentLines, agentRow, hintLine, MAX_WIDGET_ROWS, SELECT_HINT, STATE_COLOR } from "./worker-widget.ts";
+import { sessionPickerIndex, sessionPickerLines, sessionPickerWorkerId, STATE_COLOR, widgetWorkers, workerRows } from "./worker-widget.ts";
 
 // The transcript view (epic a338): one worker's transcript on the whole
 // screen, read from the worker board. It is a full-screen overlay through
@@ -20,10 +20,10 @@ import { agentLines, agentRow, hintLine, MAX_WIDGET_ROWS, SELECT_HINT, STATE_COL
 // as `\x1b[27u`, and an overlay that missed Esc and ctrl+c would trap the user
 // (rcjm's first live try).
 //
-// The view is drawn in slots, top to bottom: a bar, the header, the worker's
-// nested workers, the transcript and a footer. They make three parts (head,
-// body and live lines) that a layout arranges. The header and the bar are
-// options (TranscriptSlot), drawn by transcript-header.ts by default. The bar
+// The view is drawn in slots, top to bottom: a bar, the header, the main-plus-workers
+// picker, the transcript and a footer. They make three parts (head, body and
+// live lines) that a layout arranges. The header and the bar are options
+// (TranscriptSlot), drawn by transcript-header.ts by default. The bar
 // only tells: an asking worker or an idle orchestrator never closes the view,
 // moves it or takes a key, so the user leaves when they choose to.
 
@@ -78,15 +78,18 @@ export interface BodyWindow {
 }
 
 /** The view's parts, built apart from how a layout arranges them (s993): the
- *  head (the bar, the header and the nested workers), the body (the
- *  transcript with its notices and end state) and the live lines (the footer).
- *  The live lines take the body's window when a layout windows it; their
- *  count never depends on it, so a layout can size the window by them. */
+ *  head (the bar, the header and the session picker), the body (the transcript
+ *  with its notices and end state) and the live lines (the picker in regular
+ *  tuiMode, stats and the footer). The live lines take the body's window when
+ *  a layout windows it; their count never depends on it, so a layout can size
+ *  the window by them. */
 export interface TranscriptParts {
   readonly head: readonly string[];
   readonly body: readonly string[];
   readonly live: (window?: BodyWindow) => readonly string[];
 }
+
+export type TranscriptViewExit = "back" | "main";
 
 export interface TranscriptViewOptions {
   /** The workers' working directory, for the built-in tools' paths. Default: the process's. */
@@ -110,8 +113,6 @@ export interface TranscriptViewOptions {
 const TICK_MS = 1_000;
 
 const SEPARATOR = " · ";
-/** The nested workers' hint: ↑ and ↓ select one, Enter shows its transcript. */
-const NESTED_HINT = `${SELECT_HINT} · Enter to open`;
 /** pi marks user messages for terminal prompt navigation; an overlay is no prompt. */
 const PROMPT_MARKS = /\x1b\]133;[A-D]\x07/g;
 
@@ -143,7 +144,7 @@ export class TranscriptView {
   readonly #theme: Theme;
   readonly #keys: TranscriptKeys;
   readonly #board: TranscriptBoard;
-  readonly #close: () => void;
+  readonly #close: (exit: TranscriptViewExit) => void;
   readonly #options: TranscriptViewOptions;
   readonly #now: () => number;
   readonly #unsubscribeBoard: () => void;
@@ -159,8 +160,8 @@ export class TranscriptView {
   /** The transcript's height and length at the last render, for the scroll keys. */
   #bodyHeight = 1;
   #bodyLength = 0;
-  /** The selected nested worker. */
-  #selected = 0;
+  /** The session row selected in the main-plus-workers picker. */
+  #selectedSessionId: string | undefined;
   #confirming = false;
   /** A one-off line in the footer, until the next key. */
   #flash: string | undefined;
@@ -170,7 +171,7 @@ export class TranscriptView {
   /** The next redraw reprints the whole terminal, as after a switch of worker in regular tuiMode. */
   #reprint = false;
 
-  constructor(tui: TranscriptViewTui, theme: Theme, keys: TranscriptKeys, board: TranscriptBoard, workerId: string, close: () => void, options: TranscriptViewOptions = {}) {
+  constructor(tui: TranscriptViewTui, theme: Theme, keys: TranscriptKeys, board: TranscriptBoard, workerId: string, close: (exit: TranscriptViewExit) => void, options: TranscriptViewOptions = {}) {
     this.#tui = tui;
     this.#theme = theme;
     this.#keys = keys;
@@ -209,9 +210,12 @@ export class TranscriptView {
     else if (keys.matches(data, "tui.editor.cursorRight")) this.#step(1);
     else if (keys.matches(data, "app.tools.expand")) this.#transcript?.setExpanded(this.#expanded = !this.#expanded);
     else if (printable(data)?.toLowerCase() === "x") this.#askStop();
-    else if (keys.matches(data, "tui.select.up")) this.#selected = Math.max(0, this.#selected - 1);
-    else if (keys.matches(data, "tui.select.down")) this.#selected = Math.min(Math.max(0, this.#nested().length - 1), this.#selected + 1);
-    else if (keys.matches(data, "tui.select.confirm")) this.#openNested();
+    else if (keys.matches(data, "tui.select.up")) this.#moveSession(-1);
+    else if (keys.matches(data, "tui.select.down")) this.#moveSession(1);
+    else if (keys.matches(data, "tui.select.confirm")) {
+      if (this.#selectedSessionId === undefined) return this.#leave("main");
+      this.#openSelectedSession();
+    }
     // In regular tuiMode the terminal scrolls the view: the scroll keys are the overlay's alone.
     else if (this.#regular) return;
     else if (keys.matches(data, "tui.select.pageUp")) this.#scrollTo(this.#currentTop() - this.#bodyHeight);
@@ -248,10 +252,10 @@ export class TranscriptView {
       orchestrator: this.#board.orchestratorState(), now: this.#now(), theme: this.#theme, width };
     const bar = (this.#options.bar ?? orchestratorBar)(frame);
     if (this.#regular) {
-      // The nested workers sit just above the stats line, where the user reads the live state (n39l).
-      return { head: transcriptTop(frame), body: this.#body(width), live: () => [...this.#nestedLines(frame), ...liveStats(frame), ...bar, this.#footer(undefined)] };
+      // The session picker stays just above the stats line while regular tuiMode scrolls the body.
+      return { head: transcriptTop(frame), body: this.#body(width), live: () => [...this.#sessionPickerLines(frame), ...liveStats(frame), ...bar, this.#footer(undefined)] };
     }
-    const head = [...bar, ...(this.#options.header ?? transcriptHeader)(frame), ...this.#nestedLines(frame)];
+    const head = [...bar, ...(this.#options.header ?? transcriptHeader)(frame), ...this.#sessionPickerLines(frame)];
     return { head, body: this.#body(width), live: (window) => [this.#footer(window)] };
   }
 
@@ -289,9 +293,9 @@ export class TranscriptView {
     this.#detach();
   }
 
-  #leave(): void {
+  #leave(exit: TranscriptViewExit = "back"): void {
     this.dispose();
-    this.#close();
+    this.#close(exit);
   }
 
   /** The first transcript line to show: the last page while following. */
@@ -310,9 +314,9 @@ export class TranscriptView {
   #show(worker: BoardWorker): void {
     this.#detach();
     this.#worker = worker;
+    this.#selectedSessionId = worker.id;
     this.#following = true;
     this.#top = 0;
-    this.#selected = 0;
     this.#confirming = false;
     // A new transcript in pi's root differs from its first line on: reprint, landing at the bottom.
     this.#reprint = this.#regular;
@@ -390,27 +394,30 @@ export class TranscriptView {
     this.#tui.requestRender();
   }
 
-  /** The workers the shown worker started, in board order. */
-  #nested(): BoardWorker[] {
-    return this.#board.workers().filter((worker) => worker.parentId === this.#worker.id);
+  /** The workers the main view's widget lists (widgetWorkers), plus the viewed
+   *  and the selected worker whatever their state, and the viewed worker if a
+   *  new session cleared the board. Left and right still step through every worker. */
+  #sessionRows() {
+    const workers = [...this.#board.workers()];
+    if (!workers.some((worker) => worker.id === this.#worker.id)) workers.push(this.#worker);
+    return workerRows(widgetWorkers(workers, this.#now(), [this.#worker.id, this.#selectedSessionId]));
   }
 
-  /** The nested workers as the worker widget's agent list: a hint with the
-   *  keys the list takes, then a row per nested worker, the selected one with
-   *  the cursor. */
-  #nestedLines(frame: TranscriptFrame): string[] {
-    const nested = this.#nested();
-    if (nested.length === 0) return [];
-    this.#selected = Math.min(this.#selected, nested.length - 1);
-    // At most as many lines as the widget, scrolled to keep the selected one in view.
-    const first = Math.max(0, Math.min(this.#selected - MAX_WIDGET_ROWS + 1, nested.length - MAX_WIDGET_ROWS));
-    const window = nested.slice(first, first + MAX_WIDGET_ROWS);
-    const rows = window.map((worker) => agentRow({ worker, depth: 1 }, frame.now));
-    return [hintLine(NESTED_HINT, this.#theme, frame.width), ...agentLines(rows, this.#selected - first, this.#theme, frame.width)];
+  /** The main session and every worker, with the viewed or selected row highlighted. */
+  #sessionPickerLines(frame: TranscriptFrame): string[] {
+    const rows = this.#sessionRows();
+    return sessionPickerLines(rows, sessionPickerIndex(rows, this.#selectedSessionId), frame.now, this.#theme, frame.width);
   }
 
-  #openNested(): void {
-    const target = this.#nested()[this.#selected];
+  #moveSession(step: -1 | 1): void {
+    const rows = this.#sessionRows();
+    const current = sessionPickerIndex(rows, this.#selectedSessionId);
+    const next = Math.max(0, Math.min(rows.length, current + step));
+    this.#selectedSessionId = sessionPickerWorkerId(rows, next);
+  }
+
+  #openSelectedSession(): void {
+    const target = this.#sessionRows().find((row) => row.worker.id === this.#selectedSessionId)?.worker;
     if (target !== undefined) this.#show(target);
   }
 
@@ -444,11 +451,9 @@ export class TranscriptView {
     if (this.#confirming) return theme.fg("warning", "Stop this worker? y/n");
     if (this.#flash !== undefined) return theme.fg("muted", this.#flash);
     const stop = hasEnded(this.#worker) ? [] : ["x stop"];
-    const nested = this.#nested().length > 0 ? ["↑↓ Enter nested worker"] : [];
-    if (this.#regular) return theme.fg("dim", ["←→ worker", ...nested, ...stop, "ctrl+o tool output", "Esc back"].join(SEPARATOR));
+    if (this.#regular) return theme.fg("dim", ["←→ worker", ...stop, "ctrl+o tool output", "Esc back"].join(SEPARATOR));
     const where = window === undefined || window.following ? "following" : `line ${window.top + 1} of ${window.length}, End follows`;
-    const hints = [where, "←→ worker", "PgUp PgDn Home End scroll", ...nested,
-      ...stop, "ctrl+o tool output", "Esc back"];
+    const hints = [where, "←→ worker", "PgUp PgDn Home End scroll", ...stop, "ctrl+o tool output", "Esc back"];
     return theme.fg("dim", hints.join(SEPARATOR));
   }
 }
@@ -481,8 +486,9 @@ function swapRoot(root: RootTui, view: unknown): () => void {
   };
 }
 
-/** Shows the worker `workerId` of `board` until the user leaves with Esc (or
- *  ctrl+c), then resolves; the orchestrator's session is as it was. Tool
+/** Shows the worker `workerId` of `board` until the user leaves with Esc or
+ *  ctrl+c, or selects main and presses Enter. The result distinguishes those
+ *  exits so the widget browser can return directly to the editor. Tool
  *  output starts expanded as the orchestrator's is. Throws when no worker on
  *  the board has the id.
  *
@@ -493,15 +499,15 @@ function swapRoot(root: RootTui, view: unknown): () => void {
  *  the overlay is a stub that draws nothing and passes it the keys, as the
  *  worker widget's focus does. On leaving it puts pi's tree back before pi
  *  closes the overlay, which gives the editor its focus back. */
-export async function openTranscript(ui: TranscriptUI, board: TranscriptBoard, workerId: string, options: TranscriptViewOptions = {}): Promise<void> {
+export async function openTranscript(ui: TranscriptUI, board: TranscriptBoard, workerId: string, options: TranscriptViewOptions = {}): Promise<TranscriptViewExit> {
   if (board.worker(workerId) === undefined) throw new Error(`No worker on the board has the id ${workerId}`);
   const expanded = options.expanded ?? ui.getToolsExpanded?.() ?? false;
   let regular = false;
-  await ui.custom<void>((tui, theme, keybindings, done) => {
-    if (tui.mode !== "regular") return new TranscriptView(tui, theme, keybindings, board, workerId, () => done(), { ...options, expanded });
+  return ui.custom<TranscriptViewExit>((tui, theme, keybindings, done) => {
+    if (tui.mode !== "regular") return new TranscriptView(tui, theme, keybindings, board, workerId, (exit) => done(exit), { ...options, expanded });
     regular = true;
     let restore = () => {};
-    const view = new TranscriptView(tui, theme, keybindings, board, workerId, () => { restore(); done(); }, { ...options, expanded });
+    const view = new TranscriptView(tui, theme, keybindings, board, workerId, (exit) => { restore(); done(exit); }, { ...options, expanded });
     restore = swapRoot(tui as unknown as RootTui, view);
     return {
       render: () => [],

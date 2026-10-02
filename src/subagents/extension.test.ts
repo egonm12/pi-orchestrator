@@ -2949,7 +2949,8 @@ test("/subagents <list number> and /subagents <delegation id> open that worker's
   }
 });
 
-test("alt+a or Down at the editor's end focuses the worker widget for the orchestrator's session; Enter opens the focused worker's transcript and leaving it comes back to the list; a worker session's own alt+a does nothing", async () => {
+test("alt+a or Down at the editor's end focuses the worker widget; selecting main from the transcript returns to the editor", async () => {
+  initTheme("dark");
   const h = harness();
   const pending: (() => void)[] = [];
   try {
@@ -2988,17 +2989,19 @@ test("alt+a or Down at the editor's end focuses the worker widget for the orches
     // it opens is ever closed, so it cannot be awaited yet.
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.equal(custom.opens, 2, "Enter opened the chosen worker's transcript next");
-    custom.press("\x1b");
+    assert.ok(custom.lines().some((line) => line === "  ○ main"), "main is available from the worker transcript");
+    custom.press("\x1b[A");
+    assert.ok(custom.lines().some((line) => line === "❯ ● main"), "Up selects main from the viewed worker");
+    custom.press("\r");
     await new Promise((resolve) => setTimeout(resolve, 0));
-    assert.equal(custom.opens, 3, "leaving the transcript comes back to the list");
-    assert.ok(custom.open);
-    custom.press("\x1b");
+    assert.equal(custom.opens, 2, "selecting main closes the transcript without reopening the widget picker");
+    assert.equal(custom.open, false, "the main editor has the keyboard again");
     await focusing;
 
     assert.equal(inputs.length, 1, "one listener sees each key before the editor");
     assert.equal(inputs[0]!("x"), undefined, "any other key goes to the editor");
     assert.deepEqual(inputs[0]!("\x1b[B"), { consume: true }, "Down at the editor's end is the widget's");
-    assert.equal(custom.opens, 4, "and focuses it");
+    assert.equal(custom.opens, 3, "and focuses it");
     custom.press("\x1b");
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.equal(custom.open, false);
@@ -3008,7 +3011,7 @@ test("alt+a or Down at the editor's end focuses the worker widget for the orches
     const unmark = markWorkerSession(ctx.sessionManager.getSessionId());
     try {
       await subagents.runShortcut("alt+a", ctx);
-      assert.equal(custom.opens, 4, "no widget to focus in a worker's own session");
+      assert.equal(custom.opens, 3, "no widget to focus in a worker's own session");
     } finally { unmark(); }
 
     await subagents.shutdownSession(ctx);

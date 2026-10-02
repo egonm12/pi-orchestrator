@@ -58,10 +58,17 @@ export function workerRows(workers: readonly BoardWorker[]): WidgetRow[] {
   });
 }
 
+/** The workers the widget lists at `now`: the active ones and those that
+ *  finished less than LINGER_MS ago, plus any worker whose id is in `keep`
+ *  whatever its state (the transcript view's viewed and selected sessions). */
+export function widgetWorkers(workers: readonly BoardWorker[], now: number, keep: readonly (string | undefined)[] = []): BoardWorker[] {
+  return workers.filter((worker) => shown(worker, now) || keep.includes(worker.id));
+}
+
 /** The widget's rows at `now` from the board's workers, in board order: each
  *  nested worker right after its parent delegation's worker, one level deeper. */
 export function widgetRows(workers: readonly BoardWorker[], now: number): WidgetRows {
-  const rows = workerRows(workers.filter((worker) => shown(worker, now)));
+  const rows = workerRows(widgetWorkers(workers, now));
   return { rows: rows.slice(0, MAX_WIDGET_ROWS), more: Math.max(0, rows.length - MAX_WIDGET_ROWS) };
 }
 
@@ -320,6 +327,33 @@ export function widgetLines(rows: WidgetRows, selected: number | undefined, now:
   ];
   if (rows.more > 0) lines.push(fitLine(`${" ".repeat(MARKS_WIDTH)}${theme.fg("muted", `+${rows.more} more`)}`, width));
   return lines;
+}
+
+/** The row index in the main-plus-workers picker for its current session. */
+export function sessionPickerIndex(rows: readonly WidgetRow[], workerId: string | undefined): number {
+  if (workerId === undefined) return 0;
+  const index = rows.findIndex((row) => row.worker.id === workerId);
+  return index < 0 ? 0 : index + 1;
+}
+
+/** The worker for a selected picker row; row zero is the orchestrator's main session. */
+export function sessionPickerWorkerId(rows: readonly WidgetRow[], selected: number): string | undefined {
+  return selected <= 0 ? undefined : rows[selected - 1]?.worker.id;
+}
+
+/** The session picker in a worker transcript view, with main fixed above a
+ *  scrolling window of workers so the viewed or selected worker stays visible. */
+export function sessionPickerLines(rows: readonly WidgetRow[], selected: number, now: number, theme: Theme, width: number): string[] {
+  const current = Math.max(0, Math.min(selected, rows.length));
+  const first = current === 0 ? 0 : Math.max(0, Math.min(current - MAX_WIDGET_ROWS, rows.length - MAX_WIDGET_ROWS));
+  const visible = rows.slice(first, first + MAX_WIDGET_ROWS);
+  const range = rows.length > MAX_WIDGET_ROWS ? `${SEPARATOR}${first + 1}–${first + visible.length} of ${rows.length}` : "";
+  const selectedRow = current === 0 ? 0 : current - first;
+  return [
+    hintLine(`${FOCUS_HINT}${range}`, theme, width),
+    "",
+    ...agentLines([MAIN_ROW, ...visible.map((row) => agentRow(row, now))], selectedRow, theme, width),
+  ];
 }
 
 /** The widget's key among pi's extension widgets. */

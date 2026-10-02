@@ -4,7 +4,7 @@ import type { AgentSessionEvent, Theme } from "@earendil-works/pi-coding-agent";
 import { WorkerBoard, type WorkerSession } from "./worker-board.ts";
 // pi's own keybindings manager, the one it hands a ctx.ui.custom factory; its public entry exports only the type.
 import { KeybindingsManager } from "../../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js";
-import { compactLines, startWorkerWidget, widgetLines, widgetRows, WORKER_WIDGET, type WorkerWidgetFocusUI, type WorkerWidgetUI } from "./worker-widget.ts";
+import { compactLines, sessionPickerIndex, sessionPickerLines, sessionPickerWorkerId, startWorkerWidget, widgetLines, widgetRows, workerRows, WORKER_WIDGET, type WorkerWidgetFocusUI, type WorkerWidgetUI } from "./worker-widget.ts";
 
 // The worker widget below the editor, drawn as Claude Code's agent list, and
 // the compact worker lines of the /subagents listing, where there is no UI
@@ -247,6 +247,38 @@ test("the selected row has the ❯ cursor, a filled dot and its name in bold acc
     `  <dim>○</> <muted>worker</>   ${details}`,
     `<accent>❯ ●</> <accent>**worker**</>   ${details}`,
   ], "in the focused widget the selected worker has the cursor and the filled dot, and main a hollow one");
+});
+
+test("the session picker selects main in the main view and the viewed worker in a transcript view", () => {
+  const time = clock();
+  const board = new WorkerBoard({ now: time.now });
+  const lead = board.add({ callId: "call-1", background: false, task: "Lead the work", agent: "lead", model: { kind: "routed" } });
+  const second = board.add({ callId: "call-1", background: false, task: "Check the tests", agent: "tester", model: { kind: "routed" } });
+  const rows = workerRows(board.workers());
+
+  assert.equal(sessionPickerIndex(rows, undefined), 0, "main is row zero in the main view");
+  assert.equal(sessionPickerIndex(rows, lead.id), 1, "the first worker follows main in its transcript view");
+  assert.equal(sessionPickerIndex(rows, second.id), 2, "another worker is selected by its own id");
+  assert.equal(sessionPickerWorkerId(rows, 0), undefined, "selecting main returns no worker id");
+  assert.equal(sessionPickerWorkerId(rows, 2), second.id, "selecting a worker returns that worker's id");
+
+  assert.deepEqual(sessionPickerLines(rows, sessionPickerIndex(rows, undefined), time.now(), PLAIN, WIDE).slice(2, 5), [
+    "❯ ● main",
+    row("lead", "routing… · queued", 6),
+    row("tester", "routing… · queued", 6),
+  ], "main is marked when it is the current session");
+  assert.deepEqual(sessionPickerLines(rows, sessionPickerIndex(rows, second.id), time.now(), PLAIN, WIDE).slice(2, 5), [
+    "  ○ main",
+    row("lead", "routing… · queued", 6),
+    "❯ ● tester   routing… · queued",
+  ], "the viewed worker is marked in its transcript view");
+
+  const many = new WorkerBoard({ now: time.now });
+  for (let item = 1; item <= 8; item++) many.add({ callId: "call", background: true, task: `Item ${item}`, delegationId: `bg-${item}`, model: { kind: "routed" } });
+  const manyRows = workerRows(many.workers());
+  const last = sessionPickerLines(manyRows, sessionPickerIndex(manyRows, manyRows.at(-1)!.worker.id), time.now(), PLAIN, WIDE);
+  assert.equal(last[0], "  ↑/↓ to select · Enter to open · Esc to go back · 3–8 of 8");
+  assert.match(last.at(-1)!, /^❯ ● worker/);
 });
 
 test("the widget shows at most 6 worker rows below main, then \"+N more\" for the rest", () => {
