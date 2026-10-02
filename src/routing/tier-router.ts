@@ -12,7 +12,7 @@ import {
   type BudgetPreflightConstraint,
   type RefusedAlternative,
 } from "../recipients/authorized-delegation.ts";
-import { RISK_TIERS, type RiskTier } from "./classifier.ts";
+import { RISK_TIERS, type RiskTier } from "./tiers.ts";
 import type { RemovalReason } from "./skip-reasons.ts";
 import type { ResolvedTierMap, TierRung } from "./tier-map.ts";
 

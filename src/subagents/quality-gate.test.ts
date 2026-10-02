@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { fixtureClassification, fixtureRefusal, fixtureRoute, fixtureTierMap, SONNET } from "../fixtures/routing-decision.ts";
 import { buildAgentModelRecord, buildDecisionRecord, buildEditRecord, buildForkRecord, type RoutingRecord } from "../routing/decision-record.ts";
-import type { RiskTier } from "../routing/classifier.ts";
+import type { RiskTier } from "../routing/tiers.ts";
 import { delegationRouting, gateAction, isGateLevel, isHigherGateLevel, tiersByGateAction } from "./quality-gate.ts";
 
 // The quality gate's decisions that the records settle (ADR 0010, ADR 0011).

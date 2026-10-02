@@ -15,7 +15,6 @@ import {
 } from "../fixtures/guarded-agent-dir.ts";
 import { configureBanLists, resetBanLists } from "../policy/ban-lists.ts";
 import { livePiModelAvailability, PI_LIST_MODELS_TIMEOUT_MS, selectedLivePiModel } from "../policy/live-model.ts";
-import { classifyTask } from "./classifier.ts";
 import { SCHEMA_VERSION } from "./tier-answer-schema.ts";
 import {
   CLASSIFIER_ALLOWANCE_LABEL,
@@ -28,7 +27,7 @@ import {
   type ClassifierModelCall,
   type TierClassification,
 } from "./tier-classifier.ts";
-import { RUBRIC_VERSION } from "./tier-rubric.ts";
+import { RUBRIC_VERSION, TIER_RUBRIC } from "./tier-rubric.ts";
 import { useOwnerBanLists } from "../fixtures/owner-ban-lists.ts";
 
 useOwnerBanLists();
@@ -166,7 +165,7 @@ test("a schema-valid standard from the primary is recorded with cause, the four 
   assert.equal(record.schemaVersion, SCHEMA_VERSION);
   assert.match(RUBRIC_VERSION, /\d/);
   assert.match(SCHEMA_VERSION, /\d/);
-  assert.equal(record.floor, "none");
+  assert.equal("floor" in record, false, "no keyword floor");
   assert.deepEqual(record.hops.map((hop) => [hop.hop, hop.outcome]), [[LUNA, "decided"]]);
 });
 
@@ -200,51 +199,79 @@ test("the model sees the task text, the role and the named paths, and never the 
 });
 
 // ---------------------------------------------------------------------------
-// Checkbox 3 and 4 (story 16)
+// Only the classifier model chooses the tier (ADR 0015). The tasks are the
+// routing log's false criticals, 2026-09-25 to 2026-10-01.
 // ---------------------------------------------------------------------------
 
-test("one credential signal sets an elevated floor the model's mechanical cannot lower", async () => {
-  const { record } = await classify("Please rotate the API key used by the nightly job.", DEFAULT_CLASSIFIER_CONFIG, {
-    [LUNA]: { answer: answer("mechanical") },
+const RENAME_TASK =
+  "Rename `formatDate` to `formatIsoDate` in src/util/dates.ts and update its callers. Commit the change on the current branch. " +
+  "Do not push or force-push. Report the commit hash.";
+
+const DLQ_TASK =
+  "Investigate the contents of the AWS SQS FIFO dead-letter queue `orders-effects-dlq.fifo` (production, region eu-west-1): " +
+  "read a sample of its messages and the consumer's Datadog logs, and report why the messages reached the DLQ. " +
+  "Do NOT redrive, purge, delete or modify any message or queue. If login is needed (e.g. aws sso login), stop and report it; " +
+  "do not handle credentials yourself.";
+
+const AUTH_CHANGE_TASK =
+  "Change one line in src/auth/middleware.ts so the authentication check also accepts requests whose session is still refreshing.";
+
+test("a mechanical answer for a rename that forbids a push and asks for the commit hash stays mechanical", async () => {
+  const { record } = await classify(RENAME_TASK, DEFAULT_CLASSIFIER_CONFIG, {
+    [LUNA]: { answer: answer("mechanical", { kindOfWork: "mechanical-edit", why: "a rename a tool can check" }) },
+  });
+  assert.equal(record.tier, "mechanical");
+  assert.equal(record.cause, `model:${LUNA}`);
+  assert.equal(record.why, "a rename a tool can check");
+});
+
+test("the DLQ investigation keeps the model's tier, though it forbids redrive, purge and delete and names aws sso login", async () => {
+  const reasons = ["reads production messages and logs", "changes nothing: the task forbids redrive, purge and delete"];
+  const { record } = await classify(DLQ_TASK, DEFAULT_CLASSIFIER_CONFIG, {
+    [LUNA]: { answer: answer("elevated", {
+      risk: { level: "some", reasons },
+      ambiguity: "partial",
+      complexity: "high",
+      kindOfWork: "research",
+      why: "a read-only production investigation across several systems",
+    }) },
   });
   assert.equal(record.tier, "elevated");
-  assert.equal(record.floor, "elevated (credential)");
-  assert.equal(record.modelTier, "mechanical");
   assert.equal(record.cause, `model:${LUNA}`);
+  // The model's own reason explains the tier, and nothing else does.
+  assert.equal(record.why, "a read-only production investigation across several systems");
+  assert.deepEqual(record.risk, { level: "some", reasons });
+  for (const field of ["floor", "floorTier", "floorSignals", "modelTier"]) assert.equal(field in record, false, field);
 });
 
-test("a security and a destructive signal together set a critical floor naming both", async () => {
-  const { record } = await classify(
-    "Store the password hash column elsewhere, then drop table legacy_users.",
-    DEFAULT_CLASSIFIER_CONFIG,
-    { [LUNA]: { answer: answer("standard") } },
-  );
+test("the model may still choose critical, and its critical stays critical", async () => {
+  const { record } = await classify(AUTH_CHANGE_TASK, DEFAULT_CLASSIFIER_CONFIG, { [LUNA]: { answer: answer("critical") } });
   assert.equal(record.tier, "critical");
-  assert.equal(record.floor, "critical (credential, crypto, data-loss)");
-  assert.deepEqual(
-    record.floorSignals.map((signal) => signal.label),
-    ["credential", "crypto", "data-loss"],
-  );
-});
-
-test("password and drop table alone yield critical with exactly those two signals", async () => {
-  const { record } = await classify("Reset the admin password and drop table sessions_old.", DEFAULT_CLASSIFIER_CONFIG, {
-    [LUNA]: { answer: answer("mechanical") },
-  });
-  assert.equal(record.tier, "critical");
-  assert.equal(record.floor, "critical (credential, data-loss)");
-  assert.deepEqual(
-    record.floorSignals.map((signal) => [signal.kind, signal.label]),
-    [["security-sensitive", "credential"], ["destructive", "data-loss"]],
-  );
-});
-
-test("the model may raise above the floor: critical for a text with no keyword signals stays critical", async () => {
-  assert.equal(classifyTask(PLAIN_TASK).signals.length, 0);
-  const { record } = await classify(PLAIN_TASK, DEFAULT_CLASSIFIER_CONFIG, { [LUNA]: { answer: answer("critical") } });
-  assert.equal(record.tier, "critical");
-  assert.equal(record.floor, "none");
   assert.equal(record.cause, `model:${LUNA}`);
+  const plain = await classify(PLAIN_TASK, DEFAULT_CLASSIFIER_CONFIG, { [LUNA]: { answer: answer("critical") } });
+  assert.equal(plain.record.tier, "critical");
+});
+
+test("the rubric judges the action, not the subject: read-only work is never critical and a prohibition is a constraint", async () => {
+  assert.equal(RUBRIC_VERSION, "tier-rubric-3");
+  const { calls } = await classify(PLAIN_TASK, DEFAULT_CLASSIFIER_CONFIG, { [LUNA]: { answer: answer("standard") } });
+  const prompt = calls[0]!.prompt;
+  assert.ok(prompt.startsWith(TIER_RUBRIC));
+  for (const rule of [
+    "Judge the action the task asks the worker to perform, not the subject it touches.",
+    "A review, audit or investigation that changes nothing is never critical, however sensitive its subject: its tier follows how hard the reasoning is.",
+    "A prohibition in the task, such as \"do not delete anything\" or \"do not push\", is a constraint on the worker, not the action it asks for: it never raises the tier.",
+    "Judge the riskiest part of the requested action.",
+    "Example: review a pull request that changes OAuth. The review changes nothing, so it is elevated, not critical.",
+    "Not critical: \"do not delete anything\" destroys no data.",
+    "Example: investigate why messages reached the DLQ and report the cause.",
+    // The critical rule and its example stay.
+    "1. critical: does the task change a security boundary, or destroy data that cannot be recovered?",
+    "Example: grant the support role write access to billing settings.",
+  ]) {
+    assert.ok(prompt.includes(rule), rule);
+  }
+  assert.doesNotMatch(TIER_RUBRIC, /Judge the riskiest part of the task\./);
 });
 
 // ---------------------------------------------------------------------------
@@ -293,28 +320,33 @@ test("an unknown tier moves to the next hop", async () => {
   assert.equal(record.hops[0]?.outcome, "unknown-tier");
 });
 
-test("with every model hop failing the chain ends in keywords and the tier equals the keyword classifier's", async () => {
-  const task = "Please rotate the API key used by the nightly job.";
-  const { record } = await classify(task, config(LUNA, [HAIKU, SOL, LUNA_MEDIUM, GPT5_LUNA]), {
-    [LUNA]: "timeout",
-    [HAIKU]: "nonsense",
-    [SOL]: "unknown-tier",
-    [LUNA_MEDIUM]: "out-of-usage",
-    [GPT5_LUNA]: "throws",
-  });
-  assert.equal(record.cause, "keywords");
-  assert.equal(record.tier, classifyTask(task).riskTier);
-  assert.equal(record.tier, "elevated");
-  assert.equal(record.floor, "elevated (credential)");
-  assert.equal(record.rubricVersion, RUBRIC_VERSION);
-  assert.deepEqual(record.hops.map((hop) => [hop.hop, hop.outcome]), [
-    [LUNA, "timeout"],
-    [HAIKU, "schema-invalid"],
-    [SOL, "unknown-tier"],
-    [LUNA_MEDIUM, "out-of-usage"],
-    [GPT5_LUNA, "error"],
-    ["keywords", "decided"],
-  ]);
+test("with every model hop failing the task is unclassified: elevated, whatever words it holds", async () => {
+  const risky = "Delete the admin password hash, drop table users, rotate the API key and force-push the branch.";
+  for (const task of [risky, PLAIN_TASK, RENAME_TASK]) {
+    const { record } = await classify(task, config(LUNA, [HAIKU, SOL, LUNA_MEDIUM, GPT5_LUNA]), {
+      [LUNA]: "timeout",
+      [HAIKU]: "nonsense",
+      [SOL]: "unknown-tier",
+      [LUNA_MEDIUM]: "out-of-usage",
+      [GPT5_LUNA]: "throws",
+    });
+    assert.equal(record.cause, "unclassified", task);
+    assert.equal(record.tier, "elevated", task);
+    assert.deepEqual(record.risk, { level: "unassessed", reasons: [] });
+    assert.equal(record.ambiguity, "unassessed");
+    assert.equal(record.complexity, "unassessed");
+    assert.equal(record.kindOfWork, "unassessed");
+    assert.match(record.why, /no classifier model could classify the task, so it runs as elevated/);
+    assert.equal(record.rubricVersion, RUBRIC_VERSION);
+    assert.equal("floor" in record, false);
+    assert.deepEqual(record.hops.map((hop) => [hop.hop, hop.outcome]), [
+      [LUNA, "timeout"],
+      [HAIKU, "schema-invalid"],
+      [SOL, "unknown-tier"],
+      [LUNA_MEDIUM, "out-of-usage"],
+      [GPT5_LUNA, "error"],
+    ]);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -394,12 +426,12 @@ test("a failed hop still settles its reservation, so every attempted call is acc
   ]);
 });
 
-test("with zero remaining allowance the model hop is skipped and the cause is keywords", async () => {
+test("with zero remaining allowance the model hop is skipped and the task is unclassified", async () => {
   const budget = allowance(0);
   const { record, calls } = await classify(PLAIN_TASK, DEFAULT_CLASSIFIER_CONFIG, { [LUNA]: { answer: answer("critical") } }, budget);
   assert.equal(calls.length, 0);
-  assert.equal(record.cause, "keywords");
-  assert.equal(record.tier, classifyTask(PLAIN_TASK).riskTier);
+  assert.equal(record.cause, "unclassified");
+  assert.equal(record.tier, "elevated");
   assert.equal(record.hops[0]?.outcome, "allowance-exhausted");
   assert.match(record.hops[0]!.detail ?? "", /no remaining task allowance/);
   assert.equal(budget.owner.snapshot().settled.length, 0);
@@ -410,7 +442,7 @@ test("a metered hop whose estimate exceeds the remaining allowance is refused an
   const budget = meteredAllowance(0.0001);
   const { record, calls } = await classify(PLAIN_TASK, DEFAULT_CLASSIFIER_CONFIG, { [LUNA]: { answer: answer("critical") } }, budget);
   assert.equal(calls.length, 0);
-  assert.equal(record.cause, "keywords");
+  assert.equal(record.cause, "unclassified");
   assert.equal(record.hops[0]?.outcome, "allowance-refused");
   assert.match(record.hops[0]!.detail ?? "", /exceeds the \$0\.0001 remaining/);
   assert.equal(budget.owner.snapshot().open.length, 0);
@@ -449,7 +481,7 @@ for (const reportedUsd of [Number.NaN, -1, Number.POSITIVE_INFINITY]) {
       { task: PLAIN_TASK, role: "worker", paths: [] },
       { chain: loadClassifierChain(DEFAULT_CLASSIFIER_CONFIG), callModel: call, allowance: budget },
     );
-    assert.equal(record.cause, "keywords");
+    assert.equal(record.cause, "unclassified");
     assert.equal(record.hops[0]?.outcome, "error");
     assert.match(record.hops[0]!.detail ?? "", /invalid reported cost/);
     assert.equal(record.hops[0]?.allowance?.settlement, "held-open");

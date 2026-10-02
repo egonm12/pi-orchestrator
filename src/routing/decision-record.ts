@@ -32,11 +32,16 @@
 // rung it moved to.
 //
 // This module imports no other harness module at run time except the tier
-// list, so the report CLI that reads records loads nothing else.
+// list (./tiers.ts) and the skip reasons, so the report CLI that reads records
+// loads nothing else.
+//
+// Records written before ADR 0015 carry the keyword floor (`floor`,
+// `floorTier`, `floorSignals`) and the model's own tier (`modelTier`) in their
+// classification. New records carry neither; readers accept both.
 
 import { appendFileSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { RISK_TIERS, type ClassificationSignal, type RiskTier } from "./classifier.ts";
+import { RISK_TIERS, type RiskTier } from "./tiers.ts";
 import type { HopOutcome, TierClassification } from "./tier-classifier.ts";
 import type { ResolvedTierMap, TierMapDrop, TierOrder, TierRung } from "./tier-map.ts";
 import type { LadderSkippedRung } from "./effort-ladder.ts";
@@ -105,6 +110,7 @@ const FREE_TEXT_FIELDS: readonly (readonly [path: readonly string[], limit: numb
   [["taskTextPrefix"], TASK_TEXT_PREFIX_LIMIT],
   [["classification", "why"], FREE_TEXT_LIMIT],
   [["classification", "risk", "reasons", "[]"], FREE_TEXT_LIMIT],
+  // Only records written before ADR 0015 hold floor signals; read checks still apply.
   [["classification", "floorSignals", "[]", "matched"], FREE_TEXT_LIMIT],
   [["classification", "hops", "[]", "detail"], FREE_TEXT_LIMIT],
   [["tierMap", "drops", "[]", "reason"], FREE_TEXT_LIMIT],
@@ -205,18 +211,31 @@ export interface RecordedHop {
   readonly allowance?: { readonly reservationId: string; readonly settlement: string };
 }
 
+/** A keyword signal of the floor on a record written before ADR 0015. */
+export interface RecordedFloorSignal {
+  readonly kind: string;
+  readonly label: string;
+  readonly matched: string;
+}
+
 export interface RecordedClassification {
   readonly tier: RiskTier;
-  /** The deciding hop: `model:<rung>` or `keywords`. */
+  /** What gave the tier: `model:<rung>`, `unclassified`, or
+   *  `retry:<delegation id>` for a retry on the tier of the delegation it
+   *  retries. `keywords` on records written before ADR 0015. */
   readonly cause: string;
+  /** Records written before ADR 0015 only: the model's tier before the floor. */
   readonly modelTier?: RiskTier;
-  readonly floor: string;
+  /** Records written before ADR 0015 only: `none`, or the floor tier with its signal labels. */
+  readonly floor?: string;
   readonly floorTier?: RiskTier;
-  readonly floorSignals: readonly ClassificationSignal[];
+  readonly floorSignals?: readonly RecordedFloorSignal[];
+  /** The model's risk level and its reasons. */
   readonly risk: { readonly level: string; readonly reasons: readonly string[] };
   readonly ambiguity: string;
   readonly complexity: string;
   readonly kindOfWork: string;
+  /** The model's reason for the tier. */
   readonly why: string;
   readonly rubricVersion: string;
   readonly schemaVersion: string;
@@ -561,19 +580,24 @@ function checkClassification(record: Json): void {
   checkKeys(
     value,
     path,
-    ["tier", "cause", "floor", "floorSignals", "risk", "ambiguity", "complexity", "kindOfWork", "why", "rubricVersion", "schemaVersion", "hops"],
-    ["modelTier", "floorTier"],
+    ["tier", "cause", "risk", "ambiguity", "complexity", "kindOfWork", "why", "rubricVersion", "schemaVersion", "hops"],
+    // Written before ADR 0015 only.
+    ["modelTier", "floor", "floorTier", "floorSignals"],
   );
   oneOf(value, "tier", path, RISK_TIERS);
   if (value.modelTier !== undefined) oneOf(value, "modelTier", path, RISK_TIERS);
   if (value.floorTier !== undefined) oneOf(value, "floorTier", path, RISK_TIERS);
-  for (const key of ["cause", "floor", "ambiguity", "complexity", "kindOfWork", "rubricVersion", "schemaVersion"]) {
+  for (const key of ["cause", "ambiguity", "complexity", "kindOfWork", "rubricVersion", "schemaVersion"]) {
     stringAt(value, key, path, { nonBlank: true });
   }
+  if (value.floor !== undefined) stringAt(value, "floor", path, { nonBlank: true });
   stringAt(value, "why", path);
-  eachObject(value, "floorSignals", path, (signal, signalPath) => {
-    checkKeys(signal, signalPath, ["kind", "label", "matched"]);
-  });
+  if (value.floorSignals !== undefined) {
+    eachObject(value, "floorSignals", path, (signal, signalPath) => {
+      checkKeys(signal, signalPath, ["kind", "label", "matched"]);
+      for (const key of ["kind", "label", "matched"]) stringAt(signal, key, signalPath);
+    });
+  }
   const risk = objectAt(value, "risk", path);
   checkKeys(risk, `${path}.risk`, ["level", "reasons"]);
   stringAt(risk, "level", `${path}.risk`, { nonBlank: true });
@@ -863,10 +887,6 @@ function recordedClassification(classification: TierClassification): RecordedCla
   return {
     tier: classification.tier,
     cause: classification.cause,
-    ...(classification.modelTier === undefined ? {} : { modelTier: classification.modelTier }),
-    floor: classification.floor,
-    ...(classification.floorTier === undefined ? {} : { floorTier: classification.floorTier }),
-    floorSignals: classification.floorSignals.map((signal) => ({ kind: signal.kind, label: signal.label, matched: signal.matched })),
     risk: { level: classification.risk.level, reasons: [...classification.risk.reasons] },
     ambiguity: classification.ambiguity,
     complexity: classification.complexity,

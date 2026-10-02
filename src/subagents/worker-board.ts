@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { AgentSession, AgentSessionEvent, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { watchServedRungs, type RungEscalation, type ServedRung } from "../router/served-rungs.ts";
-import type { RiskTier } from "../routing/classifier.ts";
+import type { RiskTier } from "../routing/tiers.ts";
 
 // The worker board: one in-process record of every worker of the
 // orchestrator session, foreground, background and nested, for the live

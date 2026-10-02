@@ -4,7 +4,7 @@
 // SCHEMA_VERSION. The JSON schema is what the model is shown; `checkTierAnswer`
 // is what the harness enforces. They describe the same shape.
 
-import { RISK_TIERS, type RiskTier } from "./classifier.ts";
+import { RISK_TIERS, type RiskTier } from "./tiers.ts";
 
 export const SCHEMA_VERSION = "tier-answer-1";
 

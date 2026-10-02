@@ -1,4 +1,4 @@
-import type { RiskTier } from "../routing/classifier.ts";
+import type { RiskTier } from "../routing/tiers.ts";
 
 // The rung that serves each request of a worker on the auto model, for the
 // worker board (src/subagents/worker-board.ts). Replies are labelled

@@ -11,7 +11,7 @@ import {
   saveAuthorization,
   type RecipientAuthorization,
 } from "../recipients/authorization.ts";
-import type { RiskTier } from "../routing/classifier.ts";
+import type { RiskTier } from "../routing/tiers.ts";
 import { tierMapFromSettings } from "../routing/tier-map.ts";
 import { checkModelScope } from "../models/model-scope.ts";
 import { getSupportedThinkingLevels, type ModelInfo, type ThinkingLevel } from "../models/model-info.ts";

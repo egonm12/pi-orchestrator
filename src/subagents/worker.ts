@@ -8,8 +8,9 @@ import type { ResumeWorker } from "./resume.ts";
 import type { BackgroundMessageMode } from "./background.ts";
 import { REPORT_TOOL, reportExtension, type WorkerReports } from "./report.ts";
 import { missingResultSections, REPORTING_RULES, type ResultSection } from "./result-format.ts";
-import { AUTO_MODEL_ID, AUTO_PROVIDER, requestFailover, setRoutingConstraints } from "../router/auto-model.ts";
+import { AUTO_MODEL_ID, AUTO_PROVIDER, requestFailover, setCarriedClassification, setRoutingConstraints } from "../router/auto-model.ts";
 import { limitErrorObservation } from "../router/limit-errors.ts";
+import type { TierClassification } from "../routing/tier-classifier.ts";
 import type { RoutingConstraints } from "../routing/tier-router.ts";
 import type { ThinkingLevel } from "../models/model-info.ts";
 import type { WorkerSession } from "./worker-board.ts";
@@ -88,6 +89,10 @@ export interface WorkerSetup {
   /** Routing constraints for the worker's first request (../router/auto-model.ts).
    *  Only a routed worker takes them: one with a fork, a named model or a resume fails. */
   readonly routingConstraints?: RoutingConstraints;
+  /** A retry's classification, carried from the delegation it retries
+   *  (./retry.ts): the router routes the worker's first request on it instead
+   *  of classifying it. Like routing constraints, only a routed worker takes it. */
+  readonly carriedClassification?: TierClassification;
   /** The delegation this worker reviews (ADR 0010): its decision record links
    *  to it, and `prompt`, the review rules and the reviewed delegation
    *  (./review.ts), follows the reporting rules in its system prompt. */
@@ -272,7 +277,8 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
 
   const { instructions, reports, review } = setup;
   // Constraints bind the router's choice, so a worker the router does not choose for must not drop them unseen.
-  if ((setup.routingConstraints !== undefined || review !== undefined) && (setup.fork || setup.namedModel || setup.resume)) {
+  if ((setup.routingConstraints !== undefined || setup.carriedClassification !== undefined || review !== undefined) &&
+    (setup.fork || setup.namedModel || setup.resume)) {
     return failed("routing constraints and a review need a newly routed worker, not a fork, a named model or a resume");
   }
   // Every non-fork worker gets the reporting rules, whatever its agent
@@ -371,6 +377,7 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
   // Before binding, so the extensions see the mark at session_start.
   const unmarkWorkerSession = markWorkerSession(sessionId, setup.parentDelegationId, reviewed);
   const unsetConstraints = setup.routingConstraints === undefined ? undefined : setRoutingConstraints(sessionId, setup.routingConstraints);
+  const unsetClassification = setup.carriedClassification === undefined ? undefined : setCarriedClassification(sessionId, setup.carriedClassification);
   let unregisterMessage: (() => void) | undefined;
   try {
     // Binding starts the extensions: the router extension reads its settings
@@ -405,6 +412,7 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
     unsubscribe();
     session.dispose();
     unsetConstraints?.();
+    unsetClassification?.();
     unmarkWorkerSession();
   }
 }

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { fixtureClassification, fixtureRefusal, fixtureRoute, fixtureTierMap, HAIKU as FIXTURE_HAIKU, OPUS, SONNET } from "../fixtures/routing-decision.ts";
-import type { RiskTier } from "../routing/classifier.ts";
+import type { RiskTier } from "../routing/tiers.ts";
 import {
   appendRoutingRecord,
   buildEditRecord,
@@ -50,9 +50,18 @@ function expectedCounts(row: Omit<ExpectedReportRow, "tier" | "rung">): string {
     `ungated 0, missing ${row.missing ?? 0}, shadow agreement ${agreement}`;
 }
 
-/** The report the test expects, written from its own list of rows in the
- *  report's line format, never from `buildRoutingReport`. */
-function expectedReport(folder: string, rows: readonly ExpectedReportRow[], orphanedVerdicts: number): string {
+/** A decision's classification line: its id, tier, cause and the model's reason. */
+interface ExpectedClassification {
+  readonly delegationId: string;
+  readonly tier: RiskTier;
+  readonly cause: string;
+  readonly why: string;
+}
+
+/** The report the test expects, written from its own list of rows and
+ *  classifications in the report's line format, never from `buildRoutingReport`. */
+function expectedReport(folder: string, rows: readonly ExpectedReportRow[], orphanedVerdicts: number,
+  classifications: readonly ExpectedClassification[]): string {
   const total = {
     decisions: rows.reduce((sum, row) => sum + row.decisions, 0),
     verdicts: rows.flatMap((row) => row.verdicts),
@@ -64,9 +73,11 @@ function expectedReport(folder: string, rows: readonly ExpectedReportRow[], orph
     `routing report for ${folder}`,
     ...rows.map((row) => `tier ${row.tier}, ${row.rung === null ? "refused" : `rung ${row.rung}`}: ${expectedCounts(row)}`),
     `all: ${expectedCounts(total)}`,
+    `unclassified decisions: ${classifications.filter((classification) => classification.cause === "unclassified").length}`,
     `orphaned verdicts: ${orphanedVerdicts}`,
     // Every delegation here is routed.
     "unrouted delegations: accept 0, request_changes 0, same-rung accept 0, same-rung request_changes 0, ungated 0, missing 0",
+    ...classifications.map(({ delegationId, tier, cause, why }) => `classification ${delegationId}: ${tier}, ${cause}: ${why}`),
     "",
   ].join("\n");
 }
@@ -129,7 +140,8 @@ test("the hand-computed report equals routing-report.ts over a folder with known
       { tier: "mechanical", rung: `${FIXTURE_HAIKU}:low`, decisions: 3, verdicts: ["accept", "accept"], missing: 1, shadowDecisions: 2, shadowAgreements: 1 },
       { tier: "standard", rung: "anthropic/claude-sonnet-5:medium", decisions: 1, verdicts: [], shadowDecisions: 0, shadowAgreements: 0 },
       { tier: "elevated", rung: null, decisions: 1, verdicts: ["request_changes"], shadowDecisions: 0, shadowAgreements: 0 },
-    ], 1);
+    ], 1, ([["m-live", "mechanical"], ["m-shadow-agrees", "mechanical"], ["m-shadow-differs", "mechanical"], ["s-live", "standard"], ["e-refused", "elevated"]] as const)
+      .map(([delegationId, tier]) => ({ delegationId, tier, cause: "model:openai-codex/gpt-6-luna:low", why: `fixture classifier says ${tier}` })));
     const run = runRoutingReport(records);
     assert.equal(run.status, 0, run.stderr);
     assert.equal(run.stdout, expected);

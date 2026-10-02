@@ -8,9 +8,10 @@ import {
   type RoutingRecord,
 } from "../routing/decision-record.ts";
 import type { LadderChoice } from "../routing/effort-ladder.ts";
+import type { TierClassification } from "../routing/tier-classifier.ts";
 import type { ResolvedTierMap, TierRung } from "../routing/tier-map.ts";
 import type { RoutingConstraints } from "../routing/tier-router.ts";
-import type { RiskTier } from "../routing/classifier.ts";
+import type { RiskTier } from "../routing/tiers.ts";
 import { orchestratorRouter, type OrchestratorRouter } from "../router/orchestrator-router.ts";
 import { editingDelegationProblem } from "./quality-gate.ts";
 import { readWorkerOutcome } from "./resume.ts";
@@ -57,6 +58,15 @@ import { workerBoard } from "./worker-board.ts";
 // from its saved worker session or, when it was not saved, from the worker
 // board, with the orchestrator's feedback. It follows the failed attempt's
 // agent definition, as the board or its saved outcome names it.
+//
+// The retry's tier (CONTEXT.md, Retry tier). A retry keeps the tier of the
+// delegation it retries: the failed attempt's latest decision record's
+// classification is carried to the router, which routes the retry on it
+// without calling the classifier, so the feedback's words cannot move the
+// tier. A retry's own decision record carries it on, so a retry of a retry
+// keeps the same tier. Extra care comes from the effort ladder's next rung
+// alone. An attempt without a decision record (a fork, a named model, routing
+// off) has no tier to keep; with routing on its retry is classified.
 
 /** Climbs one task may make on the effort ladder. */
 export const MAX_CLIMBS = 2;
@@ -66,15 +76,36 @@ type LadderPosition =
   | { readonly placed: true; readonly tier: RiskTier; readonly rung: TierRung; readonly kindOfWork: string }
   | { readonly placed: false; readonly why: string };
 
+/** `id`'s latest decision, fork or agent-model record. */
+function latestRouting(records: readonly RoutingRecord[], id: string) {
+  return records.filter((record) => record.delegationId === id &&
+    (record.recordType === "decision" || record.recordType === "fork" || record.recordType === "agent-model")).at(-1);
+}
+
 function ladderPosition(records: readonly RoutingRecord[], id: string): LadderPosition {
-  const own = records.filter((record) => record.delegationId === id);
-  const latest = own.filter((record) => record.recordType === "decision" || record.recordType === "fork" || record.recordType === "agent-model").at(-1);
+  const latest = latestRouting(records, id);
   if (latest?.recordType === "fork") return { placed: false, why: `delegation ${id} is a forked worker, which runs unrouted on the session model` };
   if (latest?.recordType === "agent-model") return { placed: false, why: `delegation ${id}'s agent definition names its model, so it was not routed` };
   if (latest?.recordType !== "decision") return { placed: false, why: `no routing decision names delegation ${id}'s rung: it ran with routing off` };
   const { route } = latest;
   if (route.outcome !== "chosen") return { placed: false, why: `delegation ${id}'s route refused every rung, so it ran on the session model` };
   return { placed: true, tier: route.tier, rung: route.rung as TierRung, kindOfWork: latest.classification.kindOfWork };
+}
+
+/** The classification a retry of `id` is routed on: `id`'s, from its latest
+ *  decision record, with the cause `retry:<id>` and no classifier hops.
+ *  `undefined` when `id` has no decision record to keep a tier from. */
+function retriedClassification(records: readonly RoutingRecord[], id: string): TierClassification | undefined {
+  const latest = latestRouting(records, id);
+  if (latest?.recordType !== "decision") return undefined;
+  // Written from a TierClassification by the record writer, so its values are the classifier's own.
+  const { tier, risk, ambiguity, complexity, kindOfWork, why, rubricVersion, schemaVersion } = latest.classification;
+  return {
+    tier, cause: `retry:${id}`,
+    risk: { level: risk.level as TierClassification["risk"]["level"], reasons: [...risk.reasons] },
+    ambiguity: ambiguity as TierClassification["ambiguity"], complexity: complexity as TierClassification["complexity"],
+    kindOfWork: kindOfWork as TierClassification["kindOfWork"], why, rubricVersion, schemaVersion, hops: [],
+  };
 }
 
 /** The attempts of `id`'s task from its first attempt to `id`, and its climbs so far. */
@@ -207,6 +238,9 @@ export function retrySetup(ctx: Pick<ExtensionContext, "cwd" | "sessionManager">
 export interface StartedRetry {
   /** The routing constraints of a placed retry: its forced rung. */
   readonly constraints?: RoutingConstraints;
+  /** The retried delegation's classification, which the router routes the
+   *  retry on instead of classifying it; absent when that delegation has none. */
+  readonly classification?: TierClassification;
   /** The ladder record written for it. */
   readonly record: EffortLadderRecord;
   /** One line on where it runs, for its Result. */
@@ -228,8 +262,10 @@ export function startRetry(ctx: Pick<ExtensionContext, "cwd" | "sessionManager">
     : buildEffortLadderRecord({ ...common, mode: plan.mode, step: plan.choice.step, skipped: plan.choice.skipped,
       kindOfWork: plan.kindOfWork, tierMap: plan.tierMap, route: plan.choice });
   appendRoutingRecord(recordDir, record);
+  const classification = retriedClassification(records, id);
   return {
     record, text: startedText(id, plan),
     ...(plan.kind === "placed" ? { constraints: { forcedRung: { rung: plan.choice.rung, tier: plan.choice.tier } } } : {}),
+    ...(classification === undefined ? {} : { classification }),
   };
 }

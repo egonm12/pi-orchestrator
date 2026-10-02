@@ -12,6 +12,12 @@
 // model without fresh evidence for the task type is not admitted remains here
 // only.
 //
+// Nothing live reaches this path: `route` is called only by
+// `delegateWithSwitch` (../recipients/authorized-delegation.ts), which only
+// tests call; the extensions import that module for `providerOf` and
+// `NO_BUDGET_CONSTRAINT` alone. A request brings its own assessment. The
+// keyword classifier that filled one in when it did not is gone (ADR 0015).
+//
 // Structured in two stages because tickets 07, 09 and 19 depend on that shape:
 //
 //   STAGE 1  allowedCandidates()  -- the BOUNDARY. A deterministic function of
@@ -62,12 +68,20 @@ import {
   type DelegationIdentity,
 } from "../policy/model-resolution.ts";
 import { subagentBanListReason } from "../policy/ban-lists.ts";
-import {
-  classifyTask,
-  tierRank,
-  type RiskAssessment,
-  type RiskTier,
-} from "./classifier.ts";
+import type { RiskTier } from "./tiers.ts";
+
+/**
+ * An assessment of the TASK: its risk tier, how clear it is, and the
+ * confidence in that assessment, made by the caller. It is never a number a
+ * model reported about its own answer, and this module has no field for one.
+ */
+export interface RiskAssessment {
+  readonly riskTier: RiskTier;
+  readonly ambiguity: "clear" | "underspecified";
+  /** 0..1 confidence in THIS ASSESSMENT, not a quality prediction. */
+  readonly confidence: number;
+  readonly rationale: string;
+}
 
 // ---------------------------------------------------------------------------
 // Policy configuration
@@ -95,7 +109,7 @@ export interface RoutingPolicyConfig {
    * its confidence falls below a threshold, and the LLM cascade-deferral
    * literature applies the same thresholding to route-or-defer decisions. The
    * borrowed part is the mechanism -- threshold, abstain, take the safe
-   * branch. The classification itself is ours (classifier.ts).
+   * branch. The assessment comes with the request.
    */
   readonly confidenceThreshold: number;
   /** The tier taken when confidence falls below the threshold. Configurable,
@@ -122,14 +136,10 @@ export interface RoutingRequest {
   readonly taskType: string;
   readonly privacy?: PrivacyConstraint;
   /**
-   * Overrides the classifier. Exists so a caller can route an assessment that
-   * was made elsewhere, and so tests can drive the escalation path with an
-   * exact confidence instead of hunting for wording that happens to produce
-   * one. It is an assessment of the TASK, from the same shape the classifier
-   * produces -- there is no path here for a number a model reported about its
-   * own answer.
+   * The assessment of the TASK the request is routed on, made elsewhere.
+   * There is no path here for a number a model reported about its own answer.
    */
-  readonly assessment?: RiskAssessment;
+  readonly assessment: RiskAssessment;
 }
 
 // ---------------------------------------------------------------------------
@@ -305,7 +315,7 @@ export function allowedCandidates(input: Stage1Input): AllowedCandidates {
   const config = input.config ?? DEFAULT_ROUTING_POLICY;
   const now = input.now ?? Date.now();
   const { request, catalog } = input;
-  const assessment = request.assessment ?? classifyTask(request.taskDescription);
+  const { assessment } = request;
 
   // The reject-option step. Below the threshold the classification is not
   // trusted and the fallback tier is applied instead. This depends only on
@@ -605,7 +615,6 @@ export function formatRoutingRecord(
     fallbackTier: allowed.fallbackTier,
     fallbackTriggered: allowed.fallbackTriggered,
     allowanceApplied: allowed.allowanceApplied,
-    classifierBasis: allowed.assessment.classifierBasis,
     admitted: allowed.admitted.map((c) => c.model),
     rejected: allowed.rejected.map((c) => ({ model: c.model, why: c.rejectedBecause })),
     reason: decision.ok ? decision.reason : decision.message,

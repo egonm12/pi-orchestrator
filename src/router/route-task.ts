@@ -5,7 +5,7 @@ import { classifyTier, type ClassifierModelCall, type LoadedClassifierChain, typ
 import type { ResolvedTierMap } from "../routing/tier-map.ts";
 import { routeForcedRung, routeTier, type ProviderUsage, type RouterEvidence, type RoutingConstraints } from "../routing/tier-router.ts";
 import { nextRungAfterFailure, type FailedDecision, type LadderDecision } from "../routing/effort-ladder.ts";
-import { isAtLeastTier } from "../routing/classifier.ts";
+import { isAtLeastTier } from "../routing/tiers.ts";
 import { deriveProviderUsage, type RoutingEvidence, type RoutingEvidenceSource } from "./evidence.ts";
 import { lowOnUsage, readUsageObservations, usageLimits, type UsageObservations } from "./usage-observations.ts";
 import { readUsableRoutingRecords, type RoutingMode } from "../routing/decision-record.ts";

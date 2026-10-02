@@ -10,7 +10,7 @@ import { emptyRefreshState } from "../catalog/refresh-lifecycle.ts";
 import { INSTALLED_MODEL_INFO } from "../fixtures/installed-model-info.ts";
 import { DEFAULT_BAN_LISTS } from "../policy/ban-lists.ts";
 import { authorizeRecipient, emptyAuthorization, grantOwnerApproval } from "../recipients/authorization.ts";
-import type { RiskTier } from "../routing/classifier.ts";
+import type { RiskTier } from "../routing/tiers.ts";
 import type { RoutingRecord } from "../routing/decision-record.ts";
 import type { ResolvedTierMap, TierRung } from "../routing/tier-map.ts";
 import type { ActiveRouter } from "../router/route-task.ts";

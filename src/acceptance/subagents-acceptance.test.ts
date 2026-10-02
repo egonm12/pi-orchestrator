@@ -21,8 +21,8 @@ import { SUBAGENTS_TOOL } from "../subagents/worker.ts";
 // through pi's `context` hook, mimicking context-mode. One `subagents` call
 // carries two items, both under the default `maxParallel` of 4, so both
 // workers start together. The router must classify each worker from its own
-// task text only: the noisy extension's injected "Purge" text must set no
-// keyword floor and must not reach a decision record's task text.
+// task text only: the noisy extension's injected "Purge" text must not reach
+// a decision record's task text.
 //
 // Only anthropic/claude-haiku-4-5 is approved for this live route. A provider
 // refusal (usage, quota, rate limit) is a skip, never a pass or a failure.
@@ -46,7 +46,7 @@ const TIERS = {
 
 // The wording of the retired pi-subagents routing gate's mechanical tasks:
 // known to classify mechanical on this live route, with no destructive
-// keyword of its own.
+// action of its own.
 const TASK_A = "Reformat src/report.ts with prettier: fix the indentation and add the missing trailing commas. No behaviour change.";
 const TASK_B = "Reformat src/invoice.ts with prettier: fix the indentation and add the missing trailing commas. No behaviour change.";
 
@@ -230,7 +230,6 @@ test(`live ${HAIKU} session: two parallel workers through the built-in subagents
         assert.equal(record.mode, "live");
         assert.equal(record.taskTextPrefix, task, "the decision's task text is the item's task, nothing appended");
         assert.doesNotMatch(record.taskTextPrefix, /purge/i, "the noisy extension's injected text is not the task text");
-        assert.deepEqual(record.classification.floorSignals, [], "the noisy extension's \"Purge\" text set no keyword floor");
         assert.equal(record.classification.tier, "mechanical", JSON.stringify(record.classification));
         assert.equal(record.route.outcome === "chosen" && record.route.rung.rung, RUNG.mechanical, JSON.stringify(record.route));
         assert.equal(record.ranOn, RUNG.mechanical);

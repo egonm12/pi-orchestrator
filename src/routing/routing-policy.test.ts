@@ -13,7 +13,6 @@ import {
 } from "../fixtures/catalog-facts.ts";
 import { INSTALLED_MODEL_IDS } from "../fixtures/installed-models.ts";
 import { createProviderDouble } from "../fixtures/provider-double.ts";
-import { classifyTask, type RiskAssessment } from "./classifier.ts";
 import {
   allowedCandidates,
   correctnessFirstPicker,
@@ -23,6 +22,7 @@ import {
   ROUTING_RECORD_PREFIX,
   type AllowedCandidates,
   type Picker,
+  type RiskAssessment,
   type RoutingPolicyConfig,
   type RoutingRequest,
 } from "./routing-policy.ts";
@@ -48,13 +48,8 @@ const baseCatalog = buildCatalog({ modelIds: [...INSTALLED_MODEL_IDS] });
 const SECURITY_TASK = "fix a one-line auth bypass check in the login handler";
 const MECHANICAL_TASK = "reformat this file's imports alphabetically";
 
-function request(overrides: Partial<RoutingRequest> & { taskType: string }): RoutingRequest {
-  return { taskDescription: overrides.taskDescription ?? MECHANICAL_TASK, ...overrides };
-}
-
-/** An assessment with an exact confidence, so escalation tests drive the
- *  threshold directly instead of hunting for wording that happens to produce
- *  one. Shaped exactly like the classifier's own output. */
+/** An assessment with an exact tier and confidence. A request brings its own
+ *  assessment: no keyword classifier fills one in (ADR 0015). */
 function assessmentWith(
   confidence: number,
   riskTier: RiskAssessment["riskTier"],
@@ -63,21 +58,20 @@ function assessmentWith(
     riskTier,
     ambiguity: "clear",
     confidence,
-    signals: [],
-    signalCounts: {
-      "security-sensitive": 0,
-      destructive: 0,
-      "public-behavior": 0,
-      mechanical: 0,
-      ambiguity: 0,
-    },
     rationale: "fixed assessment supplied by test",
-    classifierBasis: "first-pass-heuristic-unvalidated",
   };
 }
 
+const MECHANICAL = assessmentWith(0.9, "mechanical");
+const CRITICAL = assessmentWith(0.9, "critical");
+
+/** A request for `MECHANICAL_TASK`, assessed mechanical, unless overridden. */
+function request(overrides: Partial<RoutingRequest> & { taskType: string }): RoutingRequest {
+  return { taskDescription: overrides.taskDescription ?? MECHANICAL_TASK, ...overrides, assessment: overrides.assessment ?? MECHANICAL };
+}
+
 function routingSources(): Record<string, string> {
-  const files = ["classifier.ts", "routing-policy.ts"];
+  const files = ["tiers.ts", "routing-policy.ts"];
   const out: Record<string, string> = {};
   for (const file of files) out[file] = readFileSync(join(here, file), "utf8");
   return out;
@@ -115,55 +109,6 @@ test("routing excludes prohibited ids by name and records the prohibition", () =
   assert.ok(result.admitted.some((candidate) => candidate.model === allowed));
 });
 
-// The classifier: risk and ambiguity, not size
-// ---------------------------------------------------------------------------
-
-test("a small security-sensitive task classifies as critical, not mechanical", () => {
-  const assessment = classifyTask(SECURITY_TASK);
-  assert.equal(assessment.riskTier, "critical");
-  assert.ok(
-    assessment.confidence >= DEFAULT_ROUTING_POLICY.confidenceThreshold,
-    `expected confident classification, got ${assessment.confidence}`,
-  );
-  assert.ok(assessment.signals.some((s) => s.kind === "security-sensitive"));
-});
-
-test("genuinely mechanical work classifies as mechanical, confidently", () => {
-  const assessment = classifyTask(MECHANICAL_TASK);
-  assert.equal(assessment.riskTier, "mechanical");
-  assert.equal(assessment.ambiguity, "clear");
-  assert.ok(assessment.confidence >= DEFAULT_ROUTING_POLICY.confidenceThreshold);
-});
-
-test("a short featureless description produces low confidence, not a cheap guess", () => {
-  const assessment = classifyTask("fix the thing");
-  assert.equal(assessment.ambiguity, "underspecified");
-  assert.ok(
-    assessment.confidence < DEFAULT_ROUTING_POLICY.confidenceThreshold,
-    `expected low confidence, got ${assessment.confidence}`,
-  );
-});
-
-test("hedging language lowers confidence in the classification", () => {
-  const hedged = classifyTask("maybe clean up the auth module a bit, improve it somehow");
-  const plain = classifyTask("rewrite the auth module's session validation");
-  assert.ok(
-    hedged.confidence < plain.confidence,
-    `hedged ${hedged.confidence} should be below plain ${plain.confidence}`,
-  );
-  assert.equal(hedged.ambiguity, "underspecified");
-});
-
-test("every assessment states that the classifier is unvalidated", () => {
-  for (const text of [SECURITY_TASK, MECHANICAL_TASK, "fix the thing"]) {
-    assert.equal(classifyTask(text).classifierBasis, "first-pass-heuristic-unvalidated");
-  }
-});
-
-test("the classifier is deterministic", () => {
-  assert.deepEqual(classifyTask(SECURITY_TASK), classifyTask(SECURITY_TASK));
-});
-
 // ---------------------------------------------------------------------------
 // Checklist 1: routing considers all six inputs
 // ---------------------------------------------------------------------------
@@ -195,6 +140,7 @@ test("routing considers risk, capability, availability, headroom, privacy and co
     request: request({
       taskDescription: SECURITY_TASK,
       taskType: "security-review",
+      assessment: CRITICAL,
       privacy: { approvedRecipients: ["anthropic"], reason: "ticket 07 seam" },
     }),
     catalog,
@@ -393,7 +339,6 @@ test("the confidence threshold and the fallback tier are configurable and visibl
   assert.equal(parsed.fallbackTriggered, true);
   assert.equal(parsed.effectiveTier, "elevated");
   assert.equal(parsed.riskTier, "mechanical");
-  assert.equal(parsed.classifierBasis, "first-pass-heuristic-unvalidated");
   assert.equal(typeof parsed.confidence, "number");
 });
 
@@ -504,7 +449,7 @@ test("no self-reported confidence or answer-quality signal is consumed anywhere 
 test("with no capability evidence at all, routing blocks rather than assigning something", () => {
   // The catalog as actually built: taskSuitability is unknown for every model.
   const decision = route({
-    request: request({ taskDescription: SECURITY_TASK, taskType: "security-review" }),
+    request: request({ taskDescription: SECURITY_TASK, taskType: "security-review", assessment: CRITICAL }),
     catalog: baseCatalog,
   });
 
@@ -607,7 +552,7 @@ test("a swapped picker changes the choice without moving the boundary", () => {
     [HAIKU]: { "security-review": 0.95 },
   });
   const input = {
-    request: request({ taskDescription: SECURITY_TASK, taskType: "security-review" }),
+    request: request({ taskDescription: SECURITY_TASK, taskType: "security-review", assessment: CRITICAL }),
     catalog,
   };
 
@@ -670,7 +615,7 @@ test("the same task routes sensibly through two differently-shaped provider cata
 });
 
 test("a high-risk task routes to the best-evidenced model in either catalog", () => {
-  const task = request({ taskDescription: SECURITY_TASK, taskType: "security-review" });
+  const task = request({ taskDescription: SECURITY_TASK, taskType: "security-review", assessment: CRITICAL });
   const catalogA = withTaskSuitability(onlyModels(baseCatalog, [OPUS, HAIKU]), {
     [OPUS]: { "security-review": 0.95 },
     [HAIKU]: { "security-review": 0.91 },
@@ -708,7 +653,7 @@ test("no provider name appears anywhere in the routing source", () => {
 
 test("route refuses a picker that fabricates a prohibited model", () => {
   const decision = route(
-    { catalog: baseCatalog, request: request({ taskType: "security-review", taskDescription: SECURITY_TASK }) },
+    { catalog: baseCatalog, request: request({ taskType: "security-review", taskDescription: SECURITY_TASK, assessment: CRITICAL }) },
     () => ({ model: PROHIBITED, reason: "rogue picker", cheapenedOnCostEvidence: false }),
   );
   assert.equal(decision.ok, false);
@@ -722,7 +667,7 @@ test("routing independently excludes a prohibited model before ticket 04", () =>
     [PROHIBITED]: { "security-review": 1 },
   });
   const decision = route({
-    request: request({ taskDescription: SECURITY_TASK, taskType: "security-review" }),
+    request: request({ taskDescription: SECURITY_TASK, taskType: "security-review", assessment: CRITICAL }),
     catalog,
   });
 

@@ -575,6 +575,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               ...(parentDelegationId === undefined ? {} : { parentDelegationId }),
               ...(target === undefined || reviewing === undefined ? {} : { routingConstraints: target.constraints, review: reviewing }),
               ...(climb?.constraints === undefined ? {} : { routingConstraints: climb.constraints }),
+              ...(climb?.classification === undefined ? {} : { carriedClassification: climb.classification }),
               onActivity: backgroundCall?.onActivity[index], reports, onSession: feeds[index]!.session,
               onTool: (tool) => showProgress(index, { ...item, ...workerModel, status: "running", ...(tool === undefined ? {} : { tool }) }),
               ...(backgroundCall === undefined ? {} : { onMessageReady: (receive) => backgroundCalls.registerWorker(backgroundCall.delegationIds[index]!, receive) }),

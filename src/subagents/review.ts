@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { parseSessionEntries, SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { RiskTier } from "../routing/classifier.ts";
+import type { RiskTier } from "../routing/tiers.ts";
 import type { EditRecord, ForkRecord, GateLevel, RoutingRecord } from "../routing/decision-record.ts";
 import { providerOf } from "../recipients/authorized-delegation.ts";
 import type { ConstraintRung } from "../routing/tier-router.ts";

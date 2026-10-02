@@ -19,7 +19,7 @@ import {
   type BanLists,
 } from "../policy/ban-lists.ts";
 import { HARNESS_MODEL_SCOPE } from "../policy/model-resolution.ts";
-import { RISK_TIERS, type RiskTier } from "./classifier.ts";
+import { RISK_TIERS, type RiskTier } from "./tiers.ts";
 
 // Ticket 22, ADR 0001: the owner-written tier map.
 //

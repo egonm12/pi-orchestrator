@@ -6,8 +6,9 @@
 // Reads the record folder's day files and nothing else (no settings, no
 // ledger, no agent dir), and prints one line per tier and rung: decisions,
 // verdicts by kind, same-rung verdicts, ungated delegations, missing verdicts
-// and the shadow agreement rate, then the totals, the orphaned verdict count
-// and the same counts for unrouted delegations.
+// and the shadow agreement rate, then the totals, the unclassified decision
+// count, the orphaned verdict count, the same counts for unrouted delegations
+// and each decision's classification with its reason.
 //
 //   - A decision's row is the tier and rung it chose, or `<tier routing
 //     started at>, refused` when the router refused: the classified tier,
@@ -27,6 +28,12 @@
 //     chosen rung's model equals the hand-picked model. A refused shadow
 //     decision chose no rung, so it does not agree.
 //   - Orphaned verdicts count once per delegation id.
+//   - Unclassified decisions (CONTEXT.md, Unclassified task) count the
+//     decisions whose cause is `unclassified`: no classifier model could
+//     classify the task.
+//   - Each decision's classification line gives its tier, its cause and the
+//     model's reason (`why`), so a reviewer argues with the reason. A record
+//     written before ADR 0015 whose keyword floor was set also names the floor.
 //   - A delegation the router did not route (a forked worker, an agent
 //     definition's named model, a worker that ran with routing off) has no
 //     row: its verdict, ungated delegation or missing verdict counts in its own
@@ -44,7 +51,7 @@
 
 import { existsSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { RISK_TIERS, type RiskTier } from "./classifier.ts";
+import { RISK_TIERS, type RiskTier } from "./tiers.ts";
 import {
   readRoutingRecords,
   RoutingRecordError,
@@ -78,9 +85,23 @@ export interface RoutingReportRow extends GateCounts {
   readonly shadowAgreements: number;
 }
 
+/** A decision's classification: what gave its tier, and why. */
+export interface ReportedClassification {
+  readonly delegationId: string;
+  readonly tier: RiskTier;
+  readonly cause: string;
+  readonly why: string;
+  /** The keyword floor of a record written before ADR 0015, when it was set. */
+  readonly floor?: string;
+}
+
 export interface RoutingReport {
   readonly rows: readonly RoutingReportRow[];
   readonly totals: Omit<RoutingReportRow, "tier" | "rung">;
+  /** Decisions no classifier model could classify. */
+  readonly unclassified: number;
+  /** One per decision, in the order the decisions were first written. */
+  readonly classifications: readonly ReportedClassification[];
   readonly orphanedVerdicts: number;
   /** The same counts for delegations without a routing decision. */
   readonly unrouted: GateCounts;
@@ -186,7 +207,10 @@ export function buildRoutingReport(folder: string, reader?: RecordFolderReader):
     if (b.rung === null) return -1;
     return a.rung < b.rung ? -1 : a.rung > b.rung ? 1 : 0;
   });
-  return { rows: ordered, totals, orphanedVerdicts: orphans.size, unrouted, ladders };
+  const classifications = [...decisions.values()].map(({ delegationId, classification: { tier, cause, why, floor } }): ReportedClassification =>
+    ({ delegationId, tier, cause, why, ...(floor === undefined || floor === "none" ? {} : { floor }) }));
+  const unclassified = classifications.filter((classification) => classification.cause === "unclassified").length;
+  return { rows: ordered, totals, unclassified, classifications, orphanedVerdicts: orphans.size, unrouted, ladders };
 }
 
 function agreement(shadowDecisions: number, shadowAgreements: number): string {
@@ -212,8 +236,13 @@ export function renderRoutingReport(folder: string, report: RoutingReport): stri
     lines.push(`tier ${row.tier}, ${row.rung === null ? "refused" : `rung ${row.rung}`}: ${counts(row)}`);
   }
   lines.push(`all: ${counts(report.totals)}`);
+  lines.push(`unclassified decisions: ${report.unclassified}`);
   lines.push(`orphaned verdicts: ${report.orphanedVerdicts}`);
   lines.push(`unrouted delegations: ${gateCounts(report.unrouted)}`);
+  for (const { delegationId, tier, cause, why, floor } of report.classifications) {
+    // One line each: a reason that spans lines is joined with spaces.
+    lines.push(`classification ${delegationId}: ${tier}, ${cause}${floor === undefined ? "" : `, floor ${floor}`}: ${why.replace(/\s+/g, " ").trim()}`);
+  }
   for (const ladder of report.ladders) {
     const climb = ladder.step === "unplaced" ? `unplaced (${ladder.detail})` : `${ladder.step}; ${ladder.route.tier} ${ladder.route.rung.rung}`;
     lines.push(`effort ladder: ${ladder.previousDecisionId} -> ${ladder.delegationId}; ${climb}${ladder.mode === "live" ? "" : `; ${ladder.mode}`}`);

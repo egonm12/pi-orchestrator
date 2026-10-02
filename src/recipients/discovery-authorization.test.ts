@@ -11,9 +11,9 @@ import { createProviderDouble, type ModelCondition } from "../fixtures/provider-
 import {
   allowedCandidates,
   type Picker,
+  type RiskAssessment,
   type Stage1Input,
 } from "../routing/routing-policy.ts";
-import type { RiskAssessment } from "../routing/classifier.ts";
 import {
   approvedRecipients,
   authorizeRecipient,
@@ -90,16 +90,7 @@ function assessmentWith(
     riskTier,
     ambiguity: "clear",
     confidence,
-    signals: [],
     rationale: `fixed assessment for tests (${riskTier})`,
-    signalCounts: {
-      "security-sensitive": 0,
-      destructive: 0,
-      "public-behavior": 0,
-      mechanical: 0,
-      ambiguity: 0,
-    },
-    classifierBasis: "first-pass-heuristic-unvalidated",
   };
 }
 
@@ -651,7 +642,7 @@ test("routing and catalog code cannot mutate the authorization store", () => {
   const mutators = ["grantOwnerApproval", "authorizeRecipient", "saveAuthorization"];
   const sources = [
     "routing/routing-policy.ts",
-    "routing/classifier.ts",
+    "routing/tiers.ts",
     "catalog/model-catalog.ts",
     "catalog/epistemic.ts",
   ];

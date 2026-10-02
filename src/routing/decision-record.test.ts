@@ -108,12 +108,13 @@ test("one shadow write and one live write leave exactly two records, each carryi
       assert.equal(record.timestamp, NOW.toISOString());
       assert.equal(record.taskTextPrefix, TASK);
       assert.equal(record.agentRole, "worker");
-      // Classification: tier, deciding hop, floor, the four signals, versions.
+      // Classification: tier, deciding hop, the model's why and risk reasons,
+      // the four signals, versions, and no keyword floor (ADR 0015).
       const { classification } = record;
       assert.equal(classification.tier, "standard");
       assert.equal(classification.cause, "model:openai-codex/gpt-6-luna:low");
-      assert.equal(classification.floor, "none");
-      assert.deepEqual(classification.floorSignals, []);
+      assert.equal(classification.why, "fixture classifier says standard");
+      for (const field of ["floor", "floorTier", "floorSignals", "modelTier"]) assert.equal(field in classification, false, field);
       assert.deepEqual(classification.risk, { level: "some", reasons: ["fixture reason"] });
       assert.equal(classification.ambiguity, "clear");
       assert.equal(classification.complexity, "medium");
@@ -261,6 +262,37 @@ test("a record with a missing or an unknown field fails validation on read, nami
   } finally {
     cleanup();
   }
+});
+
+test("a record written before ADR 0015, with the keyword floor and the model's own tier, still reads and validates its floor", async () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    const { record } = writeDecisionRecord(dir, await liveInput());
+    const old = JSON.parse(JSON.stringify(record)) as DecisionRecord;
+    const withFloor = {
+      ...old,
+      delegationId: "attempt-with-floor",
+      classification: {
+        ...old.classification, tier: "critical", cause: "model:anthropic/claude-haiku-4-5:off", modelTier: "elevated",
+        floor: "critical (login, data-loss)", floorTier: "critical",
+        floorSignals: [{ kind: "security-sensitive", label: "login", matched: "login" }, { kind: "destructive", label: "data-loss", matched: "purge" }],
+      },
+    };
+    const keywords = { ...old, delegationId: "attempt-on-keywords",
+      classification: { ...old.classification, cause: "keywords", floor: "none", floorSignals: [], complexity: "unassessed", kindOfWork: "unassessed" } };
+    writeFileSync(decisionRecordPath(dir, NOW), [withFloor, keywords, record].map((item) => JSON.stringify(item)).join("\n") + "\n");
+    const [first, second, third] = readRoutingRecords(dir) as [DecisionRecord, DecisionRecord, DecisionRecord];
+    assert.deepEqual(first.classification, withFloor.classification);
+    assert.equal(second.classification.cause, "keywords");
+    assert.equal("floor" in third.classification, false);
+    // The old fields are still checked where they are present.
+    const badFloor = { ...withFloor, classification: { ...withFloor.classification, floor: "" } };
+    assert.throws(() => validateRoutingRecord(badFloor), /field 'classification\.floor' must be a non-blank string/);
+    const badSignal = { ...withFloor, classification: { ...withFloor.classification, floorSignals: [{ kind: "destructive", label: "data-loss" }] } };
+    assert.throws(() => validateRoutingRecord(badSignal), /field 'classification\.floorSignals\[0\]\.matched' is missing/);
+    const badTier = { ...withFloor, classification: { ...withFloor.classification, modelTier: "extreme" } };
+    assert.throws(() => validateRoutingRecord(badTier), /field 'classification\.modelTier' must be one of/);
+  } finally { cleanup(); }
 });
 
 test("a folder reads legacy decisions, explicit records and verdicts beside new decisions without relaxing validation", async () => {

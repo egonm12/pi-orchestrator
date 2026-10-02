@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { fixtureClassification, fixtureRoute, fixtureTierMap, SONNET } from "../fixtures/routing-decision.ts";
-import type { RiskTier } from "../routing/classifier.ts";
+import type { RiskTier } from "../routing/tiers.ts";
 import { buildDecisionRecord, buildEditRecord, type RoutingRecord } from "../routing/decision-record.ts";
 import { commitReminder, gatedGitAction, UnjudgedNotices, waitingForVerdict } from "./commit-gate.ts";
 

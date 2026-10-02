@@ -15,13 +15,15 @@ import {
   OPUS,
   SONNET,
 } from "../fixtures/routing-decision.ts";
-import type { RiskTier } from "./classifier.ts";
+import type { RiskTier } from "./tiers.ts";
 import {
   appendRoutingRecord,
+  buildDecisionRecord,
   buildEditRecord,
   buildGateRequirementRecord,
   NODE_RECORD_FOLDER_READER,
   writeDecisionRecord,
+  type DecisionRecord,
   type DecisionRecordInput,
   type GateAction,
   type GateLevel,
@@ -153,8 +155,11 @@ function expectedReport(folder: string): string {
     "tier elevated, refused: decisions 1, accept 0, request_changes 0, same-rung accept 0, same-rung request_changes 0, " +
       "ungated 0, missing 0, shadow agreement 0 of 1 (0%)",
     "all: decisions 6, accept 1, request_changes 1, same-rung accept 0, same-rung request_changes 1, ungated 1, missing 1, shadow agreement 2 of 4 (50%)",
+    "unclassified decisions: 0",
     "orphaned verdicts: 2",
     "unrouted delegations: accept 1, request_changes 0, same-rung accept 1, same-rung request_changes 0, ungated 1, missing 1",
+    ...[["d1", "standard"], ["d2", "standard"], ["d3", "standard"], ["d4", "standard"], ["d5", "mechanical"], ["d6", "elevated"]].map(([id, tier]) =>
+      `classification ${id}: ${tier}, model:openai-codex/gpt-6-luna:low: fixture classifier says ${tier}`),
     "",
   ].join("\n");
 }
@@ -205,6 +210,48 @@ test("a missing verdict leaves the report once a verdict follows the latest edit
   }
 });
 
+test("the report counts unclassified decisions and gives each decision's reason, with the floor of a record written before ADR 0015", async () => {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), "pi-harness-routing-report-reasons-")));
+  try {
+    const records = join(home, "routing");
+    const at = new Date("2026-10-01T14:36:54.840Z");
+    const tierMap = fixtureTierMap();
+    const input = async (delegationId: string, tier: RiskTier) => {
+      const route = fixtureRoute(tier, tierMap);
+      return { delegationId, at, mode: "live" as const, taskText: `task ${delegationId}`, agentRole: "worker",
+        classification: await fixtureClassification(`task ${delegationId}`, tier), tierMap, route, ranOn: route.ok ? route.rung.rung : HAIKU };
+    };
+    // A decision whose every classifier hop failed.
+    const unclassified = await input("u1", "elevated");
+    writeDecisionRecord(records, { ...unclassified, classification: { ...unclassified.classification, cause: "unclassified",
+      risk: { level: "unassessed", reasons: [] }, ambiguity: "unassessed", complexity: "unassessed", kindOfWork: "unassessed",
+      why: "no classifier model could classify the task, so it runs as elevated" } });
+    // The routing log's DLQ investigation, as the floor raised it to critical before ADR 0015.
+    const decided = buildDecisionRecord(await input("f1", "critical"));
+    const old: DecisionRecord = { ...decided, classification: { ...decided.classification, cause: "model:anthropic/claude-haiku-4-5:off", modelTier: "elevated",
+      floor: "critical (login, data-loss)", floorTier: "critical",
+      floorSignals: [{ kind: "security-sensitive", label: "login", matched: "login" }, { kind: "destructive", label: "data-loss", matched: "purge" }],
+      why: "production incident investigation" } };
+    appendRoutingRecord(records, old);
+    writeDecisionRecord(records, await input("m1", "standard"));
+
+    const report = buildRoutingReport(records);
+    assert.equal(report.totals.decisions, 3);
+    assert.equal(report.unclassified, 1);
+    const lines = renderRoutingReport(records, report).split("\n");
+    assert.ok(lines.includes("unclassified decisions: 1"), lines.join("\n"));
+    assert.deepEqual(lines.filter((line) => line.startsWith("classification ")), [
+      "classification u1: elevated, unclassified: no classifier model could classify the task, so it runs as elevated",
+      "classification f1: critical, model:anthropic/claude-haiku-4-5:off, floor critical (login, data-loss): production incident investigation",
+      "classification m1: standard, model:openai-codex/gpt-6-luna:low: fixture classifier says standard",
+    ]);
+    assert.ok(lines.includes("tier critical, rung anthropic/claude-opus-5:xhigh: decisions 1, accept 0, request_changes 0, same-rung accept 0, " +
+      "same-rung request_changes 0, ungated 0, missing 0, shadow agreement n/a (no shadow decisions)"), lines.join("\n"));
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("an explicit-model record (ticket 27) is neither a decision row nor an orphaned verdict", async () => {
   const known = await knownFolder();
   try {
@@ -243,7 +290,7 @@ test("the report reads only files inside the record folder", async () => {
     const allowed = [
       known.records,
       join(realpathSync(REPO), "package.json"),
-      ...["routing-report.ts", "decision-record.ts", "classifier.ts", "skip-reasons.ts"].map((file) => join(realpathSync(HERE), file)),
+      ...["routing-report.ts", "decision-record.ts", "tiers.ts", "skip-reasons.ts"].map((file) => join(realpathSync(HERE), file)),
     ];
     const run = spawnSync(
       process.execPath,

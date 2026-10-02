@@ -8,7 +8,7 @@ import { allowanceConstraint, newTaskLedger, TaskAllowanceOwner } from "../budge
 import { buildCatalog } from "../catalog/model-catalog.ts";
 import { withTaskSuitability } from "../fixtures/catalog-facts.ts";
 import { INSTALLED_MODEL_IDS } from "../fixtures/installed-models.ts";
-import { route } from "../routing/routing-policy.ts";
+import { route, type RiskAssessment } from "../routing/routing-policy.ts";
 import {
   banListsFromSettings,
   configureBanLists,
@@ -33,6 +33,9 @@ const harnessRoot = join(here, "..");
 // Tests that configure the module-level lists must not leak them into the
 // next test in this process.
 afterEach(() => resetBanLists());
+
+/** The legacy routing path routes on the assessment a request brings (ADR 0015). */
+const MECHANICAL: RiskAssessment = { riskTier: "mechanical", ambiguity: "clear", confidence: 0.95, rationale: "fixed assessment for tests" };
 
 const WITH_SONNET: BanLists = {
   subagentBanList: ["fable", "astra", "sonnet"],
@@ -132,7 +135,7 @@ test("a configured name is refused by routing and budget admission too, with no 
     { asOf: now.toISOString() },
   );
   const routed = route({
-    request: { taskDescription: "reformat this file's imports alphabetically", taskType: "implementation" },
+    request: { taskDescription: "reformat this file's imports alphabetically", taskType: "implementation", assessment: MECHANICAL },
     catalog,
     now: now.getTime(),
   });
@@ -222,7 +225,7 @@ test("a banned name in task text, a commit message, a path or shell text does no
     'rename the heading in notes/astra.md, then run `echo astra` and git commit -m "drop the fable idea"; ' +
     "the doc compares Fable, Astra and Sonnet";
   const result = route({
-    request: { taskDescription, taskType: "implementation" },
+    request: { taskDescription, taskType: "implementation", assessment: MECHANICAL },
     catalog,
     now: new Date("2026-09-21T12:00:00.000Z").getTime(),
   });

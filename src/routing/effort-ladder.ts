@@ -1,5 +1,5 @@
 import { getSupportedThinkingLevels, type ModelInfo } from "../models/model-info.ts";
-import { RISK_TIERS, type RiskTier } from "./classifier.ts";
+import { RISK_TIERS, type RiskTier } from "./tiers.ts";
 import type { ResolvedTierMap, TierRung } from "./tier-map.ts";
 import { MAX_NOT_LISTED, type LadderSkipReason } from "./skip-reasons.ts";
 import { checkEstimatedPromptTokens, failedHardFilter, refusedAlternatives, routeTier, type RouterEvidence, type RemovedRung, type TierRouteChoice, type TierRouteRefusal } from "./tier-router.ts";

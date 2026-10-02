@@ -336,15 +336,18 @@ async function firstRequest(auto: AutoModel, messages: readonly unknown[], sessi
 const CONTEXT_MODE_ANCHOR = "context-mode active. Hierarchy: ctx_batch_execute > ctx_execute > ctx_execute_file > ctx_search. " +
   "Stats → ctx_stats. Doctor → ctx_doctor. Upgrade → ctx_upgrade. Purge → ctx_purge.";
 
-test("text another extension appends after the delegated prompt sets no keyword floor", async () => {
+test("text another extension appends after the delegated prompt does not reach the classifier", async () => {
   const h = harness(LIVE);
   try {
     const registry = fakeSessionRegistry([{ events: answerEvents("ok") }]);
-    const auto = await loadAutoModel(h, registry);
+    const classifier = answering("mechanical");
+    const auto = await loadAutoModel(h, registry, { classifierCall: () => classifier.call });
     await firstRequest(auto, [...FIX_README, { role: "user", content: CONTEXT_MODE_ANCHOR }], "injected-worker");
+    assert.equal(classifier.prompts.length, 1);
+    assert.doesNotMatch(classifier.prompts[0]!, /context-mode active|ctx_purge/);
     const [record] = h.records();
     assert.ok(record?.recordType === "decision");
-    assert.deepEqual(record.classification.floorSignals, []);
+    assert.doesNotMatch(record.taskTextPrefix, /ctx_purge/);
     assert.equal(record.classification.tier, "mechanical");
     assert.equal(record.ranOn, `${HAIKU}:low`);
   } finally { h.cleanup(); }
@@ -1506,7 +1509,7 @@ test("by default the router classifies through the session's model registry, not
   } finally { h.cleanup(); }
 });
 
-test("a failing in-session classifier request is a recorded hop failure: the router stays enabled and the worker is routed on keywords", async () => {
+test("a failing in-session classifier request is a recorded hop failure: the router stays enabled and the worker runs unclassified, as elevated", async () => {
   const h = harness(LIVE);
   try {
     const registry = fakeSessionRegistry([
@@ -1520,8 +1523,9 @@ test("a failing in-session classifier request is a recorded hop failure: the rou
     });
     assert.doesNotMatch(stderr, /pi-orchestrator router disabled/, stderr);
     const [first, second] = h.records();
-    assert.deepEqual(first?.recordType === "decision" && first.classification.hops.map((hop) => [hop.hop, hop.outcome]), [[`${HAIKU}:low`, "out-of-usage"], ["keywords", "decided"]]);
-    assert.equal(first?.recordType === "decision" && first.classification.cause, "keywords");
+    assert.deepEqual(first?.recordType === "decision" && first.classification.hops.map((hop) => [hop.hop, hop.outcome]), [[`${HAIKU}:low`, "out-of-usage"]]);
+    assert.equal(first?.recordType === "decision" && first.classification.cause, "unclassified");
+    assert.equal(first?.recordType === "decision" && first.classification.tier, "elevated");
     assert.equal(second?.recordType === "decision" && second.classification.cause, `model:${HAIKU}:low`, "the next worker still classifies in the session");
   } finally { h.cleanup(); }
 });

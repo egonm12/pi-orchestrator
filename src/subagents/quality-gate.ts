@@ -1,5 +1,5 @@
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { RISK_TIERS, type RiskTier } from "../routing/classifier.ts";
+import { RISK_TIERS, type RiskTier } from "../routing/tiers.ts";
 import {
   appendRoutingRecord,
   buildGateRequirementRecord,

@@ -84,12 +84,18 @@ function approvedAnthropic() {
   return authorizeRecipient(emptyAuthorization(), "anthropic", approval);
 }
 
+/** Every prompt the fake classifier got, in every router extension copy. */
+const classifierPrompts: string[] = [];
+
 /** The router extension's dependencies. Its classifier answers the tier a
- *  task names in brackets, such as `[standard]`, and mechanical otherwise. */
+ *  task first names in brackets, such as `[standard]`, and mechanical otherwise. */
 function routerDependencies(approved = true) {
   const answer = (tier: string) => JSON.stringify({ tier, risk: { level: "none", reasons: [] }, ambiguity: "clear", complexity: "low", kindOfWork: "implement", why: `fake classifier says ${tier}` });
   return {
-    classifierCall: () => async (prompt: string) => answer(/\[(standard|elevated|critical)\]/.exec(prompt)?.[1] ?? "mechanical"),
+    classifierCall: () => async (prompt: string) => {
+      classifierPrompts.push(prompt);
+      return answer(/\[(standard|elevated|critical)\]/.exec(prompt)?.[1] ?? "mechanical");
+    },
     evidence: () => () => ({ catalog: buildCatalog({ modelIds: [HAIKU, SONNET], now: NOW }), refreshState: emptyRefreshState(),
       authorization: approved ? approvedAnthropic() : emptyAuthorization() }),
     now: () => NOW,
@@ -288,6 +294,33 @@ test("request_changes names the next rung; a retry runs there as a new delegatio
   } finally { await o.shutdown(); h.cleanup(); }
 });
 
+test("a retry runs at the tier of the delegation it retries, with no classifier call, whatever its feedback says; so does a retry of a retry", async () => {
+  const h = harness();
+  const o = await orchestrator(h);
+  try {
+    const first = await one(o, { task: `[standard]\n${WRITE_NOTES}` });
+    const id = first.sessionId!;
+    const original = decisionOf(h, id).classification;
+    assert.deepEqual([original.tier, original.why], ["standard", "fake classifier says standard"]);
+    // Reviewer feedback full of delete, auth and credential, naming a higher tier the fake classifier would answer.
+    const feedback = "[critical] Delete the stale auth token cache and the credential fixture; purge nothing else and do not force-push.\n" + ADD_HEADING;
+    let previous = id;
+    for (const climb of [1, 2]) {
+      assert.ok((await verdict(o, requestChanges(previous))).startsWith("Recorded request_changes"));
+      const classified = classifierPrompts.length;
+      const retry = await one(o, { retry: previous, task: feedback });
+      assert.equal(retry.status, "completed", JSON.stringify(retry));
+      assert.ok(requestsOf(o, retry.sessionId)[0]!.task.includes("[critical] Delete the stale auth token cache"), "the feedback reached the retry");
+      assert.equal(classifierPrompts.length, classified, `climb ${climb}: the retry is not classified`);
+      const { classification, route } = decisionOf(h, retry.sessionId!);
+      assert.deepEqual([classification.tier, classification.cause, classification.why, classification.hops], ["standard", `retry:${previous}`, original.why, []]);
+      assert.deepEqual([classification.risk, classification.kindOfWork], [original.risk, original.kindOfWork]);
+      assert.equal(route.outcome === "chosen" && route.tier, "standard", "the effort ladder climbs within the tier");
+      previous = retry.sessionId!;
+    }
+  } finally { await o.shutdown(); h.cleanup(); }
+});
+
 test("a retry keeps the failed attempt's label, on the board and in its saved outcome, so a retry of a retry keeps it too", async () => {
   const h = harness();
   const o = await orchestrator(h);
@@ -463,6 +496,8 @@ test("forked and named-model attempts retry unplaced without a forced rung, whil
       const decision = decisionOf(h, retry.sessionId!);
       assert.equal(decision.constraints, undefined, "an unplaced retry routes normally, with no forced rung");
       assert.equal(decision.ranOn, `${HAIKU}:low`);
+      // The attempt has no tier of its own to keep, so its retry is classified.
+      assert.equal(decision.classification.cause, `model:${HAIKU}:low`);
       if (kind === "agent-model") {
         assert.equal(readWorkerOutcome(retry.sessionFile!)?.agent, "scribe");
         assert.ok(requestsOf(o, retry.sessionId)[0]!.systemPrompt.includes("Write notes carefully."),
@@ -495,6 +530,8 @@ test("a refused first route retries unplaced, with a normal refusal decision on 
     assert.equal(decision.route.outcome, "refused");
     assert.equal(decision.constraints, undefined);
     assert.equal(decision.ranOn, SESSION_MODEL);
+    // The refused attempt was classified, so its retry keeps that tier.
+    assert.deepEqual([decision.classification.tier, decision.classification.cause], ["standard", `retry:${id}`]);
   } finally { await o.shutdown(); h.cleanup(); }
 });
 

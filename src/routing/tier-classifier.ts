@@ -1,17 +1,15 @@
 // Ticket 23: the classifier. Assigns a tier to one delegated task (stories
-// 13 to 20, ADR 0003).
+// 13 to 20, ADR 0003). Only the classifier model chooses the tier (ADR 0015):
+// no keyword list raises or replaces its answer.
 //
-//   1. Keyword floor. Ticket 06's keyword classifier (`classifyTask`) runs
-//      first. Its security-sensitive and destructive signals set the floor:
-//      one sets `elevated`, two or more set `critical`. A model's tier below
-//      the floor is raised to it; a tier above it stands.
-//   2. Model chain. The primary rung, then each fallback rung in order. Each
+//   1. Model chain. The primary rung, then each fallback rung in order. Each
 //      hop has the configured timeout. A timeout, a schema-invalid answer, an
 //      unknown tier, a thrown error or a provider out of usage moves to the
 //      next hop. A rung refused at load (subagent ban list, allowed-model list,
-//      no effort) is skipped without being called.
-//   3. Keywords alone. When no model hop decides, the keyword classifier's own
-//      tier is the answer and the cause is `keywords`.
+//      no effort) is skipped without being called. The first hop that decides
+//      gives the tier, with the model's own `why` and `risk.reasons`.
+//   2. Unclassified. When no model hop decides, the task runs as `elevated`
+//      and the cause is `unclassified` (CONTEXT.md, Unclassified task).
 //
 // Every model hop reserves against the shared task allowance (ticket 09)
 // under the label `classifier` before the call and settles after it. With no
@@ -34,12 +32,7 @@ import {
   THINKING_LEVELS,
 } from "../models/model-info.ts";
 import { resolveDelegationModel } from "../policy/model-resolution.ts";
-import {
-  classifyTask,
-  tierRank,
-  type ClassificationSignal,
-  type RiskTier,
-} from "./classifier.ts";
+import type { RiskTier } from "./tiers.ts";
 import {
   checkTierAnswer,
   SCHEMA_VERSION,
@@ -60,7 +53,8 @@ export interface ClassifierConfig {
   readonly model: string;
   /** Per-hop timeout in milliseconds. */
   readonly timeoutMs: number;
-  /** Fallback rungs tried in order after the primary. Keywords come last. */
+  /** Fallback rungs tried in order after the primary. When none decides,
+   *  the task is unclassified. */
   readonly fallback: readonly string[];
 }
 
@@ -234,7 +228,7 @@ export type HopOutcomeKind =
   | "error";
 
 export interface HopOutcome {
-  /** The rung, or `keywords` for the last hop. */
+  /** The rung. */
   readonly hop: string;
   readonly outcome: HopOutcomeKind;
   readonly detail?: string;
@@ -243,50 +237,28 @@ export interface HopOutcome {
   readonly allowance?: { readonly reservationId: string; readonly settlement: "settled" | "held-open" };
 }
 
-export type ClassifierCause = `model:${string}` | "keywords";
+/** What gave the tier: the deciding model hop, `unclassified` when none
+ *  decided, or `retry:<delegation id>` for a retry routed on the tier of the
+ *  delegation it retries (CONTEXT.md, Retry tier), which is not classified. */
+export type ClassifierCause = `model:${string}` | "unclassified" | `retry:${string}`;
+
+/** The tier an unclassified task runs at. */
+export const UNCLASSIFIED_TIER: RiskTier = "elevated";
 
 export interface TierClassification {
   readonly tier: RiskTier;
   readonly cause: ClassifierCause;
-  /** The deciding model's own tier, before the floor. Absent for keywords. */
-  readonly modelTier?: RiskTier;
-  /** `none`, or the floor tier with its signal labels: `elevated (credential)`. */
-  readonly floor: string;
-  readonly floorTier?: RiskTier;
-  readonly floorSignals: readonly ClassificationSignal[];
-  readonly risk: { readonly level: RiskLevel; readonly reasons: readonly string[] };
-  readonly ambiguity: AmbiguityLevel;
-  /** `unassessed` when keywords decided: the keyword classifier does not judge it. */
+  /** `unassessed` and no reasons when the task is unclassified. */
+  readonly risk: { readonly level: RiskLevel | "unassessed"; readonly reasons: readonly string[] };
+  /** `unassessed` when the task is unclassified, here and in the two below. */
+  readonly ambiguity: AmbiguityLevel | "unassessed";
   readonly complexity: ComplexityLevel | "unassessed";
   readonly kindOfWork: KindOfWork | "unassessed";
+  /** The deciding model's reason for the tier. */
   readonly why: string;
   readonly rubricVersion: string;
   readonly schemaVersion: string;
   readonly hops: readonly HopOutcome[];
-}
-
-// ---------------------------------------------------------------------------
-// The keyword floor
-// ---------------------------------------------------------------------------
-
-export interface KeywordFloor {
-  readonly tier?: RiskTier;
-  readonly signals: readonly ClassificationSignal[];
-  readonly describe: string;
-}
-
-/** Security-sensitive and destructive keyword signals set the floor. */
-export function keywordFloor(task: string): KeywordFloor {
-  const signals = classifyTask(task).signals.filter(
-    (signal) => signal.kind === "security-sensitive" || signal.kind === "destructive",
-  );
-  if (signals.length === 0) return { signals, describe: "none" };
-  const tier: RiskTier = signals.length >= 2 ? "critical" : "elevated";
-  return { tier, signals, describe: `${tier} (${signals.map((signal) => signal.label).join(", ")})` };
-}
-
-function atLeastFloor(tier: RiskTier, floor: KeywordFloor): RiskTier {
-  return floor.tier !== undefined && tierRank(tier) < tierRank(floor.tier) ? floor.tier : tier;
 }
 
 // ---------------------------------------------------------------------------
@@ -424,23 +396,11 @@ export interface ClassifyTierOptions {
   readonly allowance: ClassifierAllowance;
 }
 
-function keywordsRisk(floor: KeywordFloor): TierClassification["risk"] {
-  const level: RiskLevel = floor.signals.length === 0 ? "none" : floor.signals.length === 1 ? "some" : "high";
-  return { level, reasons: floor.signals.map((signal) => `${signal.label} (${signal.matched})`) };
-}
-
 export async function classifyTier(input: ClassifierInput, options: ClassifyTierOptions): Promise<TierClassification> {
   // Read the three inputs by name, so nothing else a caller's object carries
   // (a conversation, say) can reach the prompt.
   const prompt = classifierPrompt({ task: input.task, role: input.role, paths: [...input.paths] });
-  const floor = keywordFloor(input.task);
-  const common = {
-    floor: floor.describe,
-    ...(floor.tier === undefined ? {} : { floorTier: floor.tier }),
-    floorSignals: floor.signals,
-    rubricVersion: RUBRIC_VERSION,
-    schemaVersion: SCHEMA_VERSION,
-  };
+  const versions = { rubricVersion: RUBRIC_VERSION, schemaVersion: SCHEMA_VERSION };
   const hops: HopOutcome[] = [];
 
   for (const entry of options.chain.entries) {
@@ -453,30 +413,28 @@ export async function classifyTier(input: ClassifierInput, options: ClassifyTier
     if (!result.decided) continue;
     const { answer } = result;
     return {
-      tier: atLeastFloor(answer.tier, floor),
+      tier: answer.tier,
       cause: `model:${entry.rung}`,
-      modelTier: answer.tier,
-      ...common,
       risk: answer.risk,
       ambiguity: answer.ambiguity,
       complexity: answer.complexity,
       kindOfWork: answer.kindOfWork,
       why: answer.why,
+      ...versions,
       hops,
     };
   }
 
-  const keywords = classifyTask(input.task);
-  hops.push({ hop: "keywords", outcome: "decided" });
+  // No hop decided: the words of the task are not read for a tier (ADR 0015).
   return {
-    tier: atLeastFloor(keywords.riskTier, floor),
-    cause: "keywords",
-    ...common,
-    risk: keywordsRisk(floor),
-    ambiguity: keywords.ambiguity === "clear" ? "clear" : "partial",
+    tier: UNCLASSIFIED_TIER,
+    cause: "unclassified",
+    risk: { level: "unassessed", reasons: [] },
+    ambiguity: "unassessed",
     complexity: "unassessed",
     kindOfWork: "unassessed",
-    why: `keywords: ${keywords.rationale}`,
+    why: `no classifier model could classify the task, so it runs as ${UNCLASSIFIED_TIER}`,
+    ...versions,
     hops,
   };
 }

@@ -4,7 +4,7 @@ import { buildCatalog } from "../catalog/model-catalog.ts";
 import { HARNESS_MODEL_SCOPE } from "../policy/model-resolution.ts";
 import { authorizeRecipient, emptyAuthorization, grantOwnerApproval } from "../recipients/authorization.ts";
 import { NO_BUDGET_CONSTRAINT } from "../recipients/authorized-delegation.ts";
-import type { RiskTier } from "../routing/classifier.ts";
+import type { RiskTier } from "../routing/tiers.ts";
 import { LEGACY_DECISION_RECORD_SCHEMA_VERSION, type ExplicitModelRecord } from "../routing/decision-record.ts";
 import { classifyTier, loadClassifierChain, type TierClassification } from "../routing/tier-classifier.ts";
 import type { KindOfWork } from "../routing/tier-answer-schema.ts";

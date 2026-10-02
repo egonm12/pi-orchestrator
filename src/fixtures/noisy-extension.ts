@@ -5,13 +5,12 @@ import { join } from "node:path";
 // plain `{role: "user"}` message via pi's `context` hook, after the delegated
 // prompt and before a worker's first reply. `firstTaskAndRole`
 // (router/auto-model.ts) reads only the first user message, so this noise
-// must set no keyword floor and must not appear in a decision record's task
-// text. `PI_NOISY_EXTENSION_LOG`, when set in the worker's environment, gets
+// must not reach the classifier or appear in a decision record's task text. `PI_NOISY_EXTENSION_LOG`, when set in the worker's environment, gets
 // one line per `context` event, so a live test can confirm the noise really
 // ran instead of passing because nothing injected anything.
 
-/** Matches the "data-loss" keyword floor (routing/classifier.ts): a
- *  regression here would push a worker's tier to at least elevated. */
+/** Names a destructive action ("Purge"), so a regression that let it reach
+ *  the classifier could change a worker's tier. */
 export const NOISY_EXTENSION_ANCHOR =
   "noisy-extension active. Purge → ctx_purge. This line is injected noise, not the task.";
 

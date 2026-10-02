@@ -146,15 +146,15 @@ test("a provider out of usage is a ProviderOutOfUsageError and the hop is out-of
     (error: unknown) => error instanceof ProviderOutOfUsageError && /pi classifier call ended with error: You're out of extra usage\./.test(error.message),
   );
   const { record, budget } = await classifyWith([{ events: errorEvents("You're out of extra usage.") }]);
-  assert.deepEqual(hopOutcomes(record), [[HAIKU_LOW, "out-of-usage"], ["keywords", "decided"]]);
-  assert.equal(record.cause, "keywords");
+  assert.deepEqual(hopOutcomes(record), [[HAIKU_LOW, "out-of-usage"]]);
+  assert.equal(record.cause, "unclassified");
   assert.equal(budget.owner.snapshot().open.length, 0, "the failed hop's reservation is settled");
 });
 
 test("a throttle (429 rate_limit_error) is out-of-usage, as the subprocess call maps it", async () => {
   const throttled = '429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed the rate limit"}}';
   const { record } = await classifyWith([{ events: errorEvents(throttled) }]);
-  assert.deepEqual(hopOutcomes(record), [[HAIKU_LOW, "out-of-usage"], ["keywords", "decided"]]);
+  assert.deepEqual(hopOutcomes(record), [[HAIKU_LOW, "out-of-usage"]]);
 });
 
 test("a provider refusal that is not about usage is an error hop, not out-of-usage", async () => {
@@ -165,17 +165,17 @@ test("a provider refusal that is not about usage is an error hop, not out-of-usa
     (error: unknown) => error instanceof Error && !(error instanceof ProviderOutOfUsageError) && /prompt is too long/.test(error.message),
   );
   const { record } = await classifyWith([{ events: errorEvents(refusal) }]);
-  assert.deepEqual(hopOutcomes(record), [[HAIKU_LOW, "error"], ["keywords", "decided"]]);
+  assert.deepEqual(hopOutcomes(record), [[HAIKU_LOW, "error"]]);
   assert.match(record.hops[0]?.detail ?? "", /pi classifier call ended with error: .*prompt is too long/);
 });
 
 test("an unparseable reply is schema-invalid, and a reply with only thinking is too", async () => {
   const nonsense = await classifyWith([{ events: answerEvents("I would say this is a standard task.") }]);
-  assert.deepEqual(hopOutcomes(nonsense.record), [[HAIKU_LOW, "schema-invalid"], ["keywords", "decided"]]);
+  assert.deepEqual(hopOutcomes(nonsense.record), [[HAIKU_LOW, "schema-invalid"]]);
   const thinkingOnly = await classifyWith([{
     events: [{ type: "done", reason: "stop", message: assistantMessage({ content: [{ type: "thinking", thinking: "standard" }] }) }],
   }]);
-  assert.deepEqual(hopOutcomes(thinkingOnly.record), [[HAIKU_LOW, "schema-invalid"], ["keywords", "decided"]]);
+  assert.deepEqual(hopOutcomes(thinkingOnly.record), [[HAIKU_LOW, "schema-invalid"]]);
 });
 
 test("missing auth, reported as pi reports it (an error event), is an error hop, not out-of-usage", async () => {
@@ -188,13 +188,13 @@ test("missing auth, reported as pi reports it (an error event), is an error hop,
     (error: unknown) => error instanceof Error && !(error instanceof ProviderOutOfUsageError) && /No API key found for "anthropic"/.test(error.message),
   );
   const { record } = await classifyWith([{ events: errorEvents(noAuth) }]);
-  assert.deepEqual(hopOutcomes(record), [[HAIKU_LOW, "error"], ["keywords", "decided"]]);
+  assert.deepEqual(hopOutcomes(record), [[HAIKU_LOW, "error"]]);
   assert.match(record.hops[0]?.detail ?? "", /pi classifier call ended with error: No API key found for "anthropic"/);
 });
 
 test("a synchronous throw from streamSimple (defensive), a model the registry lacks and a stream with no final message are error hops", async () => {
   const thrown = await classifyWith([{ throws: "streamSimple threw before returning a stream" }]);
-  assert.deepEqual(hopOutcomes(thrown.record), [[HAIKU_LOW, "error"], ["keywords", "decided"]]);
+  assert.deepEqual(hopOutcomes(thrown.record), [[HAIKU_LOW, "error"]]);
   assert.match(thrown.record.hops[0]?.detail ?? "", /streamSimple threw before returning a stream/);
 
   const registry = fakeSessionRegistry([], []);
@@ -205,7 +205,7 @@ test("a synchronous throw from streamSimple (defensive), a model the registry la
   assert.equal(registry.calls.length, 0, "nothing is streamed for a model the registry lacks");
 
   const unfinished = await classifyWith([{ events: [{ type: "start" }, { type: "text_delta", delta: "{" }] }]);
-  assert.deepEqual(hopOutcomes(unfinished.record), [[HAIKU_LOW, "error"], ["keywords", "decided"]]);
+  assert.deepEqual(hopOutcomes(unfinished.record), [[HAIKU_LOW, "error"]]);
   assert.match(unfinished.record.hops[0]?.detail ?? "", /no final assistant message/);
 });
 
@@ -217,7 +217,7 @@ test("the hop's timeout aborts the stream's signal and the hop is a timeout", as
   const started = performance.now();
   const { record, registry, budget } = await classifyWith([{ hangUntilAborted: true }], 50);
   assert.ok(performance.now() - started < 2_000, "the hop did not wait for the stream");
-  assert.deepEqual(hopOutcomes(record), [[HAIKU_LOW, "timeout"], ["keywords", "decided"]]);
+  assert.deepEqual(hopOutcomes(record), [[HAIKU_LOW, "timeout"]]);
   const signal = registry.calls[0]?.options?.signal;
   assert.ok(signal, "the stream was given the hop's signal");
   assert.equal(signal.aborted, true, "the stream's signal was aborted");

@@ -9,7 +9,7 @@ import { classifyTask, routeTask, type ActiveRouter } from "./route-task.ts";
 import { withRoutingChoice } from "./routing-choice-lock.ts";
 import { parentDelegationOf, reviewedDelegationOf } from "../subagents/worker-sessions.ts";
 import { publishServedRung, type RungEscalation } from "./served-rungs.ts";
-import { RISK_TIERS, type RiskTier } from "../routing/classifier.ts";
+import { RISK_TIERS, type RiskTier } from "../routing/tiers.ts";
 import type { ProviderUsage, RoutingConstraints } from "../routing/tier-router.ts";
 import { providerOf } from "../recipients/authorized-delegation.ts";
 import { limitErrorObservation } from "./limit-errors.ts";
@@ -53,8 +53,10 @@ export const SESSION_VIRTUAL_MODEL_ENV = "PI_ORCHESTRATOR_SESSION_VIRTUAL_MODEL"
 
 const ROUTING_CONSTRAINTS = Symbol.for("pi-orchestrator.router.routing-constraints");
 const FAILOVER_REQUESTS = Symbol.for("pi-orchestrator.router.failover-requests");
+const CARRIED_CLASSIFICATIONS = Symbol.for("pi-orchestrator.router.carried-classifications");
 type Pin = { readonly model: string; readonly effort: ThinkingLevel };
-type ProcessGlobal = typeof globalThis & { [ROUTING_CONSTRAINTS]?: Map<string, RoutingConstraints>; [FAILOVER_REQUESTS]?: Map<string, FailedFirstRequest> };
+type ProcessGlobal = typeof globalThis & { [ROUTING_CONSTRAINTS]?: Map<string, RoutingConstraints>; [FAILOVER_REQUESTS]?: Map<string, FailedFirstRequest>;
+  [CARRIED_CLASSIFICATIONS]?: Map<string, TierClassification> };
 
 // Constraints are set by the orchestrator's extension copy and read by the
 // worker's, so they are kept on the process's global object.
@@ -64,6 +66,17 @@ function routingConstraints(): Map<string, RoutingConstraints> { return (globalT
 export function setRoutingConstraints(id: string, constraints: RoutingConstraints): () => void {
   routingConstraints().set(id, constraints);
   return () => { routingConstraints().delete(id); };
+}
+
+function carriedClassifications(): Map<string, TierClassification> { return (globalThis as ProcessGlobal)[CARRIED_CLASSIFICATIONS] ??= new Map(); }
+/** The classification a retry carries from the delegation it retries
+ *  (CONTEXT.md, Retry tier), for the worker with session id `id`: its first
+ *  request is routed on it instead of being classified. Set by the
+ *  orchestrator's extension copy and read by the worker's, like routing
+ *  constraints. Returns the function that removes it. */
+export function setCarriedClassification(id: string, classification: TierClassification): () => void {
+  carriedClassifications().set(id, classification);
+  return () => { carriedClassifications().delete(id); };
 }
 
 /** A worker's first request that ended in a limit error pi does not retry,
@@ -376,13 +389,18 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
     const constraints = routingConstraints().get(sessionId);
     if (!router) return { pin: fallbackPin(deps.banLists(), constraints, "allowed") };
     const { taskText, agentRole } = firstTaskAndRole(messages);
-    // Classification may call a provider. Do it before taking the shared
-    // queue; only choice and record must be serialized.
+    // A retry keeps the tier of the delegation it retries and is not
+    // classified. Classification may call a provider. Do it before taking
+    // the shared queue; only choice and record must be serialized.
     let classification: TierClassification;
-    try { classification = await classifyTask(router, taskText, agentRole); }
-    catch (error) {
-      deps.disable(error);
-      return { pin: fallbackPin(deps.banLists(), constraints, "allowed") };
+    const carried = carriedClassifications().get(sessionId);
+    if (carried !== undefined) classification = carried;
+    else {
+      try { classification = await classifyTask(router, taskText, agentRole); }
+      catch (error) {
+        deps.disable(error);
+        return { pin: fallbackPin(deps.banLists(), constraints, "allowed") };
+      }
     }
     return withRoutingChoice(router.recordDir, async (): Promise<FirstRoute> => {
       try {

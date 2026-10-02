@@ -162,8 +162,15 @@ _Avoid_: Prohibited patterns, Fable/Astra rule, ban list (alone)
 The owner's optional list of model names the orchestrator's own session may not run on. Empty by default.
 
 **Classifier**:
-The step that assigns a tier to a task. A general instruction model applies a fixed rubric to the task text and role and answers in a JSON schema; keyword signals set a floor it cannot lower.
-_Avoid_: Decision engine, Jev, scorer, System One
+The step that assigns a tier to a task. A general instruction model applies a fixed rubric to the task text and role and answers in a JSON schema, with a reason. No keyword list raises or replaces its answer. A task's tier follows the action it asks for, not the subject it touches: a review or investigation that changes nothing is never critical, and a prohibition ("do not delete anything") is a constraint, not a risk.
+_Avoid_: Decision engine, Jev, scorer, System One, keyword floor
+
+**Unclassified task**:
+A task no classifier model could classify. It runs as elevated, and the routing log records it as unclassified.
+_Avoid_: Keyword fallback
+
+**Retry tier**:
+A retry keeps the tier of the delegation it retries. Extra care comes from the effort ladder's next rung, not from classifying the retry again.
 
 **Router extension**:
 The part of pi-orchestrator that serves the auto model: it classifies a worker's first request, routes it through the tier map, pins the worker and records the decision. When routing refuses, and in shadow mode, the worker runs on the orchestrator's own session model. A worker that names a real model is not routed; refusing banned models stays the guard's job.
