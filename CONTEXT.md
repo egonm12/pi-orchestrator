@@ -22,12 +22,16 @@ A worker's final reply to the orchestrator: what it confirmed with evidence, wha
 _Avoid_: Report (that is a background worker's message), answer, output
 
 **Quality gate**:
-The orchestrator's duty to judge every implementation result before using it, by its own spot check or an independent reviewer, and to record that judgement as a verdict. It reminds, never blocks: commit and push go through and name the delegations still waiting for a verdict.
+The orchestrator's duty to judge every implementation result before using it, by its own spot check or an independent reviewer, and to record that judgement as a verdict. It reminds, never blocks: commit and push go through and name the delegations still waiting for a verdict. At gate level off there is no quality gate.
 _Avoid_: Review gate, report gate
 
 **Gate level**:
-How strictly the quality gate treats each tier: low, medium, high or max. Per tier it sets the gate action (none, the orchestrator's spot check, or an independent reviewer). The owner's level is a floor; the orchestrator may raise it for one delegation, never lower it.
+How strictly the quality gate treats each tier: off, low, medium, high or max. Per tier it sets the gate action (none, the orchestrator's spot check, or an independent reviewer); at off every tier's action is none. The owner sets a personal level and each project may set its own, higher or lower. The owner's level is a floor; the orchestrator may raise it for one delegation, never lower it.
 _Avoid_: Verification level (that sounds like the worker's own checks), review level
+
+**Worker limit**:
+How many workers run at the same time across the whole orchestrator session, foreground and background together. Workers beyond it are queued, never refused. The owner sets a personal limit and each project may set its own, higher or lower.
+_Avoid_: Max parallel, background worker limit, items per call
 
 **Gate action**:
 What the quality gate requires for one editing delegation: none, a spot check (the orchestrator's own verdict) or a reviewer (an independent reviewer worker). Set by the gate level and the delegation's tier.
