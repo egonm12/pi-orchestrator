@@ -22,10 +22,12 @@
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.99.0"
+    "@earendil-works/pi-coding-agent": ">=0.99.0",
+    "@earendil-works/pi-tui": ">=0.99.0"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.99.0",
+    "@earendil-works/pi-tui": "^0.99.2",
     "@types/node": "^22.10.0",
     "typescript": "^5.7.0"
   }

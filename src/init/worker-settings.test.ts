@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { INSTALLED_MODEL_INFO } from "../fixtures/installed-model-info.ts";
-import { DONE, SAVE_LIST } from "./ban-list-picker.ts";
+import { DONE } from "./ban-list-picker.ts";
 import { runInit, type InitContext } from "./command.ts";
 import { starterTierMap } from "./setup.ts";
 import {
@@ -30,6 +30,7 @@ function scriptedUi(script: Answer[]) {
   const calls: Call[] = [];
   const answers = [...script];
   const next = (kind: string, title: string) => {
+    if (answers.length === 0 && kind === "select" && title === "Classifier model") return undefined;
     if (answers.length === 0) throw new Error(`script ran out at ${kind}: ${title}`);
     return answers.shift();
   };
@@ -46,7 +47,7 @@ function scriptedUi(script: Answer[]) {
   return { ui, calls, remaining: () => answers.length };
 }
 
-const BAN_STEP = [DONE, SAVE_LIST];
+const BAN_STEP = [DONE];
 const GATE_TITLE = /^Gate level/;
 const LIMIT_TITLE = /^Worker limit/;
 const RUNG = ["anthropic/claude-haiku-4-5:low"];
@@ -245,19 +246,18 @@ test("Escape at the target skips both values; Escape at one value still asks the
   } finally { f.cleanup(); }
 });
 
-test("an existing tier map is rebuilt only after a yes, and the classifier stays", async () => {
+test("an existing tier map is rebuilt only after a yes, and Escape at the routing picker keeps the existing routing", async () => {
   const classifier = { model: "anthropic/claude-haiku-4-5:low" };
   const personal = { orchestrator: { subagentBanList: [], sessionBanList: [], routing: { enabled: true, mode: "shadow", tiers: TIERS, classifier } } };
-  const starter = starterTierMap(INSTALLED_MODEL_INFO, { subagentBanList: [], sessionBanList: [] })!;
   const yes = dirs({ personal, marker: "none" });
   try {
     const run = await init(yes, [...BAN_STEP, undefined, undefined, true], yes.cwd);
     assert.ok(run.calls.some((call) => call.kind === "confirm" && call.title === "Rebuild the tier map from installed models?"));
     const routing = yes.personal().orchestrator.routing;
-    assert.deepEqual(routing.tiers, starter.tiers);
+    assert.deepEqual(routing.tiers, TIERS);
     assert.deepEqual(routing.classifier, classifier);
     assert.equal(routing.mode, "shadow");
-    assert.match(run.lines, /rebuilt from installed models/);
+    assert.match(run.lines, /rebuilt from picked models/);
   } finally { yes.cleanup(); }
   const no = dirs({ personal, marker: "none" });
   try {
@@ -265,6 +265,22 @@ test("an existing tier map is rebuilt only after a yes, and the classifier stays
     await init(no, [...BAN_STEP, undefined, undefined, false], no.cwd);
     assert.equal(readFileSync(no.settingsPath, "utf8"), before);
   } finally { no.cleanup(); }
+});
+
+test("rebuilding can replace the classifier while tier Escapes keep existing tiers", async () => {
+  const oldClassifier = { model: "anthropic/claude-haiku-4-5:low" };
+  const personal = { orchestrator: { subagentBanList: [], sessionBanList: [], routing: { enabled: true, mode: "shadow", tiers: TIERS, classifier: oldClassifier } } };
+  const starter = starterTierMap(INSTALLED_MODEL_INFO, { subagentBanList: [], sessionBanList: [] })!;
+  const selectedModel = starter.classifier.slice(0, starter.classifier.lastIndexOf(":"));
+  const selectedLevel = starter.classifier.slice(starter.classifier.lastIndexOf(":") + 1);
+  assert.notEqual(starter.classifier, oldClassifier.model);
+  const d = dirs({ personal, marker: "none" });
+  try {
+    await init(d, [...BAN_STEP, undefined, undefined, true, selectedModel, selectedLevel, undefined, undefined, undefined, undefined], d.cwd);
+    const routing = d.personal().orchestrator.routing;
+    assert.deepEqual(routing.tiers, TIERS);
+    assert.deepEqual(routing.classifier, { model: starter.classifier });
+  } finally { d.cleanup(); }
 });
 
 test("without a tier map, init writes the starter map without asking to rebuild", async () => {

@@ -11,7 +11,7 @@ import {
   saveAuthorization,
   type RecipientAuthorization,
 } from "../recipients/authorization.ts";
-import type { RiskTier } from "../routing/tiers.ts";
+import { RISK_TIERS, type RiskTier } from "../routing/tiers.ts";
 import { tierMapFromSettings } from "../routing/tier-map.ts";
 import { checkModelScope } from "../models/model-scope.ts";
 import { getSupportedThinkingLevels, type ModelInfo, type ThinkingLevel } from "../models/model-info.ts";
@@ -66,14 +66,14 @@ export function setupNotice(status: SetupStatus, stateDir: string): string | und
 // Starter tier map
 // ---------------------------------------------------------------------------
 
-const TIER_EFFORT: Record<RiskTier, readonly ThinkingLevel[]> = {
+export const TIER_EFFORT: Record<RiskTier, readonly ThinkingLevel[]> = {
   mechanical: ["low", "minimal", "off"],
   standard: ["medium", "low", "off"],
   elevated: ["high", "medium", "off"],
   critical: ["xhigh", "high", "medium", "off"],
 };
 
-function rungFor(model: ModelInfo, tier: RiskTier): string {
+export function starterRungFor(model: ModelInfo, tier: RiskTier): string {
   const supported = getSupportedThinkingLevels(model);
   const effort = TIER_EFFORT[tier].find((level) => supported.includes(level)) ?? supported[0] ?? "off";
   return `${model.fullId}:${effort}`;
@@ -86,35 +86,70 @@ export interface StarterTierMap {
   readonly skipped: readonly string[];
 }
 
+export interface EligibleRoutingModels {
+  /** Eligible installed models, sorted by known output price, then unknown price, then id. */
+  readonly models: readonly ModelInfo[];
+  /** Installed models left out, with why. */
+  readonly skipped: readonly string[];
+}
+
+export function publishedOutputPrice(model: ModelInfo): number | undefined {
+  const catalog = buildCatalog({ modelIds: [model.fullId] });
+  const entry = lookup(catalog, model.fullId);
+  const price = entry && readFact(entry.publishedListPrice);
+  return price && price.state !== "unknown" ? price.value.outputUsdPerMTok : undefined;
+}
+
+function pricedRoutingModels(models: readonly ModelInfo[]): { model: ModelInfo; output: number }[] {
+  return models.flatMap((model) => {
+    const output = publishedOutputPrice(model);
+    return output === undefined ? [] : [{ model, output }];
+  });
+}
+
+export function eligibleRoutingModels(installed: readonly ModelInfo[], banLists: BanLists): EligibleRoutingModels {
+  const skipped: string[] = [];
+  const eligible: ModelInfo[] = [];
+  for (const model of installed) {
+    if (isProhibitedModel(model.fullId, banLists)) { skipped.push(`${model.fullId}: subagent ban list`); continue; }
+    if (checkModelScope(model.fullId, HARNESS_MODEL_SCOPE, "explicit")?.severity === "error") { skipped.push(`${model.fullId}: allowed-model list`); continue; }
+    eligible.push(model);
+  }
+  return {
+    models: eligible.sort((a, b) => {
+      const aPrice = publishedOutputPrice(a);
+      const bPrice = publishedOutputPrice(b);
+      if (aPrice !== undefined && bPrice !== undefined) return aPrice - bPrice || a.fullId.localeCompare(b.fullId);
+      if (aPrice !== undefined) return -1;
+      if (bPrice !== undefined) return 1;
+      return a.fullId.localeCompare(b.fullId);
+    }),
+    skipped,
+  };
+}
+
 /** A starter tier map from the installed models: those the allowed-model
  *  list and the ban list admit and whose published price is known, cheapest
  *  first. Mechanical takes the cheapest two, standard the middle, elevated
  *  and critical the two most expensive at rising effort. The classifier runs
  *  on the cheapest. `undefined` when no installed model qualifies. */
 export function starterTierMap(installed: readonly ModelInfo[], banLists: BanLists): StarterTierMap | undefined {
-  const skipped: string[] = [];
-  const catalog = buildCatalog({ modelIds: installed.map((model) => model.fullId) });
-  const priced: { model: ModelInfo; output: number }[] = [];
-  for (const model of installed) {
-    if (isProhibitedModel(model.fullId, banLists)) { skipped.push(`${model.fullId}: subagent ban list`); continue; }
-    if (checkModelScope(model.fullId, HARNESS_MODEL_SCOPE, "explicit")?.severity === "error") { skipped.push(`${model.fullId}: allowed-model list`); continue; }
-    const entry = lookup(catalog, model.fullId);
-    const price = entry && readFact(entry.publishedListPrice);
-    if (!price || price.state === "unknown") { skipped.push(`${model.fullId}: no published price`); continue; }
-    priced.push({ model, output: price.value.outputUsdPerMTok });
-  }
-  if (priced.length === 0) return undefined;
-  const sorted = priced.sort((a, b) => a.output - b.output || a.model.fullId.localeCompare(b.model.fullId)).map((entry) => entry.model);
+  const eligible = eligibleRoutingModels(installed, banLists);
+  const priced = pricedRoutingModels(eligible.models).sort((a, b) => a.output - b.output || a.model.fullId.localeCompare(b.model.fullId));
+  const sorted = priced.map((entry) => entry.model);
+  const unpriced = eligible.models.filter((model) => publishedOutputPrice(model) === undefined).map((model) => `${model.fullId}: no published price`);
+  const skipped = [...eligible.skipped, ...unpriced];
+  if (sorted.length === 0) return undefined;
   const pick = (from: number, count: number) => sorted.slice(Math.max(0, from), Math.max(0, from) + count);
   const middle = Math.floor((sorted.length - 1) / 2);
   const top = pick(sorted.length - 2, 2).reverse();
   const tiers: Record<RiskTier, string[]> = {
-    mechanical: pick(0, 2).map((model) => rungFor(model, "mechanical")),
-    standard: pick(middle, 2).map((model) => rungFor(model, "standard")),
-    elevated: top.map((model) => rungFor(model, "elevated")),
-    critical: top.map((model) => rungFor(model, "critical")),
+    mechanical: pick(0, 2).map((model) => starterRungFor(model, "mechanical")),
+    standard: pick(middle, 2).map((model) => starterRungFor(model, "standard")),
+    elevated: top.map((model) => starterRungFor(model, "elevated")),
+    critical: top.map((model) => starterRungFor(model, "critical")),
   };
-  return { tiers, classifier: rungFor(sorted[0]!, "mechanical"), skipped };
+  return { tiers, classifier: starterRungFor(sorted[0]!, "mechanical"), skipped };
 }
 
 /** The providers a tier map and classifier would send task text to. */
@@ -141,6 +176,27 @@ export function currentSubagentBanList(personal: unknown): string[] {
   return Array.isArray(list) ? list.filter((entry): entry is string => typeof entry === "string") : [];
 }
 
+export function currentClassifierRung(personal: unknown): string | undefined {
+  return classifierModelIn(routingOf(personal));
+}
+
+function tierRungsFrom(value: unknown): string[] | undefined {
+  if (Array.isArray(value)) return value.filter((entry): entry is string => typeof entry === "string");
+  if (isPlainObject(value) && Array.isArray(value.rungs)) return value.rungs.filter((entry): entry is string => typeof entry === "string");
+  return undefined;
+}
+
+export function currentTierRungs(personal: unknown): Partial<Record<RiskTier, string[]>> | undefined {
+  const tiers = routingOf(personal).tiers;
+  if (!isPlainObject(tiers)) return undefined;
+  const current: Partial<Record<RiskTier, string[]>> = {};
+  for (const tier of RISK_TIERS) {
+    const rungs = tierRungsFrom(tiers[tier]);
+    if (rungs && rungs.length > 0) current[tier] = rungs;
+  }
+  return Object.keys(current).length > 0 ? current : undefined;
+}
+
 export interface SettingsPlan {
   /** The settings after init; equal to the input when nothing changes. */
   readonly settings: Record<string, unknown>;
@@ -148,37 +204,57 @@ export interface SettingsPlan {
 }
 
 export interface PlanOptions {
-  /** Replace an existing tier map with the starter; the owner confirmed it. */
+  /** Replace an existing tier map with the picked map; the owner confirmed it. */
   readonly rebuildTiers?: boolean;
 }
 
+function classifierModelIn(routing: Record<string, unknown>): string | undefined {
+  const classifier = routing.classifier;
+  if (!isPlainObject(classifier)) return undefined;
+  return typeof classifier.model === "string" ? classifier.model : undefined;
+}
+
+function setClassifierModel(routing: Record<string, unknown>, model: string, changes: string[]): void {
+  const existing = routing.classifier;
+  if (classifierModelIn(routing) === model) return;
+  routing.classifier = isPlainObject(existing) ? { ...existing, model } : { model };
+  changes.push(`orchestrator.routing.classifier.model = ${model}`);
+}
+
+function withPickedTiersPreservingOrders(existing: unknown, picked: Record<RiskTier, string[]>): Record<RiskTier, string[] | { order?: unknown; rungs: string[] }> {
+  const result = {} as Record<RiskTier, string[] | { order?: unknown; rungs: string[] }>;
+  const current = isPlainObject(existing) ? existing : {};
+  for (const tier of RISK_TIERS) {
+    const value = current[tier];
+    result[tier] = isPlainObject(value) && value.order !== undefined
+      ? { order: value.order, rungs: picked[tier] }
+      : picked[tier];
+  }
+  return result;
+}
+
 /** Add what is missing and keep what is there: an existing tier map is
- *  replaced only with `rebuildTiers`, and an existing classifier never.
- *  The subagent ban list is the exception:
- *  init's picker starts from the current list, so the picked list replaces
- *  it when it differs. A new tier map starts in shadow
- *  mode, which records decisions while workers run on the session model;
- *  a rebuilt one keeps the mode and switch already set. */
+ *  replaced only with `rebuildTiers`. When rebuilding, the classifier is
+ *  replaced too because init just asked for it, with the existing classifier
+ *  preselected by the UI when it is still eligible. The subagent ban list is
+ *  the exception: init's picker starts from the current list, so the picked
+ *  list replaces it when it differs. A new tier map starts in shadow mode,
+ *  which records decisions while workers run on the session model; a rebuilt
+ *  one keeps the mode and switch already set. */
 export function planSettings(personal: Record<string, unknown>, starter: StarterTierMap | undefined, subagentBanList: readonly string[], options: PlanOptions = {}): SettingsPlan {
   const changes: string[] = [];
   const orchestrator = { ...orchestratorOf(personal) };
   const routing = { ...routingOf(personal) };
   if (routing.tiers !== undefined && starter && options.rebuildTiers) {
-    routing.tiers = starter.tiers;
-    changes.push("orchestrator.routing.tiers (rebuilt from installed models)");
-    if (routing.classifier === undefined) {
-      routing.classifier = { model: starter.classifier };
-      changes.push(`orchestrator.routing.classifier.model = ${starter.classifier}`);
-    }
+    routing.tiers = withPickedTiersPreservingOrders(routing.tiers, starter.tiers);
+    changes.push("orchestrator.routing.tiers (rebuilt from picked models)");
+    setClassifierModel(routing, starter.classifier, changes);
   } else if (routing.tiers === undefined && starter) {
     routing.tiers = starter.tiers;
     if (routing.enabled === undefined) routing.enabled = true;
     if (routing.mode === undefined) routing.mode = "shadow";
-    changes.push("orchestrator.routing.tiers (starter map, shadow mode)");
-    if (routing.classifier === undefined) {
-      routing.classifier = { model: starter.classifier };
-      changes.push(`orchestrator.routing.classifier.model = ${starter.classifier}`);
-    }
+    changes.push("orchestrator.routing.tiers (picked map, shadow mode)");
+    setClassifierModel(routing, starter.classifier, changes);
   }
   const existing = orchestrator.subagentBanList;
   const unchanged = Array.isArray(existing) && existing.length === subagentBanList.length && existing.every((entry, index) => entry === subagentBanList[index]);

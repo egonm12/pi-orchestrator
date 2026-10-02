@@ -5,7 +5,7 @@ date: 2026-09-24
 
 # Route from an owner-written tier map, not from earned suitability scores
 
-Tickets 06 and 08 admitted a model to a task only once it had earned a task-suitability score from at least three verified outcomes. In practice that meant the router could never pick anything, because a model earns a score only by being picked. Following LiteLLM's auto-routing design, the router now starts from a tier map the owner writes: four tiers, each an ordered list of rungs (model plus effort). The classifier assigns the tier, hard filters remove rungs, and the first surviving rung wins. Review verdicts are recorded from day one so that adaptive choice within a tier can be switched on once data exists, but no evidence is required to route.
+Tickets 06 and 08 admitted a model to a task only once it had earned a task-suitability score from at least three verified outcomes. In practice that meant the router could never pick anything, because a model earns a score only by being picked. Following LiteLLM's auto-routing design, the router now starts from a tier map the owner writes: four tiers, each a list of rungs (model plus effort). The classifier assigns the tier, hard filters remove rungs, and the tier's order policy chooses among survivors. Review verdicts are recorded from day one so that adaptive choice within a tier can be switched on once data exists, but no evidence is required to route.
 
 ## Considered options
 

@@ -6,9 +6,9 @@ import { test } from "node:test";
 import { INSTALLED_MODEL_INFO } from "../fixtures/installed-model-info.ts";
 import { loadAuthorization } from "../recipients/authorization.ts";
 import { tierMapFromSettings } from "../routing/tier-map.ts";
-import { DONE, SAVE_LIST, TYPE_OWN } from "./ban-list-picker.ts";
+import { DONE, TYPE_OWN } from "./ban-list-picker.ts";
 import { runInit, type InitContext } from "./command.ts";
-import { planSettings, recipientProviders, RECIPIENTS_FILE, setupNotice, setupStatus, starterTierMap } from "./setup.ts";
+import { currentTierRungs, eligibleRoutingModels, planSettings, recipientProviders, RECIPIENTS_FILE, setupNotice, setupStatus, starterTierMap } from "./setup.ts";
 
 const NO_BANS = { subagentBanList: [], sessionBanList: [] };
 
@@ -51,6 +51,17 @@ test("the starter tier map loads through the router's own loader and skips banne
   assert.deepEqual(map.drops, []);
 });
 
+test("eligible routing models include unpriced models but starter selection excludes them", () => {
+  const unpriced = { provider: "anthropic", id: "claude-sonnet-5-5", fullId: "anthropic/claude-sonnet-5-5", reasoning: true };
+  const priced = INSTALLED_MODEL_INFO.find((model) => model.fullId === "anthropic/claude-haiku-4-5")!;
+  const installed = [priced, unpriced];
+  const eligible = eligibleRoutingModels(installed, NO_BANS);
+  assert.ok(eligible.models.some((model) => model.fullId === unpriced.fullId));
+  const starter = starterTierMap(installed, NO_BANS)!;
+  assert.equal(Object.values(starter.tiers).flat().some((rung) => rung.startsWith(`${unpriced.fullId}:`)), false);
+  assert.ok(starter.skipped.includes(`${unpriced.fullId}: no published price`));
+});
+
 test("planSettings adds what is missing, starts in shadow mode, never replaces an existing map and replaces a changed ban list", () => {
   const starter = starterTierMap(INSTALLED_MODEL_INFO, NO_BANS)!;
   const fresh = planSettings({ theme: "dark" }, starter, ["fable"]);
@@ -70,10 +81,36 @@ test("planSettings adds what is missing, starts in shadow mode, never replaces a
   assert.deepEqual((replaced.settings.orchestrator as Record<string, any>).routing, kept.orchestrator.routing);
 });
 
+test("rebuilding tiers preserves existing per-tier order fields and reads existing rungs", () => {
+  const starter = starterTierMap(INSTALLED_MODEL_INFO, NO_BANS)!;
+  const personal = {
+    orchestrator: {
+      routing: {
+        mode: "live",
+        tiers: {
+          mechanical: { order: "ordered", rungs: ["anthropic/claude-haiku-4-5:low"] },
+          standard: ["anthropic/claude-sonnet-4-5:medium"],
+          elevated: { order: "balanced", rungs: ["anthropic/claude-opus-5:high"] },
+          critical: ["anthropic/claude-opus-5:xhigh"],
+        },
+      },
+    },
+  };
+  assert.deepEqual(currentTierRungs(personal)?.mechanical, ["anthropic/claude-haiku-4-5:low"]);
+  const rebuilt = planSettings(personal, starter, [], { rebuildTiers: true });
+  const tiers = (rebuilt.settings.orchestrator as any).routing.tiers;
+  assert.equal(tiers.mechanical.order, "ordered");
+  assert.deepEqual(tiers.mechanical.rungs, starter.tiers.mechanical);
+  assert.equal(tiers.elevated.order, "balanced");
+  assert.deepEqual(tiers.elevated.rungs, starter.tiers.elevated);
+  assert.deepEqual(tiers.standard, starter.tiers.standard);
+  assert.equal((rebuilt.settings.orchestrator as any).routing.mode, "live");
+});
+
 /** The ban list step is answered by typing `banList` (when not empty),
- *  then Done, then Save. */
+ *  then Done. */
 function fakeCtx(answers: { banList: string; approve: Record<string, boolean> }, notes: string[]): InitContext {
-  const selects = [...(answers.banList ? [TYPE_OWN] : []), DONE, SAVE_LIST];
+  const selects = [...(answers.banList ? [TYPE_OWN] : []), DONE];
   return {
     hasUI: true,
     modelRegistry: { getAvailable: () => [...INSTALLED_MODEL_INFO] },

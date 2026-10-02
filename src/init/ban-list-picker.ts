@@ -1,12 +1,13 @@
 import { subagentBanListEntry } from "../policy/ban-lists.ts";
 import type { ModelInfo } from "../models/model-info.ts";
 import { emptiedPersonalTiers } from "../routing/tier-map.ts";
+import { canUseCustomCheckbox, checkboxSelect, type CheckboxSelectUi } from "./checkbox-select.ts";
 
 // The ban list step of `/pi-orchestrator init`: pick installed model
-// families or type entries, preview what each entry blocks, then save or go
-// back and edit. pi has no multi-select, so the picker is a loop of single
-// selects. Escape at any select cancels the step and the caller keeps the
-// previous list.
+// families or type entries, preview what each entry blocks, then continue.
+// In the TUI, entries are shown as checkboxes; other modes fall back to the
+// old select loop. Escape at any select cancels the step and the caller keeps
+// the previous list.
 
 export const BAN_LIST_HINT =
   "Subagent ban list: each entry blocks every model whose id contains it, case-insensitive. For example, `opus` excludes every Opus model.";
@@ -15,14 +16,12 @@ export const REMOVE_ENTRY = "Remove an entry…";
 export const DONE = "Done";
 /** Holds a comma, which a typed entry cannot, so it never names an entry. */
 export const BACK = "Back, remove nothing";
-export const SAVE_LIST = "Save this list";
 export const EDIT_LIST = "Go back and edit";
 export const NO_MATCH_NOTE = "matches no installed model yet";
 
 /** The pi UI calls the picker uses. */
-export interface PickerUi {
+export interface PickerUi extends CheckboxSelectUi {
   notify(message: string, type?: "info" | "warning" | "error"): void;
-  select(title: string, options: string[]): Promise<string | undefined>;
   input(title: string, placeholder?: string): Promise<string | undefined>;
 }
 
@@ -94,21 +93,31 @@ export function emptiedTierWarnings(settings: unknown, entries: readonly string[
 
 const sameEntry = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
 
+function addUnique(entries: string[], entry: string): void {
+  if (!entries.some((other) => sameEntry(other, entry))) entries.push(entry);
+}
+
+function banListOptions(families: readonly string[], chosen: readonly string[]): string[] {
+  const options: string[] = [];
+  for (const entry of chosen) addUnique(options, entry);
+  for (const family of families) addUnique(options, family);
+  options.push(TYPE_OWN);
+  return options;
+}
+
 /** Run the picker from `current`. Returns the list to save, or `undefined`
  *  when the owner pressed Escape at a select. Escape at the typed-entry
  *  input only returns to the picker. With an `existing` tier map, a list
  *  that would leave one of its tiers with no rungs is not offered for
  *  saving; the preview offers only going back. */
-export async function pickSubagentBanList(
+async function pickSubagentBanListFallback(
   ui: PickerUi,
   installed: readonly ModelInfo[],
   current: readonly string[],
   existing?: ExistingTierMap,
 ): Promise<string[] | undefined> {
-  ui.notify(BAN_LIST_HINT);
   const families = installedFamilies(installed);
   const chosen = [...current];
-  const add = (entry: string) => { if (!chosen.some((other) => sameEntry(other, entry))) chosen.push(entry); };
   for (;;) {
     const title = `Subagent ban list: ${chosen.length > 0 ? chosen.join(", ") : "(none)"}. Add a model family, type your own, or Done`;
     const options = [
@@ -121,7 +130,7 @@ export async function pickSubagentBanList(
     if (choice === undefined) return undefined;
     if (choice === TYPE_OWN) {
       const typed = await ui.input("Ban-list entries (comma-separated; each blocks every model whose id contains it)", "e.g. fable, astra");
-      for (const entry of (typed ?? "").split(",").map((part) => part.trim()).filter(Boolean)) add(entry);
+      for (const entry of (typed ?? "").split(",").map((part) => part.trim()).filter(Boolean)) addUnique(chosen, entry);
     } else if (choice === REMOVE_ENTRY) {
       const removed = await ui.select("Remove which entry?", [...chosen, BACK]);
       if (removed === undefined) return undefined;
@@ -130,16 +139,51 @@ export async function pickSubagentBanList(
       for (const line of banListPreview(chosen, installed)) ui.notify(line, line.endsWith(NO_MATCH_NOTE) ? "warning" : "info");
       const emptied = existing ? emptiedTierWarnings(existing.settings, chosen, installed) : [];
       for (const line of emptied) ui.notify(line, "warning");
-      const verdict = emptied.length > 0
-        ? await ui.select(
-            `Subagent ban list ${chosen.join(", ")} would leave a tier of the existing tier map with no models, so it cannot be saved. Edit the tier map in ${existing!.path} first, or ban less.`,
-            [EDIT_LIST],
-          )
-        : await ui.select(`Save subagent ban list: ${chosen.join(", ") || "(none)"}?`, [SAVE_LIST, EDIT_LIST]);
+      if (emptied.length === 0) return chosen;
+      const verdict = await ui.select(
+        `Subagent ban list ${chosen.join(", ")} would leave a tier of the existing tier map with no models, so it cannot be saved. Edit the tier map in ${existing!.path} first, or ban less.`,
+        [EDIT_LIST],
+      );
       if (verdict === undefined) return undefined;
-      if (verdict === SAVE_LIST) return chosen;
     } else {
-      add(choice);
+      addUnique(chosen, choice);
     }
+  }
+}
+
+export async function pickSubagentBanList(
+  ui: PickerUi,
+  installed: readonly ModelInfo[],
+  current: readonly string[],
+  existing?: ExistingTierMap,
+): Promise<string[] | undefined> {
+  ui.notify(BAN_LIST_HINT);
+  if (!canUseCustomCheckbox(ui)) return pickSubagentBanListFallback(ui, installed, current, existing);
+  const families = installedFamilies(installed);
+  let chosen = [...current];
+  for (;;) {
+    const picked = await checkboxSelect(
+      ui,
+      "Subagent ban list",
+      banListOptions(families, chosen),
+      chosen,
+      "Space toggles model families or current entries. Select Type your own to add comma-separated entries, then press Enter to save and continue.",
+    );
+    if (picked === undefined) return undefined;
+    chosen = picked.filter((entry) => entry !== TYPE_OWN);
+    if (picked.includes(TYPE_OWN)) {
+      const typed = await ui.input("Ban-list entries (comma-separated; each blocks every model whose id contains it)", "e.g. fable, astra");
+      for (const entry of (typed ?? "").split(",").map((part) => part.trim()).filter(Boolean)) addUnique(chosen, entry);
+      continue;
+    }
+    for (const line of banListPreview(chosen, installed)) ui.notify(line, line.endsWith(NO_MATCH_NOTE) ? "warning" : "info");
+    const emptied = existing ? emptiedTierWarnings(existing.settings, chosen, installed) : [];
+    for (const line of emptied) ui.notify(line, "warning");
+    if (emptied.length === 0) return chosen;
+    const verdict = await ui.select(
+      `Subagent ban list ${chosen.join(", ")} would leave a tier of the existing tier map with no models, so it cannot be saved. Edit the tier map in ${existing!.path} first, or ban less.`,
+      [EDIT_LIST],
+    );
+    if (verdict === undefined) return undefined;
   }
 }

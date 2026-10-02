@@ -15,7 +15,6 @@ import {
   NO_MATCH_NOTE,
   pickSubagentBanList,
   REMOVE_ENTRY,
-  SAVE_LIST,
   TYPE_OWN,
   type PickerUi,
 } from "./ban-list-picker.ts";
@@ -51,7 +50,7 @@ test("a model family is the id without provider, date and version suffixes", () 
 });
 
 test("the picker shows the hint, offers families not yet chosen and shows the selection in the title", async () => {
-  const { ui, calls } = scriptedUi(["claude-opus", "gpt-6", DONE, SAVE_LIST]);
+  const { ui, calls } = scriptedUi(["claude-opus", "gpt-6", DONE]);
   const picked = await pickSubagentBanList(ui, INSTALLED_MODEL_INFO, []);
   assert.deepEqual(picked, ["claude-opus", "gpt-6"]);
   assert.equal(calls[0]!.kind, "notify");
@@ -69,31 +68,49 @@ test("the picker shows the hint, offers families not yet chosen and shows the se
 });
 
 test("own entries are typed comma-separated and duplicates are dropped", async () => {
-  const { ui, calls } = scriptedUi([TYPE_OWN, "Fable, astra, , OPUS", "claude-opus", DONE, SAVE_LIST]);
+  const { ui, calls } = scriptedUi([TYPE_OWN, "Fable, astra, , OPUS", "claude-opus", DONE]);
   const picked = await pickSubagentBanList(ui, INSTALLED_MODEL_INFO, ["opus"]);
   assert.deepEqual(picked, ["opus", "Fable", "astra", "claude-opus"]);
   assert.ok(calls.some((call) => call.kind === "input"));
 });
 
+test("custom checkbox ban-list picker shows selections and uses Type your own as an add action", async () => {
+  const calls: { kind: "custom" | "input" | "select" | "notify"; title: string; options?: string[] }[] = [];
+  const customAnswers = [["claude-opus", TYPE_OWN], ["claude-opus", "nebula"]];
+  const ui: PickerUi = {
+    mode: "tui",
+    notify: (message) => { calls.push({ kind: "notify", title: message }); },
+    input: async (title) => { calls.push({ kind: "input", title }); return "nebula"; },
+    select: async (title, options) => { calls.push({ kind: "select", title, options: [...options] }); return undefined; },
+    custom: async <T>() => {
+      calls.push({ kind: "custom", title: "Subagent ban list" });
+      return customAnswers.shift() as T;
+    },
+  };
+  assert.deepEqual(await pickSubagentBanList(ui, INSTALLED_MODEL_INFO, []), ["claude-opus", "nebula"]);
+  assert.equal(calls.filter((call) => call.kind === "custom").length, 2);
+  assert.ok(calls.some((call) => call.kind === "input"));
+  assert.equal(calls.some((call) => call.kind === "select"), false);
+});
+
 test("the preview lists the installed models each entry matches and marks an entry that matches none", async () => {
-  const { ui, calls } = scriptedUi([TYPE_OWN, "OPUS-5, nebula", DONE, SAVE_LIST]);
+  const { ui, calls } = scriptedUi([TYPE_OWN, "OPUS-5, nebula", DONE]);
   const picked = await pickSubagentBanList(ui, INSTALLED_MODEL_INFO, []);
   assert.deepEqual(picked, ["OPUS-5", "nebula"]);
   const preview = calls.filter((call) => call.kind === "notify").map((call) => call.title).join("\n");
   assert.match(preview, /OPUS-5: anthropic\/claude-opus-5, anthropic\/claude-opus-5-5/);
   assert.doesNotMatch(preview, /OPUS-5:[^\n]*claude-opus-4/);
   assert.match(preview, new RegExp(`nebula: ${NO_MATCH_NOTE}`));
-  const confirm = calls.filter((call) => call.kind === "select").at(-1)!;
-  assert.deepEqual(confirm.options, [SAVE_LIST, EDIT_LIST]);
+  assert.equal(calls.filter((call) => call.kind === "select").length, 2);
 });
 
 test("going back from the preview edits the same selection", async () => {
-  const { ui } = scriptedUi(["claude-opus", DONE, EDIT_LIST, REMOVE_ENTRY, "claude-opus", "gpt-5", DONE, SAVE_LIST]);
+  const { ui } = scriptedUi(["claude-opus", REMOVE_ENTRY, "claude-opus", "gpt-5", DONE]);
   assert.deepEqual(await pickSubagentBanList(ui, INSTALLED_MODEL_INFO, []), ["gpt-5"]);
 });
 
-test("Escape at any select cancels the picker", async () => {
-  for (const script of [[undefined], ["claude-opus", undefined], ["claude-opus", DONE, undefined], ["claude-opus", REMOVE_ENTRY, undefined]]) {
+test("Escape at active selects cancels the picker", async () => {
+  for (const script of [[undefined], ["claude-opus", undefined], ["claude-opus", REMOVE_ENTRY, undefined]]) {
     const { ui, remaining } = scriptedUi(script);
     assert.equal(await pickSubagentBanList(ui, INSTALLED_MODEL_INFO, ["fable"]), undefined, JSON.stringify(script));
     assert.equal(remaining(), 0);
@@ -101,7 +118,7 @@ test("Escape at any select cancels the picker", async () => {
 });
 
 test("re-running starts from the current list, offers removal, and offers no family already listed", async () => {
-  const { ui, calls } = scriptedUi([REMOVE_ENTRY, "fable", DONE, SAVE_LIST]);
+  const { ui, calls } = scriptedUi([REMOVE_ENTRY, "fable", DONE]);
   assert.deepEqual(await pickSubagentBanList(ui, INSTALLED_MODEL_INFO, ["fable", "GPT-6"]), ["GPT-6"]);
   const selects = calls.filter((call) => call.kind === "select");
   assert.match(selects[0]!.title, /fable, GPT-6/);
@@ -110,7 +127,7 @@ test("re-running starts from the current list, offers removal, and offers no fam
 });
 
 test("an entry named like the back option can be removed", async () => {
-  const { ui, calls } = scriptedUi([REMOVE_ENTRY, "Back", DONE, SAVE_LIST]);
+  const { ui, calls } = scriptedUi([REMOVE_ENTRY, "Back", DONE]);
   assert.deepEqual(await pickSubagentBanList(ui, INSTALLED_MODEL_INFO, ["Back", "fable"]), ["fable"]);
   const removal = calls.filter((call) => call.kind === "select")[1]!;
   assert.deepEqual(removal.options, ["Back", "fable", BACK]);
@@ -134,7 +151,7 @@ const OPUS_ELEVATED = {
 };
 
 test("the preview names a tier of the existing map the list would empty and offers only going back", async () => {
-  const { ui, calls } = scriptedUi([TYPE_OWN, "opus", DONE, EDIT_LIST, REMOVE_ENTRY, "opus", TYPE_OWN, "opus-5", DONE, SAVE_LIST]);
+  const { ui, calls } = scriptedUi([TYPE_OWN, "opus", DONE, EDIT_LIST, REMOVE_ENTRY, "opus", TYPE_OWN, "opus-5", DONE]);
   const existing = { settings: OPUS_ELEVATED, path: "/home/owner/.pi/agent/settings.json" };
   assert.deepEqual(await pickSubagentBanList(ui, INSTALLED_MODEL_INFO, [], existing), ["opus-5"]);
   const notes = calls.filter((call) => call.kind === "notify").map((call) => call.title);
@@ -144,8 +161,8 @@ test("the preview names a tier of the existing map the list would empty and offe
   const blocked = selects[2]!;
   assert.deepEqual(blocked.options, [EDIT_LIST]);
   assert.match(blocked.title, /edit the tier map in \/home\/owner\/\.pi\/agent\/settings\.json first, or ban less/i);
-  // `opus-5` removes only some rungs of the elevated tier, so it saves.
-  assert.deepEqual(selects.at(-1)!.options, [SAVE_LIST, EDIT_LIST]);
+  // `opus-5` removes only some rungs of the elevated tier, so it saves without a confirmation select.
+  assert.equal(selects.at(-1)!.options!.includes(EDIT_LIST), false);
   assert.equal(notes.filter((note) => /would have no models left/.test(note)).length, 1);
 });
 
@@ -171,7 +188,7 @@ test("init replaces an existing ban list with the picked one and leaves an exist
   const tiers = { mechanical: rung, standard: rung, elevated: rung, critical: rung };
   const dirs = initDirs({ orchestrator: { subagentBanList: ["fable"], sessionBanList: [], routing: { tiers } } });
   try {
-    const { ui, calls } = scriptedUi([REMOVE_ENTRY, "fable", "gpt-6", DONE, SAVE_LIST, undefined, undefined]);
+    const { ui, calls } = scriptedUi([REMOVE_ENTRY, "fable", "gpt-6", DONE, undefined, undefined]);
     await runInit("init", initCtx(ui), { stateDir: dirs.stateDir, agentDir: dirs.agentDir });
     const settings = JSON.parse(readFileSync(dirs.settingsPath, "utf8"));
     assert.deepEqual(settings.orchestrator.subagentBanList, ["gpt-6"]);
@@ -200,7 +217,7 @@ test("init does not save a list that empties a tier of the existing map; Escape 
 test("init saves a list that removes only some rungs of a tier of the existing map", async () => {
   const dirs = initDirs(OPUS_ELEVATED);
   try {
-    const { ui } = scriptedUi([TYPE_OWN, "opus-5", DONE, SAVE_LIST, undefined, undefined]);
+    const { ui } = scriptedUi([TYPE_OWN, "opus-5", DONE, undefined, undefined]);
     await runInit("init", initCtx(ui), { stateDir: dirs.stateDir, agentDir: dirs.agentDir });
     const settings = JSON.parse(readFileSync(dirs.settingsPath, "utf8"));
     assert.deepEqual(settings.orchestrator.subagentBanList, ["opus-5"]);
@@ -212,7 +229,7 @@ test("an existing tier map that does not load is named as the existing map, and 
   const dirs = initDirs({ orchestrator: { subagentBanList: [], sessionBanList: [], routing: { tiers: { mechanical: ["anthropic/claude-haiku-4-5:low"] } } } });
   try {
     const before = readFileSync(dirs.settingsPath, "utf8");
-    const { ui } = scriptedUi(["gpt-6", DONE, SAVE_LIST, undefined, undefined]);
+    const { ui } = scriptedUi(["gpt-6", DONE, undefined, undefined]);
     const lines = (await runInit("init", initCtx(ui), { stateDir: dirs.stateDir, agentDir: dirs.agentDir })).join("\n");
     assert.equal(readFileSync(dirs.settingsPath, "utf8"), before);
     assert.match(lines, new RegExp(`the existing tier map in ${dirs.settingsPath.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")} does not load \\(.*standard.*is missing`));
