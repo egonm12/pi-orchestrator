@@ -723,19 +723,105 @@ test("eight items with maxParallel 2 run at most two workers and return results 
 });
 
 
-test("more than eight items or an empty call is refused before starting workers", async () => {
-  const h = harness();
+test("the schema's maxItems and the description follow the worker limit read at session start, and a call takes 1 to 32 items", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { workerLimit: 6 } } });
   try {
     const provider = fakeAnthropic("done");
-    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
-    for (const count of [0, 9]) {
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const maxItems = () => (subagents.tool().parameters as { properties: { items: { maxItems: number } } }).properties.items.maxItems;
+    const ctx = orchestrator(h).ctx;
+    assert.equal(maxItems(), 32, "before a session starts the ceiling holds");
+    await assert.rejects(subagents.tool().execute("call-1", { items: Array.from({ length: 33 }, (_, index) => ({ task: `Item ${index}` })), background: false } as never,
+      undefined, undefined, ctx), /1 to 32 items/);
+    await subagents.startSession(ctx);
+    assert.equal(maxItems(), 6);
+    assert.match(subagents.tool().description, /^Hand 1 to 6 tasks to workers\. At most 6 workers run at once/);
+    for (const count of [0, 33]) {
       await assert.rejects(
-        tool.execute("call-1", { items: Array.from({ length: count }, (_, index) => ({ task: `Item ${index}` })), background: false } as never, undefined, undefined, orchestrator(h).ctx),
-        /1 to 8 items/,
+        subagents.tool().execute("call-1", { items: Array.from({ length: count }, (_, index) => ({ task: `Item ${index}` })), background: false } as never, undefined, undefined, ctx),
+        /1 to 32 items/,
       );
     }
     assert.equal(provider.requests.length, 0);
   } finally { h.cleanup(); }
+});
+
+test("a worker limit above 32 is cut to 32 with one warning", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { workerLimit: 50 } } });
+  try {
+    const provider = fakeAnthropic("done");
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h).ctx;
+    const lines = await stderrLines(async () => {
+      await subagents.startSession(ctx);
+      await callSubagents(subagents.tool(), ctx, "First task");
+      await callSubagents(subagents.tool(), ctx, "Second task");
+    });
+    assert.equal((subagents.tool().parameters as { properties: { items: { maxItems: number } } }).properties.items.maxItems, 32);
+    assert.deepEqual(lines.filter((line) => line.includes("ceiling")),
+      ["pi-orchestrator subagents: orchestrator.subagents.workerLimit 50 is above the ceiling of 32; 32 workers run at once"]);
+  } finally { h.cleanup(); }
+});
+
+test("a settings error at session start is logged as a settings error, and the schema keeps the default worker limit", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { workerLimit: 6, gateLevel: "extreme" } } });
+  try {
+    const subagents = loadSubagents([routerExtension(), fakeAnthropic("done").extension]);
+    const lines = await stderrLines(() => subagents.startSession(orchestrator(h).ctx));
+    const logged = lines.filter((line) => line.includes("worker limit"));
+    assert.equal(logged.length, 1, lines.join("\n"));
+    assert.ok(!lines.some((line) => line.startsWith("pi-orchestrator subagents: worker limit:")), "no worker limit label on a gateLevel error");
+    assert.match(logged[0]!, /^pi-orchestrator subagents: could not read settings at session start: .*gateLevel.*; the tool's schema uses the default worker limit of 4$/);
+    assert.equal((subagents.tool().parameters as { properties: { items: { maxItems: number } } }).properties.items.maxItems, 4);
+  } finally { h.cleanup(); }
+});
+
+test("the worker limit counts a foreground and a background call's workers together, and queues the excess instead of refusing it", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { workerLimit: 2 } } });
+  const pending: (() => void)[] = [];
+  let peak = 0, active = 0;
+  try {
+    const provider = fakeAnthropic("done", (finish) => {
+      active++;
+      peak = Math.max(peak, active);
+      pending.push(() => { active--; finish(); });
+    });
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h).ctx;
+    const items = (prefix: string, count: number) => Array.from({ length: count }, (_, index) => ({ task: `${prefix} ${index + 1}` }));
+    const started = (task: string) => provider.requests.some((request) => request.messages.some((message) => message.includes(task)));
+    await subagents.tool().execute("call-bg", { items: items("Background", 2), background: true } as never, undefined, undefined, ctx);
+    await waitFor(() => pending.length === 2, "the background call's two workers run");
+    const queuedBackground = await subagents.tool().execute("call-bg-2", { items: items("Late background", 1), background: true } as never, undefined, undefined, ctx);
+    assert.match(toolText(queuedBackground), /^Background subagents call call-bg-2 started\./, "a background call past the limit is not refused");
+    const updates: SubagentsProgressDetails[] = [];
+    const foreground = subagents.tool().execute("call-fg", { items: items("Foreground", 2), background: false } as never, undefined,
+      (update: { details: unknown }) => { updates.push(update.details as SubagentsProgressDetails); }, ctx);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(pending.length, 2, "no third worker starts");
+    assert.deepEqual(updates.at(-1)?.results.map((result) => result.status), ["queued", "queued"]);
+    const states = (callId: string) => workerBoard().workers().filter((worker) => worker.callId === callId).map((worker) => worker.state);
+    assert.deepEqual([...states("call-bg-2"), ...states("call-fg")], ["queued", "queued", "queued"]);
+
+    pending.shift()!();
+    await waitFor(() => started("Late background 1"), "a freed slot goes to the first queued worker");
+    assert.ok(!started("Foreground 1"), "the foreground items wait their turn");
+    pending.shift()!();
+    await waitFor(() => started("Foreground 1"), "the next freed slot goes to the foreground call");
+    while (!started("Foreground 2") || pending.length > 0) {
+      await waitFor(() => pending.length > 0, "a worker is waiting");
+      pending.shift()!();
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    const details = (await foreground).details as SubagentsDetails;
+    assert.deepEqual(details.results.map((result) => result.status), ["completed", "completed"]);
+    await waitFor(() => subagents.messages.length === 2, "both background calls sent their notices");
+    assert.equal(peak, 2, "at most two workers ran at once across the three calls");
+    assert.equal(provider.requests.length, 5);
+  } finally {
+    for (const finish of pending) finish();
+    h.cleanup();
+  }
 });
 
 test("abort stops running workers and marks queued items not started", async () => {
@@ -760,13 +846,13 @@ test("abort stops running workers and marks queued items not started", async () 
   }
 });
 
-test("the default concurrency is four and project settings need personal permission to override it", async () => {
+test("the default worker limit is four and project settings need personal permission to override it", async () => {
   for (const allowProjectOverrides of [false, true]) {
     const h = harness({ orchestrator: { routing: ROUTING, subagents: { allowProjectOverrides } } });
     const pending: (() => void)[] = [];
     try {
       mkdirSync(join(h.projectDir, ".pi"));
-      writeFileSync(join(h.projectDir, ".pi", "settings.json"), JSON.stringify({ orchestrator: { subagents: { maxParallel: 2 } } }));
+      writeFileSync(join(h.projectDir, ".pi", "settings.json"), JSON.stringify({ orchestrator: { subagents: { workerLimit: 2 } } }));
       const provider = fakeAnthropic("done", (finish) => pending.push(finish));
       const tool = loadSubagentsTool([routerExtension(), provider.extension]);
       const controller = new AbortController();
@@ -1686,10 +1772,10 @@ test("a background call returns its call id and delegation ids at once, and one 
     }
     assert.equal(subagents.messages.length, 0, "no notice before the items finish");
 
-    // Each call keeps its own maxParallel of 1: one worker per call runs.
-    await waitFor(() => pending.length === 2, "each call starts one worker");
+    // The deprecated maxParallel of 1 is the session's worker limit: one worker runs across both calls.
+    await waitFor(() => pending.length === 1, "the first worker starts");
     await new Promise((resolve) => setTimeout(resolve, 20));
-    assert.equal(pending.length, 2, "no call runs a second worker at once");
+    assert.equal(pending.length, 1, "no second worker runs at once");
     while (subagents.messages.length < 2) {
       await waitFor(() => pending.length > 0 || subagents.messages.length === 2, "a worker is waiting or both notices are in");
       pending.shift()?.();
@@ -1863,30 +1949,29 @@ test("the subagents tool tells the orchestrator its calls run in the background 
   assert.match(subagents.statusTool().description, /only when you cannot go on without/, subagents.statusTool().description);
 });
 
-test("maxBackgroundWorkers refuses a background call that would exceed it, with or without the option, with the reason, and frees room as calls finish", async () => {
+test("the deprecated maxBackgroundWorkers sets the worker limit: a background call past it, with or without the option, queues instead of being refused", async () => {
   const h = harness({ orchestrator: { routing: ROUTING, subagents: { maxBackgroundWorkers: 3 } } });
   const pending: (() => void)[] = [];
   try {
     const provider = fakeAnthropic("done", (finish) => pending.push(finish));
     const subagents = loadSubagents([routerExtension(), provider.extension]);
     const ctx = orchestrator(h).ctx;
-    // Calls 1 and 2 leave the option out, which is a background call too; calls 3 and 4 ask for it.
+    // Calls 1 and 2 leave the option out, which is a background call too; call 3 asks for it.
     const call = (id: string, count: number, option: { background?: true } = { background: true }) => subagents.tool().execute(id,
       { items: Array.from({ length: count }, (_, index) => ({ task: `Item ${index + 1}` })), ...option } as never, undefined, undefined, ctx);
     await call("call-1", 2, {});
-    await assert.rejects(call("call-2", 2, {}),
-      /refused the background call: its 2 workers and the 2 background workers already queued or running would exceed orchestrator\.subagents\.maxBackgroundWorkers \(3\)/);
+    assert.match(toolText(await call("call-2", 2, {})), /^Background subagents call call-2 started\./);
     await call("call-3", 1);
 
-    await waitFor(() => pending.length === 3, "the three accepted workers run");
-    for (const finish of pending.splice(0)) finish();
-    await waitFor(() => subagents.messages.length === 2, "both accepted calls sent their notices");
-    assert.deepEqual(subagents.messages.map(({ message }) => (message.details as NoticeDetails).callId).sort(), ["call-1", "call-3"]);
-    await call("call-4", 3);
-    await waitFor(() => pending.length === 3, "a finished call's workers no longer count");
-    assert.equal(provider.requests.length, 6, "the refused call started no worker");
-    for (const finish of pending.splice(0)) finish();
-    await waitFor(() => subagents.messages.length === 3, "the last call sent its notice");
+    await waitFor(() => pending.length === 3, "three workers run");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(provider.requests.length, 3, "the other two queue");
+    while (subagents.messages.length < 3) {
+      await waitFor(() => pending.length > 0 || subagents.messages.length === 3, "a worker is waiting or every notice is in");
+      pending.shift()?.();
+    }
+    assert.equal(provider.requests.length, 5, "every queued worker ran");
+    assert.deepEqual(subagents.messages.map(({ message }) => (message.details as NoticeDetails).callId).sort(), ["call-1", "call-2", "call-3"]);
   } finally {
     for (const finish of pending) finish();
     h.cleanup();
@@ -1969,7 +2054,7 @@ test("Ctrl+C does not stop background workers, and session shutdown aborts them 
 });
 
 test("/subagents stop is unchanged: it still stops one worker or a whole background call by id, and an unrecognized word (xytd: no longer a usage message) is refused as an unknown direct jump", async () => {
-  const h = harness({ orchestrator: { routing: ROUTING, subagents: { maxParallel: 1 } } });
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { workerLimit: 2 } } });
   const pending: (() => void)[] = [];
   try {
     const provider = fakeAnthropic("done", (finish) => pending.push(finish));
@@ -1979,11 +2064,11 @@ test("/subagents stop is unchanged: it still stops one worker or a whole backgro
       { items: tasks.map((task) => ({ task })), background: true } as never, undefined, undefined, ctx)).details as BackgroundStart;
     const first = await background("call-1", ["Fix the parser", "Update the docs"]);
     const second = await background("call-2", ["Review the diff", "Run the benchmarks"]);
-    await waitFor(() => pending.length === 2, "each call runs its first worker");
+    await waitFor(() => pending.length === 2, "call-1's two workers run, and call-2's queue");
 
-    // Stopping one worker aborts it; the call's next item then runs.
+    // Stopping one worker aborts it; the next queued item, call-2's first, then runs.
     assert.deepEqual(await subagents.runCommand("subagents", `stop ${first.delegationIds[0]}`, ctx), [`Stopping worker ${first.delegationIds[0]}.`]);
-    await waitFor(() => provider.requests.length === 3, "call-1's second item starts");
+    await waitFor(() => provider.requests.length === 3, "call-2's first item starts");
     // Stopping a call aborts its running worker and leaves its queued item not started.
     assert.deepEqual(await subagents.runCommand("subagents", "stop call-2", ctx), ["Stopping background call call-2."]);
     await waitFor(() => subagents.messages.length === 1, "call-2's notice is in");
@@ -1999,7 +2084,8 @@ test("/subagents stop is unchanged: it still stops one worker or a whole backgro
     assert.deepEqual(await subagents.runCommand("subagents", "halt", ctx),
       ["No worker of this session has the delegation id halt. /subagents lists every worker."]);
 
-    pending.at(-1)!();
+    // Only call-1's second worker is still running; the aborted ones' finishes change nothing.
+    for (const finish of pending.splice(0)) finish();
     await waitFor(() => subagents.messages.length === 2, "call-1's notice is in");
     const finished = subagents.messages[1]!.message.details as NoticeDetails;
     assert.deepEqual(finished.results.map((result) => result.status), ["aborted", "completed"]);
@@ -2375,6 +2461,121 @@ test("the worker board shows a background worker asking while its question waits
     await subagents.tool("subagents_message").execute("message-1", { id, text: "Use config.json" } as never, undefined, undefined, main.ctx);
     await waitFor(() => subagents.messages.length === 2, "the completion notice");
     assert.equal(workerBoard().byDelegation(id)?.state, "completed");
+  } finally { h.cleanup(); }
+});
+
+/** Asks its question when its task starts with "Ask", then answers with the reply; any other worker says "done".
+ *  A request `held` returns true for waits until its `finish` is called. */
+function askingAnthropic(held: (request: ScriptedRequest) => boolean = () => false) {
+  const holds: (() => void)[] = [];
+  const provider = scriptedAnthropic((request) => {
+    const [result] = request.toolResults;
+    if (!request.task.startsWith("Ask")) return { text: "done" };
+    if (result) return { text: `answer: ${result.text}` };
+    return { toolCall: { name: "report", arguments: { kind: "question", text: "Which config file?" } } };
+  }, (request, finish) => {
+    if (!held(request)) return false;
+    holds.push(finish);
+    return true;
+  });
+  return { ...provider, holds };
+}
+
+/** Settles with `promise`, or fails after `ms` milliseconds. */
+async function within<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([promise, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`timed out waiting until ${what}`)), ms); })]);
+  } finally { clearTimeout(timer); }
+}
+
+test("a background worker asking a question gives up its worker slot, so a foreground call's item runs and finishes meanwhile", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { workerLimit: 1 } } });
+  try {
+    const provider = askingAnthropic();
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h).ctx;
+    const start = (await subagents.tool().execute("call-bg", { items: [{ task: "Ask first" }], background: true } as never,
+      undefined, undefined, ctx)).details as BackgroundStart;
+    const id = start.delegationIds[0]!;
+    await waitFor(() => subagents.messages.length === 1, "the question is in");
+    assert.equal(workerBoard().byDelegation(id)?.state, "asking");
+
+    const foreground = await within(subagents.tool().execute("call-fg", { items: [{ task: "Foreground task" }], background: false } as never,
+      undefined, undefined, ctx), 2000, "the foreground call finishes while the background worker asks");
+    assert.deepEqual((foreground.details as SubagentsDetails).results.map((result) => result.status), ["completed"]);
+
+    await subagents.tool("subagents_message").execute("message-1", { id, text: "Use config.json" } as never, undefined, undefined, ctx);
+    await waitFor(() => subagents.messages.length === 2, "the background call's notice");
+    const [result] = (subagents.messages[1]!.message.details as NoticeDetails).results;
+    assert.equal(result?.status, "completed", JSON.stringify(result));
+    assert.equal(result?.finalText, "answer: The orchestrator answered: Use config.json");
+  } finally { h.cleanup(); }
+});
+
+test("an answered worker queues for a worker slot again and goes on once one frees", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { workerLimit: 1 } } });
+  try {
+    const provider = askingAnthropic((request) => request.task === "Foreground task");
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h).ctx;
+    const start = (await subagents.tool().execute("call-bg", { items: [{ task: "Ask first" }], background: true } as never,
+      undefined, undefined, ctx)).details as BackgroundStart;
+    const id = start.delegationIds[0]!;
+    await waitFor(() => subagents.messages.length === 1, "the question is in");
+    const foreground = subagents.tool().execute("call-fg", { items: [{ task: "Foreground task" }], background: false } as never,
+      undefined, undefined, ctx);
+    await waitFor(() => provider.holds.length === 1, "the foreground worker holds the slot");
+
+    await subagents.tool("subagents_message").execute("message-1", { id, text: "Use config.json" } as never, undefined, undefined, ctx);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const askingRequests = () => provider.requests.filter((request) => request.task === "Ask first").length;
+    assert.equal(askingRequests(), 1, "the answered worker waits for a slot before it goes on");
+    assert.equal(subagents.messages.length, 1, "no notice yet");
+
+    provider.holds.shift()!();
+    assert.deepEqual(((await foreground).details as SubagentsDetails).results.map((result) => result.status), ["completed"]);
+    await waitFor(() => subagents.messages.length === 2, "the background call's notice");
+    assert.equal(askingRequests(), 2);
+    const [result] = (subagents.messages[1]!.message.details as NoticeDetails).results;
+    assert.equal(result?.finalText, "answer: The orchestrator answered: Use config.json");
+  } finally { h.cleanup(); }
+});
+
+test("a worker stopped while it queues again after its answer ends without giving back a slot it does not hold", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { workerLimit: 1 } } });
+  try {
+    const provider = askingAnthropic((request) => !request.task.startsWith("Ask"));
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h).ctx;
+    const start = (await subagents.tool().execute("call-bg", { items: [{ task: "Ask first" }], background: true } as never,
+      undefined, undefined, ctx)).details as BackgroundStart;
+    const id = start.delegationIds[0]!;
+    await waitFor(() => subagents.messages.length === 1, "the question is in");
+    const foreground = subagents.tool().execute("call-fg", { items: [{ task: "Foreground task" }], background: false } as never,
+      undefined, undefined, ctx);
+    await waitFor(() => provider.holds.length === 1, "the foreground worker holds the slot");
+    await subagents.tool("subagents_message").execute("message-1", { id, text: "Use config.json" } as never, undefined, undefined, ctx);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    await subagents.runCommand("subagents", `stop ${id}`, ctx);
+    await waitFor(() => subagents.messages.length === 2, "the stopped call's notice");
+    assert.deepEqual((subagents.messages[1]!.message.details as NoticeDetails).results.map((result) => result.status), ["aborted"]);
+    provider.holds.shift()!();
+    assert.deepEqual(((await foreground).details as SubagentsDetails).results.map((result) => result.status), ["completed"]);
+
+    // The limit of 1 still holds: a slot given back twice would let two workers run.
+    const next = subagents.tool().execute("call-fg-2", { items: [{ task: "First" }, { task: "Second" }], background: false } as never,
+      undefined, undefined, ctx);
+    await waitFor(() => provider.holds.length === 1, "the next call's first worker runs");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(provider.holds.length, 1, "its second worker queues");
+    while (provider.holds.length > 0 || provider.requests.filter((request) => request.task === "Second").length === 0) {
+      await waitFor(() => provider.holds.length > 0, "a worker is waiting");
+      provider.holds.shift()!();
+    }
+    assert.deepEqual(((await next).details as SubagentsDetails).results.map((result) => result.status), ["completed", "completed"]);
+    assert.equal(provider.requests.filter((request) => request.task === "Ask first").length, 1, "the stopped worker never went on");
   } finally { h.cleanup(); }
 });
 
@@ -3250,8 +3451,8 @@ test("a notice that starts no turn is never held: a call session shutdown stoppe
   } finally { h.cleanup(); }
 });
 
-test("under the default a Ctrl+C during a status wait stops only the wait, a call past maxBackgroundWorkers is refused, /subagents stop sends the stopped call's notice, and session shutdown records one without a turn", async () => {
-  const h = harness({ orchestrator: { routing: ROUTING, subagents: { maxBackgroundWorkers: 2 } } });
+test("under the default a Ctrl+C during a status wait stops only the wait, a call past the worker limit queues, /subagents stop sends the stopped call's notice, and session shutdown records one without a turn", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { workerLimit: 2 } } });
   const heldWorkers: (() => void)[] = [];
   const workerProvider = fakeAnthropic("leaf done", (finish) => { heldWorkers.push(finish); });
   const hold = holdToolExtension();
@@ -3299,22 +3500,24 @@ test("under the default a Ctrl+C during a status wait stops only the wait, a cal
       assert.deepEqual(notices(), [], "no notice: the workers run on");
 
       await promptWithin(session, "Start one more");
-      const refused = lastResult("subagents");
-      assert.equal(refused.isError, true);
-      assert.match(refused.text, /refused the background call: its 1 workers and the 2 background workers already queued or running would exceed orchestrator\.subagents\.maxBackgroundWorkers \(2\)/);
-      assert.ok(!workerProvider.requests.some((request) => request.messages.some((message) => message.includes("Item C"))), "the refused call started no worker");
+      const queued = lastResult("subagents");
+      assert.notEqual(queued.isError, true);
+      assert.match(queued.text, /^Background subagents call \S+ started\./, "a call past the worker limit is not refused");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.ok(!workerProvider.requests.some((request) => request.messages.some((message) => message.includes("Item C"))), "its worker waits for a slot");
 
       await session.prompt(`/subagents stop ${callId}`);
       await until(() => notices().length === 1 && session.isIdle && mainRequests().at(-1)!.userMessages.includes(notices()[0]!), "the stopped call's notice and the run it starts");
       for (const id of first!.delegationIds) assert.ok(notices()[0]!.includes(`Worker ${id} aborted.`), notices()[0]);
+      await until(() => heldWorkers.length === 3, "the queued worker's first request, in a slot the stopped call freed");
 
       await promptWithin(session, "Start again");
       assert.match(lastResult("subagents").text, /^Background subagents call \S+ started\./, "the stopped call's workers no longer count");
-      await until(() => heldWorkers.length === 3, "the new worker's first request");
+      await until(() => heldWorkers.length === 4, "the new worker's first request");
       const requestsBefore = mainRequests().length;
       await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
-      assert.equal(notices().length, 2, "shutdown waits until the call has ended");
-      assert.match(notices()[1]!, /^Background subagents call \S+ finished[\s\S]*Worker \S+ aborted\./, notices()[1]);
+      assert.equal(notices().length, 3, "shutdown waits until both running calls have ended");
+      for (const notice of notices().slice(1)) assert.match(notice, /^Background subagents call \S+ finished[\s\S]*Worker \S+ aborted\./, notice);
       assert.equal(mainRequests().length, requestsBefore, "the notice is recorded without starting a turn");
     } finally {
       hold.release();

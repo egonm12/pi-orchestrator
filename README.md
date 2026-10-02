@@ -4,7 +4,7 @@ A [pi](https://pi.dev) package for sessions that hand work to subagent workers. 
 
 ## What it does
 
-- **Subagents:** a `subagents` tool that starts 1 to 8 workers in the orchestrator's own process, in the foreground or background. Workers can be resumed, forked from the current branch, reviewed and retried.
+- **Subagents:** a `subagents` tool that starts workers in the orchestrator's own process, in the foreground or background, at most `workerLimit` (default 4) running at once and the rest queued. Workers can be resumed, forked from the current branch, reviewed and retried.
 - **Router:** serves the auto model `orchestrator/auto`. It classifies a worker's first request into a tier (mechanical, standard, elevated, critical) and sends it to a model from your tier map.
 - **Guard:** enforces a ban list of models that workers may never use, and an optional ban list for the orchestrator itself.
 - **Review gate:** an editing worker needs a verdict (`subagents_verdict`) from the orchestrator or an independent reviewer, depending on its tier and the gate level (`low`, `medium`, `high`, `max`).

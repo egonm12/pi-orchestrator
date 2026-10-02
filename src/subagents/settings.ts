@@ -12,9 +12,9 @@ import { GATE_LEVELS, type GateLevel } from "../routing/decision-record.ts";
 type AgentDefinitionModelUse = "route" | "preserve";
 
 export interface SubagentsSettings {
-  readonly maxParallel: number;
-  /** At most this many background workers, queued or running, at once (ADR 0008). */
-  readonly maxBackgroundWorkers: number;
+  /** The worker limit: at most this many workers run at once across the
+   *  orchestrator's session, foreground and background; the rest queue. */
+  readonly workerLimit: number;
   readonly agentDefinitionModel: {
     readonly use: AgentDefinitionModelUse;
     /** Under "preserve", a definition-named model may be on the subagent ban list (ADR 0002 follow-up). */
@@ -32,8 +32,10 @@ export interface LoadedSubagentsSettings {
   /** Personal settings only. */
   readonly allowProjectOverrides: boolean;
   /** Dotted keys the project's `orchestrator.subagents` carried and the
-   *  loader ignored, e.g. `orchestrator.subagents.maxParallel`. */
+   *  loader ignored, e.g. `orchestrator.subagents.workerLimit`. */
   readonly ignoredProjectKeys: readonly string[];
+  /** Warnings about values the loader changed, for the extension to log once. */
+  readonly warnings: readonly string[];
 }
 
 const SUBAGENTS_KEY = "orchestrator.subagents";
@@ -42,6 +44,12 @@ export const DEFAULT_EXPLORATION_NUDGE = 3;
 /** `gateLevel` when the owner sets none (ADR 0011). */
 export const DEFAULT_GATE_LEVEL: GateLevel = "medium";
 const FLAG = "allowProjectOverrides";
+/** `workerLimit` when the owner sets none. */
+export const DEFAULT_WORKER_LIMIT = 4;
+/** The highest worker limit; a higher value is cut to it with a warning. */
+export const WORKER_LIMIT_CEILING = 32;
+/** The worker limit's key, then its deprecated aliases in the order they are read. */
+const WORKER_LIMIT_KEYS = ["workerLimit", "maxParallel", "maxBackgroundWorkers"] as const;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -65,12 +73,16 @@ export function subagentsSettingsFromSettings(personal: unknown, project?: unkno
   const projectOptions = projectSubagents(project);
   const ignoredProjectKeys: string[] = [];
   const options: Record<string, unknown> = { ...personalOptions };
+  // The worker limit is read from one source as a whole: a project allowed to override that sets any of its keys,
+  // else personal settings, so a project's deprecated key still beats a personal `workerLimit`.
+  let limitOptions: Record<string, unknown> = options;
   if (projectOptions !== undefined) {
     if (!allowProjectOverrides) {
       if (isPlainObject(projectOptions)) ignoredProjectKeys.push(...Object.keys(projectOptions).map((key) => `${SUBAGENTS_KEY}.${key}`));
       else ignoredProjectKeys.push(SUBAGENTS_KEY);
     } else {
       if (!isPlainObject(projectOptions)) throw new Error(`project ${SUBAGENTS_KEY} must be an object`);
+      if (WORKER_LIMIT_KEYS.some((key) => projectOptions[key] !== undefined)) limitOptions = projectOptions;
       for (const [key, value] of Object.entries(projectOptions)) {
         if (key === FLAG) ignoredProjectKeys.push(`${SUBAGENTS_KEY}.${key}`);
         else options[key] = value;
@@ -78,14 +90,18 @@ export function subagentsSettingsFromSettings(personal: unknown, project?: unkno
     }
   }
 
-  const maxParallel = options.maxParallel ?? 4;
-  if (typeof maxParallel !== "number" || !Number.isInteger(maxParallel) || maxParallel < 1) {
-    throw new Error(`${SUBAGENTS_KEY}.maxParallel must be a positive integer`);
+  // `maxParallel` and `maxBackgroundWorkers` are deprecated aliases from before the
+  // worker limit; the first key set counts, each checked under its own name.
+  const warnings: string[] = [];
+  const limitKey = WORKER_LIMIT_KEYS.find((key) => limitOptions[key] !== undefined) ?? "workerLimit";
+  const setLimit = limitOptions[limitKey] ?? DEFAULT_WORKER_LIMIT;
+  if (typeof setLimit !== "number" || !Number.isInteger(setLimit) || setLimit < 1) {
+    throw new Error(`${SUBAGENTS_KEY}.${limitKey} must be a positive integer`);
   }
-  const maxBackgroundWorkers = options.maxBackgroundWorkers ?? 8;
-  if (typeof maxBackgroundWorkers !== "number" || !Number.isInteger(maxBackgroundWorkers) || maxBackgroundWorkers < 1) {
-    throw new Error(`${SUBAGENTS_KEY}.maxBackgroundWorkers must be a positive integer`);
+  if (setLimit > WORKER_LIMIT_CEILING) {
+    warnings.push(`${SUBAGENTS_KEY}.${limitKey} ${setLimit} is above the ceiling of ${WORKER_LIMIT_CEILING}; ${WORKER_LIMIT_CEILING} workers run at once`);
   }
+  const workerLimit = Math.min(setLimit, WORKER_LIMIT_CEILING);
   // `explorationBudget` is the key's name from before ADR 0013; it still counts when `explorationNudge` is absent.
   const nudgeKey = options.explorationNudge === undefined && options.explorationBudget !== undefined ? "explorationBudget" : "explorationNudge";
   const explorationNudge = options[nudgeKey] ?? DEFAULT_EXPLORATION_NUDGE;
@@ -104,9 +120,10 @@ export function subagentsSettingsFromSettings(personal: unknown, project?: unkno
   if (typeof allowBanned !== "boolean") throw new Error(`${SUBAGENTS_KEY}.agentDefinitionModel.allowBanned must be a boolean`);
 
   return {
-    settings: { maxParallel: Math.min(maxParallel, 8), maxBackgroundWorkers, agentDefinitionModel: { use, allowBanned }, explorationNudge, gateLevel: gateLevel as GateLevel },
+    settings: { workerLimit, agentDefinitionModel: { use, allowBanned }, explorationNudge, gateLevel: gateLevel as GateLevel },
     allowProjectOverrides,
     ignoredProjectKeys,
+    warnings,
   };
 }
 

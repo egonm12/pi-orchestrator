@@ -154,21 +154,6 @@ export class BackgroundCalls {
     this.#deliver = deliver;
   }
 
-  /** Background workers, queued or running, in this session's calls. */
-  workerCount(): number {
-    let count = 0;
-    for (const { call } of this.#running.values()) count += call.progress.filter(unfinished).length;
-    return count;
-  }
-
-  /** Throws the reason when `items` more background workers would exceed `maxBackgroundWorkers`. */
-  assertRoom(items: number, maxBackgroundWorkers: number): void {
-    const running = this.workerCount();
-    if (running + items <= maxBackgroundWorkers) return;
-    throw new Error(`subagents refused the background call: its ${items} workers and the ${running} background workers ` +
-      `already queued or running would exceed orchestrator.subagents.maxBackgroundWorkers (${maxBackgroundWorkers})`);
-  }
-
   /** Registers `call` as running. Its notice is delivered when the result handed to `finish` settles. */
   start(call: BackgroundCall): BackgroundCallHandle {
     const { callId } = call;

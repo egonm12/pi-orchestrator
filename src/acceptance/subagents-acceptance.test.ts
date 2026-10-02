@@ -19,7 +19,7 @@ import { SUBAGENTS_TOOL } from "../subagents/worker.ts";
 // real pi session, with the owner's package (this checkout, no pi-subagents)
 // and one noisy extension (bean 5he0) that appends a plain user message
 // through pi's `context` hook, mimicking context-mode. One `subagents` call
-// carries two items, both under the default `maxParallel` of 4, so both
+// carries two items, both under the default worker limit of 4, so both
 // workers start together. The router must classify each worker from its own
 // task text only: the noisy extension's injected "Purge" text must not reach
 // a decision record's task text.
