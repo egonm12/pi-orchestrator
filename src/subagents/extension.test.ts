@@ -19,7 +19,8 @@ import { providerStream } from "../fixtures/provider-stream.ts";
 import { createRouterExtension } from "../router/extension.ts";
 import personalGuard from "../guard/extension.ts";
 import { readUsageObservations, recordUsageObservation, usageObservationsPath, type UsageObservation } from "../router/usage-observations.ts";
-import { createSubagentsExtension, MAX_TEXT_BYTES, type SubagentResult, type SubagentsDependencies, type SubagentsDetails, type SubagentsProgressDetails } from "./extension.ts";
+import { COMPLETION_NOTICE, createSubagentsExtension, MAX_TEXT_BYTES, type SubagentResult, type SubagentsDependencies, type SubagentsDetails, type SubagentsProgressDetails } from "./extension.ts";
+import { USER_STEER } from "./user-steering.ts";
 import { markWorkerSession } from "./worker-sessions.ts";
 import { isOrchestratorSession } from "./orchestrator-session.ts";
 import { orchestratorProtocol } from "./orchestrator-protocol.ts";
@@ -1944,6 +1945,66 @@ test("subagents_message delivers steer and followUp to a running background work
     for (const finish of pending) finish();
     h.cleanup();
   }
+});
+
+test("the user steers a background worker from its transcript view: delivered as subagents_message delivers, the orchestrator told without a turn, and the Result lists it", async () => {
+  const h = harness();
+  let releaseTool!: () => void;
+  let toolStarted!: () => void;
+  const toolRunning = new Promise<void>((resolve) => { toolStarted = resolve; });
+  const toolFinished = new Promise<void>((resolve) => { releaseTool = resolve; });
+  try {
+    const probe: InlineExtension = { name: "blocking-probe", factory: (pi) => pi.registerTool({
+      name: "probe", label: "Probe", description: "Wait for release", parameters: { type: "object", properties: {} } as Tool["parameters"],
+      async execute() { toolStarted(); await toolFinished; return { content: [{ type: "text", text: "tool finished" }], details: undefined }; },
+    }) };
+    const provider = scriptedAnthropic((request) => {
+      if (request.toolResults.length === 0) return { toolCall: { name: "probe", arguments: {} } };
+      return { text: request.userMessages.includes("Then run the tests") ? "follow-up received" : "steer received" };
+    });
+    const subagents = loadSubagents([routerExtension(), provider.extension, probe]);
+    const ctx = orchestrator(h).ctx;
+    await subagents.startSession(ctx);
+    const start = (await subagents.tool().execute("call", { items: [{ task: "Use probe", label: "research: lockfile" }], background: true } as never,
+      undefined, undefined, ctx)).details as BackgroundStart;
+    const id = start.delegationIds[0]!;
+    await toolRunning;
+
+    initTheme("dark");
+    const screen = fakeCustomUI();
+    const opening = subagents.runCommandWithUI("subagents", id, { ...ctx, hasUI: true, ui: screen.ui } as unknown as ExtensionContext);
+    assert.ok(screen.lines().includes("Tab to message this worker"), screen.lines().join("\n"));
+    const userSteers = () => subagents.messages.filter(({ message }) => message.customType === USER_STEER);
+    screen.press("\t", ..."Check the lockfile", "\r");
+    await waitFor(() => userSteers().length === 1, "the orchestrator hears of the steer");
+    screen.press(..."Then run the tests", "\x1b\r");
+    await waitFor(() => userSteers().length === 2, "the orchestrator hears of the follow-up");
+    assert.deepEqual(userSteers().map(({ message, options }) => ({ content: message.content, display: message.display, details: message.details, options })), [
+      { content: `The user steered worker ${id} (research: lockfile) directly: "Check the lockfile" (mode steer)`, display: true,
+        details: { delegationId: id, label: "research: lockfile", text: "Check the lockfile", mode: "steer", answer: false }, options: { triggerTurn: false } },
+      { content: `The user steered worker ${id} (research: lockfile) directly: "Then run the tests" (mode followUp)`, display: true,
+        details: { delegationId: id, label: "research: lockfile", text: "Then run the tests", mode: "followUp", answer: false }, options: { triggerTurn: false } },
+    ], "a custom message that never starts a turn");
+    assert.equal(provider.requests.length, 1, "neither message interrupts the worker's tool, as subagents_message's do not");
+
+    releaseTool();
+    await waitFor(() => subagents.messages.some(({ message }) => message.customType === COMPLETION_NOTICE), "the call's completion notice");
+    assert.deepEqual(provider.requests.map((request) => request.userMessages),
+      [["Use probe"], ["Use probe", "Check the lockfile"], ["Use probe", "Check the lockfile", "Then run the tests"]],
+      "the steer arrives after the tool call, the follow-up when the worker would stop");
+    const notice = subagents.messages.find(({ message }) => message.customType === COMPLETION_NOTICE)!.message;
+    assert.ok(typeof notice.content === "string" && notice.content.includes([
+      "User steering: the user messaged this worker directly from its transcript view. These came from the user, not from you:",
+      '- steer: "Check the lockfile"',
+      '- followUp: "Then run the tests"',
+    ].join("\n")), String(notice.content));
+    assert.deepEqual((notice.details as NoticeDetails).results[0]?.userSteering, [
+      { text: "Check the lockfile", mode: "steer", answer: false }, { text: "Then run the tests", mode: "followUp", answer: false },
+    ]);
+    assert.ok(!screen.lines().includes("Tab to message this worker"), "the finished worker's view has no input");
+    screen.press("\x1b");
+    await opening;
+  } finally { releaseTool?.(); h.cleanup(); }
 });
 
 test("steer waits for the current tool call and followUp waits until the worker would stop", async () => {

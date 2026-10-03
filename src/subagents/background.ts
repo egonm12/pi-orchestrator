@@ -278,12 +278,22 @@ export class BackgroundCalls {
     });
   }
 
-  /** Send to one active background worker, not to a call, queued item, or foreground worker. */
-  async message(id: string, text: string, mode: BackgroundMessageMode): Promise<void> {
+  /** Whether `message` would reach the worker `id`: an active background worker, not a call, queued item, or foreground worker. */
+  accepts(id: string): boolean {
     const running = this.#callWith(id);
     const index = running?.delegationIds.indexOf(id) ?? -1;
+    return running !== undefined && index >= 0 && running.call.progress[index]?.status === "running" && this.#receivers.has(id);
+  }
+
+  /** Whether the worker `id` waits on the answer to its question, which its next message is. */
+  asking(id: string): boolean {
+    return this.#questions.has(id);
+  }
+
+  /** Send to one active background worker, not to a call, queued item, or foreground worker. */
+  async message(id: string, text: string, mode: BackgroundMessageMode): Promise<void> {
     const receive = this.#receivers.get(id);
-    if (!running || index < 0 || running.call.progress[index]?.status !== "running" || !receive) {
+    if (!this.accepts(id) || !receive) {
       throw new Error(`subagents_message: no running background worker has the delegation id ${id}`);
     }
     const answer = this.#questions.get(id);

@@ -1,8 +1,11 @@
-import { truncateToVisualLines, type AgentSessionEvent, type ExtensionUIContext, type Theme } from "@earendil-works/pi-coding-agent";
+import { getSelectListTheme, truncateToVisualLines, type AgentSessionEvent, type ExtensionUIContext, type Theme } from "@earendil-works/pi-coding-agent";
+import { Editor, type TUI } from "@earendil-works/pi-tui";
+import type { BackgroundMessageMode } from "./background.ts";
 import { readWorkerTranscript, Transcript, type TranscriptContext } from "./transcript.ts";
 import { liveStats, orchestratorBar, transcriptHeader, transcriptTop } from "./transcript-header.ts";
 import { hasEnded, type BoardWorker, type OrchestratorState, type WorkerBoard, type WorkerBoardView } from "./worker-board.ts";
 import { sessionPickerIndex, sessionPickerLines, sessionPickerWorkerId, STATE_COLOR, widgetWorkers, workerRows } from "./worker-widget.ts";
+import type { WorkerSteering } from "./user-steering.ts";
 
 // The transcript view (epic a338): one worker's transcript on the whole
 // screen, read from the worker board. It is a full-screen overlay through
@@ -10,10 +13,13 @@ import { sessionPickerIndex, sessionPickerLines, sessionPickerWorkerId, STATE_CO
 // over the whole viewport in both tuiModes, never writes to the scrollback and
 // never touches the editor, so closing it leaves the orchestrator's session as
 // it was. A running worker's transcript is live; a finished one's comes from
-// its session file. The view is read-only: answering and steering stay with
-// the orchestrator's subagents_message, and the one thing it sends a worker
-// is the x stop, after a confirmation. It never closes on its own, so a
-// worker that finishes stays open with its end state.
+// its session file. It sends a worker two things: the x stop, after a
+// confirmation, and the user's own messages to a running background worker,
+// typed in an input like pi's editor at the bottom (bean mj35). Tab gives the
+// input the keys and Esc gives them back, so every other key of the view
+// keeps its meaning. A message goes the way subagents_message sends one, and
+// the orchestrator is told of it (user-steering.ts). The view never closes on
+// its own, so a worker that finishes stays open with its end state.
 //
 // Keys are matched through the keybindings manager pi hands the factory,
 // never as raw bytes: pi turns on the kitty keyboard protocol, so Esc arrives
@@ -104,6 +110,8 @@ export interface TranscriptViewOptions {
   readonly now?: () => number;
   /** Reads a finished worker's messages from its session file. Default: readWorkerTranscript. */
   readonly readSession?: (file: string) => readonly unknown[];
+  /** Lets the user message a running background worker. Without it the view has no input. */
+  readonly steering?: WorkerSteering;
   /** The redraw timer, for the elapsed time. Default: an unref'd setInterval, so an open view never keeps pi's process alive. */
   readonly setInterval?: (tick: () => void, ms: number) => unknown;
   readonly clearInterval?: (handle: unknown) => void;
@@ -149,6 +157,7 @@ export class TranscriptView {
   readonly #now: () => number;
   readonly #unsubscribeBoard: () => void;
   readonly #stopTimer: () => void;
+  readonly #steering: WorkerSteering | undefined;
   #worker!: BoardWorker;
   #transcript: Transcript | undefined;
   #source: Source = { kind: "none" };
@@ -170,6 +179,10 @@ export class TranscriptView {
   readonly #regular: boolean;
   /** The next redraw reprints the whole terminal, as after a switch of worker in regular tuiMode. */
   #reprint = false;
+  /** The message input, pi-tui's editor, made the first time it is shown. */
+  #input: Editor | undefined;
+  /** The input has the keys: Tab gives them to it, Esc or Tab gives them back. */
+  #typing = false;
 
   constructor(tui: TranscriptViewTui, theme: Theme, keys: TranscriptKeys, board: TranscriptBoard, workerId: string, close: (exit: TranscriptViewExit) => void, options: TranscriptViewOptions = {}) {
     this.#tui = tui;
@@ -180,6 +193,7 @@ export class TranscriptView {
     this.#options = options;
     this.#now = options.now ?? Date.now;
     this.#expanded = options.expanded ?? false;
+    this.#steering = options.steering;
     this.#regular = tui.mode === "regular";
     const worker = board.worker(workerId);
     if (worker === undefined) throw new Error(`No worker on the board has the id ${workerId}`);
@@ -204,9 +218,11 @@ export class TranscriptView {
       return this.#tui.requestRender();
     }
     this.#flash = undefined;
+    if (this.#typing) return this.#type(data);
     const keys = this.#keys;
     if (keys.matches(data, "tui.select.cancel")) return this.#leave();
-    if (keys.matches(data, "tui.editor.cursorLeft")) this.#step(-1);
+    if (keys.matches(data, "tui.input.tab") && this.#accepts()) this.#typing = true;
+    else if (keys.matches(data, "tui.editor.cursorLeft")) this.#step(-1);
     else if (keys.matches(data, "tui.editor.cursorRight")) this.#step(1);
     else if (keys.matches(data, "app.tools.expand")) this.#transcript?.setExpanded(this.#expanded = !this.#expanded);
     else if (printable(data)?.toLowerCase() === "x") this.#askStop();
@@ -224,6 +240,55 @@ export class TranscriptView {
     else if (keys.matches(data, "tui.editor.cursorLineEnd")) this.#following = true;
     else return;
     this.#redraw();
+  }
+
+  /** A key while the input has the keys. Esc, ctrl+c and Tab give them back
+   *  to the view, keeping the draft; ctrl+o still toggles tool output. Enter
+   *  sends the draft as a steer and pi's follow-up key (alt+enter) as a
+   *  follow-up; every other key edits. */
+  #type(data: string): void {
+    const keys = this.#keys;
+    const input = this.#inputEditor();
+    if (keys.matches(data, "tui.select.cancel") || keys.matches(data, "tui.input.tab")) this.#typing = false;
+    else if (keys.matches(data, "app.tools.expand")) this.#transcript?.setExpanded(this.#expanded = !this.#expanded);
+    else if (keys.matches(data, "app.message.followUp")) {
+      const text = input.getExpandedText().trim();
+      input.setText("");
+      this.#send(text, "followUp");
+    }
+    // Enter reaches onSubmit, which sends a steer.
+    else input.handleInput(data);
+    this.#tui.requestRender();
+  }
+
+  /** Whether the shown worker takes the user's messages now. */
+  #accepts(): boolean {
+    return this.#steering?.accepts(this.#worker) === true;
+  }
+
+  /** The input, made once, styled as pi's own editor. */
+  #inputEditor(): Editor {
+    if (this.#input !== undefined) return this.#input;
+    const theme = this.#theme;
+    const input = new Editor(this.#tui as unknown as TUI, { borderColor: (text) => theme.fg("borderMuted", text), selectList: getSelectListTheme() });
+    input.onSubmit = (text) => this.#send(text, "steer");
+    return this.#input = input;
+  }
+
+  /** Sends the user's `text` to the shown worker. The draft comes back when it is not sent. */
+  #send(text: string, mode: BackgroundMessageMode): void {
+    const steering = this.#steering;
+    if (text === "" || steering === undefined) return;
+    const worker = this.#worker;
+    const kind = worker.state === "asking" ? "answer" : mode === "steer" ? "steer" : "follow-up";
+    this.#flash = `Sending ${kind}…`;
+    steering.send(worker, text, mode).then(() => {
+      this.#input?.addToHistory(text);
+      if (this.#worker.id === worker.id) this.#flash = `Sent ${kind} to this worker; the orchestrator is told.`;
+    }, (error: unknown) => {
+      if (this.#input !== undefined && this.#input.getText() === "" && this.#worker.id === worker.id) this.#input.setText(text);
+      this.#flash = `Not sent: ${error instanceof Error ? error.message : String(error)}`;
+    }).finally(() => { if (!this.#disposed) this.#tui.requestRender(); });
   }
 
   #askStop(): void {
@@ -253,11 +318,12 @@ export class TranscriptView {
     const bar = (this.#options.bar ?? orchestratorBar)(frame);
     if (this.#regular) {
       // The session picker stays just above the stats line while regular tuiMode scrolls the body.
-      return { head: transcriptTop(frame), body: this.#body(width), live: () => [...this.#sessionPickerLines(frame), ...liveStats(frame), ...bar, this.#footer(undefined)] };
+      return { head: transcriptTop(frame), body: this.#body(width),
+        live: () => [...this.#sessionPickerLines(frame), ...liveStats(frame), ...bar, ...this.#inputLines(width), this.#footer(undefined)] };
     }
     const head = [...bar, ...(this.#options.header ?? transcriptHeader)(frame),
       ...(!this.#expanded ? this.#transcript?.renderTask(width) ?? [] : []), ...this.#sessionPickerLines(frame)];
-    return { head, body: this.#body(width, this.#expanded), live: (window) => [this.#footer(window)] };
+    return { head, body: this.#body(width, this.#expanded), live: (window) => [...this.#inputLines(width), this.#footer(window)] };
   }
 
   /** Regular tuiMode's arrangement: the top, the whole transcript and the
@@ -319,6 +385,9 @@ export class TranscriptView {
     this.#following = true;
     this.#top = 0;
     this.#confirming = false;
+    // A draft is for the worker it was typed to.
+    this.#typing = false;
+    this.#input?.setText("");
     // A new transcript in pi's root differs from its first line on: reprint, landing at the bottom.
     this.#reprint = this.#regular;
     this.#attach();
@@ -365,8 +434,10 @@ export class TranscriptView {
     // Every run of the delegation on the board: a resume is a new entry with the same delegation id.
     const tasks = worker.delegationId === undefined ? [worker.task]
       : this.#board.workers().filter((other) => other.delegationId === worker.delegationId).map((other) => other.task);
+    const steering = this.#steering;
     return { tui: this.#tui, theme: this.#theme, cwd: this.#options.cwd ?? process.cwd(), tasks, expanded: this.#expanded,
-      ...(toolDefinition === undefined ? {} : { toolDefinition }) };
+      ...(toolDefinition === undefined ? {} : { toolDefinition }),
+      ...(steering === undefined ? {} : { sentByUser: (text: string) => steering.sentByUser(worker, text) }) };
   }
 
   /** Stops following the shown worker and lets its transcript go. */
@@ -390,6 +461,10 @@ export class TranscriptView {
         this.#source = { kind: "read" };
       } else if (this.#source.kind === "none" && (this.#board.live(current.id) !== undefined || (hasEnded(current) && !hasEnded(was)))) {
         this.#attach();
+      }
+      if (this.#typing && !this.#accepts()) {
+        this.#typing = false;
+        if (this.#input?.getText().trim()) this.#flash = "This worker no longer takes messages; the draft was not sent.";
       }
     }
     this.#tui.requestRender();
@@ -447,14 +522,32 @@ export class TranscriptView {
     return lines;
   }
 
+  /** The message input while the shown worker takes messages: pi's editor
+   *  while it has the keys, else its frame with the draft or a hint. */
+  #inputLines(width: number): string[] {
+    if (!this.#accepts()) return [];
+    if (this.#typing) return this.#inputEditor().render(width);
+    const theme = this.#theme;
+    const rule = theme.fg("borderMuted", "─".repeat(width));
+    const [first = "", ...more] = (this.#input?.getText() ?? "").split("\n");
+    const shown = first === "" && more.length === 0 ? theme.fg("dim", "Tab to message this worker")
+      : theme.fg("muted", `${first}${more.length > 0 ? " …" : ""}`);
+    return [rule, shown, rule];
+  }
+
   #footer(window: BodyWindow | undefined): string {
     const theme = this.#theme;
     if (this.#confirming) return theme.fg("warning", "Stop this worker? y/n");
     if (this.#flash !== undefined) return theme.fg("muted", this.#flash);
+    if (this.#typing) {
+      const send = this.#worker.state === "asking" ? ["Enter answer its question"] : ["Enter steer", "alt+enter follow-up"];
+      return theme.fg("dim", [...send, "shift+enter new line", "Esc done typing"].join(SEPARATOR));
+    }
     const stop = hasEnded(this.#worker) ? [] : ["x stop"];
-    if (this.#regular) return theme.fg("dim", ["←→ worker", ...stop, "ctrl+o tool output", "Esc back"].join(SEPARATOR));
+    const message = this.#accepts() ? ["Tab message"] : [];
+    if (this.#regular) return theme.fg("dim", ["←→ worker", ...message, ...stop, "ctrl+o tool output", "Esc back"].join(SEPARATOR));
     const where = window === undefined || window.following ? "following" : `line ${window.top + 1} of ${window.length}, End follows`;
-    const hints = [where, "←→ worker", "PgUp PgDn Home End scroll", ...stop, "ctrl+o tool output", "Esc back"];
+    const hints = [where, "←→ worker", "PgUp PgDn Home End scroll", ...message, ...stop, "ctrl+o tool output", "Esc back"];
     return theme.fg("dim", hints.join(SEPARATOR));
   }
 }

@@ -8,7 +8,7 @@ import { initTheme, SessionManager, type AgentSessionEvent, type Theme } from "@
 // public entry exports only its type, so the test reaches into the package:
 // matching the real binding ids is what keeps the view from trapping the user.
 import { KeybindingsManager } from "../../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js";
-import { WorkerBoard, type WorkerFeed, type WorkerSession } from "./worker-board.ts";
+import { WorkerBoard, type BoardWorker, type WorkerFeed, type WorkerSession } from "./worker-board.ts";
 import { LINGER_MS } from "./worker-widget.ts";
 import { openTranscript, TRANSCRIPT_OVERLAY, type TranscriptUI } from "./transcript-view.ts";
 import { formatCost, formatTokens } from "./transcript-header.ts";
@@ -836,4 +836,148 @@ test("the header's token counts and cost read short, and a count never rounds up
   assert.deepEqual([999, 1_000, 12_345, 99_949, 99_950, 999_499, 999_500, 1_234_567].map(formatTokens),
     ["999", "1.0k", "12.3k", "99.9k", "100k", "999k", "1.0M", "1.2M"]);
   assert.deepEqual([0, 0.0421, 1.5].map(formatCost), ["$0.000", "$0.042", "$1.500"]);
+});
+
+// The message input (bean mj35): a fake WorkerSteering stands in for the
+// subagents extension's (user-steering.ts), so these tests see what the view
+// sends and when it shows the input; extension.test.ts follows a message to a
+// real worker and the orchestrator.
+
+/** A steering that takes messages for running background workers, records
+ *  what the view sends, and fails a send while `refuse` holds a reason. */
+function fakeSteering() {
+  const sent: { workerId: string; text: string; mode: string }[] = [];
+  const steering = {
+    refuse: undefined as string | undefined,
+    accepts: (worker: BoardWorker) => worker.background && (worker.state === "running" || worker.state === "asking"),
+    async send(worker: BoardWorker, text: string, mode: "steer" | "followUp") {
+      if (steering.refuse !== undefined) throw new Error(steering.refuse);
+      sent.push({ workerId: worker.id, text, mode });
+    },
+    sentByUser: (_worker: BoardWorker, text: string) => sent.some((message) => message.text === text),
+  };
+  return { steering, sent };
+}
+
+const ALT_ENTER = "\x1b\r";
+const TAB = "\t";
+const INPUT_HINT = "Tab to message this worker";
+
+/** Presses each character of `text`, as the terminal sends typing. */
+const typed = (text: string) => [...text];
+
+test("the message input shows only while the worker takes messages: not for a foreground, queued or finished worker", async () => {
+  const board = new WorkerBoard();
+  const { feed } = running(board, "Background job", "worker-1", { background: true });
+  running(board, "Foreground job", "worker-2");
+  board.add({ callId: "call-1", background: true, task: "Waits its turn", model: { kind: "routed" } });
+  const { steering } = fakeSteering();
+  const view = fakeUI(30);
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id, { steering });
+  const footer = () => view.text().at(-1)!;
+
+  assert.ok(view.text().includes(INPUT_HINT), view.text().join("\n"));
+  assert.match(footer(), /Tab message/);
+  for (const worker of ["foreground", "queued"]) {
+    view.press(KEY.right);
+    assert.ok(!view.text().includes(INPUT_HINT), `no input for a ${worker} worker`);
+    assert.doesNotMatch(footer(), /Tab message/);
+    view.press(TAB);
+    assert.doesNotMatch(footer(), /Enter steer/, `Tab does nothing for a ${worker} worker`);
+  }
+  view.press(KEY.left, KEY.left);
+  assert.ok(view.text().includes(INPUT_HINT));
+  feed.ended({ state: "completed", sessionFile: "/nowhere/worker-1.jsonl" });
+  assert.ok(!view.text().includes(INPUT_HINT), "a finished worker's input is gone");
+  view.press(KEY.escape);
+  assert.equal(await shown, "back");
+});
+
+test("Tab gives the input the keys: Enter sends a steer, alt+enter a follow-up, x types, and Esc gives the keys back without closing", async () => {
+  const board = new WorkerBoard();
+  running(board, "Background job", "worker-1", { background: true });
+  const { steering, sent } = fakeSteering();
+  const view = fakeUI(30);
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id, { steering });
+  const footer = () => view.text().at(-1)!;
+
+  view.press(TAB);
+  assert.equal(footer(), "Enter steer · alt+enter follow-up · shift+enter new line · Esc done typing");
+  view.press(...typed("fix x first"));
+  assert.ok(view.text().some((line) => line.includes("fix x first")), "the editor shows the draft, x included");
+  assert.notEqual(footer(), "Stop this worker? y/n", "x is typed, not a stop");
+  view.press(KEY.enter);
+  assert.deepEqual(sent, [{ workerId: board.workers()[0]!.id, text: "fix x first", mode: "steer" }]);
+  await settle();
+  assert.equal(footer(), "Sent steer to this worker; the orchestrator is told.");
+  assert.ok(!view.text().some((line) => line.includes("fix x first")), "the input is empty after sending");
+
+  view.press(...typed("then the docs"), ALT_ENTER);
+  assert.deepEqual(sent.at(-1), { workerId: board.workers()[0]!.id, text: "then the docs", mode: "followUp" });
+  await settle();
+  assert.equal(footer(), "Sent follow-up to this worker; the orchestrator is told.");
+  view.press(KEY.enter);
+  assert.equal(sent.length, 2, "an empty input sends nothing");
+
+  view.press(...typed("half a thought"), KEY.escape);
+  assert.equal(view.closed, false, "Esc while typing keeps the view open");
+  assert.match(footer(), /Tab message/, "and gives the keys back");
+  assert.ok(view.text().includes("half a thought"), "the draft stays in the input");
+  view.press(KEY.left);
+  assert.equal(view.closed, false);
+  view.press(TAB, KEY.enter);
+  assert.equal(sent.at(-1)?.text, "half a thought", "Tab again goes on with the draft");
+  view.press(KEY.escape, KEY.escape);
+  assert.equal(await shown, "back", "Esc with the keys back leaves, as before");
+});
+
+test("a message the steering refuses comes back to the input with why; a worker that ends while typing gives the keys back", async () => {
+  const board = new WorkerBoard();
+  const { feed } = running(board, "Background job", "worker-1", { background: true });
+  const { steering, sent } = fakeSteering();
+  const view = fakeUI(30);
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id, { steering });
+  const footer = () => view.text().at(-1)!;
+
+  steering.refuse = "subagents_message: no running background worker has the delegation id worker-1";
+  view.press(TAB, ...typed("too late"), KEY.enter);
+  await settle();
+  assert.equal(footer(), "Not sent: subagents_message: no running background worker has the delegation id worker-1");
+  assert.ok(view.text().some((line) => line.includes("too late")), "the draft is back in the input");
+  assert.equal(sent.length, 0);
+
+  feed.ended({ state: "aborted" });
+  assert.equal(footer(), "This worker no longer takes messages; the draft was not sent.");
+  assert.ok(!view.text().some((line) => line.includes("too late")), "no input once it ended");
+  view.press(KEY.escape);
+  assert.equal(await shown, "back", "the keys are the view's again: Esc leaves");
+});
+
+test("an asking worker's input answers its question, and the transcript marks the user's steers as the user's", async () => {
+  const board = new WorkerBoard();
+  const { fake } = running(board, "Read the notes", "worker-1", { background: true }, [
+    user("Read the notes"),
+    reply("Reading", [{ id: "call-1", name: "read", arguments: { path: "notes.md" } }]),
+    toolResult("call-1", "read", "first note"),
+    user("From the orchestrator"),
+  ]);
+  const { steering } = fakeSteering();
+  const view = fakeUI(60);
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id, { steering });
+  const footer = () => view.text().at(-1)!;
+  const marks = () => view.text().map((line) => line.trim()).filter((line) => line.startsWith("▸"));
+
+  board.asking("worker-1", true);
+  view.press(TAB);
+  assert.equal(footer(), "Enter answer its question · shift+enter new line · Esc done typing");
+  view.press(...typed("From the user"), KEY.enter);
+  await settle();
+  assert.equal(footer(), "Sent answer to this worker; the orchestrator is told.");
+  board.asking("worker-1", false);
+  fake.add(reply("Checking", [{ id: "call-2", name: "read", arguments: { path: "todo.md" } }]));
+  fake.add(toolResult("call-2", "read", "todo"));
+  fake.add(user("From the user"));
+  assert.deepEqual(marks(), ["▸ Steer from the orchestrator", "▸ Steer from the user"]);
+  view.press(KEY.escape, KEY.escape);
+  await shown;
 });

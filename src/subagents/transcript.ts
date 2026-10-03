@@ -33,7 +33,8 @@ import { SUBAGENTS_TOOL } from "./worker.ts";
 // marked, because the task prompt and ordinary tool calls look the same
 // otherwise: the worker's `report` tool calls (report.ts), and the steers and
 // follow-ups subagents_message sends it, which arrive in its session as plain
-// user messages (message.ts, worker.ts).
+// user messages (message.ts, worker.ts). The ones the user sent from the
+// transcript view are marked as the user's (user-steering.ts).
 
 /** What a transcript needs of pi's TUI: its tool components ask it to redraw. */
 export interface TranscriptTui {
@@ -118,6 +119,12 @@ const MARKS: Partial<Record<UserMessageKind, string>> = {
   followUp: "▸ Follow-up from the orchestrator",
 };
 
+/** The marks of a steer or follow-up the user sent from the transcript view (user-steering.ts). */
+const USER_MARKS: Partial<Record<UserMessageKind, string>> = {
+  steer: "▸ Steer from the user",
+  followUp: "▸ Follow-up from the user",
+};
+
 const EMPTY: Component = { render: () => [], invalidate() {} };
 
 /** The board's task is the one task card in the transcript, even before its
@@ -184,6 +191,8 @@ export interface TranscriptContext {
   readonly toolDefinition?: (name: string) => ToolRenderers | undefined;
   /** Whether tool output starts expanded. */
   readonly expanded?: boolean;
+  /** Whether the user, not the orchestrator, sent a steer or follow-up with this text; asked at each render. */
+  readonly sentByUser?: (text: string) => boolean;
 }
 
 /** One worker's transcript: its messages as pi's components, and the reply
@@ -362,10 +371,13 @@ export class Transcript {
     const text = textOf(message.content);
     if (text === "") return [];
     const component = new UserMessageComponent(text, this.#markdown);
-    const mark = MARKS[kind];
-    const { theme } = this.#context;
+    const { theme, sentByUser } = this.#context;
     const spacer = first ? [] : [""];
-    return [{ render: (width) => [...spacer, ...(mark === undefined ? [] : [theme.fg("warning", theme.bold(mark))]), ...component.render(width)] }];
+    return [{ render: (width) => {
+      // At render, not when the part is built: the user's steer is recorded once it was sent, which may be after it reached the session.
+      const mark = (sentByUser?.(text) === true ? USER_MARKS : MARKS)[kind];
+      return [...spacer, ...(mark === undefined ? [] : [theme.fg("warning", theme.bold(mark))]), ...component.render(width)];
+    } }];
   }
 
   /** Custom messages, summaries and user shell commands, as pi's chat shows them. */

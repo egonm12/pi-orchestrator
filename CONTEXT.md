@@ -37,7 +37,7 @@ _Avoid_: Max parallel, background worker limit, items per call
 What the quality gate requires for one editing delegation: none, a spot check (the orchestrator's own verdict) or a reviewer (an independent reviewer worker). Set by the gate level and the delegation's tier.
 
 **Background worker**:
-A worker whose delegating call returned before it finished. The orchestrator can check on it, steer it and answer its questions.
+A worker whose delegating call returned before it finished. The orchestrator can check on it, steer it and answer its questions; the user can steer it from its transcript view.
 
 **Report**:
 A message a background worker sends the orchestrator on its own: progress, or a question it waits on.
@@ -87,8 +87,12 @@ What a worker is doing right now, in a word: `thinking…`, `writing…`, the na
 _Avoid_: Current action, live status
 
 **Transcript view**:
-One worker's whole session, shown in place of the orchestrator's view until the user leaves it.
+One worker's whole session, shown in place of the orchestrator's view until the user leaves it. For a running background worker it has a message input for user steering.
 _Avoid_: Subagent view, worker view
+
+**User steering**:
+A message the user sends a running background worker from its transcript view: a steer, a follow-up or the answer to its question, delivered as the orchestrator's messages are. The orchestrator is told of each one in its session, and the worker's result lists them as the user's.
+_Avoid_: Direct message, user override
 
 ## Routing
 

@@ -21,6 +21,7 @@ import { workerBoard, type BoardWorker, type WorkerModelSetup } from "./worker-b
 import { agentLabel, startWorkerWidget, type WorkerWidget } from "./worker-widget.ts";
 import { findWorker, pickWorker, workerListing } from "./worker-picker.ts";
 import { openTranscript, type TranscriptViewExit } from "./transcript-view.ts";
+import { UserSteering, userSteeringNote, type UserSteer, type WorkerSteering } from "./user-steering.ts";
 import { isWorkerSession } from "./worker-sessions.ts";
 import { isOrchestratorSession } from "./orchestrator-session.ts";
 import { addOrchestratorProtocol, keepOrchestratorProtocol } from "./orchestrator-protocol.ts";
@@ -129,10 +130,15 @@ interface RetryDetails {
   readonly climb?: string;
 }
 
+/** What the user sent a background worker from its transcript view (user-steering.ts). */
+interface UserSteeringDetails {
+  readonly userSteering?: readonly UserSteer[];
+}
+
 /** An item's result. Only a started worker has a session id: an item whose
  *  agent is unknown fails before a worker starts, and an item still queued at
  *  abort is not started. */
-export type SubagentResult = WorkerModelDetails & RetryDetails & (
+export type SubagentResult = WorkerModelDetails & RetryDetails & UserSteeringDetails & (
   | (SubagentItem & WorkerResult)
   | (SubagentItem & {
     readonly status: "failed";
@@ -206,6 +212,7 @@ function resultText(result: SubagentResult, forOrchestrator: boolean, level: Gat
     result.finalText,
     // The runtime's Result check (ADR 0010) annotates and never rejects.
     ...(result.missingSections === undefined ? [] : ["", missingSectionsNote(result.missingSections)]),
+    ...(result.userSteering === undefined || result.userSteering.length === 0 ? [] : ["", userSteeringNote(result.userSteering)]),
   ].join("\n");
 }
 
@@ -258,9 +265,10 @@ const description = (limit: number) => `Hand 1 to ${limit} tasks to workers. At 
 
 /** Opens `workerId`'s transcript with no header or bar options: the
  *  transcript view's own defaults (vo0z's fuller header and orchestrator bar)
- *  apply, so every opener (the picker, a direct jump, alt+a) gets them alike. */
-function openWorker(ctx: Pick<ExtensionContext, "ui">, workerId: string): Promise<TranscriptViewExit> {
-  return openTranscript(ctx.ui, workerBoard(), workerId);
+ *  apply, so every opener (the picker, a direct jump, alt+a) gets them alike.
+ *  `steering` lets the user message a running background worker from it. */
+function openWorker(ctx: Pick<ExtensionContext, "ui">, workerId: string, steering: WorkerSteering): Promise<TranscriptViewExit> {
+  return openTranscript(ctx.ui, workerBoard(), workerId, { steering });
 }
 
 export function createSubagentsExtension(overrides: Partial<SubagentsDependencies> = {}) {
@@ -319,6 +327,8 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
       if (startTurn && settling) held.push(notice);
       else sendNotice(notice, startTurn);
     });
+    // The user's messages to background workers from the transcript view, which the orchestrator is told of (user-steering.ts).
+    const userSteering = new UserSteering(pi, backgroundCalls, workerBoard());
     pi.on("agent_end", () => { settling = true; });
     pi.on("agent_start", () => sendHeld(true));
     pi.on("agent_settled", () => sendHeld(true));
@@ -663,6 +673,11 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               feeds[index]!.ended({ state: "aborted" });
             }
           }
+          // Only a background worker takes the user's messages, and only while it runs: its run's user steering is complete now.
+          for (const [index, result] of results.entries()) {
+            const steers = userSteering.steers(feeds[index]!.id);
+            if (steers.length > 0) results[index] = { ...result, userSteering: steers };
+          }
           const details: SubagentsDetails = { results: results.map((item, index) => ({ ...item, boardWorker: board.worker(feeds[index]!.id) })) };
           const level = gateLevels.inForce(ctx).level;
           return { text: results.map((result) => resultText(result, parentDelegationId === undefined, level)).join("\n\n"), details };
@@ -701,7 +716,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
       while (browsed !== undefined && widget === browsed) {
         const result = await browsed.focus(ctx.ui, { select });
         if (result.workerId === undefined) return;
-        const exit = await openWorker(ctx, result.workerId);
+        const exit = await openWorker(ctx, result.workerId, userSteering);
         if (exit === "main") return;
         select = result.workerId;
       }
@@ -729,7 +744,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
             return;
           }
           const workerId = await pickWorker(ctx.ui, board);
-          if (workerId !== undefined) await openWorker(ctx, workerId);
+          if (workerId !== undefined) await openWorker(ctx, workerId, userSteering);
           return;
         }
         // `stop ...` is unchanged from before the picker (background.ts's own `command`);
@@ -738,7 +753,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
         const [verb] = trimmed.split(/\s+/);
         if (verb === "stop") { ctx.ui.notify(backgroundCalls.command(args), "info"); return; }
         const found = findWorker(workerBoard(), trimmed);
-        if (found.workerId !== undefined) { await openWorker(ctx, found.workerId); return; }
+        if (found.workerId !== undefined) { await openWorker(ctx, found.workerId, userSteering); return; }
         ctx.ui.notify(found.refusal, "warning");
       },
     });

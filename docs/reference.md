@@ -89,6 +89,11 @@ A background worker that asks a `report` question gives up its slot while it wai
 
 Use `subagents_message({ "id": "<delegation id>", "text": "Check this case", "mode": "steer" })` to message one running background worker. `mode` defaults to `"steer"`, delivered after its current tool call and before the next model request. `"followUp"` is delivered when the worker would otherwise stop. The same tool answers a worker's `report` question: its next message unblocks the waiting question. Call ids, queued or finished workers, foreground workers and unknown ids are refused. Workers cannot use `subagents_message`.
 
+The user can message a running background worker too, from its transcript view (see Transcript view below). The message takes the same way as a `subagents_message` and reaches the worker the same way: a steer, a follow-up, or the answer to its question. The orchestrator did not send it, so it is told twice:
+
+- A `subagents-user-steer` message in its session, such as `The user steered worker <delegation id> (<label>) directly: "<text>" (mode steer)`, or `The user answered the question of worker <delegation id> (<label>) directly: "<text>"`. It never starts a turn: an idle orchestrator reads it at its next turn, a busy one after its current turn's tool results.
+- A `User steering` part in the worker's result, in the completion notice: every message the user sent that run, in order, marked as the user's and not the orchestrator's. The result's `details` list them as `userSteering`.
+
 ### Reports
 
 Every worker has a `report` tool, `{ "kind": "progress" | "question", "text": string }`, to message the agent that delegated to it on its own, whatever its agent definition's `tools:` list says:
@@ -338,9 +343,23 @@ Three ways open it. Alt+a on the worker widget, then Enter on the selected row, 
 The transcript looks like pi's own chat: the worker's replies with their thinking, its tool calls with their results, and the tool-output expand toggle. Two kinds of message are marked, so they stand out from the task and from ordinary tool calls:
 
 - `◆ Report: progress` and `◆ Report: question` mark the worker's `report` calls, with a question's answer below it.
-- `▸ Steer from the orchestrator` and `▸ Follow-up from the orchestrator` mark the messages `subagents_message` sent the worker.
+- `▸ Steer from the orchestrator` and `▸ Follow-up from the orchestrator` mark the messages `subagents_message` sent the worker; `▸ Steer from the user` and `▸ Follow-up from the user` mark the ones the user sent from this view.
 
 A forked worker's transcript starts with the orchestrator's conversation it was copied from. A tool from another installed extension keeps its own drawing while the worker runs. In a finished worker's transcript, only pi's built-in tools, `subagents` and `report` keep theirs; other tools are drawn plainly.
+
+#### Messaging a worker
+
+While the shown worker is a running background worker, asking or not, the view has a message input at the bottom, pi's own editor, above the key hints. It is not there for a foreground, queued or finished worker, and it goes away when the worker ends. Tab gives the input the keys, and the key hints change to say so:
+
+| Key, while typing | Action |
+|-----|--------|
+| Enter | Send the text as a steer, as `subagents_message` with `mode` `"steer"`; to an asking worker, its answer |
+| alt+enter (pi's follow-up key) | Send the text as a follow-up, as `mode` `"followUp"` |
+| shift+enter | New line |
+| Esc, ctrl+c, Tab | Give the keys back to the view, keeping the draft. A second Esc leaves the view |
+| ctrl+o | Expand or collapse tool output |
+
+Every other key edits the text, so x, the arrow keys and Home/End type and move the cursor while typing. A message that cannot be sent, because the worker ended meanwhile, comes back to the input with the reason. Switching worker drops the draft. The orchestrator is told of every message that was sent (see Messages above).
 
 #### Regular TUI mode
 
@@ -367,6 +386,7 @@ orchestrator idle · 1 worker asking: worker 3 (reviewer)
 |-----|--------|
 | ← → | Show the previous or next worker, in the order they were queued, each nested worker after its parent |
 | ↑ ↓, Enter | Select one of the worker's nested workers, and open it |
+| Tab | Type a message to a running background worker (see Messaging a worker above) |
 | x | Stop this worker, after a `Stop this worker? y/n` confirmation. A running worker aborts, a queued one never starts; a nested worker's parent runs on |
 | ctrl+o | Expand or collapse tool output |
 | Esc, ctrl+c | Go back to the orchestrator's session |
@@ -400,11 +420,12 @@ Every line is cut to the terminal's width. On a narrow terminal the rung history
 | Home, End | Go to the start; go to the end and follow it again |
 | ← → | Show the previous or next worker, in the order they were queued, each nested worker after its parent |
 | ↑ ↓, Enter | Select one of the worker's nested workers, and open it |
+| Tab | Type a message to a running background worker (see Messaging a worker above) |
 | x | Stop this worker, after a `Stop this worker? y/n` confirmation. A running worker aborts, a queued one never starts; a nested worker's parent runs on |
 | ctrl+o | Expand or collapse tool output |
 | Esc, ctrl+c | Go back to the orchestrator's session |
 
-The view is read-only: answering and steering a worker stay with the orchestrator, through `subagents_message`, and x is the only thing it sends a worker. It never closes on its own. A worker that finishes while shown stays open with its end state, and a worker you stop stays open as aborted. A finished worker's transcript is read from its session file, which the view never changes. When the orchestrator's session is not saved, its workers' sessions are not saved either, and a finished worker shows the messages the session kept in memory.
+The view sends a worker two things: the x stop, and the messages you type to a running background worker, which the orchestrator is told of. It never closes on its own. A worker that finishes while shown stays open with its end state, and a worker you stop stays open as aborted. A finished worker's transcript is read from its session file, which the view never changes. When the orchestrator's session is not saved, its workers' sessions are not saved either, and a finished worker shows the messages the session kept in memory.
 
 ### Agent definitions
 
