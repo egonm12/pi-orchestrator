@@ -7,6 +7,10 @@ import { markWorkerSession } from "./worker-sessions.ts";
 // prompt starts, context_with_system for every request of every run.
 
 const PROTOCOL = orchestratorProtocol(3, "medium");
+
+test("the protocol asks for scannable Markdown delegation tasks", () => {
+  assert.match(PROTOCOL, /structured Markdown with short sections such as Goal, Context, Steps, Constraints and Report; use bullets/);
+});
 const orchestrator = { sessionManager: { getSessionId: () => "orchestrator-session" } } as never;
 
 type Message = { role: string; content?: unknown; sections?: Record<string, string | null>; timestamp?: number };

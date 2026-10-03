@@ -522,7 +522,7 @@ test("the header shows a routed worker's rung history, live, each rung since whe
   assert.equal(header(view)[1], "anthropic/claude-sonnet-4-5:medium (the agent definition's model, not routed)");
 });
 
-test("the header shows the delegation id, a nested worker's parent delegation with its agent, short ids on a narrow terminal, and the task", async () => {
+test("the header shows delegation ids and one Markdown task preview", async () => {
   const LEAD = "0199f0b1-7c2d-7e3f-8a4b-5c6d7e8f9a0b", TESTER = "0199f0c2-5e0a-7c1b-9d3e-3f2a9c1e44b0";
   const board = new WorkerBoard();
   running(board, "Lead the work", LEAD, { agent: "lead" });
@@ -531,9 +531,10 @@ test("the header shows the delegation id, a nested worker's parent delegation wi
   const view = fakeUI(20);
   void openTranscript(view.ui, board, board.workers()[1]!.id);
 
-  assert.deepEqual(header(view, 120).slice(2), [`delegation ${TESTER} · parent delegation ${LEAD} (lead)`, "Check the tests", "Then report back"]);
-  assert.deepEqual(header(view, 60).slice(2), ["delegation 0199f0c2… · parent delegation 0199f0b1… (lead)", "Check the tests", "Then report back"],
+  assert.deepEqual(header(view, 120).slice(2), [`delegation ${TESTER} · parent delegation ${LEAD} (lead)`, "Check   the tests", "Then report back"]);
+  assert.deepEqual(header(view, 60).slice(2), ["delegation 0199f0c2… · parent delegation 0199f0b1… (lead)", "Check   the tests", "Then report back"],
     "short delegation ids on a narrow terminal");
+  assert.equal(view.text().filter((line) => line.includes("Then report back")).length, 1, "no second prompt copy in the body");
   view.press(KEY.left);
   assert.equal(header(view)[2], `delegation ${LEAD}`, "a worker of the orchestrator has no parent delegation");
   view.press(KEY.right, KEY.right);
@@ -623,21 +624,40 @@ test("the view redraws every second while open, so the elapsed time ticks, and i
   assert.deepEqual(cleared, ["timer"], "leaving the view stops its timer");
 });
 
-test("in fullscreen tuiMode the header wraps the task to at most 3 lines, ending in … when it is longer", async () => {
+test("a fullscreen worker pins one short Markdown task preview, including before its session starts", async () => {
   const board = new WorkerBoard();
-  const words = Array.from({ length: 60 }, (_, index) => `word${index + 1}`).join(" ");
-  running(board, words, "worker-1");
-  running(board, "Short task", "worker-2");
-  const view = fakeUI(30, "fullscreen");
+  const task = "## Goal\n\nCheck `docker desktop`.\n\n## Steps\n\n- Read logs\n- Report back";
+  board.add({ callId: "call-1", background: false, task, model: { kind: "routed" } });
+  const view = fakeUI(25, "fullscreen");
   void openTranscript(view.ui, board, board.workers()[0]!.id);
-  const task = header(view, 60).slice(3);
-  assert.equal(task.length, 3, JSON.stringify(task));
-  assert.ok(task.every((line) => line.length <= 60));
-  assert.ok(task[0]!.startsWith("word1 word2"));
-  assert.ok(task[2]!.endsWith("…"), task[2]);
-  assert.ok(!task.join(" ").includes("word60"));
-  view.press(KEY.right);
-  assert.deepEqual(header(view, 60).slice(3), ["Short task"], "a short task takes one line, with no …");
+  assert.equal(view.text().filter((line) => line.includes("Goal")).length, 1);
+  assert.ok(view.text().some((line) => line.includes("ctrl+o to expand task")));
+  assert.ok(!view.text().some((line) => line.includes("Read logs")));
+  view.press(KEY.ctrlO, KEY.home);
+  assert.ok(view.text().some((line) => line.includes("Read logs")), "the full task is in the scrollable body");
+  assert.equal(view.text().filter((line) => line.includes("Goal")).length, 1, "not repeated in the header");
+});
+
+test("a Markdown task appears once, previews briefly, and expands with the tool-output key", async () => {
+  const board = new WorkerBoard();
+  const task = "## Goal\n\nCheck `docker desktop`.\n\n## Steps\n\n- Read logs\n- Report back";
+  running(board, task, "worker-1");
+  const view = regularUI();
+  void openTranscript(view.ui, board, board.workers()[0]!.id);
+  const collapsed = view.text();
+  assert.equal(collapsed.filter((line) => line.includes("Goal")).length, 1, "no raw header copy");
+  assert.ok(collapsed.some((line) => line.includes("docker desktop")));
+  assert.ok(collapsed.some((line) => line.includes("ctrl+o to expand task")));
+  assert.ok(!collapsed.some((line) => line.includes("Read logs")));
+  view.press(KEY.ctrlO);
+  const expanded = view.text();
+  assert.equal(expanded.filter((line) => line.includes("Goal")).length, 1);
+  assert.ok(expanded.some((line) => line.includes("Steps")));
+  assert.ok(expanded.some((line) => line.includes("Read logs")));
+  assert.ok(expanded.some((line) => line.includes("Report back")));
+  assert.ok(!expanded.some((line) => line.includes("ctrl+o to expand task")));
+  view.press(KEY.ctrlO);
+  assert.ok(!view.text().some((line) => line.includes("Read logs")));
 });
 
 /** ctx.ui.custom in regular tuiMode: pi's root holds its chat, editor and
@@ -725,9 +745,9 @@ test("in regular tuiMode the view prints its top once, the whole transcript, and
 
   assert.deepEqual(text.slice(0, 3), ["tester", "routing…", "delegation 0199f0c2-5e0a-7c1b-9d3e-3f2a9c1e44b0"]);
   const top = text.slice(3, text.findIndex((line) => line.startsWith("─")));
-  assert.ok(top.length > 3, "the whole task, wrapped without a limit");
-  assert.ok(top.every((line) => line.length <= 60));
-  assert.equal(top.join(" ").replace(/\s+/g, " "), task.trim());
+  assert.deepEqual(top, [], "the header does not repeat the task");
+  assert.ok(text.some((line) => line.includes("ctrl+o to expand task")), "the transcript previews the task");
+  assert.ok(!text.some((line) => line.includes("The very end.")), "the long task is collapsed");
   assert.ok(text.length > 40, "the transcript in full, not windowed to the terminal");
   assert.ok(text.some((line) => line.trim() === "number 1") && text.some((line) => line.trim() === "number 40"));
   assert.deepEqual(view.text().slice(-3), [

@@ -67,8 +67,9 @@ const paragraphs = (explorationNudge: number, gateLevel: GateLevel): readonly st
   "Delegate exploration and substantial work to workers with the `subagents` tool. Delegate when you expect more than two " +
     "exploratory commands (reads, searches, listings, diffs) before you can answer, when the question is open, such as " +
     "\"any risks?\" or \"why does this fail?\", or when the output will be large and you only need the conclusion. " +
-    "Decide before your first command, not after the fifth. Give each worker one bounded task. Check on a background worker " +
-    "with `subagents_status`, and steer it or answer the question in its Report with `subagents_message`.",
+    "Decide before your first command, not after the fifth. Give each worker one bounded task. Write each `subagents` task as " +
+    "structured Markdown with short sections such as Goal, Context, Steps, Constraints and Report; use bullets instead of one dense paragraph. " +
+    "Check on a background worker with `subagents_status`, and steer it or answer the question in its Report with `subagents_message`.",
   "A `subagents` call runs in the background unless you set `background: false`: it returns its call id and delegation ids at once, " +
     "and you stay free to answer the user, do unrelated work, check on or steer its workers. Its results come in one completion notice. " +
     "Keep the default for exploration, coding, reviews and anything whose length you cannot tell. Set `background: false` only for a " +

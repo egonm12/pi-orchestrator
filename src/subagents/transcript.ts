@@ -20,6 +20,7 @@ import {
   type AgentSessionEvent,
   type Theme,
 } from "@earendil-works/pi-coding-agent";
+import { Markdown } from "@earendil-works/pi-tui";
 import { REPORT_TOOL } from "./report.ts";
 import { renderSubagentsCall, renderSubagentsResult, textComponent, type Component } from "./render.ts";
 import { SUBAGENTS_TOOL } from "./worker.ts";
@@ -119,6 +120,26 @@ const MARKS: Partial<Record<UserMessageKind, string>> = {
 
 const EMPTY: Component = { render: () => [], invalidate() {} };
 
+/** The board's task is the one task card in the transcript, even before its
+ *  prompt reaches the worker's session. Pi's Markdown renderer handles both
+ *  the preview and the full task, including lists and code spans. */
+function taskPart(task: string, theme: Theme): Part {
+  const lines = task.trim().split(/\r?\n/);
+  const preview = lines.slice(0, 3).map((line) => line.length > 100 ? `${line.slice(0, 99).trimEnd()}…` : line).join("\n");
+  const shortened = preview !== task.trim();
+  const markdown = getMarkdownTheme();
+  const brief = new Markdown(preview, 0, 0, markdown);
+  const full = new Markdown(task, 0, 0, markdown);
+  let expanded = false;
+  return {
+    setExpanded: (value) => { expanded = value; },
+    render: (width) => [
+      ...(expanded ? full : brief).render(width),
+      ...(shortened && !expanded ? [theme.fg("dim", "ctrl+o to expand task")] : []),
+    ],
+  };
+}
+
 /** The worker's `report` tool, marked: its call shows the kind and text, and a
  *  question's result the orchestrator's answer. */
 const REPORT_RENDERERS: ToolRenderers = {
@@ -174,6 +195,7 @@ export class Transcript {
   #builtIn: Record<string, ToolRenderers> | undefined;
   #expanded: boolean;
   #parts: Part[] = [];
+  readonly #task: Part | undefined;
   readonly #byMessage = new WeakMap<object, Part[]>();
   readonly #tools = new Map<string, ToolExecutionComponent>();
   /** Tool calls whose final result is shown. */
@@ -184,6 +206,10 @@ export class Transcript {
   constructor(context: TranscriptContext) {
     this.#context = context;
     this.#expanded = context.expanded ?? false;
+    const task = context.tasks.at(-1);
+    this.#task = task ? taskPart(task, context.theme) : undefined;
+    this.#task?.setExpanded?.(this.#expanded);
+    if (this.#task !== undefined) this.#parts = [this.#task];
   }
 
   /** Shows the worker's messages so far. */
@@ -229,8 +255,13 @@ export class Transcript {
     for (const part of this.#parts) part.setExpanded?.(expanded);
   }
 
-  render(width: number): string[] {
-    return this.#parts.flatMap((part) => part.render(width));
+  /** The task may be pinned above an overlay's body when collapsed. */
+  renderTask(width: number): string[] {
+    return this.#task?.render(width) ?? [];
+  }
+
+  render(width: number, includeTask = true): string[] {
+    return this.#parts.flatMap((part) => part === this.#task && !includeTask ? [] : part.render(width));
   }
 
   /** The transcript is no longer shown. A tool still running gets an empty
@@ -245,7 +276,7 @@ export class Transcript {
   }
 
   #rebuild(): void {
-    const parts: Part[] = [];
+    const parts: Part[] = this.#task === undefined ? [] : [this.#task];
     const messages = this.#messages;
     const kinds = userMessageKinds(messages, this.#context.tasks);
     for (const [index, message] of messages.entries()) {
@@ -261,9 +292,11 @@ export class Transcript {
           this.#finished.add(id);
           break;
         }
-        case "user":
-          parts.push(...this.#cached(message, () => this.#user(message, kinds.get(index) ?? "prompt", parts.length === 0)));
+        case "user": {
+          const kind = kinds.get(index) ?? "prompt";
+          if (kind !== "prompt") parts.push(...this.#cached(message, () => this.#user(message, kind, parts.length === 0)));
           break;
+        }
         default:
           parts.push(...this.#cached(message, () => this.#other(message)));
       }

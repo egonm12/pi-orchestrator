@@ -255,8 +255,9 @@ export class TranscriptView {
       // The session picker stays just above the stats line while regular tuiMode scrolls the body.
       return { head: transcriptTop(frame), body: this.#body(width), live: () => [...this.#sessionPickerLines(frame), ...liveStats(frame), ...bar, this.#footer(undefined)] };
     }
-    const head = [...bar, ...(this.#options.header ?? transcriptHeader)(frame), ...this.#sessionPickerLines(frame)];
-    return { head, body: this.#body(width), live: (window) => [this.#footer(window)] };
+    const head = [...bar, ...(this.#options.header ?? transcriptHeader)(frame),
+      ...(!this.#expanded ? this.#transcript?.renderTask(width) ?? [] : []), ...this.#sessionPickerLines(frame)];
+    return { head, body: this.#body(width, this.#expanded), live: (window) => [this.#footer(window)] };
   }
 
   /** Regular tuiMode's arrangement: the top, the whole transcript and the
@@ -430,10 +431,10 @@ export class TranscriptView {
   }
 
   /** The transcript, or a notice when there is none yet, and a finished worker's end state. */
-  #body(width: number): string[] {
+  #body(width: number, includeTask = true): string[] {
     const theme = this.#theme;
     const worker = this.#worker;
-    const lines = this.#transcript?.render(width) ?? [];
+    const lines = this.#transcript?.render(width, includeTask) ?? [];
     // Wrapped, not cut: `fit` keeps only a line's first row, and a notice's
     // path or an error is often wider than the screen.
     const wrapped = (text: string) => truncateToVisualLines(text, Number.POSITIVE_INFINITY, width).visualLines;

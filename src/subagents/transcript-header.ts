@@ -91,32 +91,15 @@ function delegationLine(frame: TranscriptFrame): string {
   return fitted("", [["dim", full.length <= frame.width ? full : text(shortId)]], frame.theme, frame.width);
 }
 
-/** The task wrapped to the width, its blank lines left out, at most `max`
- *  lines: the last one kept ends in … when the task is longer. */
-function taskLines(frame: TranscriptFrame, max: number): string[] {
-  const text = frame.worker.task.split(/\r?\n/).map((line) => line.replace(/\s+/g, " ").trim()).filter((line) => line !== "").join("\n");
-  const lines = truncateToVisualLines(text, Number.POSITIVE_INFINITY, frame.width).visualLines.map((line) => line.trimEnd());
-  if (lines.length > max) {
-    const last = lines[max - 1]!;
-    lines.splice(max - 1, lines.length, `${last.length < frame.width ? last : last.slice(0, frame.width - 1).trimEnd()}…`);
-  }
-  return lines.map((line) => frame.theme.fg("muted", line));
-}
-
-/** How many lines the overlay's pinned header gives the task. */
-const HEADER_TASK_LINES = 3;
-
-/** The default header: the worker's agent, worker state and progress; its
- *  model; its delegation; and its task, wrapped to at most 3 lines. */
+/** The default header names the worker, model and delegation. The view adds
+ *  the one task preview separately when the overlay is collapsed. */
 export function transcriptHeader(frame: TranscriptFrame): string[] {
-  return [statsLine(frame), modelLine(frame), delegationLine(frame), ...taskLines(frame, HEADER_TASK_LINES)];
+  return [statsLine(frame), modelLine(frame), delegationLine(frame)];
 }
 
-/** Regular tuiMode's top, printed once above the transcript (ADR 0009): the
- *  agent, the model and rung history, the delegation and the whole task. */
+/** Regular tuiMode's top, printed once above the transcript (ADR 0009). */
 export function transcriptTop(frame: TranscriptFrame): string[] {
-  return [fitted("", [["accent", agentLabel(frame.worker)]], frame.theme, frame.width), modelLine(frame), delegationLine(frame),
-    ...taskLines(frame, Number.POSITIVE_INFINITY)];
+  return [fitted("", [["accent", agentLabel(frame.worker)]], frame.theme, frame.width), modelLine(frame), delegationLine(frame)];
 }
 
 /** Regular tuiMode's live stats line, at the end of the view: the header's
