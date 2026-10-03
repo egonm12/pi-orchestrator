@@ -328,8 +328,7 @@ export const LOW_USAGE_PERCENT = 10;
 /** The providers whose observations hold under LOW_USAGE_PERCENT left at
  *  `now`, for balancing to weigh. An exhausted or throttled observation is
  *  the hard filters' (usageLimits), not this. A percentage holds until the
- *  reset of the window it was read for, or for the five-hour usage window
- *  from when it was observed without one. */
+ *  earlier of its window reset and five hours after it was observed. */
 export function lowOnUsage(observations: UsageObservations, now: Date): string[] {
   const at = now.getTime();
   return Object.keys(observations).sort().filter((provider) => {
@@ -339,8 +338,11 @@ export function lowOnUsage(observations: UsageObservations, now: Date): string[]
   });
 }
 
-/** When a percentage-left observation stops saying anything: the reset of the
- *  window it was read for, else five hours after it was observed. */
+/** When a percentage-left observation stops saying anything: the earlier of
+ *  its window reset and five hours after it was observed. The age limit keeps
+ *  a cached reading from surviving an early or otherwise unobserved reset. */
 export function percentHoldsUntil(observation: UsageObservation): number {
-  return observation.resetsAt === undefined ? Date.parse(observation.observedAt) + USAGE_OBSERVATION_WINDOW_MS : Date.parse(observation.resetsAt);
+  const freshUntil = Date.parse(observation.observedAt) + USAGE_OBSERVATION_WINDOW_MS;
+  const resetAt = observation.resetsAt === undefined ? freshUntil : Date.parse(observation.resetsAt);
+  return Math.min(resetAt, freshUntil);
 }

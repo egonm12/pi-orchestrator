@@ -6,9 +6,9 @@ import { limitLiftsAt, percentHoldsUntil, type UsageObservation, type UsageObser
 // It ends the orchestrator protocol (orchestrator-protocol.ts), so it rides the
 // protocol onto every request of every orchestrator run and never reaches a
 // worker. A provider whose limit has lifted, or whose low or available reading
-// is past the reset of the window it was read for (five hours after it without
-// one, percentHoldsUntil), is left out: its observation says nothing true any
-// more. With nothing left to say there is no line.
+// is past the earlier of its window reset and its five-hour freshness limit
+// (percentHoldsUntil), is left out: its observation says nothing true any more.
+// With nothing left to say there is no line.
 
 const pad = (value: number) => String(value).padStart(2, "0");
 
