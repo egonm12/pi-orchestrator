@@ -9,7 +9,7 @@ A [pi](https://pi.dev) package for sessions that hand work to subagent workers. 
 - **Guard:** enforces a ban list of models that workers may never use, and an optional ban list for the orchestrator itself.
 - **Review gate:** an editing worker needs a verdict (`subagents_verdict`) from the orchestrator or an independent reviewer, depending on its tier and the gate level (`off`, `low`, `medium`, `high`, `max`).
 
-The three extensions are independent. You can switch any one off without touching the others.
+Workers need the subagents extension: it is the supported way to start them. You can switch the router or the guard off on its own. Another subagent extension might work if its workers can resolve the virtual model `orchestrator/auto`, but that is not supported or tested.
 
 ## Install
 

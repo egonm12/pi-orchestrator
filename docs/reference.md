@@ -20,7 +20,7 @@ Or from a local checkout:
 pi install ~/path/to/pi-orchestrator
 ```
 
-The package ships its own `subagents` tool (see below), so an orchestrator session needs no separate subagent extension to start workers. Other subagent extensions that start workers on `orchestrator/auto` still work and are still routed; use one for chains, which the built-in tool does not do. For another extension's background workers, install pi-orchestrator as a package, not just with `pi -e`: their separate process loads installed packages. The package has no runtime dependencies of its own.
+Workers need the package's own `subagents` tool (see below); an orchestrator session needs no separate subagent extension. Other subagent extensions are not supported. One might work if its workers can resolve the virtual model `orchestrator/auto`, which means each worker's session must load pi-orchestrator's router extension (ADR 0014), but that is not tested. The package has no runtime dependencies of its own.
 
 ## Set up with `init`
 
@@ -559,7 +559,7 @@ Decision records keep the first 200 characters of the task text, with credential
   { "packages": [{ "source": "git:github.com/egonm12/pi-orchestrator", "extensions": ["!src/router/extension.ts"] }] }
   ```
 
-  Use `!src/guard/extension.ts` to keep the router and drop the guard, or `!src/subagents/extension.ts` to drop only the built-in `subagents` tool, and with it the orchestrator protocol, the exploration nudge, the gate level and `/pi-orchestrator gate`, the worker limit and `/pi-orchestrator workers`, `subagents_verdict` and the commit reminder on unjudged edits, and keep routing for other subagent extensions.
+  Use `!src/guard/extension.ts` to keep the router and drop the guard, or `!src/subagents/extension.ts` to drop only the built-in `subagents` tool, and with it the orchestrator protocol, the exploration nudge, the gate level and `/pi-orchestrator gate`, the worker limit and `/pi-orchestrator workers`, `subagents_verdict` and the commit reminder on unjudged edits. pi-orchestrator then starts no workers itself (see Install).
 - **Everything, for one run**: `pi --no-extensions`.
 - **Uninstall**: `pi remove git:github.com/egonm12/pi-orchestrator`.
 
@@ -581,9 +581,10 @@ The guard protects against accidental mistakes, not a determined agent. It refus
 
 ## Known limits
 
-- A worker started on a real model is not routed. A workflow's workers are routed only if the subagent extension starts them on `orchestrator/auto`.
+- A worker started on a real model is not routed.
+- Other subagent extensions are not supported (see Install).
 - The task allowance is per session ($5 by default), not shared between the orchestrator and background workers.
-- The built-in `subagents` tool runs its workers in the orchestrator's own process; it has no chains. Use another subagent extension for those. Its background workers end with the orchestrator's session.
+- The built-in `subagents` tool runs its workers in the orchestrator's own process; it has no chains. Its background workers end with the orchestrator's session.
 
 ## Development
 
