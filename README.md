@@ -17,7 +17,15 @@ The three extensions are independent. You can switch any one off without touchin
 pi install git:github.com/egonm12/pi-orchestrator
 ```
 
-## Set up
+## Set up the orchestrator
+
+The orchestrator is your own pi session: the one you type into. Workers it starts with the `subagents` tool run on `orchestrator/auto`, and the router picks their model. A fresh install has no tier map, no ban list and no approved providers, so until you set it up every worker runs on the orchestrator's session model. Each new session says what is missing:
+
+```text
+pi-orchestrator: not set up: no tier map (...), no approved recipients (...). Run /pi-orchestrator init.
+```
+
+### 1. Run `init`
 
 Run `/pi-orchestrator init` in an interactive session. It walks you through:
 
@@ -26,7 +34,44 @@ Run `/pi-orchestrator init` in an interactive session. It walks you through:
 3. **Tier map:** a starter map built from your installed models, in shadow mode. An existing map is rebuilt only when you confirm.
 4. **Providers:** which providers may receive task text.
 
-Running it again starts from your current values. Review the result in `~/.pi/agent/settings.json` and start a new session.
+Running it again starts from your current values. Escape at any step keeps what you had.
+
+### 2. Review the settings
+
+`init` writes to the `orchestrator` key in `~/.pi/agent/settings.json`:
+
+```json
+{
+  "orchestrator": {
+    "subagentBanList": ["opus"],
+    "sessionBanList": [],
+    "routing": {
+      "enabled": true,
+      "mode": "shadow",
+      "classifier": { "model": "anthropic/claude-haiku-4-5:off" },
+      "tiers": {
+        "mechanical": ["anthropic/claude-haiku-4-5:low"],
+        "standard": ["anthropic/claude-sonnet-4-5:medium"],
+        "elevated": ["anthropic/claude-sonnet-4-5:high"],
+        "critical": ["anthropic/claude-sonnet-4-5:xhigh"]
+      }
+    },
+    "subagents": { "gateLevel": "medium", "workerLimit": 4 }
+  }
+}
+```
+
+Each rung is `provider/model:effort`. Add `sessionBanList` entries if the orchestrator itself must never run on some models. A project's `.pi/settings.json` may replace single tiers, and `orchestrator.subagents` keys when you allow project overrides; it can never change either ban list.
+
+### 3. Start a new session
+
+The router and the guard read their settings at session start, so start a new session after `init` or any edit. Pick the orchestrator's model as usual: it does the planning, delegation and checking, so a capable model pays off. The session gets the orchestrator protocol in its system prompt and the `subagents`, `subagents_status`, `subagents_message` and `subagents_verdict` tools. Workers need no setup of their own.
+
+### 4. Switch routing to live
+
+A new tier map starts in `shadow` mode: the router classifies each worker and records which model it would have picked, but the worker still runs on the orchestrator's session model. Once the recorded choices look right, set `orchestrator.routing.mode` to `"live"` and start a new session. From then on workers run on the model the router picks.
+
+### Change settings in a session
 
 Use `/pi-orchestrator gate [off|low|medium|high|max]` to change the gate level for the current session, and `/pi-orchestrator workers [1-32]` to change how many workers run at once in the current session.
 
