@@ -488,7 +488,7 @@ test("a preserved agent model resumes without a second record and keeps its agen
     assert.equal((resumed.details as SubagentsDetails).results[0]!.status, "completed");
     const resumedRow = workerBoard().workers().at(-1)!;
     assert.equal(resumedRow.agent, "reviewer", "the resumed run reads its saved agent definition");
-    const plain = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as Theme;
+    const plain = { fg: (_color: string, text: string) => text, bold: (text: string) => text, bg: (_color: string, text: string) => text } as Theme;
     assert.match(compactLines({ rows: workerRows([resumedRow]), more: 0 }, Date.now(), plain, 200)[0]!, /^reviewer · haiku-4-5:medium · \d+s · completed$/);
     assert.equal(readRoutingRecords(join(h.stateDir, "routing")).filter((record) => record.recordType === "agent-model").length, 1);
     assert.ok(provider.requests[1]!.systemText.includes("Review carefully."));
@@ -511,7 +511,7 @@ test("a resumed named worker retains its saved label in the board and widget", a
     const row = workerBoard().workers().at(-1)!;
     assert.equal(row.agent, "scout");
     assert.equal(row.label, "research: budget code");
-    const plain = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as Theme;
+    const plain = { fg: (_color: string, text: string) => text, bold: (text: string) => text, bg: (_color: string, text: string) => text } as Theme;
     assert.match(widgetLines(widgetRows([row], Date.now()), undefined, Date.now(), plain, 200)[3]!, /^  ○ research: budget code   mechanical · haiku-4-5:low · \d+s · completed$/);
   } finally { h.cleanup(); }
 });
@@ -2787,7 +2787,7 @@ test("the orchestrator's session shows its workers in the widget below the edito
     const provider = scriptedAnthropic(delegatingScript);
     const subagents = loadSubagents(installedWithSubagents(provider.extension));
     const main = orchestrator(h);
-    const plain = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+    const plain = { fg: (_color: string, text: string) => text, bold: (text: string) => text, bg: (_color: string, text: string) => text };
     let component: { render(width: number): string[]; dispose?(): void } | undefined;
     const seen: string[][] = [];
     const snapshot = () => { if (component) seen.push(component.render(200).map((line) => line.trimEnd())); };
@@ -2827,7 +2827,7 @@ test("the orchestrator's session shows its workers in the widget below the edito
 /** Opens `workerId`'s transcript view on the process's board; `closed` settles when it is left. */
 function openView(workerId: string) {
   initTheme("dark");
-  const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as unknown as Theme;
+  const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text, bg: (_color: string, text: string) => text } as unknown as Theme;
   let component: { render(width: number): string[]; handleInput(data: string): void } | undefined;
   const ui = {
     custom: (async (factory: (...args: unknown[]) => unknown) => new Promise<void>((resolve) => {
@@ -2920,7 +2920,7 @@ test("x in the transcript view stops a nested worker alone: its parent hears it 
 /** ctx.ui.custom as pi mounts it, generalised over every opener: the picker,
  *  alt+a's focus overlay and the transcript view all reach it the same way. */
 function fakeCustomUI() {
-  const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as unknown as Theme;
+  const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text, bg: (_color: string, text: string) => text } as unknown as Theme;
   let mounted: { render(width: number): string[]; handleInput(data: string): void; dispose?(): void } | undefined;
   let opens = 0;
   const ui = {
@@ -3018,7 +3018,7 @@ test("alt+a or Down at the editor's end focuses the worker widget; selecting mai
     const provider = fakeAnthropic("done", (finish) => pending.push(finish));
     const subagents = loadSubagents([routerExtension(), provider.extension]);
     const main = orchestrator(h);
-    const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as unknown as Theme;
+    const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text, bg: (_color: string, text: string) => text } as unknown as Theme;
     let widget: { render(width: number): string[] } | undefined;
     const custom = fakeCustomUI();
     const inputs: ((data: string) => { consume?: boolean } | undefined)[] = [];

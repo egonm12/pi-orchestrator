@@ -3,15 +3,21 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { initTheme, SessionManager, type AgentSessionEvent, type Theme } from "@earendil-works/pi-coding-agent";
+import { initTheme, SessionManager, type AgentSessionEvent, type Theme, type ThemeBg } from "@earendil-works/pi-coding-agent";
 // pi's own keybindings manager, the one it hands a ctx.ui.custom factory. pi's
 // public entry exports only its type, so the test reaches into the package:
 // matching the real binding ids is what keeps the view from trapping the user.
 import { KeybindingsManager } from "../../node_modules/@earendil-works/pi-coding-agent/dist/core/keybindings.js";
+// pi's global theme, the one its tool boxes are painted with: the view's theme
+// below draws text plainly, but the tints of a tool box come from here.
+import { theme as paintTheme } from "../../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 import { WorkerBoard, type BoardWorker, type WorkerFeed, type WorkerSession } from "./worker-board.ts";
 import { LINGER_MS } from "./worker-widget.ts";
 import { openTranscript, TRANSCRIPT_OVERLAY, type TranscriptUI } from "./transcript-view.ts";
 import { formatCost, formatTokens } from "./transcript-header.ts";
+// pi-tui's main-screen renderer, the one regular tuiMode draws with. pi-tui exports only its type from the package root.
+import { TuiMainScreen } from "../../node_modules/@earendil-works/pi-tui/dist/tui-main-screen.js";
+import type { Terminal } from "@earendil-works/pi-tui";
 
 // The transcript view as xytd's ways in will open it: openTranscript on a real
 // worker board, through a fake ctx.ui.custom that mounts the overlay the way
@@ -22,7 +28,7 @@ import { formatCost, formatTokens } from "./transcript-header.ts";
 // without their escape codes, as the user sees them.
 
 initTheme("dark");
-const PLAIN = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as unknown as Theme;
+const PLAIN = { fg: (_color: string, text: string) => text, bold: (text: string) => text, bg: (color: ThemeBg, text: string) => paintTheme.bg(color, text) } as unknown as Theme;
 const WIDTH = 100;
 
 const KEY = {
@@ -830,6 +836,176 @@ test("in regular tuiMode the session picker stays live above the stats line and 
   assert.match(live().picker[0]!, /^  ○ main$/, "the picker remains visible on a nested worker");
   assert.match(live().picker[6]!, /^❯ ● └ nested 7/, "the viewed worker stays selected");
   assert.equal(view.text().at(-1), "←→ worker · x stop · ctrl+o tool output · Esc back");
+});
+
+/** A terminal of a fixed size that keeps what pi-tui writes to it. */
+class CapturingTerminal implements Terminal {
+  readonly written: string[] = [];
+  readonly columns: number;
+  readonly rows: number;
+
+  constructor(columns: number, rows: number) {
+    this.columns = columns;
+    this.rows = rows;
+  }
+
+  get kittyProtocolActive(): boolean { return false; }
+  start(): void {}
+  stop(): void {}
+  async drainInput(): Promise<void> {}
+  write(data: string): void { this.written.push(data); }
+  moveBy(): void {}
+  hideCursor(): void {}
+  showCursor(): void {}
+  clearLine(): void {}
+  clearFromCursor(): void {}
+  clearScreen(): void {}
+  setTitle(): void {}
+  setProgress(): void {}
+  setProgramStatus(): void {}
+}
+
+/** ctx.ui.custom in regular tuiMode on pi-tui's own main-screen renderer:
+ *  pi's root holds its chat, the view swaps it out (ADR 0009), and the overlay
+ *  pi mounts for the keys is the view's stub. `draw` renders the frame now and
+ *  returns what pi-tui wrote for it. */
+function renderedRegularUI(rows: number) {
+  const terminal = new CapturingTerminal(WIDTH, rows);
+  const tui = new TuiMainScreen(terminal, false);
+  tui.addChild({ render: () => ["chat line"], invalidate() {} } as never);
+  tui.addChild({ render: () => ["editor text"], invalidate() {} } as never);
+  let stub: { render(width: number): string[]; handleInput(data: string): void; invalidate(): void; dispose(): void } | undefined;
+  let handle: { hide(): void } | undefined;
+  const ui: TranscriptUI = {
+    custom: (async (factory: (...args: unknown[]) => unknown, options: { overlay?: boolean; overlayOptions?: unknown }) => {
+      assert.equal(options.overlay, true);
+      const layout = typeof options.overlayOptions === "function" ? options.overlayOptions() : options.overlayOptions;
+      return new Promise<unknown>((resolve) => {
+        stub = factory(tui, PLAIN, new KeybindingsManager(), (result: unknown) => {
+          stub?.dispose();
+          handle?.hide();
+          resolve(result);
+        }) as typeof stub;
+        handle = tui.showOverlay(stub!, layout as never);
+      });
+    }) as TranscriptUI["custom"],
+    getToolsExpanded: () => false,
+  };
+  return {
+    ui, tui, terminal,
+    press(...keys: string[]) { for (const key of keys) stub!.handleInput(key); },
+    draw(): string {
+      terminal.written.length = 0;
+      (tui as unknown as { doRender(): void }).doRender();
+      return terminal.written.join("");
+    },
+  };
+}
+
+// pi-tui reprints the whole terminal when a changed line sits above the bottom
+// `rows` lines. The live section and the running tool box are at the bottom of
+// the view, so a 24-row terminal is the height where ordinary output must stay put.
+test("regular tuiMode: ordinary live output never makes pi-tui reprint the terminal, so a scrolled-up transcript keeps its place", async () => {
+  const ROWS = 24;
+  const time = clock();
+  const board = new WorkerBoard({ now: time.now });
+  const history: Message[] = [user("Investigate the build")];
+  for (let round = 1; round <= 6; round++) {
+    history.push(reply(`Round ${round}.\n\n${"Checking one more file. ".repeat(8)}`, [{ id: `read-${round}`, name: "read", arguments: { path: `src/file-${round}.ts` } }]));
+    history.push(toolResult(`read-${round}`, "read", `export const value${round} = ${round};\n`.repeat(3)));
+  }
+  const { fake } = running(board, "Investigate the build", "worker-1", { agent: "researcher", background: true }, history);
+  const { steering } = fakeSteering();
+  const ticks: (() => void)[] = [];
+  const view = renderedRegularUI(ROWS);
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id, {
+    now: time.now, steering, setInterval: (tick) => { ticks.push(tick); return ticks.length; }, clearInterval: () => {},
+  });
+  await settle();
+  view.draw();
+
+  const reprints: string[] = [];
+  const step = (label: string, act: () => void) => {
+    act();
+    if (view.draw().includes("\x1b[2J")) reprints.push(label);
+  };
+  const long = `Looking at the build.\n\n${"More detail on the module. ".repeat(10)}`;
+  const output = (lines: number) => Array.from({ length: lines }, (_, index) => `PASS case ${index + 1}`).join("\n");
+  const bash = { id: "bash-1", name: "bash", arguments: { command: "npm test" } };
+  const lint = { id: "bash-2", name: "bash", arguments: { command: "npm run lint" } };
+  const readme = { id: "read-7", name: "read", arguments: { path: "README.md" } };
+  step("a turn starts", () => fake.emit({ type: "turn_start" }));
+  step("a reply starts streaming", () => fake.emit({ type: "message_start", message: reply("") }));
+  step("the reply streams its first words", () => fake.emit({ type: "message_update", message: reply("Looking at") }));
+  step("the reply streams more paragraphs", () => fake.emit({ type: "message_update", message: reply(long) }));
+  step("the reply is saved with a tool call", () => fake.add(reply(long, [bash])));
+  step("the tool starts", () => fake.emit({ type: "tool_execution_start", toolCallId: bash.id, toolName: "bash", args: bash.arguments }));
+  for (let lines = 1; lines <= 31; lines += 3) {
+    step(`the tool prints ${lines} lines`, () => fake.emit({ type: "tool_execution_update", toolCallId: bash.id, toolName: "bash", args: bash.arguments, partialResult: { content: [{ type: "text", text: output(lines) }] } }));
+  }
+  step("the tool ends", () => fake.emit({ type: "tool_execution_end", toolCallId: bash.id, toolName: "bash", result: { content: [{ type: "text", text: output(31) }] }, isError: false }));
+  step("its result is saved", () => fake.add(toolResult(bash.id, "bash", output(31))));
+  step("a reply calls two tools at once", () => fake.add(reply("Two checks at once", [lint, readme])));
+  step("the lint starts", () => fake.emit({ type: "tool_execution_start", toolCallId: lint.id, toolName: "bash", args: lint.arguments }));
+  step("the readme starts", () => fake.emit({ type: "tool_execution_start", toolCallId: readme.id, toolName: "read", args: readme.arguments }));
+  for (let lines = 1; lines <= 13; lines += 3) {
+    step(`the lint prints ${lines} lines`, () => fake.emit({ type: "tool_execution_update", toolCallId: lint.id, toolName: "bash", args: lint.arguments, partialResult: { content: [{ type: "text", text: output(lines) }] } }));
+  }
+  step("the readme ends first", () => fake.emit({ type: "tool_execution_end", toolCallId: readme.id, toolName: "read", result: { content: [{ type: "text", text: "# Readme" }] }, isError: false }));
+  step("the readme result is saved", () => fake.add(toolResult(readme.id, "read", "# Readme")));
+  step("the lint ends", () => fake.emit({ type: "tool_execution_end", toolCallId: lint.id, toolName: "bash", result: { content: [{ type: "text", text: output(13) }] }, isError: false }));
+  step("the lint result is saved", () => fake.add(toolResult(lint.id, "bash", output(13))));
+  step("the next reply streams", () => fake.emit({ type: "message_start", message: reply("") }));
+  step("the next reply streams its text", () => fake.emit({ type: "message_update", message: reply("Both checks are in.") }));
+  step("the next reply is saved", () => fake.add(reply("Both checks are in.")));
+  step("a timer tick redraws", () => ticks.at(-1)?.());
+  step("the orchestrator starts running", () => board.setOrchestratorState("running"));
+
+  assert.deepEqual(reprints, [], "pi-tui reprinted the terminal during these steps");
+  view.press(KEY.escape);
+  assert.equal(await shown, "back");
+  view.tui.stop();
+});
+
+test("regular tuiMode: a tool call that finishes with more output than the terminal shows does not reprint the terminal", async () => {
+  for (const rows of [24, 40]) {
+    const time = clock();
+    const board = new WorkerBoard({ now: time.now });
+    const history: Message[] = [user("Build the project")];
+    for (let round = 1; round <= 8; round++) {
+      history.push(reply(`Round ${round}.\n\n${"Checking one more file. ".repeat(8)}`, [{ id: `read-${round}`, name: "read", arguments: { path: `src/file-${round}.ts` } }]));
+      history.push(toolResult(`read-${round}`, "read", `export const value${round} = ${round};\n`.repeat(3)));
+    }
+    const { fake } = running(board, "Build the project", "worker-1", { agent: "builder", background: true }, history);
+    const { steering } = fakeSteering();
+    const view = renderedRegularUI(rows);
+    const shown = openTranscript(view.ui, board, board.workers()[0]!.id, {
+      now: time.now, steering, expanded: true, setInterval: () => 0, clearInterval: () => {},
+    });
+    await settle();
+    view.draw();
+
+    const reprints: string[] = [];
+    const step = (label: string, act: () => void) => {
+      act();
+      if (view.draw().includes("\x1b[2J")) reprints.push(label);
+    };
+    const log = (lines: number) => Array.from({ length: lines }, (_, index) => `build line ${index + 1}`).join("\n");
+    const build = { id: "bash-1", name: "bash", arguments: { command: "npm run build" } };
+    step("the build is called", () => fake.add(reply("Building", [build])));
+    step("the build starts", () => fake.emit({ type: "tool_execution_start", toolCallId: build.id, toolName: "bash", args: build.arguments }));
+    for (const lines of [5, 15, 30, 45, 60]) {
+      step(`the build prints ${lines} lines`, () => fake.emit({ type: "tool_execution_update", toolCallId: build.id, toolName: "bash", args: build.arguments, partialResult: { content: [{ type: "text", text: log(lines) }] } }));
+    }
+    step("the build ends", () => fake.emit({ type: "tool_execution_end", toolCallId: build.id, toolName: "bash", result: { content: [{ type: "text", text: log(60) }] }, isError: false }));
+    step("its result is saved", () => fake.add(toolResult(build.id, "bash", log(60))));
+    step("the next reply is saved", () => fake.add(reply("The build passed")));
+
+    assert.deepEqual(reprints, [], `rows ${rows}: pi-tui reprinted the terminal during these steps`);
+    view.press(KEY.escape);
+    assert.equal(await shown, "back");
+    view.tui.stop();
+  }
 });
 
 test("the header's token counts and cost read short, and a count never rounds up past its unit", () => {

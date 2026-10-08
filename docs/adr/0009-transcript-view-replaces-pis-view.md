@@ -16,7 +16,7 @@ Spike rcjm and ticket llnk made the transcript view a full-screen overlay (`ctx.
 ## Consequences
 
 - Opening, leaving and switching worker reprint the whole terminal. You land at the bottom, not at your earlier scroll position.
-- A change above the visible screen reprints everything, as pi's chat does.
+- A change above the visible screen reprints everything, as pi's chat does, and a scrolled-up user lands at the bottom. The transcript keeps every tool box in its pending tint, so a finished call changes only its last line (bean efd2). A running collapsed bash preview still shifts its lines, which reprints on terminals shorter than about 20 rows. Fullscreen tuiMode has no scrollback reprint and is the recommended mode for watching workers.
 - While the view is open, the orchestrator's output reaches only the swapped-out tree. It shows once the user leaves.
 - The scroll keys and "following" are gone.
 

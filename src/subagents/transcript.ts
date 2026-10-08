@@ -342,7 +342,7 @@ export class Transcript {
           this.#finished.add(call.id);
         }
       }
-      parts.push(component);
+      parts.push(steadyTool(component, this.#context.theme));
     }
     return parts;
   }
@@ -401,6 +401,33 @@ export class Transcript {
         return [];
     }
   }
+}
+
+/** pi paints a tool call's box by its state: pending, then done or failed.
+ *  The tint changes when the call completes, and that repaints every line of
+ *  the box. A changed line above the bottom of the terminal makes pi-tui reprint
+ *  the whole screen, and a scrolled-up transcript jumps to the bottom
+ *  (tui-main-screen.js, doRender). So the transcript keeps the pending tint in
+ *  every state: a finished call then changes only its last line, its elapsed time. */
+function steadyToolTint(theme: Theme): (line: string) => string {
+  const paint = (color: "toolPendingBg" | "toolSuccessBg" | "toolErrorBg"): string => {
+    const mark = "\u0000";
+    const painted = theme.bg(color, mark);
+    const at = painted.indexOf(mark);
+    return at < 0 ? "" : painted.slice(0, at);
+  };
+  const pending = paint("toolPendingBg");
+  if (pending === "") return (line) => line;
+  const others = [paint("toolSuccessBg"), paint("toolErrorBg")].filter((code) => code !== "" && code !== pending);
+  return (line) => others.reduce((text, code) => text.split(code).join(pending), line);
+}
+
+/** A tool call's box, drawn with the steady tint. */
+function steadyTool(component: ToolExecutionComponent, theme: Theme): Part {
+  return {
+    render: (width) => component.render(width).map(steadyToolTint(theme)),
+    setExpanded: (expanded) => component.setExpanded(expanded),
+  };
 }
 
 /** A component after an empty line, as pi's chat spaces summaries. */
