@@ -24,7 +24,7 @@ import { stateFolderEvidence, type EvidenceSetup, type RoutingEvidenceSource } f
 import { usageObservationsPath } from "./usage-observations.ts";
 import { isOrchestratorSession } from "../subagents/orchestrator-session.ts";
 import { publishOrchestratorRouter } from "./orchestrator-router.ts";
-import { effortJudgeConfigFromSettings, loadEffortJudgeChain, judgeEffort, type EffortJudgeModelCall } from "../routing/effort-judge.ts";
+import { effortJudgeConfigFromSettings, loadEffortJudgeChain, judgeEffort, type EffortBand, type EffortJudgeModelCall } from "../routing/effort-judge.ts";
 import { sessionEffortJudgeModelCall } from "../routing/session-effort-judge-call.ts";
 import type { SessionModelRegistry } from "../routing/model-stream.ts";
 import { sessionEffortBandFromSettings } from "../routing/session-effort.ts";
@@ -217,6 +217,15 @@ function latestPhysicalAnswer(branch: readonly unknown[]): string | undefined {
   return undefined;
 }
 
+/** An owner prompt waiting for its user message to be shown, the judge's input captured at `before_agent_start`. */
+interface PendingOwnerPrompt {
+  readonly sessionId: string;
+  readonly band: EffortBand;
+  readonly prompt: string;
+  readonly lastUserMessage: string;
+  readonly lastAssistantReply: string;
+}
+
 export function createRouterExtension(overrides: Partial<RouterDependencies> = {}) {
   const deps: RouterDependencies = { ...DEFAULT_DEPENDENCIES, ...overrides };
   return function router(pi: ExtensionAPI): void {
@@ -359,7 +368,12 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
       }
     });
 
-    pi.on("before_agent_start", async (event, ctx) => {
+    // The owner's prompt is judged once its user message is shown (message_end
+    // below), not here: the judge's call must not hold the message back, and
+    // the first request reads the level the judge chose.
+    let pendingPrompt: PendingOwnerPrompt | undefined;
+    pi.on("before_agent_start", (event, ctx) => {
+      pendingPrompt = undefined;
       if (!sessionBand || sessionEffortOff || !isOrchestratorSession(ctx)) return;
       const id = ctx.sessionManager?.getSessionId();
       const model = ctx.model;
@@ -386,22 +400,38 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
       const lastAssistant = assistantEntry?.type === "message" ? assistantEntry.message : undefined;
       const textOf = (value: unknown): string => typeof value === "string" ? value : Array.isArray(value)
         ? value.filter((part) => part.type === "text").map((part) => part.text ?? "").join("\n") : "";
-      const message = event.prompt;
-      const currentEffort = pi.getThinkingLevel();
-      let decision;
-      try {
-        decision = await judgeEffort({ message, kind: "user-prompt", tier: "orchestrator", band, currentEffort,
-          turnRunning: false, lastUserMessage: textOf(lastUser && "content" in lastUser ? lastUser.content : undefined).slice(0, 400),
-          lastAssistantReply: textOf(lastAssistant && "content" in lastAssistant ? lastAssistant.content : undefined).slice(-2_000) },
-        { chain: loadEffortJudgeChain(effortJudgeConfigFromSettings(effortPersonal), ctx.modelRegistry!.getAvailable().map(toModelInfo)),
-          callModel: deps.effortJudgeCall(ctx.modelRegistry!) });
-      } catch (error) {
-        decision = { from: currentEffort, to: band.max, applyAt: "now" as const,
-          reason: `effort judge fallback to band maximum: ${String(error)}`, judgeModel: "fallback" as const };
-      }
-      emitEffortDecision({ ...decision, timestamp: deps.now().toISOString(), band, sessionId: id, kind: "user-prompt", scope: "orchestrator" });
-      if (decision.applyAt === "now") selectEffort(decision.to);
+      pendingPrompt = {
+        sessionId: id, band, prompt: event.prompt,
+        lastUserMessage: textOf(lastUser && "content" in lastUser ? lastUser.content : undefined).slice(0, 400),
+        lastAssistantReply: textOf(lastAssistant && "content" in lastAssistant ? lastAssistant.content : undefined).slice(-2_000),
+      };
     });
+
+    /** Judges the pending owner prompt, once. Never throws: a failed judge
+     *  applies the band maximum, and any other failure only warns. */
+    const judgeOwnerPrompt = async (ctx: ExtensionContext) => {
+      const pending = pendingPrompt;
+      pendingPrompt = undefined;
+      if (pending === undefined) return;
+      try {
+        const { band, sessionId } = pending;
+        const currentEffort = pi.getThinkingLevel();
+        let decision;
+        try {
+          decision = await judgeEffort({ message: pending.prompt, kind: "user-prompt", tier: "orchestrator", band, currentEffort,
+            turnRunning: false, lastUserMessage: pending.lastUserMessage, lastAssistantReply: pending.lastAssistantReply },
+          { chain: loadEffortJudgeChain(effortJudgeConfigFromSettings(effortPersonal), ctx.modelRegistry!.getAvailable().map(toModelInfo)),
+            callModel: deps.effortJudgeCall(ctx.modelRegistry!) });
+        } catch (error) {
+          decision = { from: currentEffort, to: band.max, applyAt: "now" as const,
+            reason: `effort judge fallback to band maximum: ${String(error)}`, judgeModel: "fallback" as const };
+        }
+        emitEffortDecision({ ...decision, timestamp: deps.now().toISOString(), band, sessionId, kind: "user-prompt", scope: "orchestrator" });
+        if (decision.applyAt === "now") selectEffort(decision.to);
+      } catch (error) {
+        autoDeps.warn("session-effort-judge", `could not apply the effort judgement: ${String(error).split(/\r?\n/, 1)[0]}`);
+      }
+    };
 
     pi.on("session_shutdown", (_event, ctx) => {
       const id = ctx?.sessionManager?.getSessionId();
@@ -452,6 +482,9 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
     pi.on("message_end", async (event, ctx) => {
       rememberPhysicalAnswer(event.message, ctx);
       const message = event.message as { role?: string; stopReason?: string; errorMessage?: string; provider?: string };
+      // A queued steer or follow-up also shows a user message; only the pending
+      // owner prompt is judged, so the judgement is one-shot per prompt.
+      if (message.role === "user") { await judgeOwnerPrompt(ctx); return undefined; }
       if (message.role !== "assistant" || message.stopReason !== "error" || !isAutoModel(ctx.model)) return undefined;
       if (message.provider === undefined || message.provider === AUTO_PROVIDER) return undefined;
       await recordLimitError(autoDeps, message.provider, message.errorMessage);

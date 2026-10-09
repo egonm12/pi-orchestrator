@@ -79,6 +79,11 @@ const TEST_TIERS = {
 
 const NOW = new Date("2026-09-26T12:00:00.000Z");
 
+/** A user message as pi shows it: its text is the prompt the owner typed. */
+function userMessage(text: string) {
+  return { role: "user", content: text, timestamp: 0 };
+}
+
 function approved(...providers: string[]): RecipientAuthorization {
   let authorization = emptyAuthorization();
   for (const provider of providers) {
@@ -1362,6 +1367,7 @@ test("session effort judges an owner prompt and manual selection disables it", a
       modelRegistry: registry, thinkingLevel: "high", sessionManager: { getSessionId: () => "owner", getBranch: () => [] } } as unknown as ExtensionContext;
     await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
     await handlers.get("before_agent_start")?.({ type: "before_agent_start", prompt: "Fix the typo in the documentation" }, ctx);
+    await handlers.get("message_end")?.({ type: "message_end", message: userMessage("Fix the typo in the documentation") }, ctx);
     assert.deepEqual(selected, ["low"]);
     const effortRecord = h.records().find((record) => record.recordType === "effort-decision");
     assert.ok(effortRecord, "the orchestrator effort judgement is persisted");
@@ -1374,11 +1380,94 @@ test("session effort judges an owner prompt and manual selection disables it", a
     await handlers.get("thinking_level_select")?.({ type: "thinking_level_select", level: "low", previousLevel: "high" }, ctx);
     judged = "high";
     await handlers.get("before_agent_start")?.({ type: "before_agent_start", prompt: "Fix a difficult multi-file regression" }, ctx);
+    await handlers.get("message_end")?.({ type: "message_end", message: userMessage("Fix a difficult multi-file regression") }, ctx);
     assert.deepEqual(selected, ["low", "high"]);
     await handlers.get("thinking_level_select")?.({ type: "thinking_level_select", level: "high", previousLevel: "low" }, ctx);
     await handlers.get("thinking_level_select")?.({ type: "thinking_level_select", level: "medium", previousLevel: "high" }, ctx);
     await handlers.get("before_agent_start")?.({ type: "before_agent_start", prompt: "Fix the typo again" }, ctx);
+    await handlers.get("message_end")?.({ type: "message_end", message: userMessage("Fix the typo again") }, ctx);
     assert.deepEqual(selected, ["low", "high"]);
+  } finally { h.cleanup(); }
+});
+
+test("session effort judges the owner prompt once its message is shown, not before the run starts", async () => {
+  const h = harness({ enabled: false, sessionEffort: "low-high" });
+  try {
+    const handlers = piHandlers();
+    let level = "high";
+    let judgeCalls = 0;
+    const selected: string[] = [];
+    const create = await isolatedRouterExtension();
+    create({ effortJudgeCall: () => async () => { judgeCalls++; return JSON.stringify({ effort: "low", why: "chosen" }); } })({
+      registerVirtualModel() {},
+      on(event: string, handler: Handler) { handlers.on(event, handler); },
+      getThinkingLevel: () => level,
+      setThinkingLevel(next: string) { selected.push(next); level = next; },
+    } as unknown as ExtensionAPI);
+    const registry = fakeSessionRegistry([]);
+    const ctx = { cwd: h.projectDir, hasUI: false, model: registry.find("anthropic", "claude-opus-5-5"),
+      modelRegistry: registry, thinkingLevel: "high", sessionManager: { getSessionId: () => "shown-owner", getBranch: () => [] } } as unknown as ExtensionContext;
+    await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
+    await handlers.get("before_agent_start")?.({ type: "before_agent_start", prompt: "Fix the typo in the documentation" }, ctx);
+    assert.equal(judgeCalls, 0, "no judge call before the user message is shown");
+    assert.deepEqual(selected, []);
+    await handlers.get("message_end")?.({ type: "message_end", message: userMessage("Fix the typo in the documentation") }, ctx);
+    assert.equal(judgeCalls, 1);
+    assert.deepEqual(selected, ["low"]);
+    const effortRecord = h.records().find((record) => record.recordType === "effort-decision");
+    assert.equal(effortRecord?.kind, "user-prompt");
+    assert.equal(effortRecord?.to, "low");
+    // A steer is a user message too, but the prompt's judgement is one-shot.
+    await handlers.get("message_end")?.({ type: "message_end", message: userMessage("Also fix the readme") }, ctx);
+    assert.equal(judgeCalls, 1);
+    assert.deepEqual(selected, ["low"]);
+  } finally { h.cleanup(); }
+});
+
+test("a failed owner effort judge falls back to the band maximum once the message is shown, without throwing", async () => {
+  const h = harness({ enabled: false, sessionEffort: "low-high" });
+  try {
+    const handlers = piHandlers();
+    let level = "low";
+    const selected: string[] = [];
+    const create = await isolatedRouterExtension();
+    create({ effortJudgeCall: () => async () => { throw new Error("offline"); } })({
+      registerVirtualModel() {},
+      on(event: string, handler: Handler) { handlers.on(event, handler); },
+      getThinkingLevel: () => level,
+      setThinkingLevel(next: string) { selected.push(next); level = next; },
+    } as unknown as ExtensionAPI);
+    const registry = fakeSessionRegistry([]);
+    const ctx = { cwd: h.projectDir, hasUI: false, model: registry.find("anthropic", "claude-opus-5-5"),
+      modelRegistry: registry, thinkingLevel: "low", sessionManager: { getSessionId: () => "failed-owner", getBranch: () => [] } } as unknown as ExtensionContext;
+    await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
+    await handlers.get("before_agent_start")?.({ type: "before_agent_start", prompt: "Fix this multi-file regression" }, ctx);
+    await handlers.get("message_end")?.({ type: "message_end", message: userMessage("Fix this multi-file regression") }, ctx);
+    assert.deepEqual(selected, ["high"]);
+    const effortRecord = h.records().find((record) => record.recordType === "effort-decision");
+    assert.equal(effortRecord?.judgeModel, "fallback");
+    assert.equal(effortRecord?.reason, "effort judge fallback to band maximum: offline");
+  } finally { h.cleanup(); }
+});
+
+test("a level change that fails once the owner's message is shown warns and does not throw", async () => {
+  const h = harness({ enabled: false, sessionEffort: "low-high" });
+  try {
+    const handlers = piHandlers();
+    const create = await isolatedRouterExtension();
+    create({ effortJudgeCall: () => async () => JSON.stringify({ effort: "low", why: "chosen" }) })({
+      registerVirtualModel() {},
+      on(event: string, handler: Handler) { handlers.on(event, handler); },
+      getThinkingLevel: () => "high",
+      setThinkingLevel() { throw new Error("level rejected"); },
+    } as unknown as ExtensionAPI);
+    const registry = fakeSessionRegistry([]);
+    const ctx = { cwd: h.projectDir, hasUI: false, model: registry.find("anthropic", "claude-opus-5-5"),
+      modelRegistry: registry, thinkingLevel: "high", sessionManager: { getSessionId: () => "throwing-owner", getBranch: () => [] } } as unknown as ExtensionContext;
+    await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
+    await handlers.get("before_agent_start")?.({ type: "before_agent_start", prompt: "Fix the typo in the documentation" }, ctx);
+    const warning = await stderrOf(() => handlers.get("message_end")!({ type: "message_end", message: userMessage("Fix the typo in the documentation") }, ctx) as Promise<unknown>);
+    assert.match(warning, /could not apply the effort judgement: Error: level rejected/);
   } finally { h.cleanup(); }
 });
 
