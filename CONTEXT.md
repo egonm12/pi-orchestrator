@@ -112,7 +112,7 @@ One of four levels of care a task demands: mechanical, standard, elevated or cri
 _Avoid_: Complexity level, SIMPLE/MEDIUM/COMPLEX/REASONING
 
 **Rung**:
-One model at one effort level, written `provider/model:effort`. The unit the router chooses. In pi's terms, a rung names a physical model and its thinking level.
+One model at one effort level, written `provider/model:effort`. The unit the router chooses. In pi's terms, a rung names a physical model and its thinking level. A rung written with an effort band instead of one effort, `provider/model:low-high`, or with no effort at all, is a dynamic rung: its effort is chosen per turn.
 _Avoid_: Model (alone), deployment
 
 **Tier map**:
@@ -127,8 +127,18 @@ _Avoid_: Model list, pool
 How much thinking a model is allowed per turn, as pi's levels off through max.
 _Avoid_: Reasoning effort, thinking budget
 
+**Effort band**:
+The range a dynamic rung's effort may move within, written `low-high`, both ends included. A rung with no effort has the model's full supported range as its band. Only a model whose effort can change without restarting the prompt cache, measured rather than taken from documentation, may have a dynamic rung.
+
+**Dynamic effort**:
+Choosing a dynamic rung's effort anew for each turn, inside its effort band, while the model stays pinned. Applies to workers and the orchestrator alike. A rung with one effort keeps that effort pinned.
+
+**Effort judge**:
+The step that picks a dynamic rung's effort. It judges every incoming message (a user prompt, a task, a steer, a follow-up, retry feedback) before that turn starts, never between tool calls. A short follow-up keeps the current effort without a judgement. A higher effort applies at once; a lower one waits until the running turn ends. When the judge fails, the turn runs at the top of the band. Distinct from the classifier, which assigns a tier once per delegation.
+_Avoid_: Classifier (for this step), effort router
+
 **Effort ladder**:
-Bounded recovery's retry order after a changes-requested review: one supported effort step on the same model, then the next surviving listed rung in the same tier, then the first survivor in higher tiers. Every candidate passes the router's hard filters. Max requires an explicit listing for that model. Each admitted climb links its decision record to the failed attempt, and recovery limits still stop the sequence.
+Bounded recovery's retry order after a changes-requested review: one supported effort step on the same model (on a dynamic rung, the band's floor rises one step; once the floor reaches the top, the climb moves on), then the next surviving listed rung in the same tier, then the first survivor in higher tiers. Every candidate passes the router's hard filters. Max requires an explicit listing for that model. Each admitted climb links its decision record to the failed attempt, and recovery limits still stop the sequence.
 _Avoid_: Reclassification, suitability-score escalation
 
 **Unplaced climb**:
