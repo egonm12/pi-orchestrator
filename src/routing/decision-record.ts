@@ -39,7 +39,7 @@
 // `floorTier`, `floorSignals`) and the model's own tier (`modelTier`) in their
 // classification. New records carry neither; readers accept both.
 
-import { appendFileSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { RISK_TIERS, type RiskTier } from "./tiers.ts";
 import type { HopOutcome, TierClassification } from "./tier-classifier.ts";
@@ -1146,11 +1146,25 @@ export function writeDecisionRecord(dir: string, input: DecisionRecordInput): Wr
 export interface RecordFolderReader {
   readonly readdir: (dir: string) => readonly string[];
   readonly readFile: (path: string) => string;
+  /** A reader that can stat a day file lets the walk reuse its parse while
+   *  the stat is unchanged (`RecordFileStat`). Without it every read parses. */
+  readonly stat?: (path: string) => RecordFileStat;
+}
+
+/** What says a day file is unchanged since it was parsed. */
+export interface RecordFileStat {
+  readonly size: number;
+  readonly mtimeMs: number;
+  readonly ino: number;
 }
 
 export const NODE_RECORD_FOLDER_READER: RecordFolderReader = {
   readdir: (dir) => readdirSync(dir),
   readFile: (path) => readFileSync(path, "utf8"),
+  stat: (path) => {
+    const { size, mtimeMs, ino } = statSync(path);
+    return { size, mtimeMs, ino };
+  },
 };
 
 export interface RoutingRecordEntry {
@@ -1168,6 +1182,87 @@ export interface SkippedRoutingRecordLine {
   readonly error: RoutingRecordError;
 }
 
+/** One parsed line of a day file: a valid record or a skipped line. */
+type ParsedRecordLine = RoutingRecordEntry | SkippedRoutingRecordLine;
+
+/** A day file's parse, kept while its stat is unchanged. */
+interface ParsedRecordFile {
+  readonly stat: RecordFileStat;
+  readonly text: string;
+  /** Lines `text` holds, counting a last line with no newline. */
+  readonly lineCount: number;
+  readonly lines: readonly ParsedRecordLine[];
+}
+
+/** Parsed day files by path. Each pi process reads the shared folder on every
+ *  routed first request, turn end and gated result; a day file only grows, so
+ *  a read reparses only what changed (pi-orchestrator-gwp1). Cached records
+ *  are deep-frozen: every reader shares them. */
+const parsedRecordFiles = new Map<string, ParsedRecordFile>();
+
+function deepFreeze<T>(value: T): T {
+  if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) deepFreeze(child);
+  }
+  return value;
+}
+
+/** Parse `text`'s lines, numbering the first `firstLine`. Blank lines are
+ *  dropped; a line that is not a valid record is kept as skipped. */
+function parseRecordLines(file: string, text: string, firstLine: number): ParsedRecordLine[] {
+  const parsedLines: ParsedRecordLine[] = [];
+  text.split("\n").forEach((lineText, index) => {
+    if (lineText.trim().length === 0) return;
+    const line = firstLine + index;
+    const location = `${file}:${line}`;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(lineText);
+    } catch (error) {
+      parsedLines.push({ file, line, text: lineText, error: new RoutingRecordError("(record)", `is not valid JSON (${(error as Error).message})`, location) });
+      return;
+    }
+    try {
+      parsedLines.push(Object.freeze({ file, line, record: deepFreeze(validateRoutingRecord(parsed)) }));
+    } catch (error) {
+      if (!(error instanceof RoutingRecordError)) throw error;
+      parsedLines.push({ file, line, text: lineText, error: new RoutingRecordError(error.field, error.problem, location) });
+    }
+  });
+  return parsedLines;
+}
+
+function sameStat(a: RecordFileStat, b: RecordFileStat): boolean {
+  return a.size === b.size && a.mtimeMs === b.mtimeMs && a.ino === b.ino;
+}
+
+/** A day file's parsed lines. With `reader.stat`, an unchanged stat reuses the
+ *  last parse without reading; a file that kept its old text whole up to a
+ *  newline and grew parses only the appended tail; anything else reparses. */
+function parsedRecordFile(path: string, file: string, reader: RecordFolderReader): readonly ParsedRecordLine[] {
+  if (reader.stat === undefined) return parseRecordLines(file, reader.readFile(path), 1);
+  const stat = reader.stat(path);
+  const cached = parsedRecordFiles.get(path);
+  if (cached !== undefined && sameStat(cached.stat, stat)) return cached.lines;
+  const text = reader.readFile(path);
+  let next: ParsedRecordFile;
+  if (cached !== undefined && cached.stat.ino === stat.ino && text.length > cached.text.length &&
+    cached.text.endsWith("\n") && text.startsWith(cached.text)) {
+    // The cached text ends in a newline, so its last counted line is empty and
+    // the tail starts on it.
+    const tail = text.slice(cached.text.length);
+    next = {
+      stat, text, lineCount: cached.lineCount - 1 + tail.split("\n").length,
+      lines: [...cached.lines, ...parseRecordLines(file, tail, cached.lineCount)],
+    };
+  } else {
+    next = { stat, text, lineCount: text.split("\n").length, lines: parseRecordLines(file, text, 1) };
+  }
+  parsedRecordFiles.set(path, next);
+  return next.lines;
+}
+
 /** Each record in the folder's day files, oldest file first, in file order,
  *  and each invalid line handed to `invalid`. */
 function walkRecordFolder(dir: string, reader: RecordFolderReader, invalid: (skipped: SkippedRoutingRecordLine) => void): RoutingRecordEntry[] {
@@ -1180,25 +1275,10 @@ function walkRecordFolder(dir: string, reader: RecordFolderReader, invalid: (ski
   }
   const entries: RoutingRecordEntry[] = [];
   for (const file of names.filter((name) => DAY_FILE.test(name)).sort()) {
-    const lines = reader.readFile(join(dir, file)).split("\n");
-    lines.forEach((text, index) => {
-      if (text.trim().length === 0) return;
-      const line = index + 1;
-      const location = `${file}:${line}`;
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(text);
-      } catch (error) {
-        invalid({ file, line, text, error: new RoutingRecordError("(record)", `is not valid JSON (${(error as Error).message})`, location) });
-        return;
-      }
-      try {
-        entries.push({ file, line, record: validateRoutingRecord(parsed) });
-      } catch (error) {
-        if (!(error instanceof RoutingRecordError)) throw error;
-        invalid({ file, line, text, error: new RoutingRecordError(error.field, error.problem, location) });
-      }
-    });
+    for (const parsed of parsedRecordFile(join(dir, file), file, reader)) {
+      if ("record" in parsed) entries.push(parsed);
+      else invalid(parsed);
+    }
   }
   return entries;
 }

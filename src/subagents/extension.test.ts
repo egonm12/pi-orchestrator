@@ -5086,6 +5086,231 @@ test("subagents_verdict refuses an unknown or non-editing delegation, a running 
   } finally { h.cleanup(); }
 });
 
+// A list of verdicts (`verdicts`): each entry is judged and recorded in turn, as a call of its own would be.
+
+/** One finished editing worker per path, each writing its own file; their delegation ids, in order. */
+async function editingWorkers(subagents: LoadedSubagents, ctx: ExtensionContext, paths: readonly string[]): Promise<string[]> {
+  const ids: string[] = [];
+  for (const path of paths) {
+    const { worker } = await callSubagents(subagents.tool(), ctx, runTask("write", { path, content: "x\n" }));
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    ids.push(worker.sessionId!);
+  }
+  return ids;
+}
+
+const verdictRecords = (h: Harness) => readRoutingRecords(join(h.stateDir, "routing")).flatMap((record) => record.recordType === "verdict" ? [record] : []);
+
+test("subagents_verdict takes its fields at the top level or as a list of verdicts, never both, and checks the form before judging any entry", async () => {
+  const h = routedHarness();
+  try {
+    const provider = scriptedAnthropic(runningScript);
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    const [id] = await editingWorkers(subagents, main.ctx, ["notes.md"]) as [string];
+    const entry = { delegationId: id, verdict: "accept", reason: "checked notes.md:1" };
+    const both = "subagents_verdict: give either delegationId, verdict and reason for one delegation, or verdicts for several, not both";
+    const notList = "subagents_verdict: verdicts, when given, is a list of one or more verdicts, each with a delegationId, a verdict and a reason";
+    assert.equal(await refusal(subagents, main.ctx, { ...entry, verdicts: [entry] }), both);
+    assert.equal(await refusal(subagents, main.ctx, { verdicts: [entry], reviewer: id }), both);
+    assert.equal(await refusal(subagents, main.ctx, { verdicts: [] }), notList);
+    assert.equal(await refusal(subagents, main.ctx, { verdicts: entry }), notList);
+    assert.equal(await refusal(subagents, main.ctx, { verdicts: null }), notList);
+    assert.equal(await refusal(subagents, main.ctx, {}), "subagents_verdict requires a delegationId, a verdict of accept or request_changes, and a reason");
+    assert.deepEqual(verdictRecords(h), [], "a refused form records nothing");
+    const tool = subagents.tool("subagents_verdict");
+    const schema = tool.parameters as unknown as { properties: Record<string, { items?: { required?: string[] } }>; required?: string[] };
+    assert.equal(schema.required, undefined, "no top-level field is required, as either form may omit them");
+    assert.deepEqual(Object.keys(schema.properties), ["delegationId", "verdict", "reason", "reviewer", "gateLevel", "gateLevelReason", "verdicts"]);
+    assert.deepEqual(schema.properties.verdicts?.items?.required, ["delegationId", "verdict", "reason"]);
+    assert.match(tool.description, /Several verdicts can go in one call as `verdicts`/);
+  } finally { h.cleanup(); }
+});
+
+test("a list of verdicts records each entry with its own reason, and replies with one numbered line per entry, each the line a call for that entry gives", async () => {
+  const h = routedHarness();
+  try {
+    const provider = scriptedAnthropic(runningScript);
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    const [a, b, c] = await editingWorkers(subagents, main.ctx, ["a.md", "b.md", "c.md"]) as [string, string, string];
+    const text = await recordVerdict(subagents, main.ctx, { verdicts: [
+      { delegationId: a, verdict: "accept", reason: "checked a.md" },
+      { delegationId: b, verdict: "accept", reason: "checked b.md:1" },
+      { delegationId: c, verdict: "request_changes", reason: "c.md lacks a heading" },
+    ] });
+    assert.equal(text, [
+      `1. Recorded accept on delegation ${a}.`,
+      `2. Recorded accept on delegation ${b}.`,
+      `3. Recorded request_changes on delegation ${c}. The effort ladder cannot place it: routing is off, so no tier map is loaded to climb. ` +
+        `A retry runs on the session model, climb 1 of 2. To retry, start a subagents item whose retry is ${c} and whose task is your feedback.`,
+    ].join("\n"));
+    assert.deepEqual(verdictRecords(h).map((record) => [record.delegationId, record.verdict, record.reason]),
+      [[a, "accept", "checked a.md"], [b, "accept", "checked b.md:1"], [c, "request_changes", "c.md lacks a heading"]]);
+    assert.deepEqual(buildRoutingReport(join(h.stateDir, "routing")).totals.verdicts, { accept: 2, request_changes: 1 });
+  } finally { h.cleanup(); }
+});
+
+test("a refused entry does not stop the others: each refusal reads as the call for that entry alone gives it, and only the accepted entries are recorded", async () => {
+  const h = routedHarness();
+  try {
+    const provider = scriptedAnthropic(runningScript, (request) => request.task === "Hold on");
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    const [a, b] = await editingWorkers(subagents, main.ctx, ["a.md", "b.md"]) as [string, string];
+    const research = (await callSubagents(subagents.tool(), main.ctx, "Look around")).worker.sessionId!;
+    const unknown = "0b7c7a5e-0000-4000-8000-000000000000";
+    const stop = new AbortController();
+    const held = subagents.tool().execute("call-hold", { items: [{ task: "Hold on" }], background: false } as never, stop.signal, undefined, main.ctx);
+    await waitFor(() => provider.requests.some((request) => request.task === "Hold on"), "the held worker's first request");
+    const running = provider.requests.find((request) => request.task === "Hold on")!.sessionId!;
+    try {
+      const text = await recordVerdict(subagents, main.ctx, { verdicts: [
+        { delegationId: a, verdict: "accept", reason: "checked" },
+        { delegationId: unknown, verdict: "accept", reason: "checked" },
+        { delegationId: research, verdict: "accept", reason: "checked" },
+        { delegationId: running, verdict: "accept", reason: "checked" },
+        { delegationId: b, verdict: "request_changes", reason: "no heading" },
+      ] });
+      assert.equal(text, [
+        `1. Recorded accept on delegation ${a}.`,
+        `2. subagents_verdict: unknown delegation id ${unknown}`,
+        `3. subagents_verdict: delegation ${research} did not edit; a research Result is checked but gets no verdict`,
+        `4. subagents_verdict: delegation ${running} is still running; judge its Result once it has finished`,
+        `5. Recorded request_changes on delegation ${b}. The effort ladder cannot place it: routing is off, so no tier map is loaded to climb. ` +
+          `A retry runs on the session model, climb 1 of 2. To retry, start a subagents item whose retry is ${b} and whose task is your feedback.`,
+      ].join("\n"));
+      assert.deepEqual(verdictRecords(h).map((record) => record.delegationId), [a, b], "only the accepted entries are recorded");
+    } finally {
+      stop.abort();
+      await held;
+    }
+  } finally { h.cleanup(); }
+});
+
+test("a list whose entries are all refused fails with the numbered refusals, and records nothing", async () => {
+  const h = routedHarness();
+  try {
+    const provider = scriptedAnthropic(runningScript);
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    const research = (await callSubagents(subagents.tool(), main.ctx, "Look around")).worker.sessionId!;
+    const unknown = "0b7c7a5e-0000-4000-8000-000000000000";
+    assert.equal(await refusal(subagents, main.ctx, { verdicts: [
+      { delegationId: unknown, verdict: "accept", reason: "checked" },
+      { delegationId: research, verdict: "accept", reason: "checked" },
+    ] }), [
+      `1. subagents_verdict: unknown delegation id ${unknown}`,
+      `2. subagents_verdict: delegation ${research} did not edit; a research Result is checked but gets no verdict`,
+    ].join("\n"));
+    assert.equal(readRoutingRecords(join(h.stateDir, "routing")).some((record) => record.recordType === "verdict" || record.recordType === "orphaned-verdict"), false,
+      "a refused list records nothing");
+  } finally { h.cleanup(); }
+});
+
+test("each entry keeps its own gate level raise: a raise without its reason, and a raise that does not raise, are refused alone", async () => {
+  const h = routedHarness();
+  try {
+    const provider = scriptedAnthropic(runningScript);
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    const [a, b, c, d] = await editingWorkers(subagents, main.ctx, ["a.md", "b.md", "c.md", "d.md"]) as [string, string, string, string];
+    const text = await recordVerdict(subagents, main.ctx, { verdicts: [
+      { delegationId: a, verdict: "accept", reason: "checked", gateLevel: "high", gateLevelReason: "the user asked for care" },
+      { delegationId: b, verdict: "accept", reason: "checked", gateLevel: "high" },
+      { delegationId: c, verdict: "accept", reason: "checked", gateLevel: "medium", gateLevelReason: "as it is" },
+      { delegationId: d, verdict: "accept", reason: "checked" },
+    ] });
+    assert.equal(text, [
+      `1. Recorded accept on delegation ${a}, with its gate level raised from medium to high.`,
+      "2. subagents_verdict: a raised gateLevel needs a gateLevelReason saying why, and a gateLevelReason needs a gateLevel",
+      "3. subagents_verdict: the gate level is medium, and a verdict may only raise it for its delegation, never lower it: name high or max, or leave gateLevel out",
+      `4. Recorded accept on delegation ${d}.`,
+    ].join("\n"));
+    assert.deepEqual(verdictRecords(h).map((record) => [record.delegationId, record.gateLevelRaise]),
+      [[a, { from: "medium", to: "high", reason: "the user asked for care" }], [d, undefined]]);
+  } finally { h.cleanup(); }
+});
+
+test("a malformed entry is refused alone, with the reason a call for it alone gives, and the entries around it are still recorded", async () => {
+  const h = routedHarness();
+  try {
+    const provider = scriptedAnthropic(runningScript);
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    const [a, b] = await editingWorkers(subagents, main.ctx, ["a.md", "b.md"]) as [string, string];
+    const usage = "subagents_verdict requires a delegationId, a verdict of accept or request_changes, and a reason";
+    const text = await recordVerdict(subagents, main.ctx, { verdicts: [
+      { delegationId: a, verdict: "accept", reason: "checked a.md" },
+      { delegationId: b, verdict: "maybe", reason: "checked" },
+      { delegationId: b, verdict: "accept", reason: "  " },
+      { delegationId: b, verdict: "accept", reason: "checked b.md" },
+    ] });
+    assert.equal(text, [`1. Recorded accept on delegation ${a}.`, `2. ${usage}`, `3. ${usage}`, `4. Recorded accept on delegation ${b}.`].join("\n"));
+    assert.deepEqual(verdictRecords(h).map((record) => record.delegationId), [a, b]);
+  } finally { h.cleanup(); }
+});
+
+test("a list that names one delegation twice judges the entries in turn, so the later verdict replaces the earlier one as two calls would", async () => {
+  const h = routedHarness();
+  try {
+    const provider = scriptedAnthropic(runningScript);
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    const [a] = await editingWorkers(subagents, main.ctx, ["a.md"]) as [string];
+    const text = await recordVerdict(subagents, main.ctx, { verdicts: [
+      { delegationId: a, verdict: "accept", reason: "checked" },
+      { delegationId: a, verdict: "request_changes", reason: "lacks a heading" },
+    ] });
+    assert.equal(text, [
+      `1. Recorded accept on delegation ${a}.`,
+      `2. Recorded request_changes on delegation ${a}. It replaces the earlier accept. The effort ladder cannot place it: routing is off, so no tier map is loaded to climb. ` +
+        `A retry runs on the session model, climb 1 of 2. To retry, start a subagents item whose retry is ${a} and whose task is your feedback.`,
+    ].join("\n"));
+    assert.deepEqual(buildRoutingReport(join(h.stateDir, "routing")).totals.verdicts, { accept: 0, request_changes: 1 }, "the later verdict counts");
+  } finally { h.cleanup(); }
+});
+
+test("a list's entries share one note on the routing record lines this session cannot read, given once after the last entry", async () => {
+  const h = routedHarness();
+  try {
+    const provider = scriptedAnthropic(runningScript);
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    const [a, b] = await editingWorkers(subagents, main.ctx, ["a.md", "b.md"]) as [string, string];
+    // A torn line in a's day file: every entry reads it, and the reply names it once.
+    const recordDir = join(h.stateDir, "routing");
+    const day = `${readRoutingRecords(recordDir).find((record) => record.delegationId === a)!.timestamp.slice(0, 10)}.jsonl`;
+    appendFileSync(join(recordDir, day), '{"recordType":"fail\n');
+    const line = readFileSync(join(recordDir, day), "utf8").trimEnd().split("\n").length;
+    const text = await recordVerdict(subagents, main.ctx, { verdicts: [
+      { delegationId: a, verdict: "accept", reason: "checked a.md" },
+      { delegationId: b, verdict: "accept", reason: "checked b.md" },
+    ] });
+    assert.equal(text, [
+      `1. Recorded accept on delegation ${a}.`,
+      `2. Recorded accept on delegation ${b}.`,
+      `Skipped 1 routing record line of other delegations that this session cannot read (${day}:${line}); /reload may be needed.`,
+    ].join("\n"));
+  } finally { h.cleanup(); }
+});
+
+test("at gate level off a list is refused entry by entry, and records nothing", async () => {
+  const h = routedHarness({ orchestrator: { routing: ROUTING, subagents: { gateLevel: "off" } } });
+  try {
+    const provider = scriptedAnthropic(runningScript);
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const main = orchestrator(h);
+    const [a, b] = await editingWorkers(subagents, main.ctx, ["a.md", "b.md"]) as [string, string];
+    const off = "the gate level is off, so there is no quality gate and no verdict to record";
+    assert.equal(await refusal(subagents, main.ctx, { verdicts: [
+      { delegationId: a, verdict: "accept", reason: "checked" },
+      { delegationId: b, verdict: "accept", reason: "checked" },
+    ] }), `1. subagents_verdict: ${off}\n2. subagents_verdict: ${off}`);
+    assert.deepEqual(verdictRecords(h), []);
+  } finally { h.cleanup(); }
+});
+
 test("a worker's own worker's edits count for the delegation that started it, which alone takes the verdict", async () => {
   const h = routedHarness();
   try {

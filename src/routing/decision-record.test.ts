@@ -29,7 +29,9 @@ import {
   readRoutingRecordsJudging,
   readUsableRoutingRecordEntries,
   readUsableRoutingRecords,
+  NODE_RECORD_FOLDER_READER,
   RoutingRecordError,
+  type RecordFolderReader,
   TASK_TEXT_PREFIX_LIMIT,
   UnreadableDelegationRecordError,
   validateRoutingRecord,
@@ -934,4 +936,39 @@ test("an auth token in a settings key next to orchestrator never appears in any 
   } finally {
     cleanup();
   }
+});
+
+test("a day file is parsed once while its stat is unchanged, an appended tail parses alone, and a rewrite reparses", () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    const reads: string[] = [];
+    const reader: RecordFolderReader = { ...NODE_RECORD_FOLDER_READER, readFile: (path) => { reads.push(path); return NODE_RECORD_FOLDER_READER.readFile(path); } };
+    const model = (delegationId: string) => buildAgentModelRecord({
+      delegationId, at: NOW, agent: "reviewer", definitionFile: "/owner/agents/reviewer.md", model: "anthropic/claude-haiku-4-5", effort: "high",
+    });
+    const path = appendRoutingRecord(dir, model("w-1"));
+    appendFileSync(path, "{torn\n");
+    const first = readUsableRoutingRecordEntries(dir, reader);
+    const again = readUsableRoutingRecordEntries(dir, reader);
+    assert.equal(reads.length, 1, "an unchanged stat reads the file once");
+    assert.deepEqual(again, first);
+    assert.equal(Object.isFrozen(first.entries[0]!.record), true, "cached records are shared, so frozen");
+    assert.deepEqual(first.skipped.map((line) => line.line), [2]);
+
+    appendRoutingRecord(dir, model("w-2"));
+    const grown = readUsableRoutingRecordEntries(dir, reader);
+    assert.equal(reads.length, 2);
+    assert.deepEqual(grown.entries.map((entry) => [entry.record.delegationId, entry.line]), [["w-1", 1], ["w-2", 3]]);
+    assert.deepEqual(grown.skipped.map((line) => line.line), [2], "the tail keeps file line numbers");
+    assert.throws(() => readRoutingRecords(dir, reader), /:2/, "the strict reader still names the cached bad line");
+
+    writeFileSync(path, `${JSON.stringify(model("w-3"))}\n${JSON.stringify(model("w-4"))}\n${JSON.stringify(model("w-5"))}\n`);
+    assert.deepEqual(readUsableRoutingRecords(dir, reader).map((record) => record.delegationId), ["w-3", "w-4", "w-5"], "a rewrite reparses");
+
+    const plain: RecordFolderReader = { readdir: reader.readdir, readFile: reader.readFile };
+    const before = reads.length;
+    readUsableRoutingRecords(dir, plain);
+    readUsableRoutingRecords(dir, plain);
+    assert.equal(reads.length, before + 2, "a reader without stat parses every time");
+  } finally { cleanup(); }
 });

@@ -323,6 +323,31 @@ test("subagents_verdict refuses a self-judged verdict on an elevated or critical
   } finally { h.cleanup(); }
 });
 
+test("a list of verdicts holds each entry to its own reviewer: at max a mechanical entry needs a reviewer of its own, and a reviewer of another delegation is refused alone", async () => {
+  const h = harness({ routing: ROUTING, subagents: { gateLevel: "max" } });
+  try {
+    const provider = anthropic();
+    const tools = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h);
+    const a = (await one(tools, ctx, { task: `[mechanical] ${runTask("write", { path: "a.md", content: "x\n" })}` })).sessionId!;
+    const b = (await one(tools, ctx, { task: `[mechanical] ${runTask("write", { path: "b.md", content: "x\n" })}` })).sessionId!;
+    const reviewer = await one(tools, ctx, { task: "Check a.md", review: a });
+    assert.equal(reviewer.status, "completed", JSON.stringify(reviewer));
+    assert.equal(await verdict(tools, ctx, { verdicts: [
+      { delegationId: a, verdict: "accept", reason: "checked", reviewer: reviewer.sessionId },
+      { delegationId: b, verdict: "accept", reason: "checked" },
+      { delegationId: b, verdict: "accept", reason: "checked", reviewer: reviewer.sessionId },
+    ] }), [
+      `1. Recorded accept on delegation ${a}, reviewed by delegation ${reviewer.sessionId}.`,
+      `2. subagents_verdict: delegation ${b} is mechanical and needs an independent reviewer at the max gate level: ` +
+        `start one with a subagents item whose review is ${b}, judge its Result, then name it here as reviewer`,
+      `3. subagents_verdict: reviewer ${reviewer.sessionId} reviewed delegation ${a}, not ${b}`,
+    ].join("\n"));
+    const verdicted = readRoutingRecords(join(h.stateDir, "routing")).flatMap((record) => record.recordType === "verdict" ? [record.delegationId] : []);
+    assert.deepEqual(verdicted, [a], "only the entry with its own reviewer is recorded");
+  } finally { h.cleanup(); }
+});
+
 test("a review started before the delegation's latest edit, or one that failed, does not count", async () => {
   const h = harness();
   try {

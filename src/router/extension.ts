@@ -1,7 +1,7 @@
 import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { toModelInfo, splitKnownThinkingSuffix, type ModelInfo } from "../models/model-info.ts";
-import { AUTO_MODEL_ID, AUTO_MODEL_THINKING_LEVELS, AUTO_PROVIDER, createAutoModelRouter, isAutoModel, isVirtualModel, recordLimitError, recordQuotaHeaders,
+import { agentRoleOf, AUTO_MODEL_ID, AUTO_MODEL_THINKING_LEVELS, AUTO_PROVIDER, createAutoModelRouter, isAutoModel, isVirtualModel, recordLimitError, recordQuotaHeaders,
   SESSION_MODEL_ENV, SESSION_VIRTUAL_MODEL_ENV, type AutoModelDependencies, type AutoModelState } from "./auto-model.ts";
 import { autoModelLimits, type AutoModelLimits } from "./auto-model-limits.ts";
 import { refuseAutoModelForMainThread } from "./main-thread.ts";
@@ -281,9 +281,19 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
         if (active) registerAutoModel(autoModelLimits(active.tierMap, active.installedModels));
         if (probe && active) process.stderr.write(`${ROUTER_PREFIX} routing enabled, mode ${active.mode}, records ${active.recordDir}\n`);
       } catch (error) { disable(error); }
+      // A newly routed worker's classification starts now, while the rest of
+      // its startup runs (MCP servers connecting), not at its first request.
+      const workerId = ctx.sessionManager?.getSessionId();
+      if (workerId !== undefined && !disabled && isAutoModel(ctx.model)) {
+        let systemPrompt = "";
+        try { systemPrompt = ctx.getSystemPrompt?.() ?? ""; } catch { /* The first request classifies again if the role differs. */ }
+        autoModel.classifyEarly(workerId, agentRoleOf(systemPrompt));
+      }
     });
 
-    pi.on("session_shutdown", () => {
+    pi.on("session_shutdown", (_event, ctx) => {
+      const id = ctx?.sessionManager?.getSessionId();
+      if (id !== undefined) autoModel.dropEarlyClassification(id);
       if (orchestratorSessionId !== undefined) publishOrchestratorRouter(orchestratorSessionId, undefined);
       orchestratorSessionId = undefined;
     });

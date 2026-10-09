@@ -92,8 +92,9 @@ export interface EditTracking {
   readonly extension: InlineExtension;
   /** Ends the run's tracking once the worker has ended: compares the working
    *  tree, records a change, and says whether the worker, or a worker it
-   *  started, edited in this run. A second call gives the same answer. */
-  finish(): boolean;
+   *  started, edited in this run. A second call gives the same answer. The
+   *  tree is read without blocking the event loop, so other workers run on. */
+  finish(): Promise<boolean>;
 }
 
 export interface EditTrackingSetup {
@@ -112,15 +113,17 @@ export interface EditTrackingSetup {
   readonly readOnly?: boolean;
 }
 
-/** Tracks one run of a worker from before its session starts until `finish`. */
-export function trackEdits(setup: EditTrackingSetup): EditTracking {
+/** Tracks one run of a worker from before its session starts until `finish`.
+ *  It resolves once the working tree before the run has been read. */
+export async function trackEdits(setup: EditTrackingSetup): Promise<EditTracking> {
   const { sessionId, parentDelegationId } = setup;
   // The parent runs for as long as its worker does, so it is found; the
   // fallback keeps a worker running if it is not.
   const run: DelegationRun = (parentDelegationId === undefined ? undefined : runs().get(parentDelegationId)) ??
     { delegationId: parentDelegationId ?? sessionId, orchestratorSession: setup.orchestratorSession, edited: false };
   runs().set(sessionId, run);
-  const before = setup.readOnly ? undefined : snapshotWorkingTree(setup.cwd);
+  // snapshotWorkingTree never rejects: a tree it cannot read is undefined.
+  const before = setup.readOnly ? undefined : await snapshotWorkingTree(setup.cwd);
   let editedHere = false;
   let recorded = false;
   // The tool of the latest call the command rule counts, for when the tree cannot be compared as the worker ends.
@@ -152,31 +155,27 @@ export function trackEdits(setup: EditTrackingSetup): EditTracking {
       if (!recorded) recorded = record(event.toolName);
     }); },
   };
-  let finished: boolean | undefined;
-  return {
-    extension,
-    finish: () => {
-      if (finished !== undefined) return finished;
-      if (runs().get(sessionId) === run) runs().delete(sessionId);
-      if (before !== undefined) {
-        const after = snapshotWorkingTree(setup.cwd);
-        if (after === undefined) {
-          if (commandRuleTool !== undefined) {
-            markEdited();
-            if (!recorded) recorded = record(commandRuleTool);
-          }
-        } else {
-          const changes = workingTreeChanges(before, after, setup.cwd);
-          if (changes.paths.length > 0 || changes.moved) {
-            markEdited();
-            record(WORKING_TREE_TOOL, changes.paths);
-          }
+  let finished: Promise<boolean> | undefined;
+  const finish = async (): Promise<boolean> => {
+    if (runs().get(sessionId) === run) runs().delete(sessionId);
+    if (before !== undefined) {
+      const after = await snapshotWorkingTree(setup.cwd);
+      if (after === undefined) {
+        if (commandRuleTool !== undefined) {
+          markEdited();
+          if (!recorded) recorded = record(commandRuleTool);
+        }
+      } else {
+        const changes = await workingTreeChanges(before, after, setup.cwd);
+        if (changes.paths.length > 0 || changes.moved) {
+          markEdited();
+          record(WORKING_TREE_TOOL, changes.paths);
         }
       }
-      finished = run.delegationId === sessionId ? run.edited : editedHere;
-      return finished;
-    },
+    }
+    return run.delegationId === sessionId ? run.edited : editedHere;
   };
+  return { extension, finish: () => finished ??= finish() };
 }
 
 /** What the record folder says about one delegation's edits. */

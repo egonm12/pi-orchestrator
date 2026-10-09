@@ -24,7 +24,7 @@ import { SettingsManager, type ExtensionAPI } from "@earendil-works/pi-coding-ag
 import type { TestContext as ExtensionContext } from "../fixtures/extension-context.ts";
 import type { SessionModelRegistry } from "../routing/model-stream.ts";
 import { createRouterExtension, type RouterDependencies, type RoutingEvidence } from "./extension.ts";
-import { requestFailover, setRoutingConstraints } from "./auto-model.ts";
+import { requestFailover, setCarriedClassification, setPendingTask, setRoutingConstraints } from "./auto-model.ts";
 import { readUsageObservations, recordUsageObservation, usageObservationsPath, type UsageObservation } from "./usage-observations.ts";
 import { useOwnerBanLists } from "../fixtures/owner-ban-lists.ts";
 
@@ -486,6 +486,107 @@ test("the classifier sees the worker's task, its agent role and the file paths t
       "- docs/specs/auto-routing.md",
     ].join("\n")), classifier.prompts[0]!.slice(-400));
   } finally { h.cleanup(); }
+});
+
+/** Starts the worker session `sessionId` as pi does once the worker runtime
+ *  set its pending task: session_start on the auto model, whose system prompt is `systemPrompt`. */
+async function startWorkerSession(h: Harness, auto: AutoModel, sessionId: string, registry: SessionModelRegistry, systemPrompt = ""): Promise<void> {
+  await auto.handlers.get("session_start")?.({ type: "session_start", reason: "startup" },
+    { ...workerContext(h, sessionId, registry), getSystemPrompt: () => systemPrompt } as unknown as ExtensionContext);
+}
+
+/** A classifier call that answers `tier` once `release` is called. */
+function heldClassifier(tier: string) {
+  const prompts: string[] = [];
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => { release = resolve; });
+  const call = async (prompt: string) => {
+    prompts.push(prompt);
+    await released;
+    return classifierAnswer(tier);
+  };
+  return { call, prompts, release };
+}
+
+test("a routed worker's classification starts at session_start and its first request routes on it", async () => {
+  const h = harness(LIVE);
+  const unset = setPendingTask("early-worker", "Fix the typo in README.md");
+  try {
+    const registry = fakeSessionRegistry([]);
+    const classifier = heldClassifier("mechanical");
+    const auto = await loadAutoModel(h, registry, { classifierCall: () => classifier.call });
+    await startWorkerSession(h, auto, "early-worker", registry, '<active_agent name="worker"/>');
+    assert.equal(classifier.prompts.length, 1, "classification starts before the first request");
+    assert.match(classifier.prompts[0]!, /Agent role: worker/);
+    assert.deepEqual(h.records(), [], "the rung is not chosen before the first request");
+    const routing = firstRequest(auto, [{ role: "system", content: '<active_agent name="worker"/>', timestamp: 0 }, ...FIX_README], "early-worker");
+    classifier.release();
+    const routed = await routing;
+    assert.equal(classifier.prompts.length, 1, "the first request reuses the early classification");
+    assert.equal(routed.rung, `${HAIKU}:low`);
+    const [record] = h.records();
+    assert.ok(record?.recordType === "decision");
+    assert.equal(record.classification.tier, "mechanical");
+    assert.equal(record.timestamp, NOW.toISOString(), "the decision is timestamped when the rung is chosen");
+  } finally { unset(); h.cleanup(); }
+});
+
+test("an early classification of another task text or role is not used: the first request classifies its own", async () => {
+  const h = harness(LIVE);
+  const unset = setPendingTask("changed-worker", "Redesign the payment flow");
+  try {
+    const registry = fakeSessionRegistry([]);
+    const classifier = answering("mechanical");
+    const auto = await loadAutoModel(h, registry, { classifierCall: () => classifier.call });
+    await startWorkerSession(h, auto, "changed-worker", registry);
+    await firstRequest(auto, FIX_README, "changed-worker");
+    assert.equal(classifier.prompts.length, 2);
+    assert.match(classifier.prompts[1]!, /Fix the typo in README\.md/);
+  } finally { unset(); h.cleanup(); }
+});
+
+test("no early classification without a pending task, with a carried classification or with routing off", async () => {
+  for (const [label, routing, carried] of [["no pending task", LIVE, false], ["carried", LIVE, true], ["routing off", { ...LIVE, enabled: false }, false]] as const) {
+    const h = harness(routing);
+    const sessionId = `quiet-${label.replace(/ /g, "-")}`;
+    const unset = label === "no pending task" ? () => {} : setPendingTask(sessionId, "Fix the typo in README.md");
+    const uncarry = carried ? setCarriedClassification(sessionId, await fixtureClassification("Fix the typo in README.md", "mechanical")) : () => {};
+    try {
+      const registry = fakeSessionRegistry([]);
+      const classifier = answering("mechanical");
+      const auto = await loadAutoModel(h, registry, { classifierCall: () => classifier.call });
+      await startWorkerSession(h, auto, sessionId, registry);
+      assert.equal(classifier.prompts.length, 0, label);
+    } finally { uncarry(); unset(); h.cleanup(); }
+  }
+});
+
+test("an early classification that fails is handled at the first request: routing switches off and the worker falls back", async () => {
+  const h = harness(LIVE);
+  const unset = setPendingTask("failing-early", "Fix the typo in README.md");
+  try {
+    const registry = fakeSessionRegistry([]);
+    let broken = false;
+    let failures = 0;
+    const auto = await loadAutoModel(h, registry, { evidence: () => () => {
+      if (!broken) return evidenceOf();
+      failures++;
+      throw new Error("evidence exploded");
+    } });
+    broken = true;
+    await startWorkerSession(h, auto, "failing-early", registry);
+    assert.equal(failures, 1, "the early classification ran and failed");
+    // Give a rejection time to surface as unhandled before the first request awaits it.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    process.env.PI_ORCHESTRATOR_SESSION_MODEL = "anthropic/claude-sonnet-5:medium";
+    let routed: Routed | undefined;
+    const stderr = await stderrOf(async () => { routed = await firstRequest(auto, FIX_README, "failing-early"); });
+    assert.equal(routed?.rung, "anthropic/claude-sonnet-5:medium");
+    assert.equal(routed?.state, undefined);
+    assert.match(stderr, /evidence exploded/);
+    assert.equal(failures, 1, "the first request awaited the failed early classification instead of classifying again");
+    assert.deepEqual(h.records(), []);
+  } finally { unset(); h.cleanup(); }
 });
 
 // ---------------------------------------------------------------------------

@@ -54,9 +54,10 @@ export const SESSION_VIRTUAL_MODEL_ENV = "PI_ORCHESTRATOR_SESSION_VIRTUAL_MODEL"
 const ROUTING_CONSTRAINTS = Symbol.for("pi-orchestrator.router.routing-constraints");
 const FAILOVER_REQUESTS = Symbol.for("pi-orchestrator.router.failover-requests");
 const CARRIED_CLASSIFICATIONS = Symbol.for("pi-orchestrator.router.carried-classifications");
+const PENDING_TASKS = Symbol.for("pi-orchestrator.router.pending-tasks");
 type Pin = { readonly model: string; readonly effort: ThinkingLevel };
 type ProcessGlobal = typeof globalThis & { [ROUTING_CONSTRAINTS]?: Map<string, RoutingConstraints>; [FAILOVER_REQUESTS]?: Map<string, FailedFirstRequest>;
-  [CARRIED_CLASSIFICATIONS]?: Map<string, TierClassification> };
+  [CARRIED_CLASSIFICATIONS]?: Map<string, TierClassification>; [PENDING_TASKS]?: Map<string, string> };
 
 // Constraints are set by the orchestrator's extension copy and read by the
 // worker's, so they are kept on the process's global object.
@@ -77,6 +78,24 @@ function carriedClassifications(): Map<string, TierClassification> { return (glo
 export function setCarriedClassification(id: string, classification: TierClassification): () => void {
   carriedClassifications().set(id, classification);
   return () => { carriedClassifications().delete(id); };
+}
+
+function pendingTasks(): Map<string, string> { return (globalThis as ProcessGlobal)[PENDING_TASKS] ??= new Map(); }
+/** The task a newly routed worker with session id `id` is about to be
+ *  prompted with, so its router can start classifying it at session_start,
+ *  while the worker still starts up (MCP servers connecting), instead of at
+ *  its first request. Set by the worker runtime only for a routed worker
+ *  without a carried classification. Returns the function that removes it. */
+export function setPendingTask(id: string, task: string): () => void {
+  pendingTasks().set(id, task);
+  return () => { if (pendingTasks().get(id) === task) pendingTasks().delete(id); };
+}
+
+const ACTIVE_AGENT = /<active_agent\s+name=["']([^"']+)["']/;
+
+/** The agent role a system prompt names, else "unknown". */
+export function agentRoleOf(systemPrompt: string): string {
+  return systemPrompt.match(ACTIVE_AGENT)?.[1] ?? "unknown";
 }
 
 /** A worker's first request that ended in a limit error pi does not retry,
@@ -169,7 +188,7 @@ function firstTaskAndRole(messages: readonly LooseMessage[]): { taskText: string
   const prompt = messages.filter((message) => message.role === "system").flatMap((message) => [
     contentText(message.content), ...Object.values(message.sections ?? {}).filter((value): value is string => typeof value === "string"),
   ]).join("\n");
-  return { taskText, agentRole: prompt.match(/<active_agent\s+name=["']([^"']+)["']/)?.[1] ?? "unknown" };
+  return { taskText, agentRole: agentRoleOf(prompt) };
 }
 
 /** Whether a failed response produced anything before its error. */
@@ -354,6 +373,23 @@ export interface AutoModelRouter {
   providerInFlight(sessionId: string): string | undefined;
   /** Forgets session `sessionId`'s routed provider, when its own request runs on a physical model. */
   forget(sessionId: string): void;
+  /** Starts classifying the pending task of worker session `sessionId`
+   *  (setPendingTask), whose system prompt names `agentRole`, so its first
+   *  request awaits a classification already under way. Does nothing with
+   *  routing off, without a pending task or with a carried classification.
+   *  Only the classification starts early: the rung is still chosen in the
+   *  choice queue at the first request. */
+  classifyEarly(sessionId: string, agentRole: string): void;
+  /** Drops session `sessionId`'s early classification, when its session ends unrouted. */
+  dropEarlyClassification(sessionId: string): void;
+}
+
+/** A classification started before a worker's first request, with what it classifies. */
+interface EarlyClassification {
+  readonly router: ActiveRouter;
+  readonly taskText: string;
+  readonly agentRole: string;
+  readonly classification: Promise<TierClassification>;
 }
 
 export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRouter {
@@ -362,6 +398,7 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
   // kept by session id, for the quota headers of its response.
   const routedProviders = new Map<string, string>();
   const failovers = new Map<string, FailoverContext>();
+  const earlyClassifications = new Map<string, EarlyClassification>();
 
   function physical(registry: Registry, pin: Pin) {
     const slash = pin.model.indexOf("/");
@@ -385,6 +422,8 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
   /** Classifies and routes a worker's first request, writes its decision
    *  record, and returns its pin. */
   async function firstRoute(sessionId: string, messages: readonly LooseMessage[], registry: Registry): Promise<FirstRoute> {
+    const early = earlyClassifications.get(sessionId);
+    earlyClassifications.delete(sessionId);
     const router = deps.disabled() ? undefined : deps.router();
     const constraints = routingConstraints().get(sessionId);
     if (!router) return { pin: fallbackPin(deps.banLists(), constraints, "allowed") };
@@ -396,7 +435,11 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
     const carried = carriedClassifications().get(sessionId);
     if (carried !== undefined) classification = carried;
     else {
-      try { classification = await classifyTask(router, taskText, agentRole); }
+      // An early classification counts only for the very task, role and
+      // router this request has; otherwise the task is classified now.
+      const started = early !== undefined && early.router === router && early.taskText === taskText && early.agentRole === agentRole
+        ? early.classification : undefined;
+      try { classification = await (started ?? classifyTask(router, taskText, agentRole)); }
       catch (error) {
         deps.disable(error);
         return { pin: fallbackPin(deps.banLists(), constraints, "allowed") };
@@ -485,6 +528,17 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
   return {
     providerInFlight: (sessionId) => routedProviders.get(sessionId),
     forget: (sessionId) => { routedProviders.delete(sessionId); },
+    classifyEarly(sessionId, agentRole) {
+      const taskText = pendingTasks().get(sessionId);
+      const router = deps.disabled() ? undefined : deps.router();
+      if (taskText === undefined || router === undefined || carriedClassifications().has(sessionId)) return;
+      const classification = classifyTask(router, taskText, agentRole);
+      // The first request awaits it and handles its failure; until then a
+      // rejection must not count as unhandled.
+      classification.catch(() => undefined);
+      earlyClassifications.set(sessionId, { router, taskText, agentRole, classification });
+    },
+    dropEarlyClassification: (sessionId) => { earlyClassifications.delete(sessionId); },
     async route(request, ctx) {
       const started = performance.now();
       const sessionId = ctx.sessionManager?.getSessionId();

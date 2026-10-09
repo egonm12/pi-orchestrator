@@ -100,6 +100,7 @@ const qualityGateParagraphs = (gateLevel: GateLevel): readonly string[] => [
     "account of it: spot-check the diff and the claims that matter, or read a reviewer's Result. Then record the verdict with " +
     "`subagents_verdict`: the delegation id, accept or request_changes, and a reason naming what you checked. A later verdict on " +
     "the same delegation replaces the earlier one, and a resume that edits again needs a new one. A research Result gets no verdict. " +
+    "Several verdicts can go in one call as `verdicts`, a list of those entries, each judged on its own. " +
     "Your git commit or git push always goes through, and its result names each editing delegation still waiting for a verdict. " +
     "Record those verdicts, or tell the user which are missing: the routing report counts every missing verdict.",
   gateLevelParagraph(gateLevel),

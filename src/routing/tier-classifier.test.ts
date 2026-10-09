@@ -253,7 +253,7 @@ test("the model may still choose critical, and its critical stays critical", asy
 });
 
 test("the rubric judges the action, not the subject: read-only work is never critical and a prohibition is a constraint", async () => {
-  assert.equal(RUBRIC_VERSION, "tier-rubric-3");
+  assert.equal(RUBRIC_VERSION, "tier-rubric-4");
   const { calls } = await classify(PLAIN_TASK, DEFAULT_CLASSIFIER_CONFIG, { [LUNA]: { answer: answer("standard") } });
   const prompt = calls[0]!.prompt;
   assert.ok(prompt.startsWith(TIER_RUBRIC));
@@ -272,6 +272,18 @@ test("the rubric judges the action, not the subject: read-only work is never cri
     assert.ok(prompt.includes(rule), rule);
   }
   assert.doesNotMatch(TIER_RUBRIC, /Judge the riskiest part of the task\./);
+});
+
+test("the why answer is one short sentence of at most 120 characters, and an over-long why is still a decision, never a schema failure", async () => {
+  assert.ok(TIER_RUBRIC.includes("- why: one short sentence, at most 120 characters, explaining the tier from the action the task asks for."));
+  assert.doesNotMatch(TIER_RUBRIC, /one or two sentences/);
+  const long = "The task changes a shared helper used across several modules, so a mistake would spread to every caller. ".repeat(3).trim();
+  assert.ok(long.length > 120, long);
+  const { record } = await classify(PLAIN_TASK, DEFAULT_CLASSIFIER_CONFIG, { [LUNA]: { answer: answer("standard", { why: long }) } });
+  assert.equal(record.tier, "standard");
+  assert.equal(record.cause, `model:${LUNA}`);
+  assert.equal(record.why, long);
+  assert.deepEqual(record.hops.map((hop) => [hop.hop, hop.outcome]), [[LUNA, "decided"]]);
 });
 
 // ---------------------------------------------------------------------------

@@ -8,7 +8,7 @@
 
 import { TIER_ANSWER_SCHEMA } from "./tier-answer-schema.ts";
 
-export const RUBRIC_VERSION = "tier-rubric-3";
+export const RUBRIC_VERSION = "tier-rubric-4";
 
 export interface ClassifierInput {
   readonly task: string;
@@ -45,7 +45,7 @@ Also report:
 - ambiguity: "clear", "partial" or "vague" for how well the task states what done looks like.
 - complexity: "low", "medium" or "high" for how much must be understood and changed.
 - kindOfWork: one of "implement", "fix-after-review", "review", "security-review", "mechanical-edit", "research".
-- why: one or two sentences explaining the tier from the action the task asks for.`;
+- why: one short sentence, at most 120 characters, explaining the tier from the action the task asks for.`;
 
 function namedPaths(paths: readonly string[]): string {
   return paths.length === 0 ? "(none)" : paths.map((path) => `- ${path}`).join("\n");

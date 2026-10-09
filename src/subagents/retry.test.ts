@@ -233,6 +233,30 @@ function decisionOf(h: Harness, id: string): DecisionRecord {
 
 const requestChanges = (delegationId: string) => ({ delegationId, verdict: "request_changes", reason: "notes.md has no heading" });
 
+test("a list of verdicts names the next rung of each request_changes entry on its own line, and a retry starts from the rung it names", async () => {
+  const h = harness();
+  const o = await orchestrator(h);
+  try {
+    const first = await one(o, { task: `[standard]\n${WRITE_NOTES}` });
+    const second = await one(o, { task: `[standard]\n${WRITE_NOTES}` });
+    assert.equal(first.status, "completed", JSON.stringify(first));
+    assert.equal(second.status, "completed", JSON.stringify(second));
+    const [id, other] = [first.sessionId!, second.sessionId!];
+    assert.equal(await verdict(o, { verdicts: [
+      { delegationId: id, verdict: "request_changes", reason: "notes.md has no heading" },
+      { delegationId: other, verdict: "accept", reason: "checked notes.md:1" },
+    ] }), [
+      `1. Recorded request_changes on delegation ${id}. The next effort-ladder rung is ${HAIKU}:high at the standard tier (step effort), climb 1 of 2. ` +
+        `To retry, start a subagents item whose retry is ${id} and whose task is your feedback.`,
+      `2. Recorded accept on delegation ${other}.`,
+    ].join("\n"));
+    const retry = await one(o, { retry: id, task: ADD_HEADING });
+    assert.equal(retry.status, "completed", JSON.stringify(retry));
+    assert.equal(retry.retry, id);
+    assert.deepEqual(requestsOf(o, retry.sessionId).map((request) => request.rung).at(0), `${HAIKU}:high`, "the retry runs on the rung the reply named");
+  } finally { await o.shutdown(); h.cleanup(); }
+});
+
 test("request_changes names the next rung; a retry runs there as a new delegation linked to the failed attempt; the third climb is refused", async () => {
   const h = harness();
   const o = await orchestrator(h);

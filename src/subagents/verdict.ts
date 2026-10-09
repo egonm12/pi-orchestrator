@@ -33,6 +33,13 @@ import { planRetry, planText, retrySetup } from "./retry.ts";
 // validate refuses the verdict, which cannot be judged without it
 // (pi-orchestrator-zb6t).
 //
+// A call may judge several delegations at once: `verdicts`, a list of entries
+// with the same fields, in place of the top-level ones. Each entry is judged
+// and recorded in turn, as a call of its own would be, so a refused entry does
+// not stop the others. The reply numbers each entry's outcome, and a list that
+// records nothing fails. The two forms cannot be mixed; the form is checked
+// before any entry is judged.
+//
 // At gate level off there is no quality gate, so the tool leaves the
 // orchestrator's active tools while that level is in force, and refuses a call
 // that reaches it anyway. The level is read as each prompt starts its run and
@@ -40,7 +47,7 @@ import { planRetry, planText, retrySetup } from "./retry.ts";
 
 export const SUBAGENTS_VERDICT_TOOL = "subagents_verdict";
 
-/** The tool's input. */
+/** The tool's input for one delegation. */
 interface VerdictInput {
   readonly delegationId: string;
   readonly verdict: Verdict;
@@ -52,6 +59,31 @@ interface VerdictInput {
 }
 
 const USAGE = `${SUBAGENTS_VERDICT_TOOL} requires a delegationId, a verdict of accept or request_changes, and a reason`;
+
+/** The fields one verdict takes: at the top level of a call for one delegation, or in each entry of `verdicts`. */
+const VERDICT_FIELDS = ["delegationId", "verdict", "reason", "reviewer", "gateLevel", "gateLevelReason"] as const;
+
+/** A refusal, as the tool's reply or error names it. */
+function refusal(why: string): Error {
+  return new Error(`${SUBAGENTS_VERDICT_TOOL}: ${why}`);
+}
+
+/** The call's form: one delegation's fields at the top level, or a list of verdicts. */
+type VerdictForm = { readonly kind: "one"; readonly input: unknown } | { readonly kind: "list"; readonly entries: readonly unknown[] };
+
+/** Which form the call takes. Refused, before any verdict is judged, when it
+ *  takes both forms, or `verdicts` is not a non-empty list. */
+function verdictForm(params: unknown): VerdictForm {
+  const given = (params ?? {}) as Record<string, unknown>;
+  if (given.verdicts === undefined) return { kind: "one", input: params };
+  if (VERDICT_FIELDS.some((field) => given[field] !== undefined)) {
+    throw refusal("give either delegationId, verdict and reason for one delegation, or verdicts for several, not both");
+  }
+  if (!Array.isArray(given.verdicts) || given.verdicts.length === 0) {
+    throw refusal("verdicts, when given, is a list of one or more verdicts, each with a delegationId, a verdict and a reason");
+  }
+  return { kind: "list", entries: given.verdicts };
+}
 
 function verdictInput(params: unknown): VerdictInput {
   const { delegationId, verdict, reason, reviewer, gateLevel, gateLevelReason } = (params ?? {}) as Record<string, unknown>;
@@ -137,6 +169,67 @@ export class VerdictToolSwitch {
   }
 }
 
+/** The properties one verdict takes, as the tool's schema names them. A function, not a constant: the gate level list it
+ *  reads may still be loading when this module is, through an import cycle. */
+function verdictProperties() {
+  return {
+    delegationId: { type: "string", description: "The editing delegation's id, as its Result names it." },
+    verdict: { type: "string", enum: [...VERDICTS], description: "accept, or request_changes when the work falls short." },
+    reason: { type: "string", description: "What you checked and what you found." },
+    reviewer: { type: "string", description: "Optional: the delegation id of the completed review (a subagents item with review) this verdict rests on." },
+    gateLevel: { type: "string", enum: [...RAISE_GATE_LEVELS], description: "Optional: a gate level above the one in force, for this delegation only." },
+    gateLevelReason: { type: "string", description: "Why you raise the gate level; required with gateLevel." },
+  };
+}
+
+/** The reply of a call: its text. */
+const reply = (text: string) => ({ content: [{ type: "text" as const, text }], details: undefined });
+
+/** Judges one verdict's fields and records it. Returns its reply, without the
+ *  note on unreadable lines, and those lines; throws the refusal, and records
+ *  nothing, when the verdict may not be recorded. */
+function recordVerdict(params: unknown, ctx: ExtensionContext, gateLevels: GateLevels): { readonly text: string; readonly skipped: readonly SkippedRoutingRecordLine[] } {
+  const { delegationId: id, verdict, reason, reviewer, raise } = verdictInput(params);
+  const recordDir = join(stateDir(), "routing");
+  const failClosed = <T>(read: () => T): T => {
+    try { return read(); } catch (error) {
+      if (!(error instanceof UnreadableDelegationRecordError)) throw error;
+      throw refusal(`the verdict on delegation ${id} is refused: ${error.message}`);
+    }
+  };
+  const { records, skipped } = failClosed(() => readRoutingRecordsJudging(recordDir, reviewer === undefined ? [id] : [id, reviewer]));
+  const checked = editingDelegationProblem(ctx, records, id);
+  if (checked.problem !== undefined) throw refusal(problemText(id, checked.problem));
+  const { edits } = checked;
+  const inForce = gateLevels.inForce(ctx).level;
+  if (!hasQualityGate(inForce)) throw refusal("the gate level is off, so there is no quality gate and no verdict to record");
+  if (raise !== undefined) {
+    const why = raiseProblem(inForce, raise.level);
+    if (why !== undefined) throw refusal(why);
+  }
+  const level = raise?.level ?? inForce;
+  let sameRungReview = false;
+  if (reviewer !== undefined) {
+    const why = reviewerProblem(ctx, reviewer, id, records);
+    if (why !== undefined) throw refusal(why);
+    sameRungReview = isSameRungReview(ctx, reviewer, id, records);
+  } else {
+    const { tier } = delegationRouting(records, id);
+    if (gateAction(tier, level) === "reviewer") {
+      throw refusal(`delegation ${id} is ${tier ?? "without a tier, so it is gated as elevated,"} and needs an independent reviewer at the ${level} gate level: ` +
+        `start one with a subagents item whose review is ${id}, judge its Result, then name it here as reviewer`);
+    }
+  }
+  const gateLevelRaise: GateLevelRaise | undefined = raise === undefined ? undefined : { from: inForce, to: raise.level, reason: raise.reason };
+  failClosed(() => attachVerdict({ recordDir, delegationId: id, verdict, reason, sameRungReview, ...(gateLevelRaise === undefined ? {} : { gateLevelRaise }),
+    refreshStatePath: join(stateDir(), "refresh-state.json") }));
+  const replaced = edits.verdict === undefined ? "" : ` It replaces the earlier ${edits.verdict}.`;
+  const reviewed = reviewer === undefined ? "" : `, reviewed by delegation ${reviewer}${sameRungReview ? " on the delegation's own rung (a same-rung review)" : ""}`;
+  const raised = gateLevelRaise === undefined ? "" : `, with its gate level raised from ${gateLevelRaise.from} to ${gateLevelRaise.to}`;
+  const next = verdict === "request_changes" ? ` ${nextClimb(ctx, id, reason, recordDir)}` : "";
+  return { text: `Recorded ${verdict} on delegation ${id}${reviewed}${raised}.${replaced}${next}`, skipped };
+}
+
 /** Registers `subagents_verdict` for the orchestrator's session, active only
  *  while the gate level in force is not off. */
 export function registerSubagentsVerdictTool(pi: ExtensionAPI, gateLevels: GateLevels): void {
@@ -153,62 +246,46 @@ export function registerSubagentsVerdictTool(pi: ExtensionAPI, gateLevels: GateL
       "Where the gate level in force, as the orchestrator protocol names it, calls for a reviewer, name the finished review delegation as `reviewer`. " +
       "You may raise the gate level for this one delegation with `gateLevel` and `gateLevelReason`, never lower it; the verdict is then held to the raised level. " +
       "A request_changes reply names the effort ladder's next rung for a retry, or says why there is none. " +
-      "A delegation that did not edit gets no verdict.",
+      "A delegation that did not edit gets no verdict. " +
+      "Several verdicts can go in one call as `verdicts`, a list of entries with these fields; each is judged on its own, and a refused one does not stop the others.",
     parameters: {
       type: "object",
       properties: {
-        delegationId: { type: "string", description: "The editing delegation's id, as its Result names it." },
-        verdict: { type: "string", enum: [...VERDICTS], description: "accept, or request_changes when the work falls short." },
-        reason: { type: "string", description: "What you checked and what you found." },
-        reviewer: { type: "string", description: "Optional: the delegation id of the completed review (a subagents item with review) this verdict rests on." },
-        gateLevel: { type: "string", enum: [...RAISE_GATE_LEVELS], description: "Optional: a gate level above the one in force, for this delegation only." },
-        gateLevelReason: { type: "string", description: "Why you raise the gate level; required with gateLevel." },
+        ...verdictProperties(),
+        verdicts: {
+          type: "array", minItems: 1,
+          description: "Instead of the fields above, several verdicts in one call: one entry per delegation, with the same fields. " +
+            "Each entry is judged and recorded on its own, in order, and a refused entry does not stop the others.",
+          items: { type: "object", properties: verdictProperties(), required: ["delegationId", "verdict", "reason"], additionalProperties: false },
+        },
       },
-      required: ["delegationId", "verdict", "reason"],
       additionalProperties: false,
     } as Parameters<ExtensionAPI["registerTool"]>[0]["parameters"],
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const refusal = (why: string) => new Error(`${SUBAGENTS_VERDICT_TOOL}: ${why}`);
       if (!isOrchestratorSession(ctx)) throw refusal("only the orchestrator records verdicts");
-      const { delegationId: id, verdict, reason, reviewer, raise } = verdictInput(params);
-      const recordDir = join(stateDir(), "routing");
-      const failClosed = <T>(read: () => T): T => {
-        try { return read(); } catch (error) {
-          if (!(error instanceof UnreadableDelegationRecordError)) throw error;
-          throw refusal(`the verdict on delegation ${id} is refused: ${error.message}`);
-        }
-      };
-      const { records, skipped } = failClosed(() => readRoutingRecordsJudging(recordDir, reviewer === undefined ? [id] : [id, reviewer]));
-      const checked = editingDelegationProblem(ctx, records, id);
-      if (checked.problem !== undefined) throw refusal(problemText(id, checked.problem));
-      const { edits } = checked;
-      const inForce = gateLevels.inForce(ctx).level;
-      if (!hasQualityGate(inForce)) throw refusal("the gate level is off, so there is no quality gate and no verdict to record");
-      if (raise !== undefined) {
-        const why = raiseProblem(inForce, raise.level);
-        if (why !== undefined) throw refusal(why);
+      const form = verdictForm(params);
+      if (form.kind === "one") {
+        const { text, skipped } = recordVerdict(form.input, ctx, gateLevels);
+        return reply(`${text}${skippedNote(skipped)}`);
       }
-      const level = raise?.level ?? inForce;
-      let sameRungReview = false;
-      if (reviewer !== undefined) {
-        const why = reviewerProblem(ctx, reviewer, id, records);
-        if (why !== undefined) throw refusal(why);
-        sameRungReview = isSameRungReview(ctx, reviewer, id, records);
-      } else {
-        const { tier } = delegationRouting(records, id);
-        if (gateAction(tier, level) === "reviewer") {
-          throw refusal(`delegation ${id} is ${tier ?? "without a tier, so it is gated as elevated,"} and needs an independent reviewer at the ${level} gate level: ` +
-            `start one with a subagents item whose review is ${id}, judge its Result, then name it here as reviewer`);
+      // Each entry is judged and recorded in turn, as a call of its own would be, so a refused entry does not stop the others.
+      const lines: string[] = [];
+      const skipped = new Map<string, SkippedRoutingRecordLine>();
+      let recorded = 0;
+      form.entries.forEach((entry, index) => {
+        try {
+          const outcome = recordVerdict(entry, ctx, gateLevels);
+          recorded += 1;
+          lines.push(`${index + 1}. ${outcome.text}`);
+          for (const line of outcome.skipped) skipped.set(`${line.file}:${line.line}`, line);
+        } catch (error) {
+          lines.push(`${index + 1}. ${error instanceof Error ? error.message : String(error)}`);
         }
-      }
-      const gateLevelRaise: GateLevelRaise | undefined = raise === undefined ? undefined : { from: inForce, to: raise.level, reason: raise.reason };
-      failClosed(() => attachVerdict({ recordDir, delegationId: id, verdict, reason, sameRungReview, ...(gateLevelRaise === undefined ? {} : { gateLevelRaise }),
-        refreshStatePath: join(stateDir(), "refresh-state.json") }));
-      const replaced = edits.verdict === undefined ? "" : ` It replaces the earlier ${edits.verdict}.`;
-      const reviewed = reviewer === undefined ? "" : `, reviewed by delegation ${reviewer}${sameRungReview ? " on the delegation's own rung (a same-rung review)" : ""}`;
-      const raised = gateLevelRaise === undefined ? "" : `, with its gate level raised from ${gateLevelRaise.from} to ${gateLevelRaise.to}`;
-      const next = verdict === "request_changes" ? ` ${nextClimb(ctx, id, reason, recordDir)}` : "";
-      return { content: [{ type: "text", text: `Recorded ${verdict} on delegation ${id}${reviewed}${raised}.${replaced}${next}${skippedNote(skipped)}` }], details: undefined };
+      });
+      // A list that records nothing fails, as a single verdict that is refused does.
+      if (recorded === 0) throw new Error(lines.join("\n"));
+      const note = skippedNote([...skipped.values()]).trimStart();
+      return reply([...lines, ...(note === "" ? [] : [note])].join("\n"));
     },
   });
 }

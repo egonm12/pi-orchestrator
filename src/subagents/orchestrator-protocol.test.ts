@@ -119,6 +119,12 @@ test("the protocol says a subagents call runs in the background unless foregroun
   }
 });
 
+test("the protocol says several verdicts can go in one call as verdicts", () => {
+  const paragraph = PROTOCOL.split("\n\n").find((text) => text.startsWith("A delegation that edited"));
+  assert.ok(paragraph, PROTOCOL);
+  assert.ok(paragraph.includes("Several verdicts can go in one call as `verdicts`, a list of those entries, each judged on its own."), paragraph);
+});
+
 test("the protocol says what makes a delegation editing: the working tree in a repository, the command rule without one", () => {
   const paragraph = PROTOCOL.split("\n\n").find((text) => text.startsWith("A delegation that edited"));
   assert.ok(paragraph, PROTOCOL);

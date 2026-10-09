@@ -9,7 +9,7 @@ import type { BackgroundMessageMode } from "./background.ts";
 import { REPORT_TOOL, reportExtension, type WorkerReports } from "./report.ts";
 import { SUBAGENTS_VERDICT_TOOL } from "./verdict.ts";
 import { missingResultSections, REPORTING_RULES, type ResultSection } from "./result-format.ts";
-import { AUTO_MODEL_ID, AUTO_PROVIDER, requestFailover, setCarriedClassification, setRoutingConstraints } from "../router/auto-model.ts";
+import { AUTO_MODEL_ID, AUTO_PROVIDER, requestFailover, setCarriedClassification, setPendingTask, setRoutingConstraints } from "../router/auto-model.ts";
 import { limitErrorObservation } from "../router/limit-errors.ts";
 import type { TierClassification } from "../routing/tier-classifier.ts";
 import type { RoutingConstraints } from "../routing/tier-router.ts";
@@ -272,13 +272,13 @@ export async function runWorker(setup: WorkerSetup): Promise<WorkerResult> {
   try {
     const sessionManager = workerSessionManager(setup);
     // An edit counts for the orchestrator's delegation, however the worker ends (editing.ts).
-    const edits = trackEdits({ sessionId: sessionManager.getSessionId(), orchestratorSession: setup.orchestratorSession.getSessionId(),
+    const edits = await trackEdits({ sessionId: sessionManager.getSessionId(), orchestratorSession: setup.orchestratorSession.getSessionId(),
       recordDir: join(stateDir(), "routing"), cwd: setup.cwd, readOnly: isReadOnly(setup),
       ...(setup.parentDelegationId === undefined ? {} : { parentDelegationId: setup.parentDelegationId }) });
     try {
       const result = await runWorkerSession(setup, sessionManager, edits.extension, activity, () => report(false));
-      return edits.finish() ? { ...result, edited: true } : result;
-    } finally { edits.finish(); }
+      return (await edits.finish()) ? { ...result, edited: true } : result;
+    } finally { await edits.finish(); }
   } finally { report(true); }
 }
 
@@ -424,6 +424,9 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
   const unmarkWorkerSession = markWorkerSession(sessionId, setup.parentDelegationId, reviewed, setup.orchestratorSession.getSessionId(), setup.signal);
   const unsetConstraints = setup.routingConstraints === undefined ? undefined : setRoutingConstraints(sessionId, setup.routingConstraints);
   const unsetClassification = setup.carriedClassification === undefined ? undefined : setCarriedClassification(sessionId, setup.carriedClassification);
+  // A routed worker's router starts classifying its task at session_start,
+  // during the rest of its startup; a carried classification needs none.
+  const unsetPendingTask = routed && setup.carriedClassification === undefined ? setPendingTask(sessionId, setup.task) : undefined;
   let unregisterMessage: (() => void) | undefined;
   try {
     // Binding starts the extensions: the router extension reads its settings
@@ -462,6 +465,7 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
     session.dispose();
     unsetConstraints?.();
     unsetClassification?.();
+    unsetPendingTask?.();
     unmarkWorkerSession();
   }
 }
