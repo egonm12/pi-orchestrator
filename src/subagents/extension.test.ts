@@ -16,7 +16,7 @@ import { attachVerdict } from "../routing/verdicts.ts";
 import { buildRoutingReport } from "../routing/routing-report.ts";
 import { createTempRepo } from "../fixtures/temp-repo.ts";
 import { providerStream } from "../fixtures/provider-stream.ts";
-import { createRouterExtension } from "../router/extension.ts";
+import { createRouterExtension, type RouterDependencies } from "../router/extension.ts";
 import personalGuard from "../guard/extension.ts";
 import { workerSlotPaused } from "./worker-slots.ts";
 import { readUsageObservations, recordUsageObservation, usageObservationsPath, type UsageObservation } from "../router/usage-observations.ts";
@@ -108,10 +108,14 @@ interface ProviderRequest {
  *  given) offline: every request is recorded and answered with `reply`, as
  *  one text part. */
 function fakeAnthropic(reply: string, onRequest?: (finish: () => void) => void, modelIds: readonly string[] = ["claude-haiku-4-5"]) {
+  // Opus 5.5 may carry a dynamic rung: pi flags it cache-safe for effort changes (ADR 0018).
+  const dynamic = (id: string) => id === "claude-opus-5-5"
+    ? { thinkingLevelMap: { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" }, compat: { supportsMidConvoEffort: true } }
+    : {};
   const requests: ProviderRequest[] = [];
   const config: ProviderConfig = {
     name: "Fake Anthropic", baseUrl: "http://localhost/unused", apiKey: "unused", api: "fake-anthropic" as never,
-    models: modelIds.map((id) => ({ id, name: id, reasoning: true, input: ["text"],
+    models: modelIds.map((id) => ({ id, name: id, reasoning: true, input: ["text"], ...dynamic(id),
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200_000, maxTokens: 64_000 })),
     streamSimple(model, context, options) {
       // Provider contexts carry tools in system-message deltas, not context.tools.
@@ -163,7 +167,7 @@ function approvedAnthropic() {
 
 /** The router extension as the worker loads it, with a classifier that
  *  always answers mechanical and a catalog of `modelIds`. */
-function routerExtension(modelIds: readonly string[] = [HAIKU]): InlineExtension {
+function routerExtension(modelIds: readonly string[] = [HAIKU], overrides: Partial<RouterDependencies> = {}): InlineExtension {
   const classifierAnswer = JSON.stringify({ tier: "mechanical", risk: { level: "none", reasons: [] }, ambiguity: "clear", complexity: "low", kindOfWork: "implement", why: "fake classifier says mechanical" });
   return {
     name: "router",
@@ -171,6 +175,7 @@ function routerExtension(modelIds: readonly string[] = [HAIKU]): InlineExtension
       classifierCall: () => async () => classifierAnswer,
       evidence: () => () => ({ catalog: buildCatalog({ modelIds: [...modelIds], now: NOW }), refreshState: emptyRefreshState(), authorization: approvedAnthropic() }),
       now: () => NOW,
+      ...overrides,
     }),
   };
 }
@@ -403,6 +408,28 @@ test("a completed worker resumes its saved session with the same delegation and 
     attachVerdict({ recordDir, delegationId: first.worker.sessionId, verdict: "accept", refreshStatePath });
     assert.equal(buildRoutingReport(recordDir).totals.decisions, 1);
     assert.deepEqual(buildRoutingReport(recordDir).totals.verdicts, { accept: 1, request_changes: 0 });
+  } finally { h.cleanup(); }
+});
+
+test("a resumed worker on a dynamic rung has its prompt judged as a follow-up before it is sent, and runs at the judged effort", async () => {
+  const OPUS_5_5 = "anthropic/claude-opus-5-5";
+  const h = harness({ orchestrator: { routing: { ...ROUTING, tiers: { mechanical: [`${OPUS_5_5}:low-high`], standard: [RUNG], elevated: [RUNG], critical: [RUNG] } } } });
+  try {
+    mkdirSync(h.stateDir);
+    saveAuthorization(join(h.stateDir, "authorized-recipients.json"), approvedAnthropic());
+    const answers = ["high", "low"];
+    const provider = fakeAnthropic("Done", undefined, ["claude-haiku-4-5", "claude-opus-5-5"]);
+    const router = routerExtension([HAIKU, OPUS_5_5], { effortJudgeCall: () => async () => JSON.stringify({ effort: answers.shift() ?? "low", why: "chosen" }) });
+    const tool = loadSubagentsTool([router, provider.extension]);
+    const main = orchestrator(h);
+    const first = await callSubagents(tool, main.ctx, "Redesign the storage layer");
+    assert.equal(first.worker.status, "completed", JSON.stringify(first.worker));
+    const resumed = await tool.execute("call-2", { items: [{ resume: first.worker.sessionId, task: "Now fix the typo in its README" }], background: false } as never,
+      undefined, undefined, main.ctx);
+    assert.equal((resumed.details as SubagentsDetails).results[0]?.status, "completed");
+    assert.deepEqual(provider.requests.map((request) => request.thinkingLevel), ["high", "low"]);
+    const decisions = readRoutingRecords(join(h.stateDir, "routing")).filter((record) => record.recordType === "effort-decision");
+    assert.deepEqual(decisions.map((record) => `${record.kind}:${record.from}->${record.to}:${record.applyAt}`), ["task:high->high:none", "follow-up:high->low:now"]);
   } finally { h.cleanup(); }
 });
 
@@ -2236,6 +2263,49 @@ test("subagents_message delivers steer and followUp to a running background work
       assert.match(provider.requests[index * 2 + 1]!.messages.join(" "), new RegExp(`${mode} instruction`));
       assert.equal((subagents.messages[index]!.message.details as NoticeDetails).results[0]?.status, "completed");
     }
+    // A worker on a one-effort rung gets no effort judgement for a steer or follow-up.
+    assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")).filter((record) => record.recordType === "effort-decision"), []);
+  } finally {
+    for (const finish of pending) finish();
+    h.cleanup();
+  }
+});
+
+test("a background worker on a dynamic rung has each steer judged when it is sent: a raise applies to its next request, a lower effort is declined", async () => {
+  const OPUS_5_5 = "anthropic/claude-opus-5-5";
+  const h = harness({ orchestrator: { routing: { ...ROUTING, tiers: { mechanical: [`${OPUS_5_5}:low-high`], standard: [RUNG], elevated: [RUNG], critical: [RUNG] } } } });
+  const pending: (() => void)[] = [];
+  try {
+    const answers = ["low", "high", "medium"];
+    const judged: string[] = [];
+    const provider = fakeAnthropic("done", (finish) => {
+      if (provider.requests.length === 1) pending.push(finish);
+      else finish();
+    }, ["claude-haiku-4-5", "claude-opus-5-5"]);
+    const router = routerExtension([HAIKU, OPUS_5_5], { effortJudgeCall: () => async (prompt) => {
+      judged.push(prompt);
+      return JSON.stringify({ effort: answers.shift() ?? "low", why: "chosen" });
+    } });
+    const subagents = loadSubagents([router, provider.extension]);
+    const ctx = orchestrator(h).ctx;
+    const start = (await subagents.tool().execute("call", { items: [{ task: "Fix the typo in README.md" }], background: true } as never,
+      undefined, undefined, ctx)).details as BackgroundStart;
+    const id = start.delegationIds[0];
+    await waitFor(() => pending.length === 1, "the worker's first request");
+    assert.equal(provider.requests[0]?.thinkingLevel, "low");
+    for (const [index, text] of ["Redesign the whole module instead", "Also rename one variable"].entries()) {
+      await subagents.tool("subagents_message").execute(`message-${index}`, { id, text } as never, undefined, undefined, ctx);
+    }
+    // Both steers were judged before they were sent, the second from the effort the first raised.
+    assert.equal(judged.length, 3);
+    pending.shift()!();
+    await waitFor(() => subagents.messages.length === 1, "the worker's completion notice");
+    const steered = provider.requests.filter((request) => request.sessionId === id)[1];
+    assert.match(steered!.messages.join(" "), /Redesign the whole module instead/);
+    assert.equal(steered!.thinkingLevel, "high");
+    const decisions = readRoutingRecords(join(h.stateDir, "routing")).filter((record) => record.recordType === "effort-decision");
+    assert.deepEqual(decisions.map((record) => `${record.kind}:${record.from}->${record.to}:${record.applyAt}`),
+      ["task:high->low:now", "steer:low->high:now", "steer:high->medium:declined"]);
   } finally {
     for (const finish of pending) finish();
     h.cleanup();

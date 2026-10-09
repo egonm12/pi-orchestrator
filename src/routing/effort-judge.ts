@@ -150,7 +150,9 @@ export type EffortJudgeModelCall = (
 export interface EffortJudgeDecision {
   readonly from: ThinkingLevel;
   readonly to: ThinkingLevel;
-  readonly applyAt: "now" | "turn-end" | "none";
+  /** `now` applies `to` at once; `declined` keeps `from`: a lower effort
+   *  chosen while a run is in progress (ADR 0018); `none` is no change. */
+  readonly applyAt: "now" | "declined" | "none";
   readonly reason: string;
   readonly judgeModel: string | "skipped" | "fallback";
 }
@@ -173,7 +175,7 @@ function decision(
   if (to === input.currentEffort) {
     return { from: input.currentEffort, to, applyAt: "none", reason, judgeModel };
   }
-  const applyAt = input.turnRunning && effortIndex(to) < effortIndex(input.currentEffort) ? "turn-end" : "now";
+  const applyAt = input.turnRunning && effortIndex(to) < effortIndex(input.currentEffort) ? "declined" : "now";
   return { from: input.currentEffort, to, applyAt, reason, judgeModel };
 }
 

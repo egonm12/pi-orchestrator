@@ -225,7 +225,7 @@ test("an effort outside the band is clamped to its nearest bound", async () => {
   });
 });
 
-test("a lower effort waits until turn end while a turn is running", async () => {
+test("a lower effort is declined while a run is in progress", async () => {
   const decision = await judgeEffort(judgeInput({ currentEffort: "high", turnRunning: true }), {
     chain: testChain,
     callModel: async () => JSON.stringify({ effort: "low", why: "This is a straightforward lookup." }),
@@ -234,7 +234,7 @@ test("a lower effort waits until turn end while a turn is running", async () => 
   assert.deepEqual(decision, {
     from: "high",
     to: "low",
-    applyAt: "turn-end",
+    applyAt: "declined",
     reason: "This is a straightforward lookup.",
     judgeModel: JUDGE_RUNG,
   });

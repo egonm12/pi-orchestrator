@@ -1,7 +1,8 @@
 import { VIRTUAL_MODEL_STATE_ENTRY, type ExtensionContext, type ModelRoute, type ModelRouteRequest } from "@earendil-works/pi-coding-agent";
-import { judgeEffort, type JudgeEffortOptions, type EffortJudgeKind } from "../routing/effort-judge.ts";
+import { judgeEffort, type JudgeEffortOptions, type EffortJudgeDecision, type EffortJudgeKind } from "../routing/effort-judge.ts";
+import { releaseRoutingChoice, reserveRoutingChoice } from "./routing-choice-reservations.ts";
 import type { EffortBand } from "../routing/effort-rubric.ts";
-import { emitEffortDecision, type EffortDecisionEvent } from "../routing/effort-decisions.ts";
+import { emitEffortDecision } from "../routing/effort-decisions.ts";
 import { mkdirSync } from "node:fs";
 import { appendRoutingRecord, buildDecisionRecord, buildFailoverRecord } from "../routing/decision-record.ts";
 import type { TierClassification } from "../routing/tier-classifier.ts";
@@ -58,11 +59,11 @@ const ROUTING_CONSTRAINTS = Symbol.for("pi-orchestrator.router.routing-constrain
 const FAILOVER_REQUESTS = Symbol.for("pi-orchestrator.router.failover-requests");
 const CARRIED_CLASSIFICATIONS = Symbol.for("pi-orchestrator.router.carried-classifications");
 const PENDING_TASKS = Symbol.for("pi-orchestrator.router.pending-tasks");
-const INCOMING_MESSAGES = Symbol.for("pi-orchestrator.router.incoming-messages");
+const INCOMING_JUDGES = Symbol.for("pi-orchestrator.router.incoming-judges");
 type Pin = { readonly model: string; readonly effort: ThinkingLevel };
 type ProcessGlobal = typeof globalThis & { [ROUTING_CONSTRAINTS]?: Map<string, RoutingConstraints>; [FAILOVER_REQUESTS]?: Map<string, FailedFirstRequest>;
   [CARRIED_CLASSIFICATIONS]?: Map<string, TierClassification>; [PENDING_TASKS]?: Map<string, string>;
-  [INCOMING_MESSAGES]?: Map<string, { text: string; mode: "steer" | "followUp" }[]> };
+  [INCOMING_JUDGES]?: Map<string, IncomingJudge> };
 
 // Constraints are set by the orchestrator's extension copy and read by the
 // worker's, so they are kept on the process's global object.
@@ -96,13 +97,31 @@ export function setPendingTask(id: string, task: string): () => void {
   return () => { if (pendingTasks().get(id) === task) pendingTasks().delete(id); };
 }
 
-function incomingMessages(): Map<string, { text: string; mode: "steer" | "followUp" }[]> {
-  return (globalThis as ProcessGlobal)[INCOMING_MESSAGES] ??= new Map();
+/** How a message reaches a running worker. */
+export type IncomingMode = "steer" | "followUp";
+/** Judges a message for one worker session before it is sent; resolves to the
+ *  function that withdraws the effort it stored, for a send that failed. */
+type IncomingJudge = (text: string, mode: IncomingMode, running: boolean) => Promise<() => void>;
+
+function incomingJudges(): Map<string, IncomingJudge> { return (globalThis as ProcessGlobal)[INCOMING_JUDGES] ??= new Map(); }
+
+/** Registers the judge of worker session `id`'s incoming messages: set by the
+ *  router extension copy that serves the session, at its session_start, and
+ *  called by the worker runtime's copy. Returns the function that removes it. */
+export function registerIncomingJudge(id: string, judge: IncomingJudge): () => void {
+  incomingJudges().set(id, judge);
+  return () => { if (incomingJudges().get(id) === judge) incomingJudges().delete(id); };
 }
 
-/** Preserve the delivery mode pi's route reason `user` does not distinguish. */
-export function markIncomingWorkerMessage(id: string, text: string, mode: "steer" | "followUp"): void {
-  incomingMessages().set(id, [...(incomingMessages().get(id) ?? []), { text, mode }]);
+/** Judges `text`, a steer or follow-up for worker session `id` (or a resumed
+ *  worker's prompt), before the worker runtime sends it, while it knows the
+ *  delivery mode and whether a run is in progress (ADR 0018). On a dynamic
+ *  rung the effort it applies is stored for the session's next request with
+ *  reason user; any other worker gets no judgement. Resolves to the function
+ *  that withdraws that effort when the send fails. */
+export async function judgeIncomingWorkerMessage(id: string, text: string, mode: IncomingMode, running: boolean): Promise<() => void> {
+  const judge = incomingJudges().get(id);
+  return judge === undefined ? () => {} : judge(text, mode, running);
 }
 
 const ACTIVE_AGENT = /<active_agent\s+name=["']([^"']+)["']/;
@@ -153,8 +172,6 @@ export interface AutoModelState {
   readonly decisionId?: string;
   readonly failedOver: boolean;
   readonly band?: EffortBand;
-  readonly pendingEffort?: ThinkingLevel;
-  readonly pendingEffortDecision?: EffortDecisionEvent;
 }
 
 export interface AutoModelDependencies {
@@ -175,6 +192,28 @@ type RouteContext = Pick<ExtensionContext, "modelRegistry" | "sessionManager">;
 
 /** A pin and, when its routing decision escalated, the tiers it moved between. */
 type ServedPin = Pin & { readonly escalation?: RungEscalation };
+
+/** A first route's choice of a dynamic rung, reserved while its effort is judged. */
+interface FirstChoice {
+  readonly at: Date;
+  readonly route: ReturnType<typeof routeTask>["route"];
+  readonly pin: ServedPin;
+  readonly band?: EffortBand;
+  readonly tier?: RiskTier;
+}
+
+/** What a dynamic rung's effort judge is asked about: the worker's tier, band and current effort. */
+interface EffortTarget {
+  readonly tier?: RiskTier;
+  readonly band: EffortBand;
+  readonly effort: ThinkingLevel;
+}
+
+/** The effort a judgement leaves a worker at, and the timestamp of its effort decision. */
+interface JudgedEffort {
+  readonly effort: ThinkingLevel;
+  readonly decisionId: string;
+}
 
 /** What a worker's first request was routed with, kept so a limit error
  *  before any output can route it again (PRD cml8, "Failover"). */
@@ -343,9 +382,11 @@ function storedPin(state: unknown): AutoModelState | undefined {
   if (tier !== undefined && !isRiskTier(tier)) return undefined;
   if (escalatedFrom !== undefined && !isRiskTier(escalatedFrom)) return undefined;
   if (decisionId !== undefined && typeof decisionId !== "string") return undefined;
-  const { band, pendingEffort } = state as AutoModelState;
+  const { band } = state as AutoModelState;
   if (band !== undefined && (typeof band !== "object" || band === null || !isThinkingLevel(band.min) || !isThinkingLevel(band.max))) return undefined;
-  if (pendingEffort !== undefined && !isThinkingLevel(pendingEffort)) return undefined;
+  // The very object pi passed: pi stores a returned state only when it is
+  // another object. A deferred effort a state saved before the declined rule
+  // (ADR 0018) may hold is never read.
   return state as AutoModelState;
 }
 
@@ -364,6 +405,15 @@ function stateOf(pin: ServedPin, extra: { tier?: RiskTier; decisionId?: string; 
 /** The pin the session branch stores, for a direct request, which carries no state. */
 function branchPin(ctx: RouteContext): AutoModelState | undefined {
   return savedAutoModelPin(ctx.sessionManager?.getBranch?.() ?? []);
+}
+
+/** The text of the first user message on the session branch: a resumed worker's task. */
+function branchTask(ctx: RouteContext): string {
+  for (const entry of ctx.sessionManager?.getBranch?.() ?? []) {
+    const message = (entry as { type?: string; message?: LooseMessage }).message;
+    if ((entry as { type?: string }).type === "message" && message?.role === "user") return contentText(message.content);
+  }
+  return "";
 }
 
 /** The pin the latest auto model router state on `branch` holds, as pi reads
@@ -402,10 +452,13 @@ export interface AutoModelRouter {
    *  Only the classification starts early: the rung is still chosen in the
    *  choice queue at the first request. */
   classifyEarly(sessionId: string, agentRole: string): void;
-  /** Drops session `sessionId`'s early classification, when its session ends unrouted. */
+  /** Drops session `sessionId`'s early classification and its effort judgements, when its session ends. */
   dropEarlyClassification(sessionId: string): void;
-  /** Mark that the running turn ended, so a deferred lower effort can apply. */
-  turnEnded(sessionId: string): void;
+  /** Judges `text` for worker session `sessionId` on a dynamic rung, as
+   *  judgeIncomingWorkerMessage says; `ctx` is the session's, for its saved
+   *  pin and model registry. Judgements of one session run one at a time,
+   *  each from the effort the one before it left. */
+  judgeIncoming(sessionId: string, text: string, mode: IncomingMode, running: boolean, ctx: RouteContext): Promise<() => void>;
 }
 
 /** A classification started before a worker's first request, with what it classifies. */
@@ -423,7 +476,15 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
   const routedProviders = new Map<string, string>();
   const failovers = new Map<string, FailoverContext>();
   const earlyClassifications = new Map<string, EarlyClassification>();
-  const endedTurns = new Set<string>();
+  // The router state each session's latest route returned, which pi stores on
+  // its branch, and the task its first route was routed on: what a steer or
+  // follow-up is judged against.
+  const latestStates = new Map<string, AutoModelState>();
+  const firstTasks = new Map<string, string>();
+  // The effort an incoming message was judged at, for the session's next
+  // request with reason user, and the judgement under way.
+  const nextEfforts = new Map<string, { readonly effort: ThinkingLevel }>();
+  const judging = new Map<string, Promise<unknown>>();
 
   function physical(registry: Registry, pin: Pin) {
     const slash = pin.model.indexOf("/");
@@ -453,6 +514,7 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
     const constraints = routingConstraints().get(sessionId);
     if (!router) return { pin: fallbackPin(deps.banLists(), constraints, "allowed") };
     const { taskText, agentRole } = firstTaskAndRole(messages);
+    firstTasks.set(sessionId, taskText);
     // A retry keeps the tier of the delegation it retries and is not
     // classified. Classification may call a provider. Do it before taking
     // the shared queue; only choice and record must be serialized.
@@ -470,7 +532,30 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
         return { pin: fallbackPin(deps.banLists(), constraints, "allowed") };
       }
     }
-    return withRoutingChoice(router.recordDir, async (): Promise<FirstRoute> => {
+    const failed = (error: unknown): FirstRoute => {
+      // An unavailable or banned session model is a refusal, not a router bug.
+      if (error instanceof SessionModelError || error instanceof MissingRungError) throw error;
+      deps.disable(error);
+      return { pin: fallbackPin(deps.banLists(), constraints, "allowed") };
+    };
+    /** Writes the decision record for `chosen`, on the effort `judged` chose when given. */
+    const record = (chosen: FirstChoice, judged?: JudgedEffort): FirstRoute => {
+      const { at, route } = chosen;
+      const pin: ServedPin = judged === undefined ? chosen.pin : { ...chosen.pin, effort: judged.effort };
+      const common = { delegationId: sessionId, at, taskText, agentRole, classification, tierMap: router.tierMap, route,
+        ranOn: `${pin.model}:${pin.effort}`, ...commonRecordFields(sessionId), ...(constraints === undefined ? {} : { constraints }),
+        ...(judged === undefined ? {} : { effortDecisionId: judged.decisionId }) };
+      const decision = buildDecisionRecord(router.mode === "shadow"
+        ? { ...common, mode: "shadow", handPickedModel: pin.model }
+        : { ...common, mode: "live" });
+      mkdirSync(router.recordDir, { recursive: true });
+      appendRoutingRecord(router.recordDir, decision);
+      const live = router.mode === "live" && route.ok;
+      // Only a new live choice can fail over: routing picked its rung.
+      if (live) failovers.set(sessionId, { router, taskText, agentRole, classification, constraints });
+      return { pin, state: stateOf(pin, { ...(live ? { tier: route.tier, band: route.rung.band } : {}), decisionId: decision.timestamp, failedOver: false }) };
+    };
+    const chosen = await withRoutingChoice(router.recordDir, async (): Promise<FirstRoute | FirstChoice> => {
       try {
         // The classifier may be slower than another worker's. Take the
         // timestamp when choosing, after prior decisions have been written,
@@ -482,24 +567,41 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
           : { model: route.rung.model, effort: route.rung.effort as ThinkingLevel, ...escalationOf(route) };
         // A rung pi cannot send to fails the worker before it counts as pinned.
         physical(registry, pin);
-        const common = { delegationId: sessionId, at, taskText, agentRole, classification, tierMap: router.tierMap, route,
-          ranOn: `${pin.model}:${pin.effort}`, ...commonRecordFields(sessionId), ...(constraints === undefined ? {} : { constraints }) };
-        const decision = buildDecisionRecord(router.mode === "shadow"
-          ? { ...common, mode: "shadow", handPickedModel: pin.model }
-          : { ...common, mode: "live" });
-        mkdirSync(router.recordDir, { recursive: true });
-        appendRoutingRecord(router.recordDir, decision);
-        const live = router.mode === "live" && route.ok;
-        // Only a new live choice can fail over: routing picked its rung.
-        if (live) failovers.set(sessionId, { router, taskText, agentRole, classification, constraints });
-        return { pin, state: stateOf(pin, { ...(live ? { tier: route.tier, band: route.rung.band } : {}), decisionId: decision.timestamp, failedOver: false }) };
-      } catch (error) {
-        // An unavailable or banned session model is a refusal, not a router bug.
-        if (error instanceof SessionModelError || error instanceof MissingRungError) throw error;
-        deps.disable(error);
-        return { pin: fallbackPin(deps.banLists(), constraints, "allowed") };
-      }
+        const band = router.mode === "live" && route.ok ? route.rung.band : undefined;
+        if (band === undefined || deps.effortJudge === undefined) return record({ at, route, pin });
+        // A dynamic rung is judged before its record is written, outside the
+        // queue: the reservation counts the choice for other workers meanwhile.
+        reserveRoutingChoice(router.recordDir, sessionId, providerOf(pin.model), at);
+        return { at, route, pin, band, tier: route.ok ? route.tier : undefined };
+      } catch (error) { return failed(error); }
     });
+    if (!("route" in chosen)) return chosen;
+    const judged = await judgeChoice(sessionId, { tier: chosen.tier, band: chosen.band!, effort: chosen.pin.effort },
+      carried === undefined ? "task" : "retry-feedback", taskText, registry);
+    return withRoutingChoice(router.recordDir, async (): Promise<FirstRoute> => {
+      try { return record(chosen, judged); }
+      catch (error) { return failed(error); }
+      finally { try { releaseRoutingChoice(router.recordDir, sessionId); } catch { /* A stale reservation lapses with its process. */ } }
+    });
+  }
+
+  /** Judges the incoming `message` for a dynamic rung at `target`, emits the
+   *  effort decision, and returns the effort to run at: the judged one when it
+   *  applies now, else the current one. A judge that throws runs at the band's top. */
+  async function judgeChoice(sessionId: string, target: EffortTarget, kind: EffortJudgeKind, message: string, registry: Registry,
+    options: { readonly turnRunning?: boolean; readonly taskPrefix?: string } = {}): Promise<JudgedEffort> {
+    const { band, effort } = target;
+    const input = { message, kind, tier: target.tier ?? "standard", band, currentEffort: effort, turnRunning: options.turnRunning ?? false,
+      ...(options.taskPrefix === undefined ? {} : { taskPrefix: options.taskPrefix }) } as const;
+    let decision: EffortJudgeDecision;
+    try { decision = await judgeEffort(input, deps.effortJudge!(registry)); }
+    catch (error) {
+      decision = { from: effort, to: band.max, applyAt: effort === band.max ? "none" : "now",
+        reason: `effort judge fallback to band maximum: ${String(error)}`, judgeModel: "fallback" };
+    }
+    const timestamp = deps.now().toISOString();
+    emitEffortDecision({ ...decision, timestamp, band, sessionId, kind, scope: "worker" });
+    return { effort: decision.applyAt === "now" ? decision.to : effort, decisionId: timestamp };
   }
 
   /** Pins the worker again after its first request on `state`'s rung
@@ -518,12 +620,14 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
     const { errorText } = failure;
     const limit = errorText === undefined ? undefined : limitErrorObservation(errorText, deps.now());
     if (errorText === undefined || limit === undefined) return undefined;
+    const refusal = { detail: errorText, limit };
     // One attempt: a later retry of this request stays on the pin.
     failovers.delete(sessionId);
     const { router, taskText, agentRole, classification, constraints } = context;
     const refusedProvider = providerOf(state.rung.model);
     await saveObservation(deps, router, refusedProvider, limit);
-    return withRoutingChoice(router.recordDir, async () => {
+    type Chosen = { readonly at: Date; readonly route: Extract<ReturnType<typeof routeTask>["route"], { ok: true }>; readonly next: ServedPin };
+    const chosen = await withRoutingChoice(router.recordDir, async (): Promise<FirstRoute | Chosen | undefined> => {
       const at = deps.now();
       let route: ReturnType<typeof routeTask>["route"];
       try { ({ route } = routeTask(router, taskText, classification, at, constraints)); }
@@ -531,13 +635,32 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
       if (!route.ok || providerOf(route.rung.model) === refusedProvider) return undefined;
       const next: ServedPin = { model: route.rung.model, effort: route.rung.effort as ThinkingLevel, ...escalationOf(route) };
       try { physical(registry, next); } catch { return undefined; }
+      if (route.rung.band === undefined || deps.effortJudge === undefined) return record({ at, route, next });
+      // As on a first route: judged outside the queue, the choice reserved meanwhile.
+      reserveRoutingChoice(router.recordDir, sessionId, providerOf(next.model), at);
+      return { at, route, next };
+    });
+    if (chosen === undefined || !("route" in chosen)) return chosen;
+    const band = chosen.route.rung.band!;
+    const judged = await judgeChoice(sessionId, { tier: chosen.route.tier, band, effort: chosen.next.effort },
+      carriedClassifications().has(sessionId) ? "retry-feedback" : "task", taskText, registry);
+    return withRoutingChoice(router.recordDir, async () => {
+      try { return record(chosen, judged); }
+      finally { try { releaseRoutingChoice(router.recordDir, sessionId); } catch { /* A stale reservation lapses with its process. */ } }
+    });
+
+    /** Writes the failover and decision records for `chosen`, on the effort `judged` chose when given. */
+    function record(choice: Chosen, judged?: JudgedEffort): FirstRoute {
+      const { at, route } = choice;
+      const next: ServedPin = judged === undefined ? choice.next : { ...choice.next, effort: judged.effort };
       const ranOn = `${next.model}:${next.effort}`;
       const decision = buildDecisionRecord({ delegationId: sessionId, at, taskText, agentRole, classification, tierMap: router.tierMap,
-        route, ranOn, mode: "live", ...commonRecordFields(sessionId), ...(constraints === undefined ? {} : { constraints }) });
+        route, ranOn, mode: "live", ...commonRecordFields(sessionId), ...(constraints === undefined ? {} : { constraints }),
+        ...(judged === undefined ? {} : { effortDecisionId: judged.decisionId }) });
       const record = buildFailoverRecord({ delegationId: sessionId, at,
         refusedAttempt: { timestamp: state.decisionId!, rung: `${state.rung.model}:${state.rung.effort}` },
-        limit: limit.state === "exhausted" ? "exhausted" : "throttled", ...(limit.resetsAt === undefined ? {} : { resetsAt: limit.resetsAt }),
-        detail: errorText, rung: ranOn });
+        limit: refusal.limit.state === "exhausted" ? "exhausted" : "throttled",
+        ...(refusal.limit.resetsAt === undefined ? {} : { resetsAt: refusal.limit.resetsAt }), detail: refusal.detail, rung: ranOn });
       try {
         appendRoutingRecord(router.recordDir, record);
         appendRoutingRecord(router.recordDir, decision);
@@ -547,7 +670,7 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
         throw error;
       }
       return { pin: next, state: stateOf(next, { tier: route.tier, band: route.rung.band, decisionId: decision.timestamp, failedOver: true }) };
-    });
+    }
   }
 
   return {
@@ -563,8 +686,32 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
       classification.catch(() => undefined);
       earlyClassifications.set(sessionId, { router, taskText, agentRole, classification });
     },
-    dropEarlyClassification: (sessionId) => { earlyClassifications.delete(sessionId); incomingMessages().delete(sessionId); endedTurns.delete(sessionId); },
-    turnEnded: (sessionId) => { endedTurns.add(sessionId); },
+    dropEarlyClassification: (sessionId) => {
+      earlyClassifications.delete(sessionId);
+      latestStates.delete(sessionId);
+      firstTasks.delete(sessionId);
+      nextEfforts.delete(sessionId);
+      judging.delete(sessionId);
+    },
+    judgeIncoming(sessionId, text, mode, running, ctx) {
+      const run = async (): Promise<() => void> => {
+        const state = latestStates.get(sessionId) ?? branchPin(ctx);
+        const registry = ctx.modelRegistry;
+        if (state?.band === undefined || deps.effortJudge === undefined || registry === undefined) return () => {};
+        const effort = nextEfforts.get(sessionId)?.effort ?? state.rung.effort;
+        const judged = await judgeChoice(sessionId, { tier: state.tier, band: state.band, effort }, mode === "steer" ? "steer" : "follow-up",
+          text, registry, { turnRunning: running, taskPrefix: (firstTasks.get(sessionId) ?? branchTask(ctx)).slice(0, 400) });
+        if (judged.effort === effort) return () => {};
+        const stored = { effort: judged.effort };
+        nextEfforts.set(sessionId, stored);
+        return () => { if (nextEfforts.get(sessionId) === stored) nextEfforts.delete(sessionId); };
+      };
+      const result = (judging.get(sessionId) ?? Promise.resolve()).then(run, run);
+      const settled = result.catch(() => undefined);
+      judging.set(sessionId, settled);
+      void settled.then(() => { if (judging.get(sessionId) === settled) judging.delete(sessionId); });
+      return result;
+    },
     async route(request, ctx) {
       const started = performance.now();
       const sessionId = ctx.sessionManager?.getSessionId();
@@ -580,6 +727,7 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
         routedProviders.set(sessionId, model.provider);
         if (publish) publishServedRung({ delegationId: sessionId, model: pin.model, effort: pin.effort, ...(pin.escalation ? { escalation: pin.escalation } : {}) });
         probe(sessionId, `${pin.model}:${pin.effort}`, kind, started);
+        if (state !== undefined) latestStates.set(sessionId, state);
         return { model, thinkingLevel: pin.effort, ...(state === undefined ? {} : { state }) };
       };
       /** Back on a physical model pi already sent to: a retry's failed model or a direct request's previous one. */
@@ -591,27 +739,6 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
         routedProviders.set(sessionId, model.provider);
         probe(sessionId, `${model.provider}/${model.id}:${effort}`, "reused", started);
         return { model, thinkingLevel: effort };
-      };
-
-      const judged = async (state: AutoModelState, kind: EffortJudgeKind, message: string, turnRunning: boolean,
-        pinKind: "new" | "reused" = "reused"): Promise<Route> => {
-        if (!state.band || !deps.effortJudge) return to(servedPinOf(state), state, pinKind);
-        const input = { message, kind, tier: state.tier ?? "standard", band: state.band,
-          currentEffort: state.rung.effort, turnRunning,
-          ...(kind === "steer" || kind === "follow-up" ? { taskPrefix: firstTaskAndRole(messages).taskText.slice(0, 400) } : {}) } as const;
-        let decision;
-        try { decision = await judgeEffort(input, deps.effortJudge(registry)); }
-        catch (error) { decision = { from: state.rung.effort, to: state.band.max, applyAt: "now" as const,
-          reason: `effort judge fallback to band maximum: ${String(error)}`, judgeModel: "fallback" as const }; }
-        const effortDecision: EffortDecisionEvent = { ...decision, timestamp: deps.now().toISOString(), band: state.band,
-          sessionId, kind, scope: "worker", stage: "judged" };
-        emitEffortDecision(effortDecision);
-        const effort = decision.applyAt === "now" ? decision.to : state.rung.effort;
-        const next: AutoModelState = { ...state, rung: { ...state.rung, effort },
-          ...(decision.applyAt === "turn-end"
-            ? { pendingEffort: decision.to, pendingEffortDecision: effortDecision }
-            : { pendingEffort: undefined, pendingEffortDecision: undefined }) };
-        return to(servedPinOf(next), next, pinKind);
       };
 
       // A direct request (a compaction summary, an extension's streamSimple)
@@ -626,13 +753,7 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
         return to(first.pin, undefined, "new", false);
       }
 
-      let state = storedPin(request.state);
-      if (state && endedTurns.delete(sessionId) && state.pendingEffort !== undefined) {
-        const pending = state.pendingEffortDecision;
-        if (pending !== undefined) emitEffortDecision({ ...pending, timestamp: deps.now().toISOString(),
-          stage: "applied", decisionTimestamp: pending.timestamp });
-        state = { ...state, rung: { ...state.rung, effort: state.pendingEffort }, pendingEffort: undefined, pendingEffortDecision: undefined };
-      }
+      const state = storedPin(request.state);
       // The worker runtime continued the session after a first-request limit
       // error pi does not retry. The request goes to a surviving rung on
       // another provider, or nowhere: resending it to the pin's provider
@@ -641,7 +762,7 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
       if (requested !== undefined) {
         const next = state === undefined || requested.model !== state.rung.model ? undefined
           : await failOver(sessionId, state, request, { errorText: requested.errorMessage, producedOutput: false }, registry);
-        if (next) return next.state?.band ? judged(next.state, "task", firstTaskAndRole(messages).taskText, false, "new") : to(next.pin, next.state, "new");
+        if (next) return to(next.pin, next.state, "new");
         throw new Error(`no other provider's rung is left to fail over to: ${requested.errorMessage}`);
       }
       if (state) {
@@ -649,28 +770,27 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
           const failed = request.failed.message;
           const next = await failOver(sessionId, state, request, { errorText: failed.errorMessage,
             producedOutput: producedOutput(failed as { content?: readonly Part[] }) }, registry);
-          if (next) return next.state?.band ? judged(next.state, "task", firstTaskAndRole(messages).taskText, false, "new") : to(next.pin, next.state, "new");
+          if (next) return to(next.pin, next.state, "new");
           return back(request.failed, state.rung.effort);
         }
         // A worker that answered once can no longer fail over.
         if (request.previous !== undefined) failovers.delete(sessionId);
-        if (request.reason === "user" && state.band) {
-          const latest = [...messages].reverse().find((message) => message.role === "user");
-          const message = contentText(latest?.content);
-          const queue = incomingMessages().get(sessionId) ?? [];
-          const found = queue.findIndex((item) => item.text === message);
-          const mode = found < 0 ? undefined : queue.splice(found, 1)[0]?.mode;
-          if (queue.length === 0) incomingMessages().delete(sessionId);
-          const kind = mode === "steer" ? "steer" : "follow-up";
-          return judged(state, kind, message, mode === "steer");
+        // The steers and follow-ups this request carries were judged when
+        // the worker runtime sent them (judgeIncomingWorkerMessage).
+        const next = request.reason === "user" ? nextEfforts.get(sessionId) : undefined;
+        if (next !== undefined) {
+          nextEfforts.delete(sessionId);
+          if (state.band !== undefined && next.effort !== state.rung.effort) {
+            const judged: AutoModelState = { ...state, rung: { ...state.rung, effort: next.effort } };
+            return to(servedPinOf(judged), judged, "reused");
+          }
         }
         return to(servedPinOf(state), state, "reused");
       }
       // pi retries a failed request that has no pin stored on the model it failed on.
       if (request.reason === "retry" && request.failed) return back(request.failed, request.thinkingLevel);
       const first = await firstRoute(sessionId, messages, registry);
-      return first.state?.band ? judged(first.state, carriedClassifications().has(sessionId) ? "retry-feedback" : "task",
-        firstTaskAndRole(messages).taskText, false, "new") : to(first.pin, first.state, "new");
+      return to(first.pin, first.state, "new");
     },
   };
 }

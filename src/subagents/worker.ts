@@ -9,7 +9,7 @@ import type { BackgroundMessageMode } from "./background.ts";
 import { REPORT_TOOL, reportExtension, type WorkerReports } from "./report.ts";
 import { SUBAGENTS_VERDICT_TOOL } from "./verdict.ts";
 import { missingResultSections, REPORTING_RULES, type ResultSection } from "./result-format.ts";
-import { AUTO_MODEL_ID, AUTO_PROVIDER, markIncomingWorkerMessage, requestFailover, setCarriedClassification, setPendingTask, setRoutingConstraints } from "../router/auto-model.ts";
+import { AUTO_MODEL_ID, AUTO_PROVIDER, judgeIncomingWorkerMessage, requestFailover, setCarriedClassification, setPendingTask, setRoutingConstraints } from "../router/auto-model.ts";
 import { limitErrorObservation } from "../router/limit-errors.ts";
 import type { TierClassification } from "../routing/tier-classifier.ts";
 import type { RoutingConstraints } from "../routing/tier-router.ts";
@@ -434,12 +434,25 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
     await session.bindExtensions({});
     setup.signal?.addEventListener("abort", abort, { once: true });
     if (setup.signal?.aborted) return { status: "aborted", sessionId, sessionFile: saved(), finalText: "" };
-    unregisterMessage = setup.onMessageReady?.((text, mode) => {
-      if (!session.isStreaming) throw new Error("subagents_message: the background worker is no longer running");
-      // Pi's route reason `user` does not distinguish steer from follow-up.
-      if (!setup.fork && !setup.namedModel && !setup.resume?.namedModel && !setup.resume?.fork) markIncomingWorkerMessage(sessionId, text, mode);
-      return session[mode](text).then(() => undefined);
+    // A worker on the auto model has each incoming message judged before it
+    // is sent, while its mode and whether a run is in progress are known; on
+    // a dynamic rung its next request runs at the judged effort (ADR 0018).
+    const judgesIncoming = !setup.fork && !setup.namedModel && !setup.resume?.namedModel && !setup.resume?.fork;
+    unregisterMessage = setup.onMessageReady?.(async (text, mode) => {
+      const notRunning = () => new Error("subagents_message: the background worker is no longer running");
+      if (!session.isStreaming) throw notRunning();
+      const withdraw = judgesIncoming ? await judgeIncomingWorkerMessage(sessionId, text, mode, session.isStreaming) : undefined;
+      try {
+        if (!session.isStreaming) throw notRunning();
+        await session[mode](text);
+      } catch (error) {
+        withdraw?.();
+        throw error;
+      }
     });
+    // A resumed worker's prompt is a follow-up to its saved session; a new
+    // worker's task is judged with its first route.
+    if (judgesIncoming && setup.resume) await judgeIncomingWorkerMessage(sessionId, setup.task, "followUp", false);
     await session.prompt(setup.task);
     // Only a newly routed worker on the auto model fails over.
     if (routed && !retried && !setup.signal?.aborted) {

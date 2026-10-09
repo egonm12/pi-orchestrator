@@ -316,6 +316,9 @@ export interface DecisionRecord extends RecordCommon {
   readonly constraints?: RecordedConstraints;
   /** The delegation this reviewer reviews (ADR 0010); absent for any other worker. */
   readonly reviewedDelegationId?: string;
+  /** On a dynamic rung (ADR 0018): the timestamp of the effort-decision record
+   *  that chose the effort in `ranOn`. Absent on any other rung and on older records. */
+  readonly effortDecisionId?: string;
 }
 
 export interface VerdictRecord extends RecordCommon {
@@ -478,8 +481,12 @@ export interface FailoverRecord extends RecordCommon {
 
 export const EFFORT_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export const EFFORT_DECISION_KINDS = ["user-prompt", "task", "steer", "follow-up", "retry-feedback"] as const;
+/** `applied` is read on records written before ADR 0018's declined rule, when
+ *  a lower effort was deferred to the turn's end; no record is written with it now. */
 export const EFFORT_DECISION_STAGES = ["judged", "applied"] as const;
 export type EffortDecisionStage = (typeof EFFORT_DECISION_STAGES)[number];
+/** `turn-end` is read on records written before the declined rule. */
+export const EFFORT_DECISION_APPLY_AT = ["now", "declined", "none", "turn-end"] as const;
 export type EffortLevel = (typeof EFFORT_LEVELS)[number];
 
 export interface EffortDecisionRecord extends RecordCommon {
@@ -490,12 +497,12 @@ export interface EffortDecisionRecord extends RecordCommon {
   readonly kind: EffortJudgeKind;
   readonly from: EffortLevel;
   readonly to: EffortLevel;
-  readonly applyAt: "now" | "turn-end" | "none";
+  readonly applyAt: (typeof EFFORT_DECISION_APPLY_AT)[number];
   readonly reason: string;
   readonly judgeModel: string | "skipped" | "fallback";
   readonly band: { readonly min: EffortLevel; readonly max: EffortLevel };
   readonly stage: EffortDecisionStage;
-  /** Timestamp of the judged record confirmed by this later application event. */
+  /** On a legacy `applied` record: the timestamp of the judged record it applied. */
   readonly decisionTimestamp?: string;
 }
 
@@ -739,8 +746,13 @@ export function validateRoutingRecord(value: unknown): RoutingRecord {
     const mode = oneOf(value, "mode", "", ROUTING_MODES);
     const required = [...COMMON_KEYS, "mode", "taskTextPrefix", "agentRole", "classification", "tierMap", "route",
       ...(value.schemaVersion === DECISION_RECORD_SCHEMA_VERSION ? ["ranOn"] : [])];
-    checkKeys(value, "", mode === "shadow" ? [...required, "handPickedModel"] : required, ["parentDelegationId", "constraints", "reviewedDelegationId"]);
+    checkKeys(value, "", mode === "shadow" ? [...required, "handPickedModel"] : required,
+      ["parentDelegationId", "constraints", "reviewedDelegationId", ...(value.schemaVersion === DECISION_RECORD_SCHEMA_VERSION ? ["effortDecisionId"] : [])]);
     checkCommon(value);
+    if (value.effortDecisionId !== undefined) {
+      const effortDecisionId = stringAt(value, "effortDecisionId", "", { nonBlank: true });
+      if (Number.isNaN(Date.parse(effortDecisionId))) throw new RoutingRecordError("effortDecisionId", `must be an ISO-8601 time; got ${JSON.stringify(effortDecisionId)}`);
+    }
     for (const key of ["parentDelegationId", "reviewedDelegationId"]) {
       if (value[key] === undefined) continue;
       stringAt(value, key, "", { nonBlank: true });
@@ -871,7 +883,7 @@ export function validateRoutingRecord(value: unknown): RoutingRecord {
     oneOf(value, "kind", "", EFFORT_DECISION_KINDS);
     oneOf(value, "from", "", EFFORT_LEVELS);
     oneOf(value, "to", "", EFFORT_LEVELS);
-    oneOf(value, "applyAt", "", ["now", "turn-end", "none"] as const);
+    oneOf(value, "applyAt", "", EFFORT_DECISION_APPLY_AT);
     stringAt(value, "reason", "", { nonBlank: true });
     const judgeModel = stringAt(value, "judgeModel", "", { nonBlank: true });
     if (judgeModel !== "skipped" && judgeModel !== "fallback" && !judgeModel.includes("/")) {
@@ -887,6 +899,9 @@ export function validateRoutingRecord(value: unknown): RoutingRecord {
       throw new RoutingRecordError("to", "must be inside the effort band");
     }
     if (value.applyAt === "none" && value.from !== value.to) throw new RoutingRecordError("applyAt", "none requires the effort to stay unchanged");
+    if (value.applyAt === "declined" && EFFORT_LEVELS.indexOf(value.to as EffortLevel) >= EFFORT_LEVELS.indexOf(value.from as EffortLevel)) {
+      throw new RoutingRecordError("applyAt", "declined requires a lower effort");
+    }
     const stage = oneOf(value, "stage", "", EFFORT_DECISION_STAGES);
     if (stage === "applied") {
       const decisionTimestamp = stringAt(value, "decisionTimestamp", "", { nonBlank: true });
@@ -925,6 +940,8 @@ interface DecisionRecordInputCommon {
   readonly constraints?: RoutingConstraints;
   /** The delegation a reviewer reviews (ADR 0010). */
   readonly reviewedDelegationId?: string;
+  /** The effort-decision record that chose a dynamic rung's effort. */
+  readonly effortDecisionId?: string;
 }
 
 export type DecisionRecordInput =
@@ -1157,6 +1174,7 @@ export function buildDecisionRecord(input: DecisionRecordInput): DecisionRecord 
     ...(input.parentDelegationId === undefined ? {} : { parentDelegationId: input.parentDelegationId }),
     ...(constraints === undefined ? {} : { constraints }),
     ...(input.reviewedDelegationId === undefined ? {} : { reviewedDelegationId: input.reviewedDelegationId }),
+    ...(input.effortDecisionId === undefined ? {} : { effortDecisionId: input.effortDecisionId }),
   };
   return checkedRecord(record);
 }
@@ -1207,12 +1225,10 @@ export interface EffortDecisionRecordInput {
   readonly kind: EffortDecisionRecord["kind"];
   readonly from: EffortLevel;
   readonly to: EffortLevel;
-  readonly applyAt: EffortDecisionRecord["applyAt"];
+  readonly applyAt: "now" | "declined" | "none";
   readonly reason: string;
   readonly judgeModel: EffortDecisionRecord["judgeModel"];
   readonly band: EffortDecisionRecord["band"];
-  readonly stage?: EffortDecisionStage;
-  readonly decisionTimestamp?: string;
   readonly at?: Date;
 }
 
@@ -1231,8 +1247,7 @@ export function buildEffortDecisionRecord(input: EffortDecisionRecordInput): Eff
     reason: input.reason,
     judgeModel: input.judgeModel,
     band: { min: input.band.min, max: input.band.max },
-    stage: input.stage ?? "judged",
-    ...(input.decisionTimestamp === undefined ? {} : { decisionTimestamp: input.decisionTimestamp }),
+    stage: "judged",
   };
   return checkedRecord(record);
 }

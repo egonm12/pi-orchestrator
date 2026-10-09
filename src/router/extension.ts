@@ -2,7 +2,7 @@ import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { toModelInfo, splitKnownThinkingSuffix, type ModelInfo } from "../models/model-info.ts";
 import { agentRoleOf, AUTO_MODEL_ID, AUTO_MODEL_THINKING_LEVELS, AUTO_PROVIDER, createAutoModelRouter, isAutoModel, isVirtualModel, recordLimitError, recordQuotaHeaders,
-  SESSION_MODEL_ENV, SESSION_VIRTUAL_MODEL_ENV, type AutoModelDependencies, type AutoModelState } from "./auto-model.ts";
+  registerIncomingJudge, SESSION_MODEL_ENV, SESSION_VIRTUAL_MODEL_ENV, type AutoModelDependencies, type AutoModelState } from "./auto-model.ts";
 import { autoModelLimits, type AutoModelLimits } from "./auto-model-limits.ts";
 import { refuseAutoModelForMainThread } from "./main-thread.ts";
 import type { ActiveRouter } from "./route-task.ts";
@@ -87,8 +87,6 @@ function recordEffortDecisionEvents(warn: (key: string, message: string) => void
         reason: event.reason,
         judgeModel: event.judgeModel,
         band: event.band,
-        stage: event.stage,
-        ...(event.decisionTimestamp === undefined ? {} : { decisionTimestamp: event.decisionTimestamp }),
       });
     } catch (error) {
       warn(`effort-decision-record:${event.sessionId}`, `could not save effort decision for ${event.sessionId}: ${String(error).split(/\r?\n/, 1)[0]}`);
@@ -233,8 +231,6 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
     let sessionBand: ReturnType<typeof sessionEffortBandFromSettings>;
     let sessionEffortOff = false;
     let ourThinkingSelection: ThinkingLevel | undefined;
-    let pendingSessionEffort: ThinkingLevel | undefined;
-    let pendingSessionDecision: EffortDecisionEvent | undefined;
     let effortPersonal: unknown = {};
     const selectEffort = (level: ThinkingLevel) => {
       if (pi.getThinkingLevel() === level) return;
@@ -318,10 +314,11 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
       if (answered) process.env[SESSION_MODEL_ENV] = answered;
     };
     let noticeShown = false;
+    // Each worker session on the auto model this copy serves, with the
+    // function that removes its incoming-message judge.
+    const incomingJudges = new Map<string, () => void>();
     pi.on("session_start", (_event, ctx) => {
       sessionEffortOff = false;
-      pendingSessionEffort = undefined;
-      pendingSessionDecision = undefined;
       sessionBand = undefined;
       try {
         effortPersonal = readSettingsFile(join(personalAgentDir(), "settings.json")) ?? {};
@@ -350,6 +347,11 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
       // A newly routed worker's classification starts now, while the rest of
       // its startup runs (MCP servers connecting), not at its first request.
       const workerId = ctx.sessionManager?.getSessionId();
+      // Its steers and follow-ups are judged when the worker runtime sends them (ADR 0018).
+      if (workerId !== undefined && isAutoModel(ctx.model)) {
+        incomingJudges.get(workerId)?.();
+        incomingJudges.set(workerId, registerIncomingJudge(workerId, (text, mode, running) => autoModel.judgeIncoming(workerId, text, mode, running, ctx)));
+      }
       if (workerId !== undefined && !disabled && isAutoModel(ctx.model)) {
         let systemPrompt = "";
         try { systemPrompt = ctx.getSystemPrompt?.() ?? ""; } catch { /* The first request classifies again if the role differs. */ }
@@ -397,30 +399,17 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
         decision = { from: currentEffort, to: band.max, applyAt: "now" as const,
           reason: `effort judge fallback to band maximum: ${String(error)}`, judgeModel: "fallback" as const };
       }
-      const effortDecision: EffortDecisionEvent = { ...decision, timestamp: deps.now().toISOString(), band,
-        sessionId: id, kind: "user-prompt", scope: "orchestrator", stage: "judged" };
-      emitEffortDecision(effortDecision);
+      emitEffortDecision({ ...decision, timestamp: deps.now().toISOString(), band, sessionId: id, kind: "user-prompt", scope: "orchestrator" });
       if (decision.applyAt === "now") selectEffort(decision.to);
-      else if (decision.applyAt === "turn-end") {
-        pendingSessionEffort = decision.to;
-        pendingSessionDecision = effortDecision;
-      }
-    });
-    pi.on("turn_end", (_event, ctx) => {
-      const id = ctx.sessionManager?.getSessionId();
-      if (id && isAutoModel(ctx.model)) autoModel.turnEnded(id);
-      if (id && isOrchestratorSession(ctx) && pendingSessionEffort && !sessionEffortOff) {
-        selectEffort(pendingSessionEffort);
-        if (pendingSessionDecision !== undefined) emitEffortDecision({ ...pendingSessionDecision, timestamp: deps.now().toISOString(),
-          stage: "applied", decisionTimestamp: pendingSessionDecision.timestamp });
-        pendingSessionEffort = undefined;
-        pendingSessionDecision = undefined;
-      }
     });
 
     pi.on("session_shutdown", (_event, ctx) => {
       const id = ctx?.sessionManager?.getSessionId();
-      if (id !== undefined) autoModel.dropEarlyClassification(id);
+      if (id !== undefined) {
+        autoModel.dropEarlyClassification(id);
+        incomingJudges.get(id)?.();
+        incomingJudges.delete(id);
+      }
       if (orchestratorSessionId !== undefined) publishOrchestratorRouter(orchestratorSessionId, undefined);
       orchestratorSessionId = undefined;
     });
@@ -475,11 +464,7 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
     pi.on("thinking_level_select", (event, ctx) => {
       rememberSessionModel(ctx.model, event.level, ctx);
       if (ourThinkingSelection === event.level) ourThinkingSelection = undefined;
-      else if (sessionBand && isOrchestratorSession(ctx)) {
-        sessionEffortOff = true;
-        pendingSessionEffort = undefined;
-        pendingSessionDecision = undefined;
-      }
+      else if (sessionBand && isOrchestratorSession(ctx)) sessionEffortOff = true;
     });
 
     if (probe) process.stderr.write(`${ROUTER_PREFIX} loaded\n`);

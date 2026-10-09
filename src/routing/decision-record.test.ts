@@ -142,6 +142,18 @@ test("a skipped short follow-up may retain the current effort outside the config
   } finally { cleanup(); }
 });
 
+test("a declined effort decision names a lower effort; a higher one is refused", () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    const input = { at: NOW, sessionId: "worker-1", scope: "worker", kind: "steer", applyAt: "declined", reason: "a one-line check",
+      judgeModel: "anthropic/claude-haiku-5-5:low", band: { min: "low", max: "high" } } as const;
+    const { record } = writeEffortDecisionRecord(dir, { ...input, from: "high", to: "low" });
+    assert.equal(record.applyAt, "declined");
+    assert.equal(record.stage, "judged");
+    assert.throws(() => writeEffortDecisionRecord(dir, { ...input, from: "low", to: "high" }), /field 'applyAt' declined requires a lower effort/);
+  } finally { cleanup(); }
+});
+
 test("routing readers skip unknown record kinds without blocking known records", async () => {
   const { dir, cleanup } = tempDir();
   try {

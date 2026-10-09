@@ -24,7 +24,7 @@ import { SettingsManager, type ExtensionAPI } from "@earendil-works/pi-coding-ag
 import type { TestContext as ExtensionContext } from "../fixtures/extension-context.ts";
 import type { SessionModelRegistry } from "../routing/model-stream.ts";
 import { createRouterExtension, type RouterDependencies, type RoutingEvidence } from "./extension.ts";
-import { markIncomingWorkerMessage, requestFailover, setCarriedClassification, setPendingTask, setRoutingConstraints } from "./auto-model.ts";
+import { judgeIncomingWorkerMessage, requestFailover, setCarriedClassification, setPendingTask, setRoutingConstraints } from "./auto-model.ts";
 import { readUsageObservations, recordUsageObservation, usageObservationsPath, type UsageObservation } from "./usage-observations.ts";
 import { useOwnerBanLists } from "../fixtures/owner-ban-lists.ts";
 import { onEffortDecision } from "../routing/effort-decisions.ts";
@@ -1180,51 +1180,152 @@ test("a dynamic worker rung judges its first task and keeps the model pinned", a
   } finally { h.cleanup(); }
 });
 
-test("a dynamic worker judges a steer, defers a decrease, and reuses effort for continuations", async () => {
+test("a dynamic worker's decision record shows the judged effort it ran on and links the effort decision", async () => {
   const h = harness({ ...LIVE, tiers: { ...TEST_TIERS, mechanical: ["anthropic/claude-opus-5-5:low-high"] } });
-  const events: { stage: string; timestamp: string; decisionTimestamp?: string }[] = [];
+  try {
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]), {
+      effortJudgeCall: () => async () => JSON.stringify({ effort: "low", why: "simple task" }),
+    });
+    await firstRequest(auto, FIX_README, "judged-record");
+    const effortRecord = h.records().find((record) => record.recordType === "effort-decision");
+    const decision = h.records().find((record) => record.recordType === "decision");
+    assert.ok(effortRecord?.recordType === "effort-decision" && decision?.recordType === "decision");
+    assert.equal(decision.ranOn, "anthropic/claude-opus-5-5:low");
+    assert.equal(decision.route.outcome === "chosen" && decision.route.rung.rung, "anthropic/claude-opus-5-5:low-high");
+    assert.equal(decision.effortDecisionId, effortRecord.timestamp);
+  } finally { h.cleanup(); }
+});
+
+test("a dynamic worker's judged pin still counts toward provider balancing", async () => {
+  const h = harness({ ...LIVE, tiers: { ...TEST_TIERS, mechanical: ["anthropic/claude-opus-5-5:low-high", "openai-codex/gpt-6-luna:low"] } });
+  try {
+    const judge = { effortJudgeCall: () => async () => JSON.stringify({ effort: "low", why: "simple task" }) };
+    const first = await loadAutoModel(h, fakeSessionRegistry([]), judge);
+    const second = await loadAutoModel(h, fakeSessionRegistry([]), judge);
+    assert.equal((await firstRequest(first, FIX_README, "dynamic-first")).rung, "anthropic/claude-opus-5-5:low");
+    assert.equal((await firstRequest(second, FIX_README, "dynamic-next")).model.provider, "openai-codex");
+    const record = h.records().find((entry) => entry.delegationId === "dynamic-next" && entry.recordType === "decision");
+    assert.equal(record?.recordType === "decision" && record.route.outcome === "chosen" && record.route.providerCounts?.anthropic, 1);
+  } finally { h.cleanup(); }
+});
+
+test("a slow effort judge does not hold another worker's routing choice", async () => {
+  const h = harness({ ...LIVE, tiers: { ...TEST_TIERS, mechanical: ["anthropic/claude-opus-5-5:low-high", "openai-codex/gpt-6-luna:low"] } });
+  try {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const first = await loadAutoModel(h, fakeSessionRegistry([]), {
+      effortJudgeCall: () => async () => { await held; return JSON.stringify({ effort: "low", why: "simple task" }); },
+    });
+    const second = await loadAutoModel(h, fakeSessionRegistry([]));
+    const slow = firstRequest(first, FIX_README, "slow-judge");
+    const next = await firstRequest(second, FIX_README, "while-judging");
+    assert.equal(next.model.provider, "openai-codex", "the judged worker's choice is reserved while it is judged");
+    release();
+    assert.equal((await slow).rung, "anthropic/claude-opus-5-5:low");
+  } finally { h.cleanup(); }
+});
+
+const DYNAMIC_MECHANICAL = { ...LIVE, tiers: { ...TEST_TIERS, mechanical: ["anthropic/claude-opus-5-5:low-high"] } };
+
+test("a dynamic worker judges a steer when it is sent: a lower effort during a run is declined, a higher one applies from its request on", async () => {
+  const h = harness(DYNAMIC_MECHANICAL);
+  const events: { kind: string; applyAt: string }[] = [];
   const unsubscribe = onEffortDecision((event) => events.push(event));
   try {
-    const answers = ["high", "low"];
-    const auto = await loadAutoModel(h, fakeSessionRegistry([]), {
+    const answers = ["medium", "low", "high"];
+    const registry = fakeSessionRegistry([]);
+    const auto = await loadAutoModel(h, registry, {
       effortJudgeCall: () => async () => JSON.stringify({ effort: answers.shift() ?? "low", why: "chosen" }),
     });
-    const first = await auto.route("band-steer", FIX_README);
-    assert.equal(first.thinkingLevel, "high");
-    const continuation = await auto.route("band-steer", FIX_README, { reason: "continuation", state: first.state });
-    assert.equal(continuation.thinkingLevel, "high");
-    const message = "Check one typo";
-    markIncomingWorkerMessage("band-steer", message, "steer");
-    const messages = [...FIX_README, { role: "assistant", content: [{ type: "text", text: "Working" }] }, { role: "user", content: message }];
-    const steer = await auto.route("band-steer", messages, { reason: "user", state: continuation.state });
-    assert.equal(steer.thinkingLevel, "high");
-    assert.equal((steer.state as { pendingEffort?: string }).pendingEffort, "low");
-    const withinTurn = await auto.route("band-steer", messages, { reason: "continuation", state: steer.state });
-    assert.equal(withinTurn.thinkingLevel, "high");
-    await auto.handlers.get("turn_end")?.({ type: "turn_end" }, workerContext(h, "band-steer", fakeSessionRegistry([])));
-    const after = await auto.route("band-steer", messages, { reason: "continuation", state: withinTurn.state });
-    assert.equal(after.thinkingLevel, "low");
-    assert.deepEqual(events.map((event) => event.stage), ["judged", "judged", "applied"]);
-    assert.equal(events[2]?.decisionTimestamp, events[1]?.timestamp);
-    assert.deepEqual(h.records().filter((record) => record.recordType === "effort-decision").map((record) => record.stage),
-      ["judged", "judged", "applied"]);
+    await startWorkerSession(h, auto, "band-steer", registry);
+    const worker = auto.worker("band-steer");
+    assert.equal((await worker.user()).thinkingLevel, "medium");
+    assert.equal((await worker.continuation()).thinkingLevel, "medium");
+    await judgeIncomingWorkerMessage("band-steer", "Check one typo", "steer", true);
+    assert.equal((await worker.user()).thinkingLevel, "medium", "a lower effort during a run is declined");
+    assert.equal((await worker.continuation()).thinkingLevel, "medium", "a declined effort never applies later");
+    await judgeIncomingWorkerMessage("band-steer", "Now redesign the whole module", "steer", true);
+    assert.equal((await worker.continuation()).thinkingLevel, "medium", "a raise waits for the request that carries the steer");
+    assert.equal((await worker.user()).thinkingLevel, "high");
+    assert.equal((await worker.continuation()).thinkingLevel, "high");
+    assert.deepEqual(events.map((event) => `${event.kind}:${event.applyAt}`), ["task:now", "steer:declined", "steer:now"]);
+    assert.deepEqual(h.records().filter((record) => record.recordType === "effort-decision").map((record) => record.applyAt),
+      ["now", "declined", "now"]);
   } finally { unsubscribe(); h.cleanup(); }
 });
 
+test("batched steers are each judged when sent, each from the effort the one before left", async () => {
+  const h = harness(DYNAMIC_MECHANICAL);
+  const events: { from: string; to: string; applyAt: string }[] = [];
+  const unsubscribe = onEffortDecision((event) => events.push(event));
+  try {
+    const answers = ["low", "high", "medium"];
+    const registry = fakeSessionRegistry([]);
+    const auto = await loadAutoModel(h, registry, {
+      effortJudgeCall: () => async () => JSON.stringify({ effort: answers.shift() ?? "low", why: "chosen" }),
+    });
+    await startWorkerSession(h, auto, "batched", registry);
+    const worker = auto.worker("batched");
+    assert.equal((await worker.user()).thinkingLevel, "low");
+    await Promise.all([
+      judgeIncomingWorkerMessage("batched", "Redesign the whole module", "steer", true),
+      judgeIncomingWorkerMessage("batched", "Also rename one variable", "steer", true),
+    ]);
+    // pi sends both steers in one request.
+    assert.equal((await worker.user()).thinkingLevel, "high");
+    assert.deepEqual(events.slice(1).map((event) => `${event.from}->${event.to}:${event.applyAt}`), ["low->high:now", "high->medium:declined"]);
+  } finally { unsubscribe(); h.cleanup(); }
+});
+
+test("a steer whose send fails withdraws the effort it was judged at", async () => {
+  const h = harness(DYNAMIC_MECHANICAL);
+  try {
+    const answers = ["low", "high"];
+    const registry = fakeSessionRegistry([]);
+    const auto = await loadAutoModel(h, registry, {
+      effortJudgeCall: () => async () => JSON.stringify({ effort: answers.shift() ?? "low", why: "chosen" }),
+    });
+    await startWorkerSession(h, auto, "failed-send", registry);
+    const worker = auto.worker("failed-send");
+    assert.equal((await worker.user()).thinkingLevel, "low");
+    const withdraw = await judgeIncomingWorkerMessage("failed-send", "Redesign the whole module", "steer", true);
+    withdraw();
+    assert.equal((await worker.user()).thinkingLevel, "low");
+  } finally { h.cleanup(); }
+});
+
 test("a worker follow-up is judged as a follow-up and a short one keeps its effort", async () => {
-  const h = harness({ ...LIVE, tiers: { ...TEST_TIERS, mechanical: ["anthropic/claude-opus-5-5:low-high"] } });
+  const h = harness(DYNAMIC_MECHANICAL);
   const events: unknown[] = [];
   const unsubscribe = onEffortDecision((event) => events.push(event));
   try {
-    const auto = await loadAutoModel(h, fakeSessionRegistry([]), { effortJudgeCall: () => async () => JSON.stringify({ effort: "low", why: "easy" }) });
-    const first = await auto.route("follow-up-worker", FIX_README);
-    markIncomingWorkerMessage("follow-up-worker", "yes", "followUp");
-    const follow = await auto.route("follow-up-worker", [...FIX_README, { role: "assistant", content: "Done" }, { role: "user", content: "yes" }],
-      { reason: "user", state: first.state });
-    assert.equal(follow.thinkingLevel, "low");
+    const registry = fakeSessionRegistry([]);
+    const auto = await loadAutoModel(h, registry, { effortJudgeCall: () => async () => JSON.stringify({ effort: "low", why: "easy" }) });
+    await startWorkerSession(h, auto, "follow-up-worker", registry);
+    const worker = auto.worker("follow-up-worker");
+    await worker.user();
+    await judgeIncomingWorkerMessage("follow-up-worker", "yes", "followUp", true);
+    assert.equal((await worker.user()).thinkingLevel, "low");
     assert.deepEqual(events.map((event) => (event as { kind: string; judgeModel: string }).kind), ["task", "follow-up"]);
     assert.equal((events[1] as { judgeModel: string }).judgeModel, "skipped");
   } finally { unsubscribe(); h.cleanup(); }
+});
+
+test("a worker on a one-effort rung makes no judge call for a steer", async () => {
+  const h = harness(LIVE);
+  try {
+    let calls = 0;
+    const registry = fakeSessionRegistry([]);
+    const auto = await loadAutoModel(h, registry, { effortJudgeCall: () => async () => { calls++; return JSON.stringify({ effort: "low", why: "easy" }); } });
+    await startWorkerSession(h, auto, "one-effort", registry);
+    const worker = auto.worker("one-effort");
+    const first = await worker.user();
+    await judgeIncomingWorkerMessage("one-effort", "Now redesign the whole module", "steer", true);
+    assert.equal((await worker.user()).rung, first.rung);
+    assert.equal(calls, 0);
+    assert.deepEqual(h.records().filter((record) => record.recordType === "effort-decision"), []);
+  } finally { h.cleanup(); }
 });
 
 test("a failed worker judge uses the band maximum and exposes its decision", async () => {
@@ -1238,7 +1339,7 @@ test("a failed worker judge uses the band maximum and exposes its decision", asy
     assert.equal(routed.thinkingLevel, "high");
     assert.deepEqual(events, [{ sessionId: "failed-judge", scope: "worker", kind: "task", from: "high", to: "high",
       applyAt: "none", reason: "effort judge fallback to band maximum: offline", judgeModel: "fallback",
-      timestamp: NOW.toISOString(), band: { min: "low", max: "high" }, stage: "judged" }]);
+      timestamp: NOW.toISOString(), band: { min: "low", max: "high" } }]);
   } finally { unsubscribe(); h.cleanup(); }
 });
 
