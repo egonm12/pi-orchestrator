@@ -49,6 +49,7 @@ after(() => {
 
 const HAIKU = "anthropic/claude-haiku-4-5";
 const SONNET = "anthropic/claude-sonnet-5";
+const OPUS_5_5 = "anthropic/claude-opus-5-5";
 const NOW = new Date("2026-09-28T12:00:00.000Z");
 /** A standard worker runs on haiku:medium; the ladder climbs haiku's efforts first. Critical has one rung, whose next effort, max, is not listed. */
 const TIERS = { mechanical: [`${HAIKU}:low`], standard: [`${HAIKU}:medium`, `${SONNET}:medium`], elevated: [`${SONNET}:high`], critical: [`${SONNET}:xhigh`] };
@@ -96,7 +97,7 @@ function routerDependencies(approved = true) {
       classifierPrompts.push(prompt);
       return answer(/\[(standard|elevated|critical)\]/.exec(prompt)?.[1] ?? "mechanical");
     },
-    evidence: () => () => ({ catalog: buildCatalog({ modelIds: [HAIKU, SONNET], now: NOW }), refreshState: emptyRefreshState(),
+    evidence: () => () => ({ catalog: buildCatalog({ modelIds: [HAIKU, SONNET, OPUS_5_5], now: NOW }), refreshState: emptyRefreshState(),
       authorization: approved ? approvedAnthropic() : emptyAuthorization() }),
     now: () => NOW,
   };
@@ -123,7 +124,9 @@ function anthropic() {
   const requests: Request[] = [];
   const config: ProviderConfig = {
     name: "Fake Anthropic", baseUrl: "http://localhost/unused", apiKey: "unused", api: "fake-anthropic" as never,
-    models: ["claude-haiku-4-5", "claude-sonnet-5"].map((id) => ({ id, name: id, reasoning: true, input: ["text"],
+    models: ["claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5-5"].map((id) => ({ id, name: id, reasoning: true, input: ["text"],
+      ...(id === "claude-opus-5-5" ? { thinkingLevelMap: { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" },
+        compat: { supportsMidConvoEffort: true } } : {}),
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200_000, maxTokens: 64_000 })),
     streamSimple(model, context, options) {
       const task = context.messages.flatMap((message) => message.role === "user" ? [textOf(message.content)] : []).at(-1) ?? "";
@@ -315,6 +318,49 @@ test("request_changes names the next rung; a retry runs there as a new delegatio
     const report = buildRoutingReport(join(h.stateDir, "routing"));
     assert.deepEqual(report.ladders.map((record) => [record.previousDecisionId, record.delegationId]), [[id, retryId], [retryId, second.sessionId]]);
     assert.equal(report.totals.decisions, 3);
+  } finally { await o.shutdown(); h.cleanup(); }
+});
+
+test("dynamic retries preserve raised bands in records, advance at the top, and keep the climb limit", async () => {
+  const routing = { enabled: true, mode: "live", classifier: { model: `${HAIKU}:low`, timeoutMs: 1_000 }, tiers: {
+    mechanical: [`${HAIKU}:low`], standard: [`${OPUS_5_5}:high-xhigh`, `${OPUS_5_5}:max`],
+    elevated: [`${SONNET}:high`], critical: [`${SONNET}:xhigh`],
+  } };
+  const h = harness(routing);
+  const o = await orchestrator(h);
+  try {
+    const first = await one(o, { task: `[standard]\n${WRITE_NOTES}` });
+    assert.equal(first.status, "completed", JSON.stringify(first));
+    const id = first.sessionId!;
+    assert.equal(requestsOf(o, id)[0]!.rung, `${OPUS_5_5}:xhigh`);
+    assert.equal(await verdict(o, requestChanges(id)), `Recorded request_changes on delegation ${id}. ` +
+      `The next effort-ladder rung is ${OPUS_5_5}:xhigh-xhigh at the standard tier (step effort), climb 1 of 2. ` +
+      `To retry, start a subagents item whose retry is ${id} and whose task is your feedback.`);
+
+    const retry = await one(o, { retry: id, task: ADD_HEADING });
+    assert.equal(retry.status, "completed", JSON.stringify(retry));
+    const retryId = retry.sessionId!;
+    assert.equal(requestsOf(o, retryId)[0]!.rung, `${OPUS_5_5}:xhigh`);
+    const retryLadder = ladderOf(h, retryId);
+    assert.ok(retryLadder.step !== "unplaced");
+    assert.equal(retryLadder.route.rung.rung, `${OPUS_5_5}:xhigh-xhigh`);
+    const retryRoute = decisionOf(h, retryId).route;
+    assert.equal(retryRoute.outcome === "chosen" && retryRoute.rung.rung, `${OPUS_5_5}:xhigh-xhigh`);
+    assert.equal(await verdict(o, requestChanges(retryId)), `Recorded request_changes on delegation ${retryId}. ` +
+      `The next effort-ladder rung is ${OPUS_5_5}:max at the standard tier (step same-tier), climb 2 of 2. ` +
+      `To retry, start a subagents item whose retry is ${retryId} and whose task is your feedback.`);
+
+    const second = await one(o, { retry: retryId, task: ADD_HEADING });
+    assert.equal(second.status, "completed", JSON.stringify(second));
+    const secondId = second.sessionId!;
+    assert.equal(requestsOf(o, secondId)[0]!.rung, `${OPUS_5_5}:max`);
+    const secondLadder = ladderOf(h, secondId);
+    assert.ok(secondLadder.step !== "unplaced");
+    assert.equal(secondLadder.route.rung.rung, `${OPUS_5_5}:max`);
+    const secondRoute = decisionOf(h, secondId).route;
+    assert.equal(secondRoute.outcome === "chosen" && secondRoute.rung.rung, `${OPUS_5_5}:max`);
+    const limit = `its task has climbed the effort ladder twice already (delegations ${id}, ${retryId}, ${secondId}). Take the task back to the user`;
+    assert.ok((await verdict(o, requestChanges(secondId))).endsWith(`A retry is refused: ${limit}.`));
   } finally { await o.shutdown(); h.cleanup(); }
 });
 

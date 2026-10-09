@@ -5,9 +5,11 @@ import {
   buildUnplacedLadderRecord,
   type EffortLadderRecord,
   type LadderMode,
+  type RecordedRung,
   type RoutingRecord,
 } from "../routing/decision-record.ts";
 import type { LadderChoice } from "../routing/effort-ladder.ts";
+import { THINKING_LEVELS } from "../models/model-info.ts";
 import type { TierClassification } from "../routing/tier-classifier.ts";
 import type { ResolvedTierMap, TierRung } from "../routing/tier-map.ts";
 import type { RoutingConstraints } from "../routing/tier-router.ts";
@@ -82,6 +84,16 @@ function latestRouting(records: readonly RoutingRecord[], id: string) {
     (record.recordType === "decision" || record.recordType === "fork" || record.recordType === "agent-model")).at(-1);
 }
 
+function tierRungFromRecord(recorded: RecordedRung): TierRung {
+  const label = recorded.rung.slice(recorded.rung.lastIndexOf(":") + 1);
+  const ends = label.split("-");
+  if (ends.length !== 2) return recorded as TierRung;
+  const min = THINKING_LEVELS.find((level) => level === ends[0]);
+  const max = THINKING_LEVELS.find((level) => level === ends[1]);
+  if (min === undefined || max === undefined || recorded.effort !== max) return recorded as TierRung;
+  return { ...recorded, band: { min, max } } as TierRung;
+}
+
 function ladderPosition(records: readonly RoutingRecord[], id: string): LadderPosition {
   const latest = latestRouting(records, id);
   if (latest?.recordType === "fork") return { placed: false, why: `delegation ${id} is a forked worker, which runs unrouted on the session model` };
@@ -89,7 +101,7 @@ function ladderPosition(records: readonly RoutingRecord[], id: string): LadderPo
   if (latest?.recordType !== "decision") return { placed: false, why: `no routing decision names delegation ${id}'s rung: it ran with routing off` };
   const { route } = latest;
   if (route.outcome !== "chosen") return { placed: false, why: `delegation ${id}'s route refused every rung, so it ran on the session model` };
-  return { placed: true, tier: route.tier, rung: route.rung as TierRung, kindOfWork: latest.classification.kindOfWork };
+  return { placed: true, tier: route.tier, rung: tierRungFromRecord(route.rung), kindOfWork: latest.classification.kindOfWork };
 }
 
 /** The classification a retry of `id` is routed on: `id`'s, from its latest

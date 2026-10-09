@@ -37,6 +37,8 @@ export interface SessionClassifierCallReport {
 }
 
 export interface SessionClassifierCallOptions {
+  /** Override the classifier prompt for another JSON-only in-session call. */
+  readonly systemPrompt?: string;
   /** Milliseconds; defaults to `performance.now`. */
   readonly now?: () => number;
   readonly onCallEnd?: (report: SessionClassifierCallReport) => void;
@@ -118,7 +120,7 @@ export function sessionClassifierModelCall(
       const reasoning = streamReasoning(model, thinkingSuffix.slice(1));
       const stream = registry.streamSimple(
         model,
-        { systemPrompt: CLASSIFIER_SYSTEM_PROMPT, messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
+        { systemPrompt: options.systemPrompt ?? CLASSIFIER_SYSTEM_PROMPT, messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
         { signal, maxTokens: CLASSIFIER_MAX_OUTPUT_TOKENS, ...(reasoning === undefined ? {} : { reasoning }) },
       );
       const iterator = stream[Symbol.asyncIterator]();

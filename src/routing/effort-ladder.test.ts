@@ -20,7 +20,7 @@ const OPUS_5_5 = "anthropic/claude-opus-5-5";
 
 const catalog = buildCatalog({ modelIds: [...INSTALLED_MODEL_IDS], now: NOW });
 
-function evidence(): RouterEvidence {
+function evidence(overrides: Partial<RouterEvidence> = {}): RouterEvidence {
   let authorization = emptyAuthorization();
   for (const provider of ["anthropic", "openai-codex"]) {
     authorization = authorizeRecipient(authorization, provider, grantOwnerApproval({
@@ -38,6 +38,7 @@ function evidence(): RouterEvidence {
     authorization,
     banLists: DEFAULT_BAN_LISTS,
     modelScope: HARNESS_MODEL_SCOPE,
+    ...overrides,
   };
 }
 
@@ -52,9 +53,8 @@ function tierMapWith(elevated: readonly string[]): ResolvedTierMap {
   return map;
 }
 
-test("a climb from a dynamic rung's top to a listed max builds a single-effort rung, with no band", () => {
-  // The band's top is xhigh, so the next effort on Opus 5.5 is max, listed below.
-  const tierMap = tierMapWith([`${OPUS_5_5}:medium-xhigh`, `${OPUS_5_5}:max`]);
+test("a dynamic rung climb raises its floor one supported level and keeps the same maximum", () => {
+  const tierMap = tierMapWith([`${OPUS_5_5}:medium-xhigh`]);
   const failed = tierMap.tiers.elevated[0]!;
   assert.equal(failed.effort, "xhigh");
   const decision = nextRungAfterFailure({
@@ -65,5 +65,52 @@ test("a climb from a dynamic rung's top to a listed max builds a single-effort r
   });
   assert.equal(decision.step, "effort");
   assert.ok("rung" in decision);
-  assert.deepEqual(decision.rung, { rung: `${OPUS_5_5}:max`, model: OPUS_5_5, effort: "max", origin: "personal" });
+  assert.deepEqual(decision.rung, {
+    rung: `${OPUS_5_5}:high-xhigh`, model: OPUS_5_5, effort: "xhigh", band: { min: "high", max: "xhigh" }, origin: "personal",
+  });
+});
+
+test("a raised dynamic band still passes hard filters before the ladder selects it", () => {
+  const nextListed = "openai-codex/gpt-6-luna:high";
+  const tierMap = tierMapWith([`${OPUS_5_5}:medium-xhigh`, nextListed]);
+  const decision = nextRungAfterFailure({
+    failed: { delegationId: "attempt-1", tier: "elevated", rung: tierMap.tiers.elevated[0]! },
+    tierMap,
+    installedModels: INSTALLED_MODEL_INFO,
+    evidence: evidence({ providerUsage: { anthropic: { state: "out-of-usage" } } }),
+  });
+  assert.equal(decision.step, "same-tier");
+  assert.ok("rung" in decision);
+  assert.equal(decision.rung.rung, nextListed);
+  assert.deepEqual(decision.skipped.map(({ rung, reason }) => [rung, reason]), [[`${OPUS_5_5}:high-xhigh`, "provider out of usage"]]);
+});
+
+test("a dynamic rung at its top floor advances to the next listed rung without considering effort above the band", () => {
+  const tierMap = tierMapWith([`${OPUS_5_5}:xhigh-xhigh`, "openai-codex/gpt-6-luna:high"]);
+  const failed = tierMap.tiers.elevated[0]!;
+  const decision = nextRungAfterFailure({
+    failed: { delegationId: "attempt-1", tier: "elevated", rung: failed },
+    tierMap,
+    installedModels: INSTALLED_MODEL_INFO,
+    evidence: evidence(),
+  });
+  assert.equal(decision.step, "same-tier");
+  assert.ok("rung" in decision);
+  assert.deepEqual(decision.rung, tierMap.tiers.elevated[1]);
+  assert.deepEqual(decision.skipped, []);
+});
+
+test("a generated dynamic rung keeps its listed position when the next rung uses the same model", () => {
+  const tierMap = tierMapWith([`${OPUS_5_5}:medium-xhigh`, `${OPUS_5_5}:xhigh`, "openai-codex/gpt-6-luna:high"]);
+  const original = tierMap.tiers.elevated[0]!;
+  const failed = { ...original, rung: `${OPUS_5_5}:xhigh-xhigh`, band: { min: "xhigh" as const, max: "xhigh" as const } };
+  const decision = nextRungAfterFailure({
+    failed: { delegationId: "attempt-1", tier: "elevated", rung: failed },
+    tierMap,
+    installedModels: INSTALLED_MODEL_INFO,
+    evidence: evidence(),
+  });
+  assert.equal(decision.step, "same-tier");
+  assert.ok("rung" in decision);
+  assert.deepEqual(decision.rung, tierMap.tiers.elevated[1]);
 });
