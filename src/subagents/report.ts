@@ -64,11 +64,18 @@ export function reportExtension(reports: WorkerReports): InlineExtension {
           return { content: [{ type: "text", text: "Progress sent." }], details: undefined };
         }
         const answer = await reports.question(delegationId, text, signal);
-        return { content: [{ type: "text", text: `The orchestrator answered: ${answer}` }], details: undefined };
+        // The fallback speaks for itself: no one answered, so no one is named.
+        const reply = answer === UNANSWERED_QUESTION ? answer : `The orchestrator answered: ${answer}`;
+        return { content: [{ type: "text", text: reply }], details: undefined };
       },
     }),
   };
 }
+
+/** The fallback answer a child gets when its delegating worker ends its run
+ *  twice without answering (ADR 0016). It says it is a fallback, not an answer. */
+export const UNANSWERED_QUESTION = "No answer (fallback): your delegating worker ended its turn without answering your question. " +
+  "Go on without an answer: use your best judgement, and say in your Result what you assumed.";
 
 /** Reports from the workers of one subagents call, delivered into the delegating
  *  session. Only a background call's workers, given `backgroundCalls`, may ask. */

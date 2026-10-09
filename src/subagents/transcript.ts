@@ -20,7 +20,8 @@ import {
   type AgentSessionEvent,
   type Theme,
 } from "@earendil-works/pi-coding-agent";
-import { Markdown } from "@earendil-works/pi-tui";
+import { Container, Markdown, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { truncateToVisualLines } from "@earendil-works/pi-coding-agent";
 import { REPORT_TOOL } from "./report.ts";
 import { renderSubagentsCall, renderSubagentsResult, textComponent, type Component } from "./render.ts";
 import { SUBAGENTS_TOOL } from "./worker.ts";
@@ -48,6 +49,7 @@ type ToolRenderers = NonNullable<ConstructorParameters<typeof ToolExecutionCompo
 interface Part {
   render(width: number): string[];
   setExpanded?(expanded: boolean): void;
+  handleMouse?(event: TuiMouseEvent): unknown;
 }
 
 interface ContentPart {
@@ -127,9 +129,29 @@ const USER_MARKS: Partial<Record<UserMessageKind, string>> = {
 
 const EMPTY: Component = { render: () => [], invalidate() {} };
 
+/** The marks pi's user message puts around a prompt, which its prompt
+ *  navigation (ctrl+up and ctrl+down in fullscreen) jumps between. */
+const PROMPT_START = "\x1b]133;A\x07";
+const PROMPT_END = "\x1b]133;B\x07\x1b]133;C\x07";
+
+/** `lines` with the prompt marks on the first and last line. A copy: a
+ *  Markdown renderer returns its cached lines, which must stay unmarked. The
+ *  start is written last, so on a one-line prompt it still begins the line:
+ *  pi-tui matches the start at the line's beginning. */
+function markPrompt(lines: readonly string[]): string[] {
+  const marked = [...lines];
+  const last = marked.length - 1;
+  if (last >= 0) {
+    marked[last] = PROMPT_END + marked[last];
+    marked[0] = PROMPT_START + marked[0];
+  }
+  return marked;
+}
+
 /** The board's task is the one task card in the transcript, even before its
  *  prompt reaches the worker's session. Pi's Markdown renderer handles both
- *  the preview and the full task, including lists and code spans. */
+ *  the preview and the full task, including lists and code spans. The card is
+ *  a prompt, as the user's message is in pi's chat. */
 function taskPart(task: string, theme: Theme): Part {
   const lines = task.trim().split(/\r?\n/);
   const preview = lines.slice(0, 3).map((line) => line.length > 100 ? `${line.slice(0, 99).trimEnd()}…` : line).join("\n");
@@ -138,13 +160,19 @@ function taskPart(task: string, theme: Theme): Part {
   const brief = new Markdown(preview, 0, 0, markdown);
   const full = new Markdown(task, 0, 0, markdown);
   let expanded = false;
+  let cachedWidth = -1;
+  let cached: string[] = [];
   return {
-    setExpanded: (value) => { expanded = value; },
-    render: (width) => [
-      ...(expanded ? full : brief).render(width),
-      ...(shortened && !expanded ? [theme.fg("dim", "ctrl+o to expand task")] : []),
-    ],
-  };
+    setExpanded: (value) => { if (expanded !== value) { expanded = value; cachedWidth = -1; } },
+    render: (width) => {
+      if (width !== cachedWidth) {
+        cachedWidth = width;
+        cached = [...markPrompt((expanded ? full : brief).render(width)),
+          ...(shortened && !expanded ? [theme.fg("dim", "ctrl+o to expand task")] : [])];
+      }
+      return cached;
+    },
+  }; 
 }
 
 /** The worker's `report` tool, marked: its call shows the kind and text, and a
@@ -191,6 +219,8 @@ export interface TranscriptContext {
   readonly toolDefinition?: (name: string) => ToolRenderers | undefined;
   /** Whether tool output starts expanded. */
   readonly expanded?: boolean;
+  /** The terminal-scrollback mode keeps the pending tint and cuts lines once per change. */
+  readonly regular?: boolean;
   /** Whether the user, not the orchestrator, sent a steer or follow-up with this text; asked at each render. */
   readonly sentByUser?: (text: string) => boolean;
 }
@@ -207,10 +237,15 @@ export class Transcript {
   readonly #task: Part | undefined;
   readonly #byMessage = new WeakMap<object, Part[]>();
   readonly #tools = new Map<string, ToolExecutionComponent>();
+  readonly #toolParts = new Map<string, Part>();
+  readonly #wrapped = new WeakMap<Part, Part>();
+  readonly #document = new Container();
+  readonly #toolArgs = new Map<string, unknown>();
+  readonly #argsComplete = new Set<string>();
   /** Tool calls whose final result is shown. */
   readonly #finished = new Set<string>();
   #messages: readonly SessionMessage[] = [];
-  #streaming: { message: SessionMessage; component: AssistantMessageComponent } | undefined;
+  #streaming: { message: SessionMessage; component: AssistantMessageComponent; at: number } | undefined;
 
   constructor(context: TranscriptContext) {
     this.#context = context;
@@ -224,6 +259,11 @@ export class Transcript {
   /** Shows the worker's messages so far. */
   update(messages: readonly unknown[]): void {
     this.#messages = messages as readonly SessionMessage[];
+    const last = this.#messages.at(-1);
+    if (this.#streaming === undefined && last?.role === "assistant" && last.stopReason === undefined) {
+      const component = this.#cached(last, () => [new AssistantMessageComponent(last as never, true, this.#markdown)])[0] as AssistantMessageComponent;
+      this.#streaming = { message: last, component, at: this.#messages.length - 1 };
+    }
     this.#rebuild();
   }
 
@@ -235,14 +275,34 @@ export class Transcript {
       case "message_update": {
         const message = event.message as unknown as SessionMessage;
         if (message.role !== "assistant") return;
-        this.#streaming ??= { message, component: new AssistantMessageComponent(undefined, false, this.#markdown) };
+        if (this.#streaming === undefined) {
+          const component = new AssistantMessageComponent(undefined, false, this.#markdown);
+          this.#streaming = { message, component, at: this.#messages.length };
+          this.#parts.push(this.#wrap(component));
+          this.#refreshDocument();
+        }
         this.#streaming.message = message;
         this.#streaming.component.updateContent(event.message as never, true);
-        break;
+        let afterReply = this.#parts.indexOf(this.#wrap(this.#streaming.component)) + 1;
+        for (const part of this.#toolCalls(message, true)) {
+          const wrapped = this.#wrap(part);
+          if (!this.#parts.includes(wrapped)) { this.#parts.splice(afterReply, 0, wrapped); this.#refreshDocument(); }
+          afterReply++;
+        }
+        return;
       }
-      case "message_end":
-        this.#streaming = undefined;
-        break;
+      case "message_end": {
+        const message = event.message as unknown as SessionMessage;
+        if (message.role !== "assistant") return;
+        if (this.#streaming !== undefined) {
+          const { component } = this.#streaming;
+          component.updateContent(event.message as never, false);
+          this.#byMessage.set(message, [component]);
+          this.#streaming = undefined;
+        }
+        this.#toolCalls(message, false);
+        return;
+      }
       case "tool_execution_start":
         this.#tool(event.toolCallId, event.toolName, event.args).markExecutionStarted();
         break;
@@ -250,12 +310,14 @@ export class Transcript {
         if (!this.#finished.has(event.toolCallId)) this.#tools.get(event.toolCallId)?.updateResult({ ...event.partialResult, isError: false }, true);
         break;
       case "tool_execution_end":
-        this.#tools.get(event.toolCallId)?.updateResult({ ...event.result, isError: event.isError });
+        if (!this.#finished.has(event.toolCallId)) {
+          this.#tools.get(event.toolCallId)?.updateResult({ ...event.result, isError: event.isError, ...("durationMs" in event ? { durationMs: event.durationMs } : {}) }, false);
+          this.#finished.add(event.toolCallId);
+        }
         break;
       default:
         return;
     }
-    this.#rebuild();
   }
 
   /** The tool-output expand toggle, as pi's app.tools.expand. */
@@ -270,7 +332,42 @@ export class Transcript {
   }
 
   render(width: number, includeTask = true): string[] {
-    return this.#parts.flatMap((part) => part === this.#task && !includeTask ? [] : part.render(width));
+    const lines = this.#document.render(width);
+    return includeTask && this.#task !== undefined ? [...this.#task.render(width), ...lines] : lines;
+  }
+
+  handleMouse(event: TuiMouseEvent, includeTask = true): unknown {
+    const taskHeight = includeTask ? this.#task?.render(event.width).length ?? 0 : 0;
+    if (event.y < taskHeight) return undefined;
+    return this.#document.handleMouse({ ...event, y: event.y - taskHeight, height: event.height - taskHeight });
+  }
+
+  #refreshDocument(): void {
+    this.#document.clear();
+    for (const part of this.#parts) if (part !== this.#task) this.#document.addChild(part as never);
+  }
+
+  #wrap(part: Part): Part {
+    if (!this.#context.regular) return part;
+    let wrapped = this.#wrapped.get(part);
+    if (wrapped !== undefined) return wrapped;
+    let width = -1;
+    let source: string[] | undefined;
+    let lines: string[] = [];
+    wrapped = {
+      render: (nextWidth) => {
+        const next = part.render(nextWidth);
+        if (nextWidth !== width || source === undefined || next.length !== source.length || next.some((line, i) => line !== source![i])) {
+          width = nextWidth; source = next;
+          lines = next.map((line) => truncateToVisualLines(line.replace(/\x1b\]133;[A-D]\x07/g, ""), Number.POSITIVE_INFINITY, nextWidth).visualLines[0] ?? "");
+        }
+        return lines;
+      },
+      setExpanded: (expanded) => part.setExpanded?.(expanded),
+      handleMouse: (event) => part.handleMouse?.(event),
+    };
+    this.#wrapped.set(part, wrapped);
+    return wrapped;
   }
 
   /** The transcript is no longer shown. A tool still running gets an empty
@@ -287,10 +384,17 @@ export class Transcript {
   #rebuild(): void {
     const parts: Part[] = this.#task === undefined ? [] : [this.#task];
     const messages = this.#messages;
+    const streaming = this.#streaming;
     const kinds = userMessageKinds(messages, this.#context.tasks);
+    const appendStreaming = () => {
+      if (streaming === undefined) return;
+      parts.push(streaming.component, ...this.#toolCalls(streaming.message, true));
+    };
     for (const [index, message] of messages.entries()) {
+      if (index === streaming?.at) appendStreaming();
       switch (message.role) {
         case "assistant":
+          if (message === streaming?.message || (index === streaming?.at && message.stopReason === undefined)) break;
           parts.push(...this.#cached(message, () => [new AssistantMessageComponent(message as never, false, this.#markdown)]));
           parts.push(...this.#toolCalls(message, false));
           break;
@@ -310,9 +414,9 @@ export class Transcript {
           parts.push(...this.#cached(message, () => this.#other(message)));
       }
     }
-    const streaming = this.#streaming;
-    if (streaming) parts.push(streaming.component, ...this.#toolCalls(streaming.message, true));
-    this.#parts = parts;
+    if (streaming !== undefined && streaming.at >= messages.length) appendStreaming();
+    this.#parts = parts.map((part) => part === this.#task ? part : this.#wrap(part));
+    this.#refreshDocument();
   }
 
   #cached(message: SessionMessage, build: () => Part[]): Part[] {
@@ -334,15 +438,24 @@ export class Transcript {
     for (const call of message.content) {
       if (call.type !== "toolCall" || call.id === undefined) continue;
       const component = this.#tool(call.id, call.name ?? "", call.arguments);
-      if (streaming) component.updateArgs(call.arguments);
-      else if (!this.#finished.has(call.id)) {
+      if (streaming && this.#toolArgs.get(call.id) !== call.arguments) {
+        component.updateArgs(call.arguments);
+        this.#toolArgs.set(call.id, call.arguments);
+      }
+      else if (!streaming && !this.#argsComplete.has(call.id)) {
         component.setArgsComplete();
+        this.#argsComplete.add(call.id);
         if (message.stopReason === "aborted" || message.stopReason === "error") {
           component.updateResult({ content: [{ type: "text", text: message.stopReason === "aborted" ? "Operation aborted" : message.errorMessage || "Error" }], isError: true });
           this.#finished.add(call.id);
         }
       }
-      parts.push(steadyTool(component, this.#context.theme));
+      let part = this.#toolParts.get(call.id);
+      if (part === undefined) {
+        part = this.#context.regular ? steadyTool(component, this.#context.theme) : component;
+        this.#toolParts.set(call.id, part);
+      }
+      parts.push(part);
     }
     return parts;
   }
@@ -373,11 +486,20 @@ export class Transcript {
     const component = new UserMessageComponent(text, this.#markdown);
     const { theme, sentByUser } = this.#context;
     const spacer = first ? [] : [""];
-    return [{ render: (width) => {
-      // At render, not when the part is built: the user's steer is recorded once it was sent, which may be after it reached the session.
-      const mark = (sentByUser?.(text) === true ? USER_MARKS : MARKS)[kind];
-      return [...spacer, ...(mark === undefined ? [] : [theme.fg("warning", theme.bold(mark))]), ...component.render(width)];
-    } }];
+    let width = -1;
+    let fromUser = false;
+    let cached: string[] = [];
+    return [{ render: (nextWidth) => {
+      // The O(1) mark check notices a steer recorded after the message arrived.
+      const nextFromUser = sentByUser?.(text) === true;
+      if (nextWidth !== width || nextFromUser !== fromUser) {
+        width = nextWidth;
+        fromUser = nextFromUser;
+        const mark = (fromUser ? USER_MARKS : MARKS)[kind];
+        cached = [...spacer, ...(mark === undefined ? [] : [theme.fg("warning", theme.bold(mark))]), ...component.render(nextWidth)];
+      }
+      return cached;
+    }, handleMouse: (event) => component.handleMouse?.({ ...event, y: event.y - spacer.length - 1 }) }];
   }
 
   /** Custom messages, summaries and user shell commands, as pi's chat shows them. */
@@ -424,15 +546,28 @@ function steadyToolTint(theme: Theme): (line: string) => string {
 
 /** A tool call's box, drawn with the steady tint. */
 function steadyTool(component: ToolExecutionComponent, theme: Theme): Part {
+  const tint = steadyToolTint(theme);
+  let width = -1;
+  let source: string[] | undefined;
+  let lines: string[] = [];
   return {
-    render: (width) => component.render(width).map(steadyToolTint(theme)),
+    render: (nextWidth) => {
+      const next = component.render(nextWidth);
+      if (nextWidth !== width || source === undefined || next.length !== source.length || next.some((line, i) => line !== source![i])) {
+        width = nextWidth; source = next;
+        lines = next.map(tint);
+      }
+      return lines;
+    },
     setExpanded: (expanded) => component.setExpanded(expanded),
+    handleMouse: (event) => component.handleMouse(event),
   };
 }
 
 /** A component after an empty line, as pi's chat spaces summaries. */
 function spaced(component: Part): Part {
-  return { render: (width) => ["", ...component.render(width)], setExpanded: (expanded) => component.setExpanded?.(expanded) };
+  return { render: (width) => ["", ...component.render(width)], setExpanded: (expanded) => component.setExpanded?.(expanded),
+    handleMouse: (event) => event.y > 0 ? component.handleMouse?.({ ...event, y: event.y - 1, height: event.height - 1 }) : undefined };
 }
 
 /** A finished worker's messages from its saved session file. The file is only

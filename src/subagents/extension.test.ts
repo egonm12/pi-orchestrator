@@ -18,6 +18,7 @@ import { createTempRepo } from "../fixtures/temp-repo.ts";
 import { providerStream } from "../fixtures/provider-stream.ts";
 import { createRouterExtension } from "../router/extension.ts";
 import personalGuard from "../guard/extension.ts";
+import { workerSlotPaused } from "./worker-slots.ts";
 import { readUsageObservations, recordUsageObservation, usageObservationsPath, type UsageObservation } from "../router/usage-observations.ts";
 import { COMPLETION_NOTICE, createSubagentsExtension, MAX_TEXT_BYTES, type SubagentResult, type SubagentsDependencies, type SubagentsDetails, type SubagentsProgressDetails } from "./extension.ts";
 import { USER_STEER } from "./user-steering.ts";
@@ -240,6 +241,8 @@ function loadSubagents(workerExtensions: readonly InlineExtension[], orchestrato
     sendMessage(message: SentMessage["message"], options: SentMessage["options"]) { messages.push({ message, options }); },
     getActiveTools: () => [...orchestratorTools?.active ?? ORCHESTRATOR_TOOLS],
     getAllTools: () => [...orchestratorTools?.all ?? []],
+    // Settings are a system boundary: none is set, so pi's defaults hold, as the fullscreen scrollbar's.
+    getSettings: () => ({}),
     // As pi gives each session's extensions one bus, on which pi-orchestrator's subcommands join one command.
     events: createEventBus(),
   } as unknown as ExtensionAPI);
@@ -650,7 +653,7 @@ test("a call with one task routes the worker on orchestrator/auto and returns it
   } finally { h.cleanup(); }
 });
 
-test("the worker loads the installed extensions' tools but not the subagents tool", async () => {
+test("the worker loads subagents and its background controls, but not the orchestrator's verdict tool", async () => {
   const h = harness();
   try {
     const provider = fakeAnthropic("done");
@@ -661,7 +664,8 @@ test("the worker loads the installed extensions' tools but not the subagents too
     const tools = provider.requests[0]?.tools ?? [];
     assert.ok(tools.includes("read"), JSON.stringify(tools));
     assert.ok(tools.includes("probe"), `another extension's tool reaches the worker: ${JSON.stringify(tools)}`);
-    assert.equal(tools.includes("subagents"), false, JSON.stringify(tools));
+    for (const name of ["subagents", "subagents_status", "subagents_message"]) assert.ok(tools.includes(name), JSON.stringify(tools));
+    assert.equal(tools.includes("subagents_verdict"), false, JSON.stringify(tools));
   } finally { h.cleanup(); }
 });
 
@@ -675,7 +679,7 @@ function writeMcpConfig(dir: string, servers: Readonly<Record<string, string>>):
     [name, { command: process.execPath, args: [FAKE_MCP_SERVER], exposure }])) }));
 }
 
-test("a worker gets the orchestrator's MCP tools, codemode and tool_search, as pi's CLI wires them, and still not the subagents tool", async () => {
+test("a worker gets the orchestrator's MCP tools, codemode, tool_search and subagents by default", async () => {
   const h = harness();
   try {
     // A direct server's tools are declared; a codemode server's need codemode and a deferred server's tool_search, which the MCP extension activates.
@@ -686,7 +690,8 @@ test("a worker gets the orchestrator's MCP tools, codemode and tool_search, as p
     assert.equal(worker.status, "completed", JSON.stringify(worker));
     const tools = provider.requests[0]?.tools ?? [];
     for (const name of ["read", "mcp__jira__lookup", "mcp__jira__peek", "codemode", "tool_search"]) assert.ok(tools.includes(name), `${name}: ${JSON.stringify(tools)}`);
-    for (const name of ["mcp__docs__lookup", "mcp__wiki__lookup", "subagents"]) assert.equal(tools.includes(name), false, `${name}: ${JSON.stringify(tools)}`);
+    for (const name of ["mcp__docs__lookup", "mcp__wiki__lookup", "subagents_verdict"]) assert.equal(tools.includes(name), false, `${name}: ${JSON.stringify(tools)}`);
+    assert.ok(tools.includes("subagents"), JSON.stringify(tools));
   } finally { h.cleanup(); }
 });
 
@@ -1777,7 +1782,7 @@ function installedWithSubagents(provider: InlineExtension, depth = 3): InlineExt
   return [...base, { name: "subagents", factory: createSubagentsExtension({ workerExtensions: installedWithSubagents(provider, depth - 1) }) }];
 }
 
-test("a worker gets the subagents tool only when its agent definition lists it, and can then delegate", async () => {
+test("an unrestricted routed worker gets subagents without an agent definition, while a tools list can omit it", async () => {
   const h = harness();
   try {
     const agents = join(h.agentDir, "agents");
@@ -1791,10 +1796,15 @@ test("a worker gets the subagents tool only when its agent definition lists it, 
     assert.equal(withoutTool.worker.status, "completed", JSON.stringify(withoutTool.worker));
     assert.deepEqual(provider.requests.find((request) => request.sessionId === withoutTool.worker.sessionId)?.tools, ["read", "report"]);
 
+    const plain = await callSubagents(tool, main.ctx, `Delegate:${JSON.stringify({ items: [{ task: "Plain nested" }] })}`);
+    assert.equal(plain.worker.status, "completed", JSON.stringify(plain.worker));
+    assert.ok(provider.requests.find((request) => request.sessionId === plain.worker.sessionId)?.tools.includes("subagents"));
+    assert.equal(provider.requests.filter((request) => request.task === "Plain nested").length, 1);
+
     const { worker } = await callSubagents(tool, main.ctx, `Delegate:${JSON.stringify({ items: [{ task: "Find the config file" }] })}`, "lead");
     assert.equal(worker.status, "completed", JSON.stringify(worker));
     const leadRequests = provider.requests.filter((request) => request.sessionId === worker.sessionId);
-    assert.deepEqual([...(leadRequests[0]?.tools ?? [])].sort(), ["read", "report", "subagents"]);
+    assert.deepEqual([...(leadRequests[0]?.tools ?? [])].sort(), ["read", "report", "subagents", "subagents_message"]);
     const nested = provider.requests.filter((request) => request.task === "Find the config file");
     assert.equal(nested.length, 1, "the lead's subagents call started one worker");
     assert.notEqual(nested[0]?.sessionId, worker.sessionId);
@@ -1803,7 +1813,7 @@ test("a worker gets the subagents tool only when its agent definition lists it, 
   } finally { h.cleanup(); }
 });
 
-test("a nested worker cannot delegate further, and cannot start a background call", async () => {
+test("a nested worker cannot delegate further even when its definition lists subagents", async () => {
   const h = harness();
   try {
     writeAgentDefinition(join(h.agentDir, "agents"), "lead.md", { name: "lead", description: "Delegates", tools: "read, subagents" }, "Split the work.");
@@ -1821,29 +1831,314 @@ test("a nested worker cannot delegate further, and cannot start a background cal
     assert.equal(nestedLead.at(-1)?.toolResults[0]?.isError, true, "its subagents call failed");
     assert.deepEqual(provider.requests.filter((request) => request.task === "Too deep"), [], "no worker started two levels down");
 
-    const background = await callSubagents(tool, main.ctx, `Delegate:${JSON.stringify({ items: [{ task: "Run in the background" }], background: true })}`, "lead");
-    assert.equal(background.worker.status, "completed", JSON.stringify(background.worker));
-    assert.match(background.worker.finalText, /^refused: .*background/s, background.worker.finalText);
-    assert.deepEqual(provider.requests.filter((request) => request.task === "Run in the background"), [], "the background call started no worker");
   } finally { h.cleanup(); }
 });
 
-test("a worker's subagents call that asks for background is refused before any worker starts", async () => {
+test("a routed worker can start a background child and remains alive until its completion notice is delivered", async () => {
   const h = harness();
-  const main = orchestrator(h);
-  // The call comes from a worker's session, as the lead's did above; pi's schema check is passed by, as a background-capable schema would.
-  const unmark = markWorkerSession(main.sessionId);
+  let finishChild: (() => void) | undefined;
   try {
-    const provider = fakeAnthropic("done");
-    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
-    await assert.rejects(tool.execute("call-1", { items: [{ task: "Run in the background" }], background: true } as never, undefined, undefined, main.ctx),
-      /a worker's subagents calls run in the foreground only/);
-    assert.deepEqual(provider.requests, []);
-    assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")), []);
-  } finally {
-    unmark();
-    h.cleanup();
-  }
+    const provider = scriptedAnthropic(delegatingScript, (request, finish) => {
+      if (request.task === "Slow child") { finishChild = finish; return true; }
+      return false;
+    });
+    const tool = loadSubagentsTool(installedWithSubagents(provider.extension));
+    const main = orchestrator(h);
+    let done = false;
+    const parent = callSubagents(tool, main.ctx, `Delegate:${JSON.stringify({ items: [{ task: "Slow child" }], background: true })}`).then((value) => { done = true; return value; });
+    await waitFor(() => finishChild !== undefined, "the background child starts");
+    assert.equal(done, false, "the parent's run cannot end while its child is active");
+    finishChild!();
+    const { worker } = await parent;
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.ok(provider.requests.some((request) => request.sessionId === worker.sessionId &&
+      request.userMessages.some((message) => message.includes("Background subagents call") && message.includes("leaf done"))),
+      "the completion notice reaches the parent before it ends");
+  } finally { finishChild?.(); h.cleanup(); }
+});
+
+test("a worker can inspect and steer its own background child before its run ends", async () => {
+  const h = harness();
+  let finishChild: (() => void) | undefined;
+  let finishParentStatus: (() => void) | undefined;
+  try {
+    const provider = scriptedAnthropic((request) => {
+      if (request.task !== "Manage child") return { text: "leaf done" };
+      if (request.toolResults.length === 0) return { toolCall: { name: "subagents", arguments: { items: [{ task: "Slow child" }], background: true } } };
+      const started = request.toolResults[0]!.text;
+      const id = started.match(/Delegation ids, in item order:\n([^\n]+)/)?.[1];
+      assert.ok(id, started);
+      if (request.toolResults.length === 1) return { toolCall: { name: "subagents_status", arguments: { id } } };
+      if (request.toolResults.length === 2) return { toolCall: { name: "subagents_message", arguments: { id, text: "Check this" } } };
+      return { text: "managed child" };
+    }, (request, finish) => {
+      if (request.task === "Slow child" && finishChild === undefined) { finishChild = finish; finishParentStatus?.(); return true; }
+      if (request.task === "Manage child" && request.toolResults.length === 1 && finishChild === undefined) {
+        finishParentStatus = finish; return true;
+      }
+      return false;
+    });
+    const tool = loadSubagentsTool(installedWithSubagents(provider.extension));
+    const parent = callSubagents(tool, orchestrator(h).ctx, "Manage child");
+    await waitFor(() => provider.requests.some((request) => request.task === "Manage child" && request.toolResults.length >= 3),
+      "the worker uses status and message");
+    const workerRequests = provider.requests.filter((request) => request.task === "Manage child");
+    assert.ok(workerRequests[0]!.tools.includes("subagents_status") && workerRequests[0]!.tools.includes("subagents_message"));
+    assert.match(workerRequests[2]!.toolResults[1]!.text, /Slow child/);
+    assert.match(workerRequests[3]!.toolResults[2]!.text, /steer/i);
+    finishChild!();
+    const { worker } = await parent;
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+  } finally { finishParentStatus?.(); finishChild?.(); h.cleanup(); }
+});
+
+test("a worker's background call returns before a queued child runs at a limit of one", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { workerLimit: 1 } } });
+  let finishChild: (() => void) | undefined;
+  try {
+    const provider = scriptedAnthropic(delegatingScript, (request, finish) => {
+      if (request.task === "Queued background") { finishChild = finish; return true; }
+      return false;
+    });
+    const tool = loadSubagentsTool(installedWithSubagents(provider.extension));
+    const task = `Delegate:${JSON.stringify({ items: [{ task: "Queued background" }], background: true })}`;
+    const parent = callSubagents(tool, orchestrator(h).ctx, task);
+    await waitFor(() => provider.requests.some((request) => request.task === task && request.toolResults.length > 0),
+      "the background call returns to its parent before the child finishes");
+    assert.match(provider.requests.find((request) => request.task === task && request.toolResults.length > 0)!.toolResults[0]!.text,
+      /^Background subagents call/);
+    await waitFor(() => finishChild !== undefined, "the parent yields its slot and its child starts");
+    finishChild!();
+    assert.equal((await parent).worker.status, "completed");
+  } finally { finishChild?.(); h.cleanup(); }
+});
+
+test("a worker waiting on subagents_status yields its slot to a queued background child", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { workerLimit: 1 } } });
+  try {
+    const provider = scriptedAnthropic((request) => {
+      if (request.task === "Leaf") return { text: "leaf done" };
+      if (request.toolResults.length === 0) return { toolCall: { name: "subagents", arguments: { items: [{ task: "Leaf" }], background: true } } };
+      if (request.toolResults.length === 1) {
+        const id = request.toolResults[0]!.text.match(/Background subagents call (\S+) started/)?.[1];
+        assert.ok(id);
+        return { toolCall: { name: "subagents_status", arguments: { id, wait: true } } };
+      }
+      return { text: "received child" };
+    });
+    const tool = loadSubagentsTool(installedWithSubagents(provider.extension));
+    const { worker } = await callSubagents(tool, orchestrator(h).ctx, "Wait for leaf");
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.ok(provider.requests.find((request) => request.task === "Wait for leaf" && request.toolResults.length === 2)?.toolResults[1]?.text.includes("leaf done"));
+  } finally { h.cleanup(); }
+});
+
+test("a background child can ask its worker parent a question before the parent settles", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { workerLimit: 1 } } });
+  try {
+    const provider = scriptedAnthropic((request) => {
+      if (request.task === "Ask child") return request.toolResults.length === 0
+        ? { toolCall: { name: "report", arguments: { kind: "question", text: "Which file?" } } } : { text: "leaf done" };
+      const question = request.userMessages.find((message) => message.includes("asks, and waits for the answer"));
+      if (question && request.toolResults.length === 1) {
+        const id = question.match(/Worker (\S+) asks/)?.[1];
+        assert.ok(id);
+        return { toolCall: { name: "subagents_message", arguments: { id, text: "config.json" } } };
+      }
+      if (request.toolResults.length === 0) return { toolCall: { name: "subagents", arguments: { items: [{ task: "Ask child" }], background: true } } };
+      return { text: "answered" };
+    });
+    const tool = loadSubagentsTool(installedWithSubagents(provider.extension));
+    const { worker } = await callSubagents(tool, orchestrator(h).ctx, "Manage question");
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.ok(provider.requests.some((request) => request.task === "Ask child" && request.toolResults.some((result) => result.text.includes("config.json"))));
+  } finally { h.cleanup(); }
+});
+
+test("a worker can delegate at a full global worker limit without deadlocking its queued child", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { workerLimit: 1 } } });
+  try {
+    const provider = scriptedAnthropic(delegatingScript);
+    const tool = loadSubagentsTool(installedWithSubagents(provider.extension));
+    const { worker } = await Promise.race([
+      callSubagents(tool, orchestrator(h).ctx, `Delegate:${JSON.stringify({ items: [{ task: "Queued child" }], background: false })}`).then(({ worker }) => ({ worker })),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("queued child deadlocked")), 3000)),
+    ]);
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.equal(provider.requests.filter((request) => request.task === "Queued child").length, 1);
+  } finally { h.cleanup(); }
+});
+
+/** The latest board entry for `task`'s worker. */
+function boardWorkerFor(task: string) {
+  return workerBoard().workers().filter((worker) => worker.task === task).at(-1);
+}
+
+test("an answered background worker can still delegate and wait at a full worker limit of one", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { workerLimit: 1 } } });
+  try {
+    const provider = scriptedAnthropic((request) => {
+      if (request.task !== "Ask then delegate") return { text: "leaf done" };
+      if (request.toolResults.length === 0) return { toolCall: { name: "report", arguments: { kind: "question", text: "Which file?" } } };
+      if (request.toolResults.length === 1) return { toolCall: { name: "subagents", arguments: { items: [{ task: "Leaf after answer" }], background: false } } };
+      return { text: `done: ${request.toolResults[1]!.text}` };
+    });
+    const subagents = loadSubagents(installedWithSubagents(provider.extension));
+    const ctx = orchestrator(h).ctx;
+    const start = (await subagents.tool().execute("call-bg", { items: [{ task: "Ask then delegate" }], background: true } as never,
+      undefined, undefined, ctx)).details as BackgroundStart;
+    await waitFor(() => subagents.messages.length === 1, "the question is in");
+    await subagents.tool("subagents_message").execute("message-1", { id: start.delegationIds[0]!, text: "config.json" } as never, undefined, undefined, ctx);
+    await waitFor(() => subagents.messages.length === 2, "the worker delegates after its answer and its call ends");
+    const [result] = (subagents.messages[1]!.message.details as NoticeDetails).results;
+    assert.equal(result?.status, "completed", JSON.stringify(result));
+    assert.match(result!.finalText, /^done: .*leaf done/s);
+  } finally { h.cleanup(); }
+});
+
+test("a worker that asks while it waits on its own call gives back every worker slot it took", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { workerLimit: 2 } } });
+  const holds: (() => void)[] = [];
+  try {
+    const provider = scriptedAnthropic((request) => {
+      if (request.task !== "Ask while waiting") return { text: "leaf done" };
+      if (request.toolResults.length > 0) return { text: "done" };
+      return { toolCall: { name: "subagents", arguments: { items: [{ task: "Quick leaf" }], background: false } },
+        more: [{ name: "report", arguments: { kind: "question", text: "Which file?" } }] };
+    }, (request, finish) => {
+      if (!request.task.startsWith("Hold")) return false;
+      holds.push(finish);
+      return true;
+    });
+    const subagents = loadSubagents(installedWithSubagents(provider.extension));
+    const ctx = orchestrator(h).ctx;
+    const start = (await subagents.tool().execute("call-bg", { items: [{ task: "Ask while waiting" }], background: true } as never,
+      undefined, undefined, ctx)).details as BackgroundStart;
+    await waitFor(() => subagents.messages.length === 1, "the question is in");
+    await subagents.tool("subagents_message").execute("message-1", { id: start.delegationIds[0]!, text: "config.json" } as never, undefined, undefined, ctx);
+    await waitFor(() => subagents.messages.length === 2, "the call's notice");
+    assert.equal((subagents.messages[1]!.message.details as NoticeDetails).results[0]?.status, "completed");
+
+    // Both slots are free again: two held workers run at once.
+    const next = subagents.tool().execute("call-fg", { items: [{ task: "Hold A" }, { task: "Hold B" }], background: false } as never,
+      undefined, undefined, ctx);
+    await waitFor(() => holds.length === 2, "both workers run at a limit of two");
+    for (const finish of holds) finish();
+    assert.deepEqual(((await next).details as SubagentsDetails).results.map((result) => result.status), ["completed", "completed"]);
+  } finally { for (const finish of holds) finish(); h.cleanup(); }
+});
+
+test("aborting a worker that waits for its background child stops the child", async () => {
+  const h = harness();
+  try {
+    const provider = scriptedAnthropic(delegatingScript, (request) => request.task === "Held abort child");
+    const tool = loadSubagentsTool(installedWithSubagents(provider.extension));
+    const task = `Delegate:${JSON.stringify({ items: [{ task: "Held abort child" }], background: true })}`;
+    const stop = new AbortController();
+    const call = tool.execute("call-1", { items: [{ task }], background: false } as never, stop.signal, undefined, orchestrator(h).ctx);
+    await waitFor(() => provider.requests.some((request) => request.task === task && request.toolResults.length > 0), "the worker ends its turn");
+    // In agent_before_settle the worker gives up its slot to wait for its child: stop it there.
+    await waitFor(() => { const id = boardWorkerFor(task)?.delegationId; return id !== undefined && workerSlotPaused(id); }, "the worker waits for its child");
+    stop.abort();
+    const result = await within(call, 2000, "the aborted worker ends without waiting for its child to finish");
+    assert.equal((result.details as SubagentsDetails).results[0]?.status, "aborted");
+    assert.equal(boardWorkerFor("Held abort child")?.state, "aborted");
+  } finally { h.cleanup(); }
+});
+
+test("the orchestrator's session end stops a background worker's own background children", async () => {
+  const h = harness();
+  try {
+    const provider = scriptedAnthropic(delegatingScript, (request) => request.task === "Held shutdown child");
+    const subagents = loadSubagents(installedWithSubagents(provider.extension));
+    const ctx = orchestrator(h).ctx;
+    const task = `Delegate:${JSON.stringify({ items: [{ task: "Held shutdown child" }], background: true })}`;
+    await subagents.tool().execute("call-bg", { items: [{ task }], background: true } as never, undefined, undefined, ctx);
+    await waitFor(() => provider.requests.some((request) => request.task === task && request.toolResults.length > 0), "the worker ends its turn");
+    // In agent_before_settle the worker gives up its slot to wait for its child: stop it there.
+    await waitFor(() => { const id = boardWorkerFor(task)?.delegationId; return id !== undefined && workerSlotPaused(id); }, "the worker waits for its child");
+    await within(subagents.shutdownSession(ctx), 2000, "the session's end stops the worker and its child");
+    assert.equal(boardWorkerFor("Held shutdown child")?.state, "aborted");
+    assert.equal(boardWorkerFor(task)?.state, "aborted");
+  } finally { h.cleanup(); }
+});
+
+test("a worker that leaves its child's question unanswered is reminded once, then the child goes on and its result reaches the worker", async () => {
+  const h = harness();
+  try {
+    const provider = scriptedAnthropic((request) => {
+      if (request.task === "Ask unanswered") return request.toolResults.length === 0
+        ? { toolCall: { name: "report", arguments: { kind: "question", text: "Which file?" } } } : { text: `child got: ${request.toolResults[0]!.text}` };
+      const notice = request.userMessages.find((message) => message.includes("Background subagents call") && message.includes("finished"));
+      if (notice !== undefined) return { text: `parent saw: ${notice}` };
+      if (request.toolResults.length === 0) return { toolCall: { name: "subagents", arguments: { items: [{ task: "Ask unanswered" }], background: true } } };
+      return { text: "parent ignores the question" };
+    });
+    const tool = loadSubagentsTool(installedWithSubagents(provider.extension));
+    const { worker } = await within(callSubagents(tool, orchestrator(h).ctx, "Ignore the question"), 5000, "the worker ends");
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.ok(provider.requests.some((request) => request.task === "Ignore the question" &&
+      request.userMessages.some((message) => message.includes("still waits for the answer"))), "the worker was reminded");
+    assert.match(worker.finalText, /^parent saw: [\s\S]*child got: No answer \(fallback\): /, worker.finalText);
+    assert.doesNotMatch(worker.finalText, /orchestrator answered/, "the fallback names no one as answering");
+  } finally { h.cleanup(); }
+});
+
+test("a nested worker without an agent definition has no subagents tool", async () => {
+  const h = harness();
+  try {
+    const provider = scriptedAnthropic(delegatingScript);
+    const tool = loadSubagentsTool(installedWithSubagents(provider.extension));
+    const { worker } = await callSubagents(tool, orchestrator(h).ctx, `Delegate:${JSON.stringify({ items: [{ task: "Plain leaf" }] })}`);
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    const leaf = provider.requests.find((request) => request.task === "Plain leaf");
+    assert.ok(leaf, "the nested worker ran");
+    assert.equal(leaf.tools.includes("subagents"), false, JSON.stringify(leaf.tools));
+  } finally { h.cleanup(); }
+});
+
+test("a nested worker that its parent resumes still has no subagents tool", async () => {
+  const h = harness();
+  try {
+    mkdirSync(h.stateDir, { recursive: true });
+    saveAuthorization(join(h.stateDir, "authorized-recipients.json"), approvedAnthropic());
+    const provider = scriptedAnthropic((request) => {
+      if (request.task !== "Resume nested") return { text: "leaf done" };
+      if (request.toolResults.length === 0) return { toolCall: { name: "subagents", arguments: { items: [{ task: "Leaf first" }] } } };
+      if (request.toolResults.length === 1) {
+        const id = request.toolResults[0]!.text.match(/Worker (\S+) completed/)?.[1];
+        assert.ok(id, request.toolResults[0]!.text);
+        return { toolCall: { name: "subagents", arguments: { items: [{ resume: id, task: "Leaf again" }] } } };
+      }
+      return { text: `resumed: ${request.toolResults[1]!.text}` };
+    });
+    const tool = loadSubagentsTool(installedWithSubagents(provider.extension));
+    const { worker } = await callSubagents(tool, orchestrator(h).ctx, "Resume nested");
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.match(worker.finalText, /^resumed: Worker \S+ completed/, worker.finalText);
+    const leaf = provider.requests.filter((request) => request.task === "Leaf first");
+    assert.equal(leaf.length, 2, "the nested worker ran, then resumed");
+    assert.equal(leaf[1]!.sessionId, leaf[0]!.sessionId);
+    assert.equal(leaf[1]!.tools.includes("subagents"), false, JSON.stringify(leaf[1]!.tools));
+  } finally { h.cleanup(); }
+});
+
+test("a worker on a preserved agent model forks on that model and effort", async () => {
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { agentDefinitionModel: { use: "preserve" } } } });
+  try {
+    writeAgentDefinition(join(h.agentDir, "agents"), "lead.md", { name: "lead", description: "Delegates", model: HAIKU, thinking: "high" }, "Split the work.");
+    const provider = scriptedAnthropic(delegatingScript);
+    const tool = loadSubagentsTool(installedWithSubagents(provider.extension));
+    const task = `Delegate:${JSON.stringify({ items: [{ task: "Forked from preserved", fork: true }], background: false })}`;
+    const { worker } = await callSubagents(tool, orchestrator(h).ctx, task, "lead");
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.match(worker.finalText, /^delegated: Worker \S+ completed\./, worker.finalText);
+    const record = readRoutingRecords(join(h.stateDir, "routing")).find((entry) => entry.recordType === "fork");
+    assert.ok(record && record.recordType === "fork", "the fork wrote its record");
+    assert.equal(record.model, HAIKU);
+    assert.equal(record.effort, "high");
+    assert.equal(record.parentDelegationId, worker.sessionId);
+  } finally { h.cleanup(); }
 });
 
 /** Waits, a millisecond at a time, until `condition` holds. */
@@ -2072,21 +2367,23 @@ test("subagents_message refuses finished, foreground, and unknown delegation ids
   }
 });
 
-test("a worker's subagents call with a fork item is refused before any worker starts", async () => {
+test("a routed worker forks its own branch and rung, and the nested fork has no subagents tool", async () => {
   const h = harness();
-  const main = orchestrator(h);
-  const unmark = markWorkerSession(main.sessionId);
   try {
-    const provider = fakeAnthropic("done");
-    const tool = loadSubagentsTool([routerExtension(), provider.extension]);
-    await assert.rejects(tool.execute("call-1", { items: [{ task: "Plain" }, { task: "Continue me", fork: true }] } as never, undefined, undefined, main.ctx),
-      /a worker's subagents calls cannot fork/);
-    assert.deepEqual(provider.requests, []);
-    assert.deepEqual(readRoutingRecords(join(h.stateDir, "routing")), []);
-  } finally {
-    unmark();
-    h.cleanup();
-  }
+    const provider = scriptedAnthropic(delegatingScript);
+    const tool = loadSubagentsTool(installedWithSubagents(provider.extension));
+    const task = `Delegate:${JSON.stringify({ items: [{ task: "Forked child", fork: true }], background: false })}`;
+    const { worker } = await callSubagents(tool, orchestrator(h).ctx, task);
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    const fork = provider.requests.find((request) => request.task === task && request.sessionId !== worker.sessionId);
+    assert.ok(fork, "the fork copied the parent's first user message");
+    assert.equal(fork.tools.includes("subagents"), false);
+    const record = readRoutingRecords(join(h.stateDir, "routing")).find((entry) => entry.recordType === "fork");
+    assert.ok(record && record.recordType === "fork");
+    assert.equal(record.parentSession, worker.sessionId);
+    assert.equal(record.model, HAIKU);
+    assert.equal(record.parentDelegationId, worker.sessionId);
+  } finally { h.cleanup(); }
 });
 
 test("a background fork's delegation id is its copied session's id and its fork record's key", async () => {
@@ -2269,7 +2566,7 @@ test("/subagents stop is unchanged: it still stops one worker or a whole backgro
   }
 });
 
-test("a worker's own subagents call cannot be background", async () => {
+test("a worker's own subagents call can be background", async () => {
   const h = harness();
   try {
     const provider = fakeAnthropic("done");
@@ -2277,10 +2574,10 @@ test("a worker's own subagents call cannot be background", async () => {
     const ctx = orchestrator(h).ctx;
     const unmark = markWorkerSession(ctx.sessionManager.getSessionId());
     try {
-      await assert.rejects(tool.execute("call-1", { items: [{ task: "Nested" }], background: true } as never, undefined, undefined, ctx),
-        /a worker's subagents calls run in the foreground only/);
+      const result = await tool.execute("call-1", { items: [{ task: "Nested" }], background: true } as never, undefined, undefined, ctx);
+      assert.match(toolText(result), /^Background subagents call call-1 started/);
     } finally { unmark(); }
-    assert.equal(provider.requests.length, 0);
+    await waitFor(() => provider.requests.length === 1, "the background worker starts");
   } finally { h.cleanup(); }
 });
 
@@ -2427,7 +2724,7 @@ test("Ctrl+C during a subagents_status wait stops only the wait, and the call's 
   }
 });
 
-test("a worker whose agent definition lists subagents_status does not get it", async () => {
+test("a delegating worker whose tools list names subagents_status gets it", async () => {
   const h = harness();
   try {
     writeAgentDefinition(join(h.agentDir, "agents"), "lead.md", { name: "lead", description: "Delegates", tools: "read, subagents, subagents_status" }, "Split the work.");
@@ -2435,7 +2732,7 @@ test("a worker whose agent definition lists subagents_status does not get it", a
     const tool = loadSubagentsTool(installedWithSubagents(provider.extension));
     const { worker } = await callSubagents(tool, orchestrator(h).ctx, "Look around.", "lead");
     assert.equal(worker.status, "completed", JSON.stringify(worker));
-    assert.deepEqual([...(provider.requests[0]?.tools ?? [])].sort(), ["read", "report", "subagents"]);
+    assert.deepEqual([...(provider.requests[0]?.tools ?? [])].sort(), ["read", "report", "subagents", "subagents_status"]);
   } finally { h.cleanup(); }
 });
 
@@ -2828,20 +3125,29 @@ test("the orchestrator's session shows its workers in the widget below the edito
 function openView(workerId: string) {
   initTheme("dark");
   const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text, bg: (_color: string, text: string) => text } as unknown as Theme;
-  let component: { render(width: number): string[]; handleInput(data: string): void } | undefined;
+  type TestComponent = { render(width: number): string[]; handleInput(data: string): void };
+  let component: TestComponent | undefined;
+  const children: TestComponent[] = [];
+  const tui = {
+    mode: "regular" as const, terminal: { rows: 40 }, children, requestRender() {},
+    clear() { children.length = 0; },
+    addChild(child: TestComponent) { children.push(child); },
+  };
   const ui = {
     custom: (async (factory: (...args: unknown[]) => unknown) => new Promise<void>((resolve) => {
-      component = factory({ terminal: { rows: 40 }, requestRender() {} }, plainTheme, new KeybindingsManager(), () => resolve()) as typeof component;
+      component = factory(tui, plainTheme, new KeybindingsManager(), () => resolve()) as TestComponent;
     })) as never,
   };
   const closed = openTranscript(ui, workerBoard(), workerId);
   return {
     closed,
     press(...keys: string[]) { for (const key of keys) component!.handleInput(key); },
-    /** The header's agent, worker state and place, under the orchestrator bar; its elapsed time and the rest tick with the clock. */
+    /** The worker's metadata is the first line of the scrollable transcript. */
     header: () => {
-      const parts = component!.render(200)[1]!.replace(/\x1b\[[0-9;]*m/g, "").trimEnd().split(" · ");
-      return [parts[0], parts[1], parts.at(-1)].join(" · ");
+      const lines = children[0]!.render(200).map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
+      const stats = lines.find((line) => /^(?:queued|starting|running|asking|completed|failed|aborted) · /.test(line));
+      const parts = stats!.split(" · ");
+      return [lines[0], parts[0], parts.at(-1)].join(" · ");
     },
   };
 }
@@ -2921,16 +3227,23 @@ test("x in the transcript view stops a nested worker alone: its parent hears it 
  *  alt+a's focus overlay and the transcript view all reach it the same way. */
 function fakeCustomUI() {
   const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text, bg: (_color: string, text: string) => text } as unknown as Theme;
-  let mounted: { render(width: number): string[]; handleInput(data: string): void; dispose?(): void } | undefined;
+  type TestComponent = { render(width: number): string[]; handleInput(data: string): void; dispose?(): void };
+  let mounted: TestComponent | undefined;
+  const children: TestComponent[] = [];
+  const tui = {
+    mode: "regular" as const, terminal: { rows: 40 }, children, requestRender() {},
+    clear() { children.length = 0; },
+    addChild(component: TestComponent) { children.push(component); },
+  };
   let opens = 0;
   const ui = {
     custom: (async (factory: (...args: unknown[]) => unknown) => new Promise<unknown>((resolve) => {
       opens++;
-      const component = factory({ terminal: { rows: 40 }, requestRender() {} }, plainTheme, new KeybindingsManager(), (result: unknown) => {
+      const component = factory(tui, plainTheme, new KeybindingsManager(), (result: unknown) => {
         mounted = undefined;
         (component as { dispose?(): void }).dispose?.();
         resolve(result);
-      }) as typeof mounted;
+      }) as TestComponent;
       mounted = component;
     })) as never,
   };
@@ -2938,7 +3251,7 @@ function fakeCustomUI() {
     ui,
     get opens() { return opens; },
     get open() { return mounted !== undefined; },
-    lines: (width = 200) => mounted!.render(width).map((line) => line.trimEnd()),
+    lines: (width = 200) => (children[0] ?? mounted)!.render(width).map((line) => line.trimEnd()),
     press(...keys: string[]) { for (const key of keys) mounted!.handleInput(key); },
   };
 }
@@ -3704,7 +4017,7 @@ test("under the default a Ctrl+C during a status wait stops only the wait, a cal
   } finally { h.cleanup(); }
 });
 
-test("under a default background call a worker's own subagents call without the option stays in the foreground, and one asking for background is refused", async () => {
+test("under a default background call a worker's own calls may choose foreground or background", async () => {
   const h = harness();
   try {
     writeAgentDefinition(join(h.agentDir, "agents"), "lead.md", { name: "lead", description: "Delegates", tools: "read, subagents" }, "Split the work.");
@@ -3726,9 +4039,9 @@ test("under a default background call a worker's own subagents call without the 
     } finally { session.dispose(); }
     const notice = mainRequests()[2]!.userMessages.find((text) => text.includes("Background subagents call"))!;
     assert.match(notice, /delegated: Worker \S+ completed\.[\s\S]*leaf done/, "the nested call returned its worker's result, in the foreground");
-    assert.match(notice, /refused: .*background/, notice);
+    assert.match(notice, /delegated: Background subagents call \S+ started/, notice);
     assert.equal(provider.requests.filter((request) => request.task === "Find the config file").length, 1);
-    assert.deepEqual(provider.requests.filter((request) => request.task === "Run in the background"), [], "the refused call started no worker");
+    assert.equal(provider.requests.filter((request) => request.task === "Run in the background").length, 1);
   } finally { h.cleanup(); }
 });
 

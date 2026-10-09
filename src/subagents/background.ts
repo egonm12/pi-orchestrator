@@ -3,7 +3,7 @@ import { shortTask } from "./render.ts";
 import type { WorkerActivity } from "./worker.ts";
 
 // Background calls (ADR 0008). A background subagents call, the orchestrator's
-// default or `background: true` from any session but a worker's, returns at
+// default or `background: true` from a worker, returns at
 // once and its items run on here. When every item has finished, the call's one
 // completion notice is delivered. The tool's abort signal, which Ctrl+C fires,
 // does not reach these workers: each call has signals of its own, which
@@ -145,6 +145,9 @@ export class BackgroundCalls {
   readonly #running = new Map<string, RunningCall>();
   readonly #receivers = new Map<string, (text: string, mode: BackgroundMessageMode) => Promise<void>>();
   readonly #questions = new Map<string, (text: string) => void>();
+  /** Questions a delegating worker was already reminded of (remindOrAnswerQuestions). */
+  readonly #reminded = new WeakSet<(text: string) => void>();
+  readonly #changes = new Set<() => void>();
   readonly #deliver: (notice: CompletionNotice, startTurn: boolean) => void;
   #shuttingDown = false;
 
@@ -181,7 +184,9 @@ export class BackgroundCalls {
       }
       if (waiters.size === 0) this.#deliver(notice, !this.#shuttingDown);
       for (const waiter of waiters) waiter.deliver(notice);
+      this.#changed();
     }).catch((error: unknown) => {
+      this.#changed();
       process.stderr.write(`pi-orchestrator subagents: the completion notice of background call ${callId} was not delivered: ${errorText(error)}\n`);
     });
     this.#running.set(callId, {
@@ -271,6 +276,7 @@ export class BackgroundCalls {
       };
       if (signal?.aborted) return stop();
       this.#questions.set(id, answer);
+      this.#changed();
       signal?.addEventListener("abort", stop, { once: true });
       for (const waiter of running.waiters) {
         waiter.interrupt(`Stopped waiting for background call ${running.call.callId}: its worker ${id} asked a question, which follows. ${ANSWER_HINT}`);
@@ -311,6 +317,43 @@ export class BackgroundCalls {
     if (verb === "" || (verb === "list" && rest.length === 0)) return this.listing();
     if (verb === "stop" && rest.length === 1) return rest[0] === "all" ? this.#stopAll() : this.#stop(rest[0]!);
     return USAGE;
+  }
+
+  /** The questions still waiting for an answer when a delegating worker would
+   *  end its run. Each question is returned once, so the worker can be reminded
+   *  of it; one still unanswered at the next call is answered with `fallback`,
+   *  so its worker goes on and its result is not lost. */
+  remindOrAnswerQuestions(fallback: string): string[] {
+    const remind: string[] = [];
+    for (const [id, answer] of [...this.#questions]) {
+      if (this.#reminded.has(answer)) {
+        this.#questions.delete(id);
+        answer(fallback);
+      } else {
+        this.#reminded.add(answer);
+        remind.push(id);
+      }
+    }
+    return remind;
+  }
+
+  /** Wait until all child calls settle, or a child asks a question that the
+   *  parent must answer in another turn. Completion notices are delivered before
+   *  this returns. `signal` stops every call, as session shutdown does. */
+  async whenIdleOrQuestion(signal?: AbortSignal): Promise<void> {
+    const stop = () => { void this.shutdown(); this.#changed(); };
+    signal?.addEventListener("abort", stop, { once: true });
+    if (signal?.aborted) stop();
+    try {
+      while (this.#running.size > 0 && this.#questions.size === 0) {
+        await new Promise<void>((resolve) => { this.#changes.add(resolve); });
+      }
+    } finally { signal?.removeEventListener("abort", stop); }
+  }
+
+  #changed(): void {
+    for (const notify of this.#changes) notify();
+    this.#changes.clear();
   }
 
   /** Session shutdown: stops every call and waits until each has ended and its notice is delivered without starting a turn. */

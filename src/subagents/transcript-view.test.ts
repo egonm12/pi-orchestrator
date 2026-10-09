@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
-import { initTheme, SessionManager, type AgentSessionEvent, type Theme, type ThemeBg } from "@earendil-works/pi-coding-agent";
+import { test, mock } from "node:test";
+import { AssistantMessageComponent, createBashToolDefinition, getMarkdownTheme, initTheme, SessionManager, ToolExecutionComponent, UserMessageComponent, type AgentSessionEvent, type Theme, type ThemeBg } from "@earendil-works/pi-coding-agent";
 // pi's own keybindings manager, the one it hands a ctx.ui.custom factory. pi's
 // public entry exports only its type, so the test reaches into the package:
 // matching the real binding ids is what keeps the view from trapping the user.
@@ -13,19 +13,21 @@ import { KeybindingsManager } from "../../node_modules/@earendil-works/pi-coding
 import { theme as paintTheme } from "../../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 import { WorkerBoard, type BoardWorker, type WorkerFeed, type WorkerSession } from "./worker-board.ts";
 import { LINGER_MS } from "./worker-widget.ts";
-import { openTranscript, TRANSCRIPT_OVERLAY, type TranscriptUI } from "./transcript-view.ts";
+import { openTranscript, type TranscriptUI } from "./transcript-view.ts";
 import { formatCost, formatTokens } from "./transcript-header.ts";
-// pi-tui's main-screen renderer, the one regular tuiMode draws with. pi-tui exports only its type from the package root.
-import { TuiMainScreen } from "../../node_modules/@earendil-works/pi-tui/dist/tui-main-screen.js";
-import type { Terminal } from "@earendil-works/pi-tui";
+// pi's own renderer for each tuiMode (pi-tui's alt screen in fullscreen, its main screen in regular), built the way pi builds it.
+import { createInteractiveTui } from "../../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/tui-renderer.js";
+// pi's fullscreen layout: the chat in a ScrollView, and the editor, widgets and footer in a dock below it.
+import { createChatViewport } from "../../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/chat-viewport.js";
+import { Container, type Component, type ScrollView, type Terminal, type TuiMainScreen, type ViewportTUI } from "@earendil-works/pi-tui";
 
 // The transcript view as xytd's ways in will open it: openTranscript on a real
-// worker board, through a fake ctx.ui.custom that mounts the overlay the way
-// pi does (a TUI with a height and a redraw request, pi's keybindings manager,
-// and a done callback). Worker sessions are fakes that hold messages and emit
-// pi's session events. pi's message components draw with pi's global theme;
-// the view's own lines use a plain theme, and the assertions read the lines
-// without their escape codes, as the user sees them.
+// worker board, through pi's own TUI (see fakeUI) and a ctx.ui.custom that
+// mounts the view the way pi mounts a component that is not an overlay: in pi's
+// editor container, with the focus. Worker sessions are fakes that hold
+// messages and emit pi's session events. pi's message components draw with
+// pi's global theme; the view's own lines use a plain theme, and the assertions
+// read the lines without their escape codes, as the user sees them.
 
 initTheme("dark");
 const PLAIN = { fg: (_color: string, text: string) => text, bold: (text: string) => text, bg: (color: ThemeBg, text: string) => paintTheme.bg(color, text) } as unknown as Theme;
@@ -35,6 +37,34 @@ const KEY = {
   escape: "\x1b", kittyEscape: "\x1b[27u", ctrlC: "\x03", pageUp: "\x1b[5~", pageDown: "\x1b[6~", home: "\x1b[H", end: "\x1b[F",
   left: "\x1b[D", right: "\x1b[C", up: "\x1b[A", down: "\x1b[B", enter: "\r", ctrlO: "\x0f",
 };
+
+/** The bytes a terminal sends for the keys pi-tui's viewport binds. pi-tui 0.99 binds
+ *  top and bottom to home and end; pi-tui 1.1, which pi runs, binds ctrl+home and
+ *  ctrl+end, so a test asks pi's keybindings which key does what. */
+const SEQUENCES: Readonly<Record<string, string>> = {
+  home: "\x1b[H", end: "\x1b[F", "ctrl+home": "\x1b[1;5H", "ctrl+end": "\x1b[1;5F",
+  pageUp: "\x1b[5~", pageDown: "\x1b[6~", "ctrl+up": "\x1b[1;5A", "ctrl+down": "\x1b[1;5B",
+  "ctrl+shift+up": "\x1b[1;6A", "ctrl+shift+down": "\x1b[1;6B",
+};
+
+type KeybindingId = Parameters<KeybindingsManager["getKeys"]>[0];
+
+/** The bytes for the first key pi's keybindings give `binding`. */
+function keyFor(binding: KeybindingId): string {
+  const [key] = new KeybindingsManager().getKeys(binding);
+  const bytes = key === undefined ? undefined : SEQUENCES[key];
+  assert.ok(bytes !== undefined, `the test has no bytes for ${binding}, which pi binds to ${key}`);
+  return bytes;
+}
+
+/** The key pi's keybindings give the follow-the-end action, as the footer names it, and that key as a pattern. */
+const FOLLOW_KEY = new KeybindingsManager().getKeys("tui.altScreen.bottom")[0];
+const FOLLOW_PATTERN = (FOLLOW_KEY ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** The ScrollView pi-tui scrolls and follows in fullscreen: the chat's, or the worker view's while it is shown. */
+function primaryScroll(tui: unknown): ScrollView {
+  return (tui as { getPrimaryScrollView(): ScrollView }).getPrimaryScrollView();
+}
 
 /** A line as the user sees it: without colours, hyperlinks and other escape codes. */
 function plain(line: string): string {
@@ -76,34 +106,211 @@ function running(board: WorkerBoard, task: string, sessionId: string, extra: { a
   return { feed, fake };
 }
 
-/** ctx.ui.custom as pi mounts a full-screen overlay: the factory gets a TUI,
- *  a theme, pi's keybindings manager and done, which resolves the call. */
-function fakeUI(rows = 20, mode?: "fullscreen") {
-  const tui = { mode, terminal: { rows }, renders: 0, requestRender() { this.renders++; } };
-  let component: { render(width: number): string[]; handleInput(data: string): void; dispose(): void } | undefined;
-  let options: unknown;
+/** A terminal of a fixed size. It keeps what pi-tui writes to it, and `send` gives pi-tui's input callback the input the terminal reports. */
+class CapturingTerminal implements Terminal {
+  /** Everything pi-tui wrote, in order. */
+  readonly written: string[] = [];
+  columns: number;
+  rows: number;
+  private input: ((data: string) => void) | undefined;
+
+  constructor(columns: number, rows: number) {
+    this.columns = columns;
+    this.rows = rows;
+  }
+
+  get kittyProtocolActive(): boolean { return false; }
+  start(onInput?: (data: string) => void): void { this.input = onInput; }
+  /** A key or a mouse report from the terminal, as pi-tui's input callback gets it. */
+  send(data: string): void { this.input?.(data); }
+  stop(): void {}
+  async drainInput(): Promise<void> {}
+  write(data: string): void { this.written.push(data); }
+  moveBy(): void {}
+  hideCursor(): void {}
+  showCursor(): void {}
+  clearLine(): void {}
+  clearFromCursor(): void {}
+  clearScreen(): void {}
+  setTitle(): void {}
+  setProgress(): void {}
+  setProgramStatus(): void {}
+}
+
+/** The scrollbar pi-tui paints over a fullscreen transcript's last column for a second after a scroll. */
+const SCROLLBAR_CELL = /[│┃█]$/u;
+
+/** A component that draws one line, as pi's chat, editor, widgets and footer do. */
+const textLine = (text: string): Component => ({ render: () => [text], invalidate() {} });
+
+/** A container holding one component, as pi's containers hold their children. */
+function containing(child: Component): Container {
+  const container = new Container();
+  container.addChild(child);
+  return container;
+}
+
+/** pi's interactive UI in one tuiMode, mounted as pi mounts it. The renderer is pi's own for the mode (createInteractiveTui),
+ *  on a terminal the test reads and feeds. Pi's chat and editor sit in pi's layout: createChatViewport in fullscreen, pi's
+ *  containers in regular. ctx.ui.custom runs as showExtensionCustom runs it for a component that is not an overlay: the
+ *  component replaces the editor in the editor container and takes the focus, and closing puts the editor back with the
+ *  focus. Keys and mouse reports go through pi-tui's input callback, so pi-tui's listeners see them first: in fullscreen,
+ *  the alt screen's wheel and page keys. */
+function fakeUI(rows = 20, mode: "regular" | "fullscreen" = "fullscreen", theme: Theme = PLAIN) {
+  const terminal = new CapturingTerminal(WIDTH, rows);
+  // Copy on select is off, so a test never writes the clipboard. The wheel moves one line a notch: pi's "auto" scales a
+  // notch by how quickly the notches arrive, which would make the counts depend on timing.
+  const tui = createInteractiveTui({ tuiMode: mode, showHardwareCursor: false, logDirectory: tmpdir(), terminal, fullscreenCopyOnSelect: false, fullscreenWheelScrollLines: 1 });
+  const editor = textLine("editor text");
+  const pi = {
+    document: containing(textLine("chat line")), pendingMessages: new Container(), status: new Container(),
+    widgetsAbove: new Container(), editor: containing(editor), widgetsBelow: containing(textLine("worker widget")),
+    footer: containing(textLine("pi footer")),
+  };
+  if (mode === "fullscreen") (tui as unknown as ViewportTUI).setLayoutRoot(createChatViewport({ ...pi, scrollbar: "auto" }).root);
+  else for (const child of [pi.document, pi.pendingMessages, pi.status, pi.widgetsAbove, pi.editor, pi.widgetsBelow, pi.footer]) tui.addChild(child);
+  tui.setFocus(editor);
+  // Every requestRender the TUI gets, in order: true for a forced reprint of the whole terminal.
+  const requests: boolean[] = [];
+  const requestRender = tui.requestRender.bind(tui);
+  tui.requestRender = (force = false) => { requests.push(force); requestRender(force); };
+  tui.start();
+
   let closed = false;
+  let childrenAtClose: readonly Component[] | undefined;
+  let mounted: (Component & { handleInput(data: string): void; dispose(): void }) | undefined;
+  const customArguments: unknown[][] = [];
+  const keysGiven: string[] = [];
   const ui: TranscriptUI = {
-    custom: (async (factory: (...args: unknown[]) => unknown, customOptions: unknown) => {
-      options = customOptions;
-      return new Promise<void>((resolve) => {
-        component = factory(tui, PLAIN, new KeybindingsManager(), (result: unknown) => {
+    custom: ((factory: (...args: unknown[]) => unknown, ...rest: unknown[]) => {
+      customArguments.push(rest);
+      return new Promise<unknown>((resolve) => {
+        const close = (result: unknown) => {
+          if (closed) return;
           closed = true;
-          component?.dispose();
-          resolve(result as never);
-        }) as typeof component;
+          childrenAtClose = [...tui.children];
+          pi.editor.clear();
+          pi.editor.addChild(editor);
+          tui.setFocus(editor);
+          tui.requestRender();
+          resolve(result);
+          mounted?.dispose();
+        };
+        const component = factory(tui, theme, new KeybindingsManager(), close) as Component & { handleInput(data: string): void; dispose(): void };
+        mounted = component;
+        const handleInput = component.handleInput.bind(component);
+        component.handleInput = (data: string) => { keysGiven.push(data); handleInput(data); };
+        pi.editor.clear();
+        pi.editor.addChild(component);
+        tui.setFocus(component);
+        tui.requestRender();
       });
     }) as TranscriptUI["custom"],
     getToolsExpanded: () => false,
   };
+  // pi-tui's last frame: the fullscreen screen it drew, or regular mode's whole document.
+  const frame = (): readonly string[] => mode === "regular"
+    ? (tui as unknown as TuiMainScreen).captureRenderState().previousLines
+    : (tui as unknown as { readonly previousScreen: readonly string[] }).previousScreen;
   return {
-    ui, tui,
-    get options() { return options; },
-    get closed() { return closed; },
-    lines: (width = WIDTH) => component!.render(width),
-    text: (width = WIDTH) => component!.render(width).map((line) => plain(line).trimEnd()),
-    press(...keys: string[]) { for (const key of keys) component!.handleInput(key); },
+    ui, tui, terminal, requests, customArguments,
+    get closed(): boolean { return closed; },
+    get childrenAtClose(): readonly Component[] | undefined { return childrenAtClose; },
+    /** Whether pi's editor, rather than the view, has the focus. */
+    get editorFocused(): boolean { return tui.getFocusedComponent() === editor; },
+    /** The keys the focused view took, in order. */
+    get keysGiven(): readonly string[] { return keysGiven; },
+    /** Everything pi-tui wrote so far. */
+    get output(): string { return terminal.written.join(""); },
+    press(...keys: string[]) { for (const key of keys) terminal.send(key); },
+    /** Wheel notches over the screen, as the terminal reports them: SGR button 64 scrolls up, 65 down. */
+    wheel(direction: "up" | "down", notches = 1) {
+      for (let notch = 0; notch < notches; notch++) terminal.send(`\x1b[<${direction === "up" ? 64 : 65};50;6M`);
+    },
+    /** The screen as drawn now, without colours but with the scrollbar's cell, so a test can see which glyph and tag it has. */
+    raw(): string[] {
+      tui.renderNow();
+      return frame().map((line) => plain(line).trimEnd());
+    },
+    /** The screen as the user reads it: drawn now, at `width` columns and the terminal's height, without colours and, in fullscreen, without the scrollbar. Regular mode is the whole document. */
+    text(width = WIDTH): string[] {
+      terminal.columns = width;
+      tui.renderNow();
+      return frame().map((line) => {
+        const shown = plain(line);
+        return (mode === "fullscreen" ? shown.replace(SCROLLBAR_CELL, "") : shown).trimEnd();
+      });
+    },
+    /** Draws now and returns what pi-tui wrote for it: a reprint clears the whole screen with `\x1b[2J`. */
+    draw(): string {
+      terminal.written.length = 0;
+      tui.renderNow();
+      return terminal.written.join("");
+    },
+    stop(): void { tui.stop(); },
   };
+}
+
+/** pi's own fullscreen chat, mounted as pi mounts it: the task and each reply as pi's message components in createChatViewport.
+ *  The scroll tests send the same keys and notches to it and to the view, which must scroll the same way. */
+function chatUI(rows: number, task: string, replies: readonly string[]) {
+  const terminal = new CapturingTerminal(WIDTH, rows);
+  const tui = createInteractiveTui({ tuiMode: "fullscreen", showHardwareCursor: false, logDirectory: tmpdir(), terminal, fullscreenCopyOnSelect: false, fullscreenWheelScrollLines: 1 });
+  const document = new Container();
+  const markdown = getMarkdownTheme();
+  document.addChild(new UserMessageComponent(task, markdown) as unknown as Component);
+  for (const text of replies) {
+    document.addChild(new AssistantMessageComponent({ role: "assistant", content: [{ type: "text", text }], stopReason: "stop", timestamp: 0 } as never, false, markdown) as unknown as Component);
+  }
+  const editor = textLine("editor text");
+  const viewport = createChatViewport({ document, pendingMessages: new Container(), status: new Container(), widgetsAbove: new Container(),
+    editor: containing(editor), widgetsBelow: containing(textLine("worker widget")), footer: containing(textLine("pi footer")), scrollbar: "auto" });
+  (tui as unknown as ViewportTUI).setLayoutRoot(viewport.root);
+  tui.setFocus(editor);
+  tui.start();
+  return {
+    tui,
+    press(...keys: string[]) { for (const key of keys) terminal.send(key); },
+    wheel(direction: "up" | "down", notches = 1) { for (let notch = 0; notch < notches; notch++) terminal.send(`\x1b[<${direction === "up" ? 64 : 65};50;6M`); },
+    /** The screen as the user reads it, as the view's text() reads it. */
+    text(): string[] {
+      tui.renderNow();
+      return (tui as unknown as { readonly previousScreen: readonly string[] }).previousScreen.map((line) => plain(line).replace(SCROLLBAR_CELL, "").trimEnd());
+    },
+  };
+}
+
+/** Pi's chat with the same completed bash boxes as a budget transcript. */
+function budgetChat(mode: "fullscreen" | "regular", calls: number) {
+  const terminal = new CapturingTerminal(WIDTH, 40);
+  const tui = createInteractiveTui({ tuiMode: mode, showHardwareCursor: false, logDirectory: tmpdir(), terminal, fullscreenCopyOnSelect: false, fullscreenWheelScrollLines: 1 });
+  const document = new Container();
+  const markdown = getMarkdownTheme();
+  const cwd = process.cwd();
+  document.addChild(new UserMessageComponent("Task", markdown) as unknown as Component);
+  for (let i = 0; i < calls; i++) {
+    const id = `call-${i}`;
+    document.addChild(new AssistantMessageComponent(reply(`Round ${i}\n\nA detail.\n\nAnother detail.`) as never, false, markdown) as unknown as Component);
+    const tool = new ToolExecutionComponent("bash", id, { command: `seq ${i}` }, {}, createBashToolDefinition(cwd), tui as never, cwd);
+    tool.setArgsComplete();
+    tool.updateResult({ content: [{ type: "text", text: Array.from({ length: 30 }, (_, k) => `line ${k + 1} of output ${i}`).join("\n") }], isError: false }, false);
+    document.addChild(tool as unknown as Component);
+  }
+  if (mode === "fullscreen") {
+    const editor = textLine("editor text");
+    (tui as unknown as ViewportTUI).setLayoutRoot(createChatViewport({ document, pendingMessages: new Container(), status: new Container(), widgetsAbove: new Container(),
+      editor: containing(editor), widgetsBelow: containing(textLine("worker widget")), footer: containing(textLine("pi footer")), scrollbar: "auto" }).root);
+    tui.setFocus(editor);
+  } else tui.addChild(document);
+  tui.start();
+  return { tui, terminal };
+}
+
+function medianFrame(render: () => void): number {
+  for (let i = 0; i < 10; i++) render();
+  const times: number[] = [];
+  for (let i = 0; i < 40; i++) { const start = performance.now(); render(); times.push(performance.now() - start); }
+  return times.sort((a, b) => a - b)[20]!;
 }
 
 /** Lets the view's promise settle. */
@@ -153,33 +360,31 @@ const usage = (input: number, output: number, cacheRead: number, cacheWrite: num
 test("the view covers the whole screen, fits every line to it, and Esc or ctrl+c restores the orchestrator's session", async () => {
   const board = new WorkerBoard();
   const { fake } = running(board, "Fix the typo", "worker-1", { agent: "fixer" }, [user("Fix the typo"), reply(`A long line ${"x".repeat(300)}`)]);
-  const view = fakeUI(12);
+  const view = fakeUI(24);
   const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
-  const options = view.options as { overlay: boolean; overlayOptions: () => unknown };
-  assert.equal(options.overlay, true);
-  assert.deepEqual(options.overlayOptions(), TRANSCRIPT_OVERLAY, "fullscreen tuiMode, and a TUI that names none, keep the overlay");
-  assert.deepEqual(TRANSCRIPT_OVERLAY, { width: "100%", maxHeight: "100%", anchor: "top-left", margin: 0 });
+  assert.deepEqual(view.customArguments, [[]], "ctx.ui.custom gets no overlay options: the view is not an overlay");
 
-  const lines = view.lines(60);
-  assert.equal(lines.length, 12, "exactly the terminal's height");
-  assert.ok(lines.every((line) => plain(line).length <= 60), JSON.stringify(lines.map(plain)));
+  const lines = view.text(60);
+  assert.equal(lines.length, 24, "exactly the terminal's height");
+  assert.ok(lines.every((line) => line.length <= 60), JSON.stringify(lines));
   assert.equal(shownWorker(view), "fixer · running · worker 1 of 1");
   assert.deepEqual(pickerLines(view), ["  ○ main", "❯ ● fixer   routing… · 0s · running"], "the viewed worker is highlighted beside main");
   assert.ok(view.text().some((line) => line.includes("Fix the typo")));
-  view.tui.terminal.rows = 30;
-  assert.equal(view.lines().length, 30, "a resize redraws at the new size");
+  view.terminal.rows = 30;
+  assert.equal(view.text().length, 30, "a resize redraws at the new size");
 
   view.press("q", KEY.left, "z");
   assert.equal(view.closed, false, "other keys keep it open");
   view.press(KEY.kittyEscape);
   assert.equal(await shown, "back");
   assert.equal(view.closed, true, "Esc under the kitty keyboard protocol leaves");
+  assert.equal(view.editorFocused, true, "pi's editor has the focus again");
   assert.equal(fake.listeners.size, 1, "the view stopped following the worker's session; only the board does");
-  const renders = view.tui.renders;
+  const renders = view.requests.length;
   fake.emit({ type: "turn_start" });
   board.add({ callId: "call-2", background: false, task: "Later", model: { kind: "routed" } });
   board.setOrchestratorState("running");
-  assert.equal(view.tui.renders, renders, "nor does the board redraw it, the orchestrator bar included");
+  assert.equal(view.requests.length, renders, "nor does the board redraw it, the orchestrator bar included");
 
   for (const key of [KEY.escape, KEY.ctrlC, "\x1b[99;5u"]) {
     const again = fakeUI();
@@ -206,25 +411,26 @@ test("the session picker switches workers and Enter on main returns to the orche
   view.press(KEY.up, KEY.enter);
   assert.equal(shownWorker(view), "lead · running · worker 1 of 2", "Enter opens the selected worker from the picker");
   assert.equal(other.fake.listeners.size, 1, "the view stopped following the prior worker");
-  view.press(KEY.up, KEY.enter);
+  view.press(KEY.up);
   assert.equal(pickerLines(view)[0], "❯ ● main", "main is selected before it is opened");
+  view.press(KEY.enter);
   assert.equal(await shown, "main", "Enter on main leaves the transcript view");
   assert.equal(view.closed, true);
 });
 
-test("a live transcript follows the end until the user scrolls; PgUp, PgDn, Home and End scroll, and End follows again", async () => {
+test("a live transcript follows the end until the user scrolls; pi's page keys scroll it, and pi's bottom key follows again", async () => {
   const board = new WorkerBoard();
   const { fake } = running(board, "Count to many", "worker-1");
-  const view = fakeUI(12);
+  const view = fakeUI(20);
   void openTranscript(view.ui, board, board.workers()[0]!.id);
-  assert.ok(view.text().includes("following · ←→ worker · PgUp PgDn Home End scroll · x stop · ctrl+o tool output · Esc back"), JSON.stringify(view.text()));
+  assert.ok(view.text().includes("following · ←→ worker · wheel or PgUp PgDn scroll · x stop · ctrl+o tool output · Esc back"), JSON.stringify(view.text()));
 
   // A reply as it streams, then saved.
-  const renders = view.tui.renders;
+  const renders = view.requests.length;
   const partial = { role: "assistant", content: [{ type: "text", text: "Counting now" }], timestamp: 0 };
   fake.emit({ type: "message_start", message: partial });
   fake.emit({ type: "message_update", message: partial });
-  assert.ok(view.tui.renders > renders, "each event redraws the view");
+  assert.ok(view.requests.length > renders, "each event redraws the view");
   assert.ok(view.text().some((line) => line.includes("Counting now")), "the streaming reply shows");
   const numbers = Array.from({ length: 40 }, (_, index) => `number ${index + 1}`).join("\n\n");
   fake.add(reply(numbers));
@@ -235,23 +441,709 @@ test("a live transcript follows the end until the user scrolls; PgUp, PgDn, Home
   const firstShown = () => view.text().find((line) => /number \d+/.test(line))?.trim();
   const scrolled = firstShown();
   assert.notEqual(last(), "number 40");
-  assert.match(view.text().at(-1)!, /^line \d+ of \d+, End follows/);
+  assert.match(view.text().at(-1)!, new RegExp(`^line \\d+, ${FOLLOW_PATTERN} follows`));
   fake.add(reply("A new message below"));
   assert.equal(firstShown(), scrolled, "a scrolled view stays put while the worker goes on");
   assert.ok(!view.text().some((line) => line.includes("A new message below")));
 
-  view.press(KEY.home);
-  assert.ok(view.text().some((line) => line.includes("Count to many")), "Home shows the task");
+  view.press(keyFor("tui.altScreen.top"));
+  assert.ok(view.text().some((line) => line.includes("Count to many")), "pi's top key shows the task");
   view.press(KEY.pageDown);
-  assert.match(view.text().at(-1)!, /^line \d+ of \d+/);
-  view.press(KEY.end);
-  assert.ok(view.text().some((line) => line.includes("A new message below")), "End shows the end");
+  assert.match(view.text().at(-1)!, /^line \d+/);
+  view.press(keyFor("tui.altScreen.bottom"));
+  assert.ok(view.text().some((line) => line.includes("A new message below")), "pi's bottom key shows the end");
   assert.match(view.text().at(-1)!, /^following/);
   fake.add(reply("And it follows again"));
   assert.ok(view.text().some((line) => line.includes("And it follows again")));
 
   view.press(KEY.pageUp, KEY.pageDown, KEY.pageDown, KEY.pageDown);
   assert.match(view.text().at(-1)!, /^following/, "paging back down to the end follows it too");
+  const viewportKeys = [KEY.pageUp, KEY.pageDown, keyFor("tui.altScreen.top"), keyFor("tui.altScreen.bottom")];
+  assert.deepEqual(view.keysGiven.filter((key) => viewportKeys.includes(key)), [], "pi-tui's alt screen takes the page, top and bottom keys: the view gets none");
+});
+
+test("fullscreen tuiMode: pi-tui's alt screen takes the mouse wheel and scrolls the transcript under the pointer; a notch up stops following, and a notch down to the end follows again", async () => {
+  const board = new WorkerBoard();
+  const { fake } = running(board, "Count to many", "worker-1");
+  const view = fakeUI(20);
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+  fake.add(reply(Array.from({ length: 40 }, (_, index) => `number ${index + 1}`).join("\n\n")));
+  const footer = () => view.text().at(-1)!;
+  const firstLine = () => Number(new RegExp(`^line (\\d+), ${FOLLOW_PATTERN} follows`).exec(footer())?.[1]);
+  assert.match(footer(), /^following · /, "following the end");
+
+  view.wheel("up", 3);
+  assert.match(footer(), new RegExp(`^line \\d+, ${FOLLOW_PATTERN} follows`), "a notch up stops following");
+  const top = firstLine();
+  view.wheel("up");
+  assert.equal(firstLine(), top - 1, "a notch up scrolls up a line");
+  view.wheel("down", 2);
+  assert.equal(firstLine(), top + 1, "a notch down scrolls down");
+  view.wheel("down", 100);
+  assert.match(footer(), /^following · /, "reaching the end follows again");
+  assert.equal(view.text().filter((line) => /number \d+/.test(line)).at(-1)?.trim(), "number 40");
+  assert.deepEqual(view.keysGiven, [], "the alt screen takes every notch: none reaches the view's keys");
+  view.press(KEY.escape);
+  await shown;
+});
+
+test("fullscreen tuiMode: pi-tui takes the mouse presses and drags on the transcript, and the view gets none of them", async () => {
+  const board = new WorkerBoard();
+  running(board, "Count to many", "worker-1");
+  const view = fakeUI(20);
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+  view.terminal.send("\x1b[<0;10;3M");
+  view.terminal.send("\x1b[<32;14;3M");
+  view.terminal.send("\x1b[<0;14;3m");
+  assert.deepEqual(view.keysGiven, [], "no press, drag or release reaches the view");
+  view.press(KEY.escape);
+  await shown;
+});
+
+/** What the scroll tests need of a fullscreen screen: its pi-tui, keys and wheel, and the rows it shows. */
+type Side = { readonly tui: unknown; press(...keys: string[]): void; wheel(direction: "up" | "down", notches?: number): void; text(): string[] };
+
+/** A worker's transcript whose replies are long enough to scroll, as pi's chat is in the scroll tests. */
+const SCROLL_REPLIES = Array.from({ length: 30 }, (_, index) =>
+  `Reply ${index + 1}: first paragraph of the answer.\n\nSecond paragraph of reply ${index + 1}, a little longer so that it wraps.\n\nThird paragraph.`);
+
+test("fullscreen tuiMode: the view scrolls as pi's chat does for the same keys and wheel notches, page keys, top, bottom and prompt jumps included", async () => {
+  const chat = chatUI(20, "Count the replies", SCROLL_REPLIES);
+  const board = new WorkerBoard();
+  const { fake } = running(board, "Count the replies", "worker-1");
+  const view = fakeUI(20);
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+  for (const text of SCROLL_REPLIES) fake.add(reply(text));
+  const sides: [string, Side][] = [["pi's chat", chat], ["the view", view]];
+  const position = (side: Side) => {
+    side.text(); // pi-tui's layout, and so its primary ScrollView, exists once a frame is drawn
+    const scroll = primaryScroll(side.tui);
+    const page = scroll.viewportHeight;
+    const content = (scroll as unknown as { readonly contentHeight: number }).contentHeight;
+    return { top: scroll.scrollTop, following: scroll.isFollowingEnd, page, end: Math.max(0, content - page), shown: side.text().slice(0, 3) };
+  };
+  type Position = ReturnType<typeof position>;
+  /** The same keys to each side, then `expect` on each side's position before and after. */
+  const step = (label: string, act: (side: Side) => void, expect: (before: Position, after: Position, message: string) => void) => {
+    const before = new Map(sides.map(([name, side]) => [name, position(side)]));
+    for (const [, side] of sides) act(side);
+    for (const [name, side] of sides) expect(before.get(name)!, position(side), `${name}: ${label}`);
+  };
+  const isReplyStart = (rows: readonly string[]) => rows.some((row) => /Reply \d+: first paragraph/.test(row));
+
+  step("opens following the end", () => {}, (_before, after, message) => {
+    assert.ok(after.following && after.top === after.end, `${message} starts at the end, following it`);
+  });
+  step("wheel up three notches", (side) => side.wheel("up", 3), (before, after, message) => {
+    assert.equal(after.top, before.top - 3, `${message} moves one line a notch`);
+    assert.equal(after.following, false, `${message} stops following`);
+  });
+  step("wheel down one notch", (side) => side.wheel("down"), (before, after, message) => {
+    assert.equal(after.top, before.top + 1, message);
+  });
+  step("page up", (side) => side.press(KEY.pageUp), (before, after, message) => {
+    assert.equal(after.top, Math.max(0, before.top - (before.page - 4)), `${message} moves a page less four lines`);
+  });
+  step("page down", (side) => side.press(KEY.pageDown), (before, after, message) => {
+    assert.equal(after.top, Math.min(before.end, before.top + (before.page - 4)), `${message} moves a page less four lines`);
+  });
+  step("top", (side) => side.press(keyFor("tui.altScreen.top")), (_before, after, message) => {
+    assert.equal(after.top, 0, `${message} goes to the top`);
+    assert.equal(after.following, false, message);
+  });
+  step("bottom", (side) => side.press(keyFor("tui.altScreen.bottom")), (_before, after, message) => {
+    assert.equal(after.top, after.end, `${message} goes to the end`);
+    assert.equal(after.following, true, `${message} follows the end again`);
+  });
+  step("previous prompt", (side) => side.press(keyFor("tui.altScreen.previousPrompt")), (before, after, message) => {
+    assert.ok(after.top < before.top && isReplyStart(after.shown), `${message} jumps to the start of the reply above`);
+  });
+  step("previous prompt again", (side) => side.press(keyFor("tui.altScreen.previousPrompt")), (before, after, message) => {
+    assert.ok(after.top < before.top && isReplyStart(after.shown), `${message} jumps to the reply above that`);
+  });
+  step("next prompt", (side) => side.press(keyFor("tui.altScreen.nextPrompt")), (before, after, message) => {
+    assert.ok(after.top > before.top && isReplyStart(after.shown), `${message} jumps to the reply below`);
+  });
+  // Home and End are not the view's keys: whatever pi's chat does with them, the view does too.
+  for (const key of [KEY.home, KEY.end]) {
+    const outcomes = sides.map(([name, side]) => {
+      const before = position(side);
+      side.press(key);
+      const after = position(side);
+      const outcome = after.top === 0 && before.top !== 0 ? "top" : after.following && !before.following ? "end" : after.top === before.top ? "unchanged" : "moved";
+      return [name, outcome] as const;
+    });
+    assert.equal(outcomes[1]![1], outcomes[0]![1], `${JSON.stringify(key)} does what it does in pi's chat: ${outcomes[0]![1]}`);
+  }
+  (chat.tui as unknown as { stop(): void }).stop();
+  view.press(KEY.escape);
+  await shown;
+});
+
+test("fullscreen tuiMode: from the top, the view's next prompt is the task card, which carries the prompt marks pi's user message has", async () => {
+  const board = new WorkerBoard();
+  const { fake } = running(board, "Count the replies", "worker-1");
+  const view = fakeUI(20);
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+  for (const text of SCROLL_REPLIES) fake.add(reply(text));
+  view.text();
+  view.press(keyFor("tui.altScreen.top"));
+  view.press(keyFor("tui.altScreen.nextPrompt"));
+  assert.ok(view.text().slice(0, 3).some((row) => row.includes("Count the replies")), JSON.stringify(view.text().slice(0, 3)));
+  view.press(KEY.escape);
+  await shown;
+});
+
+test("fullscreen tuiMode: a scrolled-up transcript keeps its rows while output arrives, the board changes and the worker ends", async () => {
+  const board = new WorkerBoard();
+  const { fake, feed } = running(board, "Count to many", "worker-1");
+  const view = fakeUI(20);
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+  fake.add(reply(Array.from({ length: 40 }, (_, index) => `number ${index + 1}`).join("\n\n")));
+  view.text();
+  view.wheel("up", 6);
+  const scroll = () => primaryScroll(view.tui);
+  const page = scroll().viewportHeight;
+  const top = scroll().scrollTop;
+  const before = view.text();
+  /** Without the scroll-to-latest label, which pi draws over the viewport's last row and moves when the dock grows. */
+  const withoutLabel = (rows: readonly string[]) => rows.map((row) => row.replace(/\s*\u2193 Jump to latest message.*$/u, ""));
+  const held = (label: string) => {
+    const now = view.text();
+    const rows = Math.min(page, scroll().viewportHeight);
+    assert.deepEqual(withoutLabel(now.slice(0, rows)), withoutLabel(before.slice(0, rows)), `${label}: the rows shown are still shown`);
+    assert.equal(scroll().scrollTop, top, `${label}: the scroll position holds`);
+    assert.equal(scroll().isFollowingEnd, false, `${label}: the view does not follow the end`);
+  };
+  const partial = { role: "assistant", content: [{ type: "text", text: "Streaming now" }], timestamp: 0 };
+  fake.emit({ type: "message_start", message: partial });
+  fake.emit({ type: "message_update", message: partial });
+  held("a reply streams");
+  fake.add(reply("A saved reply"));
+  held("a reply is saved");
+  const id = "call-live";
+  fake.add({ role: "assistant", content: [{ type: "text", text: "Running it" }, { type: "toolCall", id, name: "bash", arguments: { command: "seq 1 200" } }], stopReason: "toolUse", timestamp: 0 });
+  fake.emit({ type: "tool_execution_start", toolCallId: id, toolName: "bash", args: { command: "seq 1 200" } });
+  held("a tool call starts");
+  for (let row = 1; row <= 30; row++) {
+    fake.emit({ type: "tool_execution_update", toolCallId: id, toolName: "bash", args: { command: "seq 1 200" }, partialResult: { content: [{ type: "text", text: Array.from({ length: row }, (_, index) => `row ${index + 1}`).join("\n") }] } });
+  }
+  held("its output grows");
+  const output = Array.from({ length: 200 }, (_, index) => `row ${index + 1}`).join("\n");
+  fake.emit({ type: "tool_execution_end", toolCallId: id, toolName: "bash", result: { content: [{ type: "text", text: output }] }, isError: false });
+  fake.add(toolResult(id, "bash", output));
+  held("the call ends with 200 lines");
+  board.add({ callId: "call-2", background: false, task: "Another", model: { kind: "routed" } });
+  board.setOrchestratorState("running");
+  held("another worker starts and the orchestrator runs");
+  fake.add(user("Also check the docs"));
+  held("the user's message is added");
+  feed.ended({ state: "completed" });
+  held("the worker completes");
+  view.press(KEY.escape);
+  await shown;
+});
+
+test("fullscreen tuiMode: the dock starts right under the transcript: a message input that takes no messages takes no rows", async () => {
+  const board = new WorkerBoard();
+  running(board, "Count to many", "worker-1");
+  const view = fakeUI(20);
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+  view.text();
+  const page = primaryScroll(view.tui).viewportHeight;
+  assert.match(view.text()[page]!, /^running \u00b7 /, "the worker's stats line is the dock's first row");
+  view.press(KEY.escape);
+  await shown;
+});
+
+/** A theme whose scrollbar colours show as zero-width tags (pi-tui's APC sequences), so a test can see which colour pi's scrollbar paints with. */
+const TAGGED = { ...PLAIN, fg: (color: string, text: string) => color.startsWith("scrollbar") ? `\x1b_${color}\x07${text}\x1b_end\x07` : text } as unknown as Theme;
+const TRACK = "\x1b_scrollbarTrack\x07";
+const THUMB = "\x1b_scrollbarThumb\x07";
+
+test("fullscreen tuiMode: the scrollbar follows pi's fullscreenScrollbar setting and paints in pi's track and thumb colours", async () => {
+  const board = new WorkerBoard();
+  const { fake } = running(board, "Count to many", "worker-1");
+  fake.add(reply(Array.from({ length: 40 }, (_, index) => `number ${index + 1}`).join("\n\n")));
+  const scrollbarRows = (view: ReturnType<typeof fakeUI>) => view.raw().slice(0, primaryScroll(view.tui).viewportHeight);
+  const always = fakeUI(20, "fullscreen", TAGGED);
+  const shownAlways = openTranscript(always.ui, board, board.workers()[0]!.id, { scrollbar: "always" });
+  const rows = scrollbarRows(always);
+  assert.ok(rows.every((row) => /(\x1b_scrollbar(Track|Thumb)\x07)[\u2502\u2503\u2588]\x1b_end\x07$/.test(row)), `always: every row ends with pi's scrollbar: ${JSON.stringify(rows.at(-1))}`);
+  assert.ok(rows.some((row) => row.includes(THUMB)) && rows.some((row) => row.includes(TRACK)), "a thumb and a track, in pi's two colours");
+  always.press(KEY.escape);
+  await shownAlways;
+
+  const auto = fakeUI(20, "fullscreen", TAGGED);
+  const shownAuto = openTranscript(auto.ui, board, board.workers()[0]!.id);
+  assert.ok(!scrollbarRows(auto).some((row) => row.includes("\x1b_scrollbar")), "auto: no scrollbar while the view follows the end");
+  auto.wheel("up", 1);
+  assert.ok(scrollbarRows(auto).some((row) => row.includes(THUMB) || row.includes(TRACK)), "auto: a scrollbar shows for a moment after a scroll");
+  auto.press(KEY.escape);
+  await shownAuto;
+
+  const hidden = fakeUI(20, "fullscreen", TAGGED);
+  const shownHidden = openTranscript(hidden.ui, board, board.workers()[0]!.id, { scrollbar: "hidden" });
+  hidden.wheel("up", 3);
+  assert.ok(!scrollbarRows(hidden).some((row) => row.includes("\x1b_scrollbar")), "hidden: no scrollbar, even after a scroll");
+  hidden.press(KEY.escape);
+  await shownHidden;
+});
+
+test("regular tuiMode: pi-tui asks the terminal for no mouse reports, so the terminal scrolls the view, while fullscreen asks for them", () => {
+  const board = new WorkerBoard();
+  running(board, "Count to many", "worker-1", {}, [user("Count to many"), reply(Array.from({ length: 40 }, (_, index) => `number ${index + 1}`).join("\n\n"))]);
+  const view = fakeUI(12, "regular");
+  void openTranscript(view.ui, board, board.workers()[0]!.id);
+  assert.doesNotMatch(view.output, /\x1b\[\?100[0236]h/, "no mouse reporting is switched on");
+  const before = view.text();
+  view.wheel("up", 3);
+  assert.deepEqual(view.text(), before, "a wheel notch does not move the view");
+  view.press(KEY.escape);
+  assert.match(fakeUI(12).output, /\x1b\[\?1000h/, "fullscreen switches mouse reporting on, so the wheel reaches pi-tui");
+});
+
+test("the view is not an overlay in either tuiMode: pi mounts it in its editor container with the focus, and leaving gives pi's view and editor back as they were", async () => {
+  for (const mode of ["regular", "fullscreen"] as const) {
+    const board = new WorkerBoard();
+    running(board, "Fix the typo", "worker-1", {}, [user("Fix the typo"), reply("Fixed it")]);
+    const view = fakeUI(20, mode);
+    const before = view.text();
+    const children = [...view.tui.children];
+    const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+    assert.deepEqual(view.customArguments, [[]], `${mode}: no overlay options`);
+    assert.equal(view.editorFocused, false, `${mode}: the view has the focus`);
+    assert.ok(view.text().some((line) => line.includes("Fixed it")), `${mode}: the view is on screen`);
+    view.press(KEY.escape);
+    assert.equal(await shown, "back");
+    assert.equal(view.editorFocused, true, `${mode}: pi's editor has the focus again`);
+    assert.deepEqual(view.tui.children, children, `${mode}: pi's children are back`);
+    assert.deepEqual(view.text(), before, `${mode}: pi's view is as it was`);
+    view.stop();
+  }
+});
+
+test("streamed tokens update only the live reply, not 200 finished replies", async () => {
+  const board = new WorkerBoard();
+  const { fake } = running(board, "Task", "worker-1", {}, [user("Task"), ...Array.from({ length: 200 }, (_, i) => reply(`Finished ${i}`))]);
+  const view = fakeUI();
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+  const updates = mock.method(AssistantMessageComponent.prototype, "updateContent");
+  try {
+    const live = reply("Streaming");
+    fake.emit({ type: "message_start", message: live });
+    updates.mock.resetCalls();
+    for (let i = 0; i < 20; i++) fake.emit({ type: "message_update", message: reply(`Streaming ${i}`) });
+    assert.equal(updates.mock.calls.length, 20);
+  } finally {
+    updates.mock.restore();
+    view.press(KEY.escape);
+    await shown;
+  }
+});
+
+test("streamed tokens leave a running tool with long partial output alone", async () => {
+  const board = new WorkerBoard();
+  const { fake } = running(board, "Task", "worker-1");
+  const view = fakeUI();
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+  const call = { id: "bash-1", name: "bash", arguments: { command: "seq 2000" } };
+  fake.add(reply("Running", [call]));
+  fake.emit({ type: "tool_execution_start", toolCallId: call.id, toolName: call.name, args: call.arguments });
+  fake.emit({ type: "tool_execution_update", toolCallId: call.id, toolName: call.name,
+    partialResult: { content: [{ type: "text", text: Array.from({ length: 2000 }, (_, i) => `line ${i}`).join("\n") }] } });
+  const args = mock.method(ToolExecutionComponent.prototype, "updateArgs");
+  const result = mock.method(ToolExecutionComponent.prototype, "updateResult");
+  const complete = mock.method(ToolExecutionComponent.prototype, "setArgsComplete");
+  try {
+    for (let i = 0; i < 20; i++) fake.emit({ type: "message_update", message: reply(`Streaming ${i}`) });
+    assert.equal(args.mock.calls.length + result.mock.calls.length + complete.mock.calls.length, 0);
+  } finally {
+    args.mock.restore(); result.mock.restore(); complete.mock.restore();
+    view.press(KEY.escape);
+    await shown;
+  }
+});
+
+test("a reply completes tool arguments once at its end, not during updates", async () => {
+  const board = new WorkerBoard();
+  const { fake } = running(board, "Task", "worker-1");
+  const view = fakeUI();
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+  const args = { command: "echo hi" };
+  const call = { id: "bash-1", name: "bash", arguments: args };
+  const complete = mock.method(ToolExecutionComponent.prototype, "setArgsComplete");
+  try {
+    fake.emit({ type: "message_start", message: reply("", [call]) });
+    for (let i = 0; i < 20; i++) fake.emit({ type: "message_update", message: reply(`Token ${i}`, [call]) });
+    assert.equal(complete.mock.calls.length, 0);
+    fake.add(reply("Done", [call]));
+    assert.equal(complete.mock.calls.length, 1);
+  } finally { complete.mock.restore(); view.press(KEY.escape); await shown; }
+});
+
+test("a finished call receives one final result with its duration", async () => {
+  const board = new WorkerBoard();
+  const { fake } = running(board, "Task", "worker-1");
+  const view = fakeUI();
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+  const call = { id: "bash-1", name: "bash", arguments: { command: "echo hi" } };
+  fake.add(reply("Running", [call]));
+  const result = mock.method(ToolExecutionComponent.prototype, "updateResult");
+  try {
+    const final = { content: [{ type: "text", text: "hi" }] };
+    fake.emit({ type: "tool_execution_end", toolCallId: call.id, toolName: call.name, result: final, isError: false, durationMs: 123 });
+    fake.add(toolResult(call.id, call.name, "hi"));
+    assert.equal(result.mock.calls.length, 1);
+    assert.equal((result.mock.calls[0]?.arguments[0] as { durationMs?: number }).durationMs, 123);
+  } finally { result.mock.restore(); view.press(KEY.escape); await shown; }
+});
+
+test("a finished streamed reply is reused as its saved message", async () => {
+  const board = new WorkerBoard();
+  const { fake } = running(board, "Task", "worker-1");
+  const view = fakeUI();
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+  const updates = mock.method(AssistantMessageComponent.prototype, "updateContent");
+  try {
+    fake.emit({ type: "message_start", message: reply("Part") });
+    updates.mock.resetCalls();
+    fake.add(reply("Finished"));
+    view.text(); view.text();
+    assert.equal(updates.mock.calls.length, 1);
+    assert.equal(view.text().filter((line) => line.includes("Finished")).length, 1);
+  } finally { updates.mock.restore(); view.press(KEY.escape); await shown; }
+});
+
+test("attaching mid-stream follows one partial reply without duplicating it", async () => {
+  const board = new WorkerBoard();
+  const partial = { ...reply("Partial answer"), stopReason: undefined };
+  const { fake } = running(board, "Task", "worker-1", {}, [user("Task"), partial]);
+  const view = fakeUI();
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+  try {
+    fake.emit({ type: "message_update", message: reply("Partial answer continued") });
+    fake.add(user("New steer"));
+    const lines = view.text();
+    assert.equal(lines.filter((line) => line.includes("Partial answer")).length, 1);
+    assert.ok(lines.findIndex((line) => line.includes("New steer")) > lines.findIndex((line) => line.includes("Partial answer")));
+  } finally { view.press(KEY.escape); await shown; }
+});
+
+test("a user steer arriving during a streamed reply appears once after it", async () => {
+  const board = new WorkerBoard();
+  const { fake } = running(board, "Task", "worker-1");
+  const view = fakeUI(50);
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+  try {
+    fake.emit({ type: "message_start", message: reply("Streaming answer") });
+    fake.add(user("Steer while streaming"));
+    const lines = view.text();
+    const answer = lines.findIndex((line) => line.includes("Streaming answer"));
+    const steer = lines.findIndex((line) => line.includes("Steer while streaming"));
+    assert.ok(answer >= 0 && steer > answer, JSON.stringify(lines));
+    assert.equal(lines.filter((line) => line.includes("Steer while streaming")).length, 1);
+  } finally { view.press(KEY.escape); await shown; }
+});
+
+test("finished sessions and live endings keep every message once", async () => {
+  for (const finished of [false, true]) {
+    const board = new WorkerBoard();
+    const history = [user("Task"), reply("Unique answer")];
+    const { fake, feed } = running(board, "Task", "worker-1", {}, history);
+    if (finished) feed.ended({ state: "completed" });
+    const view = fakeUI();
+    const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+    try {
+      if (!finished) feed.ended({ state: "completed" });
+      assert.equal(view.text().filter((line) => line.includes("Unique answer")).length, 1);
+      assert.equal(view.text().filter((line) => line.includes("The worker completed.")).length, 1);
+    } finally { view.press(KEY.escape); await shown; fake.listeners.clear(); }
+  }
+});
+
+test("a left click expands a fullscreen tool result but not the header", async () => {
+  const board = new WorkerBoard();
+  running(board, "Task", "worker-1", {}, [user("Task"), reply("Reading", [{ id: "call-1", name: "bash", arguments: { command: "seq 30" } }]), toolResult("call-1", "bash", Array.from({ length: 30 }, (_, i) => `number ${i + 1}`).join("\n"))]);
+  const view = fakeUI(60);
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+  try {
+    const click = (y: number) => { view.terminal.send(`\x1b[<0;10;${y}M`); view.terminal.send(`\x1b[<0;10;${y}m`); };
+    const row = view.text().findIndex((line) => line.includes("number 26"));
+    assert.ok(row >= 0, JSON.stringify(view.text()));
+    click(1);
+    assert.ok(!view.text().some((line) => line.includes("number 1")));
+    click(row + 1);
+    assert.ok(view.text().some((line) => line.includes("number 1")));
+  } finally { view.press(KEY.escape); await shown; }
+});
+
+test("a left click toggles a thinking block in fullscreen", async () => {
+  const board = new WorkerBoard();
+  running(board, "Task", "worker-1", {}, [user("Task"), { role: "assistant", content: [{ type: "thinking", thinking: "private thought" }, { type: "text", text: "Answer" }], stopReason: "stop", timestamp: 0 }]);
+  const view = fakeUI(45);
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+  try {
+    const row = view.text().findIndex((line) => line.includes("private thought"));
+    assert.ok(row >= 0);
+    view.terminal.send(`\x1b[<0;10;${row + 1}M`); view.terminal.send(`\x1b[<0;10;${row + 1}m`);
+    assert.ok(view.text().some((line) => line.includes("Thinking...")));
+    assert.ok(!view.text().some((line) => line.includes("private thought")));
+  } finally { view.press(KEY.escape); await shown; }
+});
+
+test("trace writes frame JSON only to its configured file", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "transcript-trace-"));
+  const file = join(directory, "frames.jsonl");
+  const previous = process.env.PI_ORCHESTRATOR_TRANSCRIPT_TRACE;
+  process.env.PI_ORCHESTRATOR_TRANSCRIPT_TRACE = file;
+  const board = new WorkerBoard();
+  running(board, "Task", "worker-1");
+  const view = fakeUI();
+  try {
+    const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+    view.draw();
+    const before = readFileSync(file, "utf8").trim().split("\n").length;
+    view.draw();
+    const lines = readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+    assert.equal(lines.length - before, 1, "one trace record per frame");
+    assert.ok(lines.some((line) => line.kind === "frame" && typeof line.renderMs === "number" && Array.isArray(line.events)));
+    view.press(KEY.escape); await shown;
+  } finally {
+    if (previous === undefined) delete process.env.PI_ORCHESTRATOR_TRANSCRIPT_TRACE;
+    else process.env.PI_ORCHESTRATOR_TRANSCRIPT_TRACE = previous;
+    view.stop(); rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("trace records a frame count once a second", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "transcript-trace-count-"));
+  const file = join(directory, "frames.jsonl");
+  const previous = process.env.PI_ORCHESTRATOR_TRANSCRIPT_TRACE;
+  process.env.PI_ORCHESTRATOR_TRANSCRIPT_TRACE = file;
+  const board = new WorkerBoard();
+  running(board, "Task", "worker-1");
+  const view = fakeUI();
+  try {
+    const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+    view.text();
+    await new Promise((resolve) => setTimeout(resolve, 1_050));
+    view.text();
+    const records = readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+    assert.ok(records.some((line) => line.kind === "seconds" && typeof line.frames === "number"));
+    view.press(KEY.escape); await shown;
+  } finally {
+    if (previous === undefined) delete process.env.PI_ORCHESTRATOR_TRANSCRIPT_TRACE;
+    else process.env.PI_ORCHESTRATOR_TRANSCRIPT_TRACE = previous;
+    view.stop(); rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("without the trace variable, no trace file is created", async () => {
+  const previous = process.env.PI_ORCHESTRATOR_TRANSCRIPT_TRACE;
+  delete process.env.PI_ORCHESTRATOR_TRANSCRIPT_TRACE;
+  const directory = mkdtempSync(join(tmpdir(), "transcript-no-trace-"));
+  const board = new WorkerBoard();
+  running(board, "Task", "worker-1");
+  const view = fakeUI();
+  try {
+    const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+    view.text();
+    assert.equal(readdirSync(directory).length, 0);
+    view.press(KEY.escape); await shown;
+  } finally {
+    if (previous !== undefined) process.env.PI_ORCHESTRATOR_TRANSCRIPT_TRACE = previous;
+    view.stop(); rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("fifty frames over finished messages call no update method or tint pass", async () => {
+  for (const mode of ["fullscreen", "regular"] as const) {
+    const board = new WorkerBoard();
+    running(board, "Task", "worker-1", {}, [user("Task"), reply("Done", [{ id: "call-1", name: "bash", arguments: { command: "echo hi" } }]), toolResult("call-1", "bash", "hi")]);
+    const view = fakeUI(30, mode);
+    const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+    view.text();
+    const assistant = mock.method(AssistantMessageComponent.prototype, "updateContent");
+    const tool = mock.method(ToolExecutionComponent.prototype as unknown as { updateDisplay(): void }, "updateDisplay");
+    const tint = mock.method(PLAIN, "bg");
+    try {
+      for (let i = 0; i < 50; i++) view.tui.renderNow();
+      assert.equal(assistant.mock.calls.length + tool.mock.calls.length + tint.mock.calls.length, 0, mode);
+    } finally { assistant.mock.restore(); tool.mock.restore(); tint.mock.restore(); view.press(KEY.escape); await shown; }
+  }
+});
+
+test("a header tick changes elapsed time without rebuilding finished messages", async () => {
+  const time = clock();
+  const board = new WorkerBoard({ now: time.now });
+  running(board, "Task", "worker-1", {}, [user("Task"), reply("Done", [{ id: "call-1", name: "bash", arguments: { command: "echo hi" } }]), toolResult("call-1", "bash", "hi")]);
+  const ticks: (() => void)[] = [];
+  const view = fakeUI();
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id, { now: time.now, setInterval: (tick) => { ticks.push(tick); return 1; }, clearInterval: () => {} });
+  view.text();
+  const assistant = mock.method(AssistantMessageComponent.prototype, "updateContent");
+  const tool = mock.method(ToolExecutionComponent.prototype as unknown as { updateDisplay(): void }, "updateDisplay");
+  const tint = mock.method(PLAIN, "bg");
+  try {
+    time.advance(3_000); ticks[0]!();
+    assert.ok(view.text().some((line) => line.includes("3s")));
+    assert.equal(assistant.mock.calls.length + tool.mock.calls.length + tint.mock.calls.length, 0);
+  } finally { assistant.mock.restore(); tool.mock.restore(); tint.mock.restore(); view.press(KEY.escape); await shown; }
+});
+
+test("ctrl+o updates each tool once and subsequent frames do not", async () => {
+  const board = new WorkerBoard();
+  running(board, "Task", "worker-1", {}, [user("Task"), reply("Done", [{ id: "call-1", name: "bash", arguments: { command: "echo hi" } }]), toolResult("call-1", "bash", "hi")]);
+  const view = fakeUI();
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+  view.text();
+  const display = mock.method(ToolExecutionComponent.prototype as unknown as { updateDisplay(): void }, "updateDisplay");
+  try {
+    view.press(KEY.ctrlO); view.text();
+    assert.equal(display.mock.calls.length, 1);
+    for (let i = 0; i < 50; i++) view.tui.renderNow();
+    assert.equal(display.mock.calls.length, 1);
+    view.press(KEY.ctrlO);
+    assert.equal(display.mock.calls.length, 2);
+  } finally { display.mock.restore(); view.press(KEY.escape); await shown; }
+});
+
+test("switching workers disposes a running tool and builds the new messages once", async () => {
+  const board = new WorkerBoard();
+  const first = running(board, "First", "worker-1", {}, [user("First"), reply("Running", [{ id: "bash-1", name: "bash", arguments: { command: "sleep 1" } }])]);
+  running(board, "Second", "worker-2", {}, [user("Second"), reply("One reply")]);
+  const view = fakeUI();
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+  const result = mock.method(ToolExecutionComponent.prototype, "updateResult");
+  const assistant = mock.method(AssistantMessageComponent.prototype, "updateContent");
+  try {
+    view.press(KEY.right);
+    assert.equal(result.mock.calls.length, 1);
+    assert.equal(assistant.mock.calls.length, 1);
+    for (let i = 0; i < 20; i++) view.tui.renderNow();
+    assert.equal(assistant.mock.calls.length, 1);
+  } finally { result.mock.restore(); assistant.mock.restore(); view.press(KEY.escape); await shown; first.feed.ended({ state: "completed" }); }
+});
+
+test("a finished worker's session is read once across twenty frames", async () => {
+  const board = new WorkerBoard();
+  const feed = board.add({ callId: "call-1", background: false, task: "Task", model: { kind: "routed" } });
+  feed.started(); feed.ended({ state: "completed", sessionFile: "/sessions/worker-1.jsonl" });
+  let reads = 0;
+  const view = fakeUI();
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id, { readSession: () => { reads++; return [user("Task"), reply("Saved")]; } });
+  try {
+    for (let i = 0; i < 20; i++) view.tui.renderNow();
+    assert.equal(reads, 1);
+  } finally { view.press(KEY.escape); await shown; }
+});
+
+test("a steer's mark needs no board snapshot on any frame", async () => {
+  const board = new WorkerBoard();
+  running(board, "Task", "worker-1", { background: true }, [user("Task"), reply("Calling", [{ id: "call-1", name: "read", arguments: { path: "a" } }]), toolResult("call-1", "read", "a"), user("Steer text")]);
+  const { steering } = fakeSteering();
+  const view = fakeUI(30);
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id, { steering });
+  const snapshots = mock.method(board, "workers");
+  try {
+    for (let i = 0; i < 20; i++) view.tui.renderNow();
+    assert.equal(snapshots.mock.calls.length, 0);
+  } finally { snapshots.mock.restore(); view.press(KEY.escape); await shown; }
+});
+
+for (const mode of ["fullscreen", "regular"] as const) {
+  test(`${mode} frames over 300 bash calls stay within twice pi's chat`, async () => {
+    const calls = 300;
+    const messages: Message[] = [user("Task")];
+    for (let i = 0; i < calls; i++) {
+      messages.push(reply(`Round ${i}\n\nA detail.\n\nAnother detail.`, [{ id: `call-${i}`, name: "bash", arguments: { command: `seq ${i}` } }]));
+      messages.push(toolResult(`call-${i}`, "bash", Array.from({ length: 30 }, (_, k) => `line ${k + 1} of output ${i}`).join("\n")));
+    }
+    const chat = budgetChat(mode, calls);
+    const board = new WorkerBoard();
+    running(board, "Task", "worker-1", {}, messages);
+    const view = fakeUI(40, mode);
+    const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+    try {
+      chat.tui.renderNow(); view.tui.renderNow();
+      const rows = mode === "fullscreen" ? (primaryScroll(view.tui) as unknown as { contentHeight: number }).contentHeight
+        : (view.tui as unknown as TuiMainScreen).captureRenderState().previousLines.length;
+      assert.ok(rows >= 5_100, `${mode}: expected 5,100 rows, got ${rows}`);
+      if (mode === "fullscreen") {
+        for (let i = 0; i < 5; i++) {
+          chat.terminal.send("\x1b[<64;50;6M"); view.terminal.send("\x1b[<64;50;6M");
+        }
+      }
+      const piMs = medianFrame(() => chat.tui.renderNow());
+      const viewMs = medianFrame(() => view.tui.renderNow());
+      assert.ok(viewMs <= piMs * 2, `${mode}: view ${viewMs.toFixed(2)} ms, pi ${piMs.toFixed(2)} ms`);
+    } finally { view.press(KEY.escape); await shown; view.stop(); chat.tui.stop(); }
+  });
+}
+
+test("streamed-token work stays flat with a thousand finished messages", async () => {
+  const measure = async (count: number) => {
+    const board = new WorkerBoard();
+    const { fake } = running(board, "Task", `worker-${count}`, {}, [user("Task"), ...Array.from({ length: count }, (_, i) => reply(`Finished ${i}`))]);
+    const view = fakeUI();
+    const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+    try {
+      fake.emit({ type: "message_start", message: reply("") });
+      const times: number[] = [];
+      for (let i = 0; i < 40; i++) {
+        const start = performance.now();
+        fake.emit({ type: "message_update", message: reply(`Token ${i}`) });
+        times.push(performance.now() - start);
+      }
+      return times.sort((a, b) => a - b)[20]!;
+    } finally { view.press(KEY.escape); await shown; view.stop(); }
+  };
+  const short = await measure(10);
+  const long = await measure(1_000);
+  assert.ok(long <= short * 2, `10 replies ${short.toFixed(3)} ms, 1000 replies ${long.toFixed(3)} ms`);
+});
+
+test("a recorded steer changes its mark from orchestrator to user", async () => {
+  const board = new WorkerBoard();
+  running(board, "Task", "worker-1", { background: true }, [user("Task"), reply("Checking", [{ id: "call-1", name: "read", arguments: { path: "a" } }]), toolResult("call-1", "read", "a"), user("A steer")]);
+  const { steering, sent } = fakeSteering();
+  const view = fakeUI(40);
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id, { steering });
+  try {
+    assert.ok(view.text().some((line) => line.includes("Steer from the orchestrator")));
+    sent.push({ workerId: board.workers()[0]!.id, text: "A steer", mode: "steer" });
+    assert.ok(view.text().some((line) => line.includes("Steer from the user")));
+  } finally { view.press(KEY.escape); await shown; }
+});
+
+test("a frame does not snapshot the board for the transcript and picker", async () => {
+  const board = new WorkerBoard();
+  running(board, "Task", "worker-1");
+  const view = fakeUI();
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+  const workers = mock.method(board, "workers");
+  try {
+    view.text();
+    assert.ok(workers.mock.calls.length <= 1, `board snapshots: ${workers.mock.calls.length}`);
+  } finally {
+    workers.mock.restore(); view.press(KEY.escape); await shown;
+  }
+});
+
+test("finished fullscreen tool boxes use pi's colours without retinting each frame", async () => {
+  const board = new WorkerBoard();
+  running(board, "Task", "worker-1", {}, [user("Task"), reply("Done", [{ id: "call-1", name: "bash", arguments: { command: "echo hi" } }]), toolResult("call-1", "bash", "hi")]);
+  const view = fakeUI();
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+  view.text();
+  const tint = mock.method(PLAIN, "bg");
+  try {
+    for (let i = 0; i < 50; i++) view.tui.renderNow();
+    assert.equal(tint.mock.calls.length, 0);
+  } finally {
+    tint.mock.restore(); view.press(KEY.escape); await shown;
+  }
 });
 
 test("pi's message rendering shows tool calls with their results and the expand toggle; reports and steers are marked", async () => {
@@ -411,7 +1303,7 @@ test("x stops the shown worker after a confirmation, and the view stays open wit
     { stop: () => { stops.push("bg-1"); feed.ended({ state: "aborted" }); } });
   feed.started();
   feed.session(fakeSession("bg-1", [user("Long job")]).session);
-  const view = fakeUI(12);
+  const view = fakeUI(20);
   const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
 
   view.press("x");
@@ -512,9 +1404,9 @@ test("the header shows a routed worker's rung history, live, each rung since whe
   assert.equal(header(view)[1], "routing…", "before its first request");
 
   time.advance(5_000);
-  const renders = view.tui.renders;
+  const renders = view.requests.length;
   board.served({ delegationId: "routed-1", model: "anthropic/claude-haiku-4-5", effort: "low", escalation: { from: "mechanical", to: "standard" } });
-  assert.ok(view.tui.renders > renders, "a served rung redraws the view");
+  assert.ok(view.requests.length > renders, "a served rung redraws the view");
   assert.equal(header(view)[1], "anthropic/claude-haiku-4-5:low since 12:00:05 (escalated from mechanical to standard)");
   time.advance(60_000);
   board.served({ delegationId: "routed-1", model: "anthropic/claude-sonnet-4-5", effort: "high" });
@@ -581,13 +1473,13 @@ test("the orchestrator bar shows whether the orchestrator runs and which workers
   const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
   assert.equal(view.text()[0], "orchestrator idle");
 
-  let renders = view.tui.renders;
+  let renders = view.requests.length;
   board.setOrchestratorState("running");
-  assert.ok(view.tui.renders > renders, "a change of the orchestrator's state redraws the view");
+  assert.ok(view.requests.length > renders, "a change of the orchestrator's state redraws the view");
   assert.equal(view.text()[0], "orchestrator running");
-  renders = view.tui.renders;
+  renders = view.requests.length;
   board.asking("reviewer-1", true);
-  assert.ok(view.tui.renders > renders, "a worker asking redraws the view");
+  assert.ok(view.requests.length > renders, "a worker asking redraws the view");
   assert.equal(view.text()[0], "orchestrator running · 1 worker asking: worker 2 (reviewer)");
   board.asking("checker-1", true);
   board.setOrchestratorState("idle");
@@ -621,34 +1513,46 @@ test("the view redraws every second while open, so the elapsed time ticks, and i
   assert.equal(ticks.length, 1, "one timer while the view is open");
 
   time.advance(3_000);
-  const renders = view.tui.renders;
+  const renders = view.requests.length;
   ticks[0]!();
-  assert.equal(view.tui.renders, renders + 1, "each tick redraws the view");
+  assert.equal(view.requests.length, renders + 1, "each tick redraws the view");
   assert.equal(header(view)[0], "worker · running · 3s · 0 turns · 0 tok · $0.000 · worker 1 of 1");
   view.press(KEY.escape);
   await shown;
   assert.deepEqual(cleared, ["timer"], "leaving the view stops its timer");
 });
 
-test("a fullscreen worker pins one short Markdown task preview, including before its session starts", async () => {
+test("fullscreen tuiMode: the header and the task preview are the transcript's first lines, so they scroll away with it rather than staying pinned", async () => {
   const board = new WorkerBoard();
   const task = "## Goal\n\nCheck `docker desktop`.\n\n## Steps\n\n- Read logs\n- Report back";
-  board.add({ callId: "call-1", background: false, task, model: { kind: "routed" } });
-  const view = fakeUI(25, "fullscreen");
-  void openTranscript(view.ui, board, board.workers()[0]!.id);
-  assert.equal(view.text().filter((line) => line.includes("Goal")).length, 1);
+  const queued = board.add({ callId: "call-1", background: false, task, model: { kind: "routed" } });
+  const view = fakeUI(24);
+  const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
+  assert.equal(view.text().filter((line) => line.includes("Goal")).length, 1, "the preview shows before the session starts");
   assert.ok(view.text().some((line) => line.includes("ctrl+o to expand task")));
   assert.ok(!view.text().some((line) => line.includes("Read logs")));
-  view.press(KEY.ctrlO, KEY.home);
+
+  queued.started();
+  const session = fakeSession("worker-1", [user(task)]);
+  queued.session(session.session);
+  session.add(reply(Array.from({ length: 40 }, (_, index) => `number ${index + 1}`).join("\n\n")));
+  assert.ok(!view.text().some((line) => line.includes("Goal")), "following the end, the preview has scrolled away");
+  assert.ok(!view.text().includes("orchestrator idle"), "and so has the bar");
+  view.press(keyFor("tui.altScreen.top"));
+  assert.equal(view.text()[0], "orchestrator idle", "the top of the transcript is the bar");
+  assert.equal(view.text().filter((line) => line.includes("Goal")).length, 1, "and the preview, below the header");
+  view.press(KEY.ctrlO, keyFor("tui.altScreen.top"));
   assert.ok(view.text().some((line) => line.includes("Read logs")), "the full task is in the scrollable body");
   assert.equal(view.text().filter((line) => line.includes("Goal")).length, 1, "not repeated in the header");
+  view.press(KEY.escape);
+  await shown;
 });
 
 test("a Markdown task appears once, previews briefly, and expands with the tool-output key", async () => {
   const board = new WorkerBoard();
   const task = "## Goal\n\nCheck `docker desktop`.\n\n## Steps\n\n- Read logs\n- Report back";
   running(board, task, "worker-1");
-  const view = regularUI();
+  const view = fakeUI(10, "regular");
   void openTranscript(view.ui, board, board.workers()[0]!.id);
   const collapsed = view.text();
   assert.equal(collapsed.filter((line) => line.includes("Goal")).length, 1, "no raw header copy");
@@ -666,74 +1570,30 @@ test("a Markdown task appears once, previews briefly, and expands with the tool-
   assert.ok(!view.text().some((line) => line.includes("Read logs")));
 });
 
-/** ctx.ui.custom in regular tuiMode: pi's root holds its chat, editor and
- *  widgets as children; the view swaps them out and puts them back. The
- *  overlay pi mounts is the view's key stub, which draws nothing. */
-function regularUI(rows = 10) {
-  const chat = { render: () => ["chat line"], invalidate() {} };
-  const editor = { render: () => ["editor text"], invalidate() {} };
-  const widget = { render: () => ["worker widget"], invalidate() {} };
-  const forced: boolean[] = [];
-  const tui = {
-    mode: "regular" as const, terminal: { rows }, children: [chat, editor, widget] as { render(width: number): string[] }[],
-    clear() { this.children = []; }, addChild(child: { render(width: number): string[] }) { this.children.push(child); },
-    requestRender(force?: boolean) { forced.push(force === true); },
-  };
-  const original = [...tui.children];
-  let stub: { render(width: number): string[]; handleInput(data: string): void; dispose(): void } | undefined;
-  let overlayOptions: unknown;
-  let childrenAtDone: unknown[] | undefined;
-  let closed = false;
-  const ui: TranscriptUI = {
-    custom: (async (factory: (...args: unknown[]) => unknown, options: { overlay?: boolean; overlayOptions?: unknown }) => {
-      assert.equal(options.overlay, true);
-      return new Promise<unknown>((resolve) => {
-        stub = factory(tui, PLAIN, new KeybindingsManager(), (result: unknown) => {
-          childrenAtDone = [...tui.children];
-          closed = true;
-          stub?.dispose();
-          resolve(result);
-        }) as typeof stub;
-        overlayOptions = typeof options.overlayOptions === "function" ? options.overlayOptions() : options.overlayOptions;
-      });
-    }) as TranscriptUI["custom"],
-    getToolsExpanded: () => false,
-  };
-  /** What the terminal shows: every root child's lines. */
-  const text = (width = WIDTH) => tui.children.flatMap((child) => child.render(width)).map((line) => plain(line).trimEnd());
-  return {
-    ui, tui, original, forced, text,
-    get stub() { return stub!; },
-    get overlayOptions() { return overlayOptions; },
-    get childrenAtDone() { return childrenAtDone; },
-    get closed() { return closed; },
-    press(...keys: string[]) { for (const key of keys) stub!.handleInput(key); },
-  };
-}
-
 test("in regular tuiMode the view replaces pi's whole view while open and puts it back intact on leaving", async () => {
   const board = new WorkerBoard();
   running(board, "Fix the typo", "worker-1", { agent: "fixer" }, [user("Fix the typo"), reply("Fixed it")]);
   running(board, "Other work", "worker-2", { agent: "other" }, [user("Other work"), reply("Other reply")]);
-  const view = regularUI();
+  const view = fakeUI(10, "regular");
+  const original = [...view.tui.children];
   const shown = openTranscript(view.ui, board, board.workers()[0]!.id);
 
   assert.equal(view.tui.children.length, 1, "pi's chat, editor and widgets are swapped out");
   assert.ok(!view.text().some((line) => ["chat line", "editor text", "worker widget"].includes(line)));
   assert.ok(view.text().some((line) => line.includes("Fixed it")));
-  assert.deepEqual(view.stub.render(WIDTH), [], "the overlay only takes the keys");
-  assert.deepEqual(view.overlayOptions, { width: 1, maxHeight: 1, anchor: "bottom-left", margin: 0 });
-  assert.equal(view.forced.at(-1), true, "opening reprints the terminal");
+  assert.equal(view.editorFocused, false, "the view has the focus, not pi's editor");
+  assert.ok(view.requests.includes(true), "opening reprints the terminal");
 
-  view.forced.length = 0;
+  view.requests.length = 0;
   view.press(KEY.right);
   assert.ok(view.text().some((line) => line.includes("Other reply")), "→ switches worker");
-  assert.equal(view.forced.at(-1), true, "switching reprints and lands at the bottom");
+  assert.equal(view.requests.at(-1), true, "switching reprints and lands at the bottom");
   view.press(KEY.left);
   view.press(KEY.up, KEY.enter);
   assert.equal(await shown, "main", "Enter on main leaves the transcript view");
-  assert.deepEqual(view.childrenAtDone, view.original, "pi's tree is back before pi's close restores the editor and its focus");
-  assert.equal(view.forced.at(-1), true, "leaving reprints");
+  assert.deepEqual(view.childrenAtClose, original, "pi's tree is back before pi's close restores the editor and its focus");
+  assert.equal(view.editorFocused, true, "pi's editor has the focus again");
+  assert.ok(view.requests.includes(true), "leaving reprints");
 });
 
 test("in regular tuiMode the view prints its top once, the whole transcript, and live lines last; scroll keys are gone", async () => {
@@ -745,7 +1605,7 @@ test("in regular tuiMode the view prints its top once, the whole transcript, and
   board.add({ callId: "call-2", background: false, task: "Waits its turn", model: { kind: "routed" } });
   fake.emit({ type: "turn_start" });
   time.advance(75_000);
-  const view = regularUI(10);
+  const view = fakeUI(10, "regular");
   void openTranscript(view.ui, board, board.workers()[0]!.id, { now: time.now });
   const text = view.text(60);
 
@@ -756,25 +1616,26 @@ test("in regular tuiMode the view prints its top once, the whole transcript, and
   assert.ok(!text.some((line) => line.includes("The very end.")), "the long task is collapsed");
   assert.ok(text.length > 40, "the transcript in full, not windowed to the terminal");
   assert.ok(text.some((line) => line.trim() === "number 1") && text.some((line) => line.trim() === "number 40"));
-  assert.deepEqual(view.text().slice(-3), [
-    "running · 1m15s · 1 turn · 0 tok · $0.000 · thinking… · worker 1 of 2",
-    "orchestrator idle",
-    "←→ worker · x stop · ctrl+o tool output · Esc back",
-  ]);
+  // The live lines come last: the stats line, then the picker, then the footer.
+  const screen = view.text();
+  const stats = screen.indexOf("running · 1m15s · 1 turn · 0 tok · $0.000 · thinking… · worker 1 of 2");
+  assert.ok(stats >= 0 && stats < screen.findIndex((line) => line.startsWith(SESSION_PICKER_HINT)), "the stats line sits above the picker");
+  assert.equal(screen.at(-1), "←→ worker · x stop · ctrl+o tool output · Esc back");
 
   for (const key of [KEY.pageUp, KEY.pageDown, KEY.home, KEY.end]) {
     view.press(key);
     assert.deepEqual(view.text(60), text, `${JSON.stringify(key)} does nothing: the terminal scrolls`);
   }
-  view.forced.length = 0;
+  view.requests.length = 0;
   view.press(KEY.ctrlO);
-  assert.deepEqual(view.forced, [false], "a key that keeps the worker redraws without reprinting");
+  assert.deepEqual(view.requests, [false], "a key that keeps the worker redraws without reprinting");
   view.press(KEY.ctrlO);
   view.press("x");
   assert.equal(view.text(60).at(-1), "Stop this worker? y/n");
   view.press("n");
+  const redraws = view.requests.length;
   board.setOrchestratorState("running");
-  assert.equal(view.text(60).at(-2), "orchestrator running", "the live lines follow the board");
+  assert.ok(view.requests.length > redraws, "the board's changes still redraw the view");
   assert.equal(view.closed, false);
 });
 
@@ -785,7 +1646,7 @@ test("the transcript's nested worker row is the widget's: label, tier, short run
   board.setTier("nested-1", "standard");
   board.served({ delegationId: "nested-1", model: "anthropic/claude-opus-5-5", effort: "xhigh" });
   nested.fake.emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash" });
-  const view = regularUI();
+  const view = fakeUI(10, "regular");
   void openTranscript(view.ui, board, board.workers()[0]!.id);
   assert.match(view.text(160).find((line) => NESTED_ROW.test(line))!, /^  ○ └ budget code   standard · opus-5-5:xhigh · \d+s · running · bash$/);
   view.press(KEY.down, KEY.enter);
@@ -795,20 +1656,19 @@ test("the transcript's nested worker row is the widget's: label, tier, short run
   view.press(KEY.escape);
 });
 
-test("in regular tuiMode the session picker stays live above the stats line and scrolls to the selected worker", async () => {
+test("in regular tuiMode the session picker stays live below the stats line and scrolls to the selected worker", async () => {
   const board = new WorkerBoard();
   running(board, "Lead the work", "lead-1", { agent: "lead" });
   const feeds: WorkerFeed[] = [];
   for (let item = 1; item <= 8; item++) {
     feeds.push(running(board, `Nested ${item}`, `nested-${item}`, { parentDelegationId: "lead-1", label: `nested ${item}` }, [user(`Nested ${item}`), reply(`Reply ${item}`)]).feed);
   }
-  const view = regularUI();
+  const view = fakeUI(10, "regular");
   void openTranscript(view.ui, board, board.workers()[0]!.id);
   const live = () => {
     const text = view.text();
-    const stats = text.findIndex((line) => line.startsWith("running · "));
     const hint = text.findIndex((line) => line.startsWith(SESSION_PICKER_HINT));
-    return { picker: text.slice(hint + 2, stats), hint: text[hint], rest: text.slice(stats) };
+    return { picker: text.slice(hint + 2, -1), hint: text[hint], footer: text.at(-1) };
   };
 
   assert.equal(live().picker.length, 7, "main stays visible above up to 6 worker rows");
@@ -817,7 +1677,9 @@ test("in regular tuiMode the session picker stays live above the stats line and 
   assert.match(live().picker[1]!, /^❯ ● lead/);
   assert.match(live().picker[2]!, /^  ○ └ nested 1/);
   assert.match(live().picker[6]!, /^  ○ └ nested 5/);
-  assert.equal(live().rest.at(-1), "←→ worker · x stop · ctrl+o tool output · Esc back");
+  const stats = view.text().findIndex((line) => line.startsWith("running · "));
+  assert.ok(stats < view.text().findIndex((line) => line.startsWith(SESSION_PICKER_HINT)), "the stats line sits above the picker");
+  assert.equal(live().footer, "←→ worker · x stop · ctrl+o tool output · Esc back");
 
   view.press(...Array.from({ length: 8 }, () => KEY.down));
   assert.match(live().picker[6]!, /^❯ ● └ nested 8   routing… · \d+s · running$/, "the window scrolls to keep the selected worker visible");
@@ -829,78 +1691,14 @@ test("in regular tuiMode the session picker stays live above the stats line and 
   view.press(KEY.down);
   assert.match(live().picker[6]!, /^❯ ● └ nested 8   routing… · \d+s · completed$/, "the list follows the board live");
   view.press(KEY.up);
-  view.forced.length = 0;
+  view.requests.length = 0;
   view.press(KEY.enter);
   assert.ok(view.text().some((line) => line.includes("Reply 7")), "Enter opens the selected worker in the same view");
-  assert.equal(view.forced.at(-1), true, "and reprints");
+  assert.equal(view.requests.at(-1), true, "and reprints");
   assert.match(live().picker[0]!, /^  ○ main$/, "the picker remains visible on a nested worker");
   assert.match(live().picker[6]!, /^❯ ● └ nested 7/, "the viewed worker stays selected");
   assert.equal(view.text().at(-1), "←→ worker · x stop · ctrl+o tool output · Esc back");
 });
-
-/** A terminal of a fixed size that keeps what pi-tui writes to it. */
-class CapturingTerminal implements Terminal {
-  readonly written: string[] = [];
-  readonly columns: number;
-  readonly rows: number;
-
-  constructor(columns: number, rows: number) {
-    this.columns = columns;
-    this.rows = rows;
-  }
-
-  get kittyProtocolActive(): boolean { return false; }
-  start(): void {}
-  stop(): void {}
-  async drainInput(): Promise<void> {}
-  write(data: string): void { this.written.push(data); }
-  moveBy(): void {}
-  hideCursor(): void {}
-  showCursor(): void {}
-  clearLine(): void {}
-  clearFromCursor(): void {}
-  clearScreen(): void {}
-  setTitle(): void {}
-  setProgress(): void {}
-  setProgramStatus(): void {}
-}
-
-/** ctx.ui.custom in regular tuiMode on pi-tui's own main-screen renderer:
- *  pi's root holds its chat, the view swaps it out (ADR 0009), and the overlay
- *  pi mounts for the keys is the view's stub. `draw` renders the frame now and
- *  returns what pi-tui wrote for it. */
-function renderedRegularUI(rows: number) {
-  const terminal = new CapturingTerminal(WIDTH, rows);
-  const tui = new TuiMainScreen(terminal, false);
-  tui.addChild({ render: () => ["chat line"], invalidate() {} } as never);
-  tui.addChild({ render: () => ["editor text"], invalidate() {} } as never);
-  let stub: { render(width: number): string[]; handleInput(data: string): void; invalidate(): void; dispose(): void } | undefined;
-  let handle: { hide(): void } | undefined;
-  const ui: TranscriptUI = {
-    custom: (async (factory: (...args: unknown[]) => unknown, options: { overlay?: boolean; overlayOptions?: unknown }) => {
-      assert.equal(options.overlay, true);
-      const layout = typeof options.overlayOptions === "function" ? options.overlayOptions() : options.overlayOptions;
-      return new Promise<unknown>((resolve) => {
-        stub = factory(tui, PLAIN, new KeybindingsManager(), (result: unknown) => {
-          stub?.dispose();
-          handle?.hide();
-          resolve(result);
-        }) as typeof stub;
-        handle = tui.showOverlay(stub!, layout as never);
-      });
-    }) as TranscriptUI["custom"],
-    getToolsExpanded: () => false,
-  };
-  return {
-    ui, tui, terminal,
-    press(...keys: string[]) { for (const key of keys) stub!.handleInput(key); },
-    draw(): string {
-      terminal.written.length = 0;
-      (tui as unknown as { doRender(): void }).doRender();
-      return terminal.written.join("");
-    },
-  };
-}
 
 // pi-tui reprints the whole terminal when a changed line sits above the bottom
 // `rows` lines. The live section and the running tool box are at the bottom of
@@ -917,7 +1715,7 @@ test("regular tuiMode: ordinary live output never makes pi-tui reprint the termi
   const { fake } = running(board, "Investigate the build", "worker-1", { agent: "researcher", background: true }, history);
   const { steering } = fakeSteering();
   const ticks: (() => void)[] = [];
-  const view = renderedRegularUI(ROWS);
+  const view = fakeUI(ROWS, "regular");
   const shown = openTranscript(view.ui, board, board.workers()[0]!.id, {
     now: time.now, steering, setInterval: (tick) => { ticks.push(tick); return ticks.length; }, clearInterval: () => {},
   });
@@ -964,7 +1762,7 @@ test("regular tuiMode: ordinary live output never makes pi-tui reprint the termi
   assert.deepEqual(reprints, [], "pi-tui reprinted the terminal during these steps");
   view.press(KEY.escape);
   assert.equal(await shown, "back");
-  view.tui.stop();
+  view.stop();
 });
 
 test("regular tuiMode: a tool call that finishes with more output than the terminal shows does not reprint the terminal", async () => {
@@ -978,7 +1776,7 @@ test("regular tuiMode: a tool call that finishes with more output than the termi
     }
     const { fake } = running(board, "Build the project", "worker-1", { agent: "builder", background: true }, history);
     const { steering } = fakeSteering();
-    const view = renderedRegularUI(rows);
+    const view = fakeUI(rows, "regular");
     const shown = openTranscript(view.ui, board, board.workers()[0]!.id, {
       now: time.now, steering, expanded: true, setInterval: () => 0, clearInterval: () => {},
     });
@@ -1004,7 +1802,7 @@ test("regular tuiMode: a tool call that finishes with more output than the termi
     assert.deepEqual(reprints, [], `rows ${rows}: pi-tui reprinted the terminal during these steps`);
     view.press(KEY.escape);
     assert.equal(await shown, "back");
-    view.tui.stop();
+    view.stop();
   }
 });
 

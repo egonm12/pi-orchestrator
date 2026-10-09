@@ -67,21 +67,21 @@ Each item's `task` is the whole task for an ordinary worker, with every fact it 
 ] }
 ```
 
-A fork uses the session model and thinking level at call time, without routing. Later model changes do not move it, even while it is queued. It can use a banned session model as an exception to the subagent ban list; its fork record marks that exception. An `agent` on a fork supplies instructions and narrowed tools, but its `model` and `thinking` are ignored without a warning. A fork gets no reporting rules (see Results below). Forked workers never receive the `subagents` tool. Forks and ordinary workers may share a call. An item with `review` set to a finished editing delegation's id starts an independent reviewer for it (see Reviewers below). An item with `retry` set to a delegation whose latest verdict is `request_changes` starts a new attempt with `task` as feedback (see Retries below). Each item's worker waits for a slot of the worker limit, so items past it queue. An orchestrator's call runs in the background unless it sets `"background": false` (see Background calls below). A foreground call waits for every item; Ctrl+C aborts its running workers and drops queued ones.
+A fork uses the session model and thinking level at call time, without routing. Later model changes do not move it, even while it is queued. It can use a banned session model as an exception to the subagent ban list; its fork record marks that exception. An `agent` on a fork supplies instructions and narrowed tools, but its `model` and `thinking` are ignored without a warning. A fork gets no reporting rules (see Results below). Forked workers never receive the `subagents` tool. A worker's own fork item copies the calling worker's branch instead and runs on the rung that served it, or on its preserved agent model (see Nested delegation below). Forks and ordinary workers may share a call. An item with `review` set to a finished editing delegation's id starts an independent reviewer for it (see Reviewers below). An item with `retry` set to a delegation whose latest verdict is `request_changes` starts a new attempt with `task` as feedback (see Retries below). Each item's worker waits for a slot of the worker limit, so items past it queue. An orchestrator's call runs in the background unless it sets `"background": false` (see Background calls below). A foreground call waits for every item; Ctrl+C aborts its running workers and drops queued ones.
 
 ### Background calls
 
 An orchestrator's call without `background`, or with `"background": true` next to `items`, returns at once with its call id and one delegation id per item, in item order. The items run on while the orchestrator does other work, within the session's worker limit. When every item has finished, one completion notice arrives with the same result text as a foreground call, headed by the call id. It is delivered as a follow-up message: it starts a turn when the orchestrator is idle, and otherwise waits for the current turn to end.
 
-With `"background": false` the call runs in the foreground instead: the orchestrator's turn stays in the tool call until every item has finished, and a message the user sends meanwhile waits until then, since pi delivers steering after the current turn's tool calls. Use it only for a short, bounded task whose result the orchestrator's next step needs. Leaving the option out used to mean a foreground call; a caller that relied on that must now set `false`. The default is the orchestrator's alone: in a session in a pi-subagents child process, a call without the option stays in the foreground, and `"background": true` still makes it a background call.
+With `"background": false` the call runs in the foreground instead: the orchestrator's turn stays in the tool call until every item has finished, and a message the user sends meanwhile waits until then, since pi delivers steering after the current turn's tool calls. Use it only for a short, bounded task whose result the orchestrator's next step needs. Leaving the option out used to mean a foreground call; a caller that relied on that must now set `false`. The default is the orchestrator's alone: in a worker's session, a call without the option stays in the foreground, and `"background": true` still makes it a background call.
 
-A background call is never refused for its number of workers: those past the worker limit queue. Ctrl+C leaves background workers running. `/subagents stop <id>` stops one: a call id stops the whole call (running workers abort, queued ones are not started), a delegation id stops that worker alone, and `all` stops every call. A stopped call still sends its notice. When the orchestrator's session ends, its background workers are aborted, and each call's notice, with status `aborted`, is recorded in the session without starting a turn. A worker's own `subagents` call cannot be background.
+A background call is never refused for its number of workers: those past the worker limit queue. Ctrl+C leaves background workers running. `/subagents stop <id>` stops one: a call id stops the whole call (running workers abort, queued ones are not started), a delegation id stops that worker alone, and `all` stops every call. A stopped call still sends its notice. When the orchestrator's session ends, its background workers are aborted, and each call's notice, with status `aborted`, is recorded in the session without starting a turn. A worker's own `subagents` call may be background too; its run does not end before its background workers do (see Nested delegation below).
 
 ### Worker limit
 
-`orchestrator.subagents.workerLimit` (default 4, at most 32) is how many workers run at the same time across the orchestrator's session, foreground and background calls together. Every worker takes a slot as it starts and gives it back when it ends. A worker without a free slot is queued, its worker state `queued` in `subagents_status`, the worker widget and the call's progress, until one frees: slots go first come first served, in item order within a call. No call is refused for its number of workers. A foreground call whose items wait behind background workers goes on as those finish; Ctrl+C drops its queued items. The limit is read on every call, so a changed setting holds from the next call: a higher one starts queued workers, a lower one lets running workers finish. A worker's own calls have slots of their own (see Nested delegation below).
+`orchestrator.subagents.workerLimit` (default 4, at most 32) is how many workers run at the same time across the orchestrator's session, foreground and background calls together. Every worker takes a slot as it starts and gives it back when it ends. A worker without a free slot is queued, its worker state `queued` in `subagents_status`, the worker widget and the call's progress, until one frees: slots go first come first served, in item order within a call. No call is refused for its number of workers. A foreground call whose items wait behind background workers goes on as those finish; Ctrl+C drops its queued items. The limit is read on every call, so a changed setting holds from the next call: a higher one starts queued workers, a lower one lets running workers finish. A worker's own calls share these slots, and a worker gives its slot up while it waits for its own workers (see Nested delegation below).
 
-`/pi-orchestrator workers <n>` sets the worker limit for the current session, over the settings, until the next session start: a new session, a resumed one or a reload starts from the settings again. `n` is a whole number from 1 to 32; a higher one is cut to 32 with a notice, as in settings. Anything else prints `usage: /pi-orchestrator workers [1-32]` and changes nothing. The limit holds from the next `subagents` call, and the tool is registered again with it, so its `maxItems` and description follow it. A worker's own calls keep the limit from settings. `/pi-orchestrator workers` without a number shows the limit in force and where it comes from: set for this session, project settings, personal settings or the default.
+`/pi-orchestrator workers <n>` sets the worker limit for the current session, over the settings, until the next session start: a new session, a resumed one or a reload starts from the settings again. `n` is a whole number from 1 to 32; a higher one is cut to 32 with a notice, as in settings. Anything else prints `usage: /pi-orchestrator workers [1-32]` and changes nothing. The limit holds from the next `subagents` call, and the tool is registered again with it, so its `maxItems` and description follow it. A worker's own calls do not change the limit: they queue for the same slots, at the limit the orchestrator's latest call set. `/pi-orchestrator workers` without a number shows the limit in force and where it comes from: set for this session, project settings, personal settings or the default.
 
 A background worker that asks a `report` question gives up its slot while it waits for the answer, since the answer only comes after the orchestrator's turn, which a foreground call waiting for a slot holds. A queued worker can take the freed slot. Once answered, the worker queues for a slot again and goes on when it gets one; its worker state stays `running` meanwhile, its `report` call still open. A worker stopped while it queues again, by `/subagents stop`, stopping its call or ending the session, ends without a slot. So the limit counts the workers actually running, and a foreground call never waits on a worker that waits for the orchestrator.
 
@@ -305,7 +305,7 @@ Each item's result has a status:
 | `aborted` | The item's worker was running when the call was aborted |
 | `not-started` | The item was still queued when the call was aborted |
 
-A worker's session is saved under the orchestrator's session folder, and its session id is its delegation id. A fork's saved session starts with a copy of the active branch up to the fork point; a fork record names its model, effort, parent session id and fork point. Verdicts attach to fork records by delegation id. It loads the same installed extensions as the orchestrator, without the `subagents` tool itself unless its agent definition lists it (see Nested delegation below). A worker's final text over 50 KB is cut, with a pointer to its session file, which keeps the whole text.
+A worker's session is saved under the orchestrator's session folder, and its session id is its delegation id. A fork's saved session starts with a copy of the active branch up to the fork point; a fork record names its model, effort, parent session id and fork point. Verdicts attach to fork records by delegation id. It loads the same installed extensions as the orchestrator. A routed worker the orchestrator starts gets the `subagents` tool too, unless its agent definition's `tools:` list leaves it out; a fork and a worker another worker started never get it (see Nested delegation below). A worker's final text over 50 KB is cut, with a pointer to its session file, which keeps the whole text.
 
 While a call runs, pi shows one line per worker: its agent name (`worker` without one), `(fork)` for a fork, its short task, and its current tool or state: queued, running, done, error, aborted or not started. A fork or a worker on a preserved model also shows its model, marked `(ban-list exception)` when an exception let it run. Expanding the result shows each worker's final text or error.
 
@@ -347,9 +347,11 @@ The transcript looks like pi's own chat: the worker's replies with their thinkin
 
 A forked worker's transcript starts with the orchestrator's conversation it was copied from. A tool from another installed extension keeps its own drawing while the worker runs. In a finished worker's transcript, only pi's built-in tools, `subagents` and `report` keep theirs; other tools are drawn plainly.
 
+The transcript is built one message at a time and kept. A finished message keeps its lines, so scrolling and the header's one-second tick do not rebuild the transcript. Only the live reply, and a tool call until it finishes, change as the worker runs. Opening a worker, or switching to another, builds its transcript once.
+
 #### Messaging a worker
 
-While the shown worker is a running background worker, asking or not, the view has a message input at the bottom, pi's own editor, above the key hints. It is not there for a foreground, queued or finished worker, and it goes away when the worker ends. Tab gives the input the keys, and the key hints change to say so:
+While the shown worker is a running background worker, asking or not, the view has a message input in pi's editor position, above the worker picker and key hints. It is not there for a foreground, queued or finished worker, and it goes away when the worker ends. Tab gives the input the keys, and the key hints change to say so:
 
 | Key, while typing | Action |
 |-----|--------|
@@ -373,19 +375,25 @@ Check the tests, then report back which ones fail and why.
 ────────
 …the whole transcript…
 ────────
+Tab to message this worker
 running · 1m15s · 2 turns · 12.3k tok · $0.042 · bash · worker 2 of 3
 orchestrator idle · 1 worker asking: worker 3 (reviewer)
-←→ worker · x stop · ctrl+o tool output · Esc back
+↑/↓ to select · Enter to open · Esc to go back
+  ○ main
+❯ ● tester   running
+←→ worker · Tab message · x stop · ctrl+o tool output · Esc back
 ```
 
 - The top is printed once and scrolls away: the worker's agent, its model and rung history, its delegation, and its whole task, wrapped without a limit.
 - The whole transcript follows, not cut to the screen.
-- The live lines come last and update in place: the workers it started, at most 6 as the worker widget draws them under a `↑/↓ to select · Enter to open` hint, the selected one with the cursor; the worker state, elapsed time, turns, tokens, cost, activity and which worker of how many it is; the orchestrator bar; and the key hints.
+- The live lines come last in pi's dock order: the message input (when available), worker stats and the orchestrator bar, the main-plus-workers picker with its selection, and the key hints.
+
+Tool boxes keep the pending tint after their call completes (the steady tint), so a finished call changes only its last line, its elapsed time, and the terminal is not reprinted above it. A failed call still shows its error text. Regular TUI mode gets no mouse reports, so clicks do nothing here; ctrl+o expands or collapses the tool output.
 
 | Key | Action |
 |-----|--------|
 | ← → | Show the previous or next worker, in the order they were queued, each nested worker after its parent |
-| ↑ ↓, Enter | Select one of the worker's nested workers, and open it |
+| ↑ ↓, Enter | Select main or a worker in the picker, and open it |
 | Tab | Type a message to a running background worker (see Messaging a worker above) |
 | x | Stop this worker, after a `Stop this worker? y/n` confirmation. A running worker aborts, a queued one never starts; a nested worker's parent runs on |
 | ctrl+o | Expand or collapse tool output |
@@ -393,7 +401,7 @@ orchestrator idle · 1 worker asking: worker 3 (reviewer)
 
 #### Fullscreen TUI mode
 
-The view is a full-screen overlay over the orchestrator's session, with a bar and a header pinned at the top:
+The view replaces pi's fullscreen chat viewport. The bar and worker metadata are the first chat item, so they scroll with the transcript rather than staying pinned at the top:
 
 ```text
 orchestrator idle · 1 worker asking: worker 3 (reviewer)
@@ -403,7 +411,7 @@ delegation 0199f0c2-5e0a-7c1b-9d3e-3f2a9c1e44b0 · parent delegation 0199f0b1-7c
 Check the tests
 ```
 
-The bar shows whether the orchestrator is running or idle, and which workers are asking it a question, by their place among the workers. It updates live, but it only tells: it never closes the view or takes a key, and the question is answered in the orchestrator's session. Regular TUI mode shows the same bar among its live lines.
+The bar shows whether the orchestrator is running or idle, and which workers are asking it a question, by their place among the workers. It only tells: it never closes the view or takes a key, and the question is answered in the orchestrator's session. Regular TUI mode shows it among the live dock lines.
 
 The header shows:
 
@@ -412,14 +420,22 @@ The header shows:
 - Its delegation id and, for a nested worker, its parent delegation and that worker's agent. A queued foreground worker gets its delegation id when it starts.
 - Its task, wrapped to at most 3 lines, ending in `…` when it is longer.
 
-Every line is cut to the terminal's width. On a narrow terminal the rung history drops its oldest rungs first, keeping the rung that serves the latest request, and the delegation ids shrink to their first eight characters. The workers it started are listed below the header. While the worker runs, the view follows the end of its transcript until you scroll.
+The fullscreen viewport clips lines to the terminal; regular mode caches its width cut per message. On a narrow terminal the rung history drops its oldest rungs first, keeping the rung that serves the latest request, and the delegation ids shrink to their first eight characters. The fullscreen chat is pi-tui's `ScrollView`, given the options pi's own chat viewport gives it: it follows the end, and its scrollbar follows pi's `fullscreenScrollbar` setting in pi's colours. Pi's alt screen routes the wheel, the page, top, bottom and prompt keys and search to it, as it does for pi's chat; the view handles none of those keys itself. Below the chat, a fixed dock holds the message input at pi's editor position, worker stats and the main-plus-workers picker at pi's worker-widget position, then the footer. The input is there only while the worker takes messages. The picker is not above the transcript. While the worker runs, the view follows the end of its transcript until you scroll. New output never moves a scrolled-up transcript: it keeps the lines you were reading until you scroll back to the end.
+
+Tool boxes turn pi's green when their call succeeds and red when it fails, as in pi's chat, and a failed call still shows its error text. Until the call completes, a box keeps pi's pending tint.
+
+To measure the view live, set `PI_ORCHESTRATOR_TRANSCRIPT_TRACE` to a file path before starting pi. The view then appends one JSON line per frame to that file, with the time the transcript took to render. Nothing is written to the terminal.
 
 | Key | Action |
 |-----|--------|
+| Mouse wheel | Scroll the transcript at pi's wheel speed (its `fullscreenWheelScrollLines` setting), as pi's chat does; scrolling up stops following, scrolling down to the end follows again |
+| Left click | Expand or collapse a tool result or a thinking block, as in pi's chat |
 | PgUp, PgDn | Scroll a page; paging back down to the end follows it again |
-| Home, End | Go to the start; go to the end and follow it again |
+| ctrl+home, ctrl+end | Go to the start; go to the end and follow it again (pi's keys for its chat viewport) |
+| ctrl+up, ctrl+down | Jump to the start of the previous or next message, the task included (pi's prompt jumps) |
+| Home, End | Move the input's cursor while typing; otherwise nothing, as in pi's chat |
 | ← → | Show the previous or next worker, in the order they were queued, each nested worker after its parent |
-| ↑ ↓, Enter | Select one of the worker's nested workers, and open it |
+| ↑ ↓, Enter | Select main or a worker in the picker, and open it |
 | Tab | Type a message to a running background worker (see Messaging a worker above) |
 | x | Stop this worker, after a `Stop this worker? y/n` confirmation. A running worker aborts, a queued one never starts; a nested worker's parent runs on |
 | ctrl+o | Expand or collapse tool output |
@@ -435,11 +451,17 @@ An item's `agent` name picks a named, owner-written kind of worker: its instruct
 
 pi's CLI loads three built-in extensions besides the installed ones: codemode, tool_search and MCP. An SDK session gets them only when they are passed to it, so the subagents tool passes them to every worker, as the CLI does: as `builtin:codemode`, `builtin:tool-search` and `builtin:mcp`, which give way to an installed extension that registers the same tool or command and which `-builtin:<name>` in the `extensions` setting turns off. A worker reads `mcp.json` from the agent dir and, when the orchestrator trusts the project, the project's `.pi/mcp.json`; it reads the project's settings and extensions only then too. It starts its own connections to the servers, and closes them when it ends. Its tools follow the same settings as the orchestrator's: `defaultTools`, `codemode.mode`, and each server's `exposure`, so a server with `direct` exposure declares its tools, and the MCP extension activates codemode for `codemode` and `codemode-deferred` servers and tool_search for `deferred` ones. pi's llama.cpp built-in is not exported to extensions, so workers go without it.
 
-A `tools:` list also narrows these. A worker with one registers only the tools it names, so an MCP tool, `codemode` or `tool_search` reaches it only when the list names it and the orchestrator has it. An MCP tool the orchestrator reaches only through codemode or tool_search, one with `codemode` or `deferred` exposure, is kept while the orchestrator has codemode or tool_search active, even though it is not active itself. When the list names such a tool but neither discovery tool, the worker gets the orchestrator's active discovery tools added: a `codemode` tool's script, or `tool_search`, can then reach the named tool, and only the named tools. A deferred tool stays undeclared until the worker's `tool_search` loads it. The subagents tools stay hidden unless the list names `subagents` (see Nested delegation below).
+A `tools:` list also narrows these. A worker with one registers only the tools it names, so an MCP tool, `codemode` or `tool_search` reaches it only when the list names it and the orchestrator has it. An MCP tool the orchestrator reaches only through codemode or tool_search, one with `codemode` or `deferred` exposure, is kept while the orchestrator has codemode or tool_search active, even though it is not active itself. When the list names such a tool but neither discovery tool, the worker gets the orchestrator's active discovery tools added: a `codemode` tool's script, or `tool_search`, can then reach the named tool, and only the named tools. A deferred tool stays undeclared until the worker's `tool_search` loads it. A list that leaves out `subagents` keeps the worker from delegating, and one that leaves out `subagents_status` or `subagents_message` keeps those from it; `subagents_verdict` is never a worker's (see Nested delegation below).
 
 ### Nested delegation
 
-A worker may start workers of its own only when its agent definition lists `subagents` in `tools:`. That is one level deep: the workers it starts never get the `subagents` tool, even when their own definition lists it. A worker's call is foreground only: leaving `background` out keeps it in the foreground, and asking for a background call fails the call before any worker starts. Its workers always run on the auto model and are routed, even when `agentDefinitionModel.use` is `"preserve"` and their definition names a model. Each of its calls has worker slots of its own, as many as the worker limit read from the same settings. They do not count against the orchestrator's slots: the calling worker holds one of those while it waits for its own workers, so sharing them could leave it waiting on itself. A worker that delegates can therefore have up to the worker limit's workers of its own running besides the orchestrator's. The decision record of a worker started by another worker has `parentDelegationId`: the delegation id of the worker that started it.
+A routed worker the orchestrator starts gets the `subagents` tool by default, with or without an agent definition, and with it `subagents_status` and `subagents_message` for its own background calls. An agent definition whose `tools:` list leaves `subagents` out keeps the worker from delegating. Delegation is one level deep: a worker started by another worker never gets the tool, even when its definition lists it, and neither does a forked worker. A worker that resumes one of its own workers keeps it one level down, so the resumed worker has no tool either. The decision record of a worker started by another worker has `parentDelegationId`: the delegation id of the worker that started it. Edits of a worker's own workers count toward the worker's delegation, so the orchestrator judges them with it.
+
+A worker's call runs in the foreground unless it sets `"background": true`. A background call returns at once; the worker reads it with `subagents_status`, steers its workers with `subagents_message`, and gets the completion notice in its own session. Its run does not end while its background workers still run: as it would end, it waits for them and gets each notice as a new turn, so their results can reach its Result. A stop of the worker, an abort of its call or the end of the orchestrator's session stops its background workers too. A background worker of its own may ask it a question with `report`. A worker that ends its turn with a question still unanswered gets one reminder; when it ends its turn again without answering, the asking worker gets an answer that tells it to go on without one, and its result still reaches the worker.
+
+A worker's ordinary workers are routed through the auto model, even when `agentDefinitionModel.use` is `"preserve"` and their definition names a model. A worker's fork item copies the calling worker's branch and runs, unrouted, on the rung that served the calling worker, or on its model and effort when it runs on a preserved agent model. Reviews and retries stay the orchestrator's.
+
+A worker's calls share the orchestrator's worker slots. A worker gives its slot up while it waits for its own workers, a status wait or an answer, and queues for one again before it goes on, so even a limit of one cannot leave it waiting on its own workers.
 
 ### `orchestrator.subagents` settings
 
@@ -574,6 +596,7 @@ Debug and probe switches:
 | `PI_ORCHESTRATOR_ROUTER_PROBE=1` | Print load, routing mode, classifier timings and each request's rung, pin and timing |
 | `PI_ORCHESTRATOR_GUARD_PROBE=1` | Print load and the effective ban lists |
 | `PI_ORCHESTRATOR_ROUTER_DEBUG=1`, `PI_ORCHESTRATOR_GUARD_DEBUG=1` | Print the stack on a failure |
+| `PI_ORCHESTRATOR_TRANSCRIPT_TRACE=<file>` | Append one JSON line per frame of the transcript view to that file: its time since the view opened, render time, rows, scroll position, whether it follows the end, and the events since the last frame. Once a second, a line with that second's frame count. Nothing reaches the terminal; unset, no file is made and no timing is taken |
 
 ## What the guard does not do
 

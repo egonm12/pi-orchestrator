@@ -6,10 +6,8 @@ import { activityPart, agentLabel, fitted, formatElapsed, formatTokens, STATE_CO
 // The token count shared with the worker widget's stats.
 export { formatTokens };
 
-// The transcript view's top (epic a338, vo0z): the orchestrator bar, which
-// keeps the user who reads one worker's transcript aware of the rest, and the
-// header, what they want to know about that worker. A few lines, each cut to
-// the width.
+// Worker metadata at the start of the scrollable chat, and live stats beside
+// the picker below the editor. Each line is cut to the available width.
 
 const SEPARATOR = " · ";
 
@@ -92,7 +90,7 @@ function delegationLine(frame: TranscriptFrame): string {
 }
 
 /** The default header names the worker, model and delegation. The view adds
- *  the one task preview separately when the overlay is collapsed. */
+ *  the one task preview separately when tool output is collapsed. */
 export function transcriptHeader(frame: TranscriptFrame): string[] {
   return [statsLine(frame), modelLine(frame), delegationLine(frame)];
 }

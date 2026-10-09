@@ -7,6 +7,7 @@ import { READ_ONLY_REVIEWER, trackEdits } from "./editing.ts";
 import type { ResumeWorker } from "./resume.ts";
 import type { BackgroundMessageMode } from "./background.ts";
 import { REPORT_TOOL, reportExtension, type WorkerReports } from "./report.ts";
+import { SUBAGENTS_VERDICT_TOOL } from "./verdict.ts";
 import { missingResultSections, REPORTING_RULES, type ResultSection } from "./result-format.ts";
 import { AUTO_MODEL_ID, AUTO_PROVIDER, requestFailover, setCarriedClassification, setRoutingConstraints } from "../router/auto-model.ts";
 import { limitErrorObservation } from "../router/limit-errors.ts";
@@ -114,9 +115,8 @@ export interface WorkerSetup {
   /** An agent definition's instructions, appended to the worker's system
    *  prompt after the reporting rules a non-fork worker gets. */
   readonly instructions?: string;
-  /** The only tools the worker may use; without it, pi's default tools and
-   *  every extension tool except the subagents tool. Only a list naming the
-   *  subagents tool gives it to the worker (ADR 0008). */
+  /** The only tools the worker may use. Without it, pi's default and extension
+   *  tools include subagents for a routed, top-level worker (ADR 0016). */
   readonly tools?: readonly string[];
   /** The delegation id of the worker that makes this delegation, if a worker does. */
   readonly parentDelegationId?: string;
@@ -170,11 +170,16 @@ export function workerSessionDir(orchestratorSession: WorkerSetup["orchestratorS
   return join(orchestratorSession.getSessionDir(), "subagents", orchestratorSession.getSessionId());
 }
 
-/** A worker does not get the `subagents` tool unless its tools list names it
- *  (ADR 0007, ADR 0008): the extension that registers it is left out of the
- *  worker's extensions. */
+/** Remove the extension that registers subagents where delegation is not allowed. */
 function withoutSubagentsTool(base: LoadExtensionsResult): LoadExtensionsResult {
   return { ...base, extensions: base.extensions.filter((extension) => !extension.tools.has(SUBAGENTS_TOOL)) };
+}
+
+/** Delegating workers can manage their own background calls, not issue the
+ *  orchestrator's quality verdicts. */
+function withoutVerdictTool(base: LoadExtensionsResult): LoadExtensionsResult {
+  return { ...base, extensions: base.extensions.map((extension) => extension.tools.has(SUBAGENTS_VERDICT_TOOL)
+    ? { ...extension, tools: new Map([...extension.tools].filter(([name]) => name !== SUBAGENTS_VERDICT_TOOL)) } : extension) };
 }
 
 interface Reply {
@@ -337,7 +342,9 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
         // A tools list also narrows the built-ins' tools: MCP tools it does not name are not registered (ADR 0007).
         extensionFactories: [...builtinExtensionsBesides(given), ...given, ...(readOnly ? [READ_ONLY_REVIEWER] : []), editTracking,
           ...(reports === undefined ? [] : [reportExtension(reports)])],
-        ...(setup.tools?.includes(SUBAGENTS_TOOL) ? {} : { extensionsOverride: withoutSubagentsTool }),
+        ...(setup.parentDelegationId === undefined && setup.fork === undefined && setup.resume?.fork !== true &&
+          (setup.tools === undefined || setup.tools.includes(SUBAGENTS_TOOL))
+          ? { extensionsOverride: withoutVerdictTool } : { extensionsOverride: withoutSubagentsTool }),
         ...(appendedPrompt.length === 0 ? {} : { appendSystemPromptOverride: (base: string[]) => [...base, ...appendedPrompt] }),
       },
     });
@@ -366,6 +373,7 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
         appendRoutingRecord(join(stateDir(), "routing"), fork ? buildForkRecord({
           delegationId: sessionId, model: fork.model, effort: fork.effort,
           parentSession: fork.parentSession, forkPoint: fork.forkPoint, banListException: fork.banListException,
+          ...(setup.parentDelegationId === undefined ? {} : { parentDelegationId: setup.parentDelegationId }),
         }) : buildAgentModelRecord({
           delegationId: sessionId, agent: namedModel!.agent, definitionFile: namedModel!.definitionFile,
           model: namedModel!.model, effort: session.thinkingLevel,
@@ -413,7 +421,7 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
     setup.onTool?.([...runningTools.values()].at(-1));
   });
   // Before binding, so the extensions see the mark at session_start.
-  const unmarkWorkerSession = markWorkerSession(sessionId, setup.parentDelegationId, reviewed);
+  const unmarkWorkerSession = markWorkerSession(sessionId, setup.parentDelegationId, reviewed, setup.orchestratorSession.getSessionId(), setup.signal);
   const unsetConstraints = setup.routingConstraints === undefined ? undefined : setRoutingConstraints(sessionId, setup.routingConstraints);
   const unsetClassification = setup.carriedClassification === undefined ? undefined : setCarriedClassification(sessionId, setup.carriedClassification);
   let unregisterMessage: (() => void) | undefined;

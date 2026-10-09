@@ -2,6 +2,7 @@ import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { rmSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext, InlineExtension } from "@earendil-works/pi-coding-agent";
+import type { ScrollViewScrollbar } from "@earendil-works/pi-tui";
 import { banListsFromSettings, personalAgentDir, readSettingsFile, subagentBanListEntry } from "../policy/ban-lists.ts";
 import { THINKING_LEVELS, splitKnownThinkingSuffix, type ThinkingLevel } from "../models/model-info.ts";
 import { agentDefinitionDirs, agentDefinitionListing, loadAgentDefinitions, resolveAgent } from "./agent-definitions.ts";
@@ -11,18 +12,19 @@ import { registerSubagentsMessageTool } from "./message.ts";
 import { renderSubagentsCall, renderSubagentsResult, shortTask } from "./render.ts";
 import { forkSession } from "./fork-session.ts";
 import { prepareResume, savedWorkerIdentity, saveWorkerOutcome } from "./resume.ts";
-import { workerReports, type WorkerReports } from "./report.ts";
+import { UNANSWERED_QUESTION, workerReports, type WorkerReports } from "./report.ts";
+export { UNANSWERED_QUESTION };
 import { missingSectionsNote } from "./result-format.ts";
 import { DEFAULT_WORKER_LIMIT, loadSubagentsSettings, WORKER_LIMIT_CEILING } from "./settings.ts";
-import { WorkerSlots, type ReleaseSlot } from "./worker-slots.ts";
+import { workerSlotsFor, registerWorkerSlot, withoutWorkerSlot, forgetWorkerSlots, type ReleaseSlot } from "./worker-slots.ts";
 import { registerSubagentsStatusTool } from "./status.ts";
 import { runWorker, SUBAGENTS_TOOL, type WorkerResult, type WorkerSetup } from "./worker.ts";
-import { workerBoard, type BoardWorker, type WorkerModelSetup } from "./worker-board.ts";
+import { workerBoard, type BoardWorker, type WorkerModelSetup, type WorkerSession } from "./worker-board.ts";
 import { agentLabel, startWorkerWidget, type WorkerWidget } from "./worker-widget.ts";
 import { findWorker, pickWorker, workerListing } from "./worker-picker.ts";
 import { openTranscript, type TranscriptViewExit } from "./transcript-view.ts";
 import { UserSteering, userSteeringNote, type UserSteer, type WorkerSteering } from "./user-steering.ts";
-import { isWorkerSession } from "./worker-sessions.ts";
+import { isWorkerSession, rootSessionOf, workerStopSignal } from "./worker-sessions.ts";
 import { isOrchestratorSession } from "./orchestrator-session.ts";
 import { addOrchestratorProtocol, keepOrchestratorProtocol } from "./orchestrator-protocol.ts";
 import { registerCommitGate } from "./commit-gate.ts";
@@ -44,8 +46,11 @@ import { usageLine } from "./usage-line.ts";
 // router extension routes it. A call takes up to the worker limit's tasks, and
 // every worker waits for one of the worker limit's slots (worker-slots.ts). A task may name an
 // agent definition, which gives the worker its instructions and narrows its
-// tools; one listing `subagents` lets the worker delegate one level deeper
-// (nested-delegation.ts). While the call runs, partial updates show each item
+// tools. A routed worker of the orchestrator's gets `subagents` unless that
+// list leaves it out, and delegates one level deeper, in the foreground or the
+// background, with routed or forked items (nested-delegation.ts, ADR 0016).
+// Its slot is given up while it waits for its own workers, and its run waits
+// for its background workers before it ends. While the call runs, partial updates show each item
 // queued, running with its worker's current tool, or finished (render.ts
 // draws them). Every worker is also on the worker board (worker-board.ts),
 // from the moment its item is queued, for the live worker view; the
@@ -70,7 +75,7 @@ const parameters = (maxItems: number) => ({
         task: { type: "string", description: "The whole task for an ordinary worker. Forks also see the current branch." },
         agent: { type: "string", description: "Optional: the name of an agent definition the worker follows." },
         label: { type: "string", description: "Optional short label saying what this delegation is for, such as research: budget code." },
-        fork: { type: "boolean", description: "Start from the orchestrator's current branch on its session model." },
+        fork: { type: "boolean", description: "Copy the calling session's current branch and run on its rung, without routing." },
         resume: { type: "string", description: "Continue a finished delegation by id, in its saved session and on its original pin." },
         review: { type: "string", description: "Start an independent reviewer of a finished editing delegation, by its id; `task` says what to check." },
         retry: { type: "string", description: "Retry a delegation whose latest verdict is request_changes, by its id, on the effort ladder's next rung; `task` is your feedback." },
@@ -78,7 +83,7 @@ const parameters = (maxItems: number) => ({
     } },
     background: { type: "boolean", description: "Optional: the orchestrator's calls run in the background by default, returning at once with the call id and delegation ids; " +
       "one completion notice with the results follows when every item has finished. Set `background: false` only for a short, bounded task " +
-      "whose result your next step needs: the call then waits for every item. A worker's calls always run in the foreground." },
+      "whose result your next step needs: the call then waits for every item. Workers may also choose background: true; their run waits for their children before ending." },
   },
   required: ["items"],
   additionalProperties: false,
@@ -225,6 +230,13 @@ export interface SubagentsBackgroundDetails {
 /** The custom message type of a background call's completion notice. */
 export const COMPLETION_NOTICE = "subagents-completion";
 
+/** The custom message type that reminds a delegating worker of a child's unanswered question (ADR 0016). */
+export const QUESTION_REMINDER = "subagents-question-reminder";
+
+
+const questionReminder = (ids: readonly string[]) => ids.map((id) => `Worker ${id} still waits for the answer to its question. ` +
+  `Answer it with subagents_message and the id ${id}. If you end your turn again without answering, it goes on without an answer.`).join("\n\n");
+
 /** A preserved agent definition model as the worker board shows it. */
 function preservedModel(named: NonNullable<WorkerSetup["namedModel"]>): WorkerModelSetup {
   return { kind: "preserved", model: named.model, ...(named.effort === undefined ? {} : { effort: named.effort }) };
@@ -250,12 +262,13 @@ const description = (limit: number) => `Hand 1 to ${limit} tasks to workers. At 
   "Keep the default for exploration, coding, reviews and work of uncertain length, and check on or steer workers meanwhile. " +
   "Set `background: false` only for a short, bounded task whose result your next step needs: the call then waits for every item, " +
   "returns the results in item order, and abort stops running workers and leaves queued workers not started. " +
-  "A worker's own calls always run in the foreground. " +
-  "An ordinary worker sees only its task text, so put every fact it needs in it. " +
+  "A routed worker may delegate one level deeper, foreground by default or in the background. Its background children finish before its run ends. " +
+  "A nested worker and a forked worker cannot delegate. An ordinary worker sees only its task text, so put every fact it needs in it. " +
+  "Every unrestricted routed worker gets subagents by default; an agent definition's `tools:` list can remove it. " +
   "An item's `agent` is optional: it names an agent definition, whose instructions the worker follows and whose tools list narrows the worker's tools. " +
   "An optional short `label` says what the delegation is for in the worker list. " +
   "An unknown agent fails that item without starting its worker. " +
-  "Set `fork: true` to copy the current branch before this call and run on the session model and effort, without routing. " +
+  "Set `fork: true` to copy the calling session's branch before this call and run on its rung and effort, without routing. " +
   "Use `resume` with `task` (without `agent`) to continue a finished saved worker on its original pin. " +
   "Use `review` with a finished editing delegation's id and a `task` saying what to check to start an independent reviewer: it is routed at that delegation's tier or higher, " +
   "elevated for one without a tier, and never on its rung, and it gets the delegation's task, Result and changed files. " +
@@ -263,12 +276,20 @@ const description = (limit: number) => `Hand 1 to ${limit} tasks to workers. At 
   "Use `retry` with the id of a delegation whose latest verdict is request_changes and your feedback as `task` to retry it as a new delegation " +
   "on the effort ladder's next rung, with its original task and agent definition; a task climbs at most twice. `retry` excludes `agent`, `fork`, `resume` and `review`.";
 
+/** pi's fullscreenScrollbar setting, as pi's chat viewport takes it: always or hidden, else auto. */
+function fullscreenScrollbar(pi: Pick<ExtensionAPI, "getSettings">): ScrollViewScrollbar {
+  const mode = pi.getSettings().fullscreenScrollbar;
+  return mode === "always" || mode === "hidden" ? mode : "auto";
+}
+
 /** Opens `workerId`'s transcript with no header or bar options: the
  *  transcript view's own defaults (vo0z's fuller header and orchestrator bar)
  *  apply, so every opener (the picker, a direct jump, alt+a) gets them alike.
- *  `steering` lets the user message a running background worker from it. */
-function openWorker(ctx: Pick<ExtensionContext, "ui">, workerId: string, steering: WorkerSteering): Promise<TranscriptViewExit> {
-  return openTranscript(ctx.ui, workerBoard(), workerId, { steering });
+ *  `steering` lets the user message a running background worker from it.
+ *  `scrollbar` is read when the view opens. That is enough: the view holds the
+ *  editor, so pi's settings cannot change under it. */
+function openWorker(ctx: Pick<ExtensionContext, "ui">, workerId: string, steering: WorkerSteering, scrollbar: ScrollViewScrollbar): Promise<TranscriptViewExit> {
+  return openTranscript(ctx.ui, workerBoard(), workerId, { steering, scrollbar });
 }
 
 export function createSubagentsExtension(overrides: Partial<SubagentsDependencies> = {}) {
@@ -331,9 +352,28 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
     const userSteering = new UserSteering(pi, backgroundCalls, workerBoard());
     pi.on("agent_end", () => { settling = true; });
     pi.on("agent_start", () => sendHeld(true));
+    pi.on("agent_before_settle", async (_event, ctx) => {
+      if (!isWorkerSession(ctx)) return;
+      // A worker is still streaming here. Deliver child notices as follow-ups
+      // before the SDK lets its prompt return and shuts down its extensions.
+      sendHeld(true);
+      if (backgroundCalls.snapshots().length === 0) return;
+      // A child's question the worker left unanswered: a reminder first, which
+      // starts another turn; the next time, a fallback answer, so the child goes on.
+      const remind = backgroundCalls.remindOrAnswerQuestions(UNANSWERED_QUESTION);
+      if (remind.length > 0) {
+        pi.sendMessage({ customType: QUESTION_REMINDER, content: questionReminder(remind), display: true }, { triggerTurn: true, deliverAs: "steer" });
+        return;
+      }
+      // pi has cleared the run's signal by now (ctx.signal is undefined), so the
+      // wait listens to the worker's own stop signal: a stop, an abort of its call
+      // or the orchestrator's session end stops its children too.
+      const sessionId = ctx.sessionManager.getSessionId();
+      const stop = workerStopSignal(sessionId);
+      await withoutWorkerSlot(sessionId, stop, () => backgroundCalls.whenIdleOrQuestion(stop));
+    });
     pi.on("agent_settled", () => sendHeld(true));
-    // The worker limit's slots for the orchestrator's calls, foreground and background (worker-slots.ts).
-    const sessionSlots = new WorkerSlots(DEFAULT_WORKER_LIMIT);
+    // The orchestrator and its workers share slots for every call (worker-slots.ts).
     // The schema's maxItems is the worker limit read at session start, or set for the session since; before one starts, the ceiling.
     const registerSubagentsTool = (toolDescription: string, maxItems: number) => pi.registerTool({
       name: SUBAGENTS_TOOL,
@@ -347,20 +387,17 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
         if (!Array.isArray(items) || items.length < 1 || items.length > WORKER_LIMIT_CEILING) {
           throw new Error(`subagents requires 1 to ${WORKER_LIMIT_CEILING} items per call`);
         }
-        const parentDelegationId = callingDelegation(ctx, params as { background?: unknown; items?: unknown });
-        // The orchestrator's calls run in the background unless it asks for the foreground; any other session's run in the
-        // foreground unless it asks for the background, which a worker may not (ADR 0008).
+        const parentDelegationId = callingDelegation(ctx);
+        // The orchestrator's calls default to background; a worker chooses foreground unless it asks for background.
         const background = requested === undefined ? isOrchestratorSession(ctx) : requested === true;
         const agentDir = personalAgentDir();
         const { settings, allowProjectOverrides, ignoredProjectKeys, warnings } = loadSubagentsSettings(agentDir, ctx.cwd);
         for (const key of ignoredProjectKeys) logOnce(`ignored project settings key ${key}`);
         for (const warning of warnings) logOnce(warning);
-        // The orchestrator's calls share the session's slots, at the limit read for this call. A worker's call has its own:
-        // its workers never wait on slots held by the orchestrator's workers, among them the worker making the call.
-        // The orchestrator's limit is the one `/pi-orchestrator workers` set for its session, if any.
-        const workerLimit = parentDelegationId === undefined ? workerLimits.session(ctx) ?? settings.workerLimit : settings.workerLimit;
-        const slots = parentDelegationId === undefined ? sessionSlots : new WorkerSlots(workerLimit);
-        slots.setLimit(workerLimit);
+        // The session limit applies to every descendant. A caller yields its slot when it waits for children.
+        const rootSessionId = rootSessionOf(ctx.sessionManager.getSessionId()) ?? ctx.sessionManager.getSessionId();
+        const workerLimit = workerLimits.session(ctx) ?? settings.workerLimit;
+        const slots = workerSlotsFor(rootSessionId, workerLimit, parentDelegationId === undefined);
         const modelSettings = { ...settings.agentDefinitionModel, banned: personalSubagentBanList(agentDir) };
         if (modelSettings.use === "route" && modelSettings.allowBanned) {
           warnOnce(ctx, "pi-orchestrator subagents: agentDefinitionModel.allowBanned has no effect under route mode");
@@ -385,10 +422,16 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
             !resolveAgent(item.agent, definitions, orchestratorTools).ok) return undefined;
           try {
             if (!ctx.model) throw new Error("the session has no model to fork");
-            const model = `${ctx.model.provider}/${ctx.model.id}`;
+            // A worker's fork runs where the calling worker runs: on its served rung, or on its preserved agent model.
+            const parentModel = parentDelegationId === undefined ? undefined : workerBoard().byDelegation(parentDelegationId)?.model;
+            const rung = parentModel?.kind === "routed" ? parentModel.rungs.at(-1)
+              : parentModel?.kind === "preserved" ? { model: parentModel.model, effort: parentModel.effort ?? ctx.thinkingLevel ?? "off" } : undefined;
+            if (parentDelegationId !== undefined && rung === undefined) throw new Error("the calling worker has no served rung or preserved model to fork");
+            const model = rung?.model ?? `${ctx.model.provider}/${ctx.model.id}`;
+            const effort = (rung?.effort ?? ctx.thinkingLevel ?? "off") as ThinkingLevel;
             const { sessionManager, forkPoint } = forkSession(ctx, toolCallId, delegationIds?.[index]);
             const banned = subagentBanListEntry(model, { subagentBanList: modelSettings.banned, sessionBanList: [] });
-            return { sessionManager, model, effort: ctx.thinkingLevel ?? "off", parentSession: ctx.sessionManager.getSessionId(), forkPoint,
+            return { sessionManager, model, effort, parentSession: ctx.sessionManager.getSessionId(), forkPoint,
               banListException: banned !== undefined } as const;
           } catch (error) { return { error: error instanceof Error ? error.message : String(error) } as const; }
         });
@@ -473,24 +516,31 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
         const { question } = callReports;
         // Each item's worker slot while it holds one (runSlot below).
         const heldSlots: (ReleaseSlot | undefined)[] = new Array(items.length);
+        const slotRegistrations: ((() => void) | undefined)[] = new Array(items.length);
+        const onWorkerSession = (index: number) => (session: WorkerSession) => {
+          feeds[index]!.session(session);
+          if (heldSlots[index] !== undefined) slotRegistrations[index] = registerWorkerSlot(session.sessionId, slots, heldSlots[index]);
+        };
         const giveUpSlot = (index: number) => {
-          heldSlots[index]?.();
+          if (slotRegistrations[index] !== undefined) slotRegistrations[index]!();
+          else heldSlots[index]?.();
+          slotRegistrations[index] = undefined;
           heldSlots[index] = undefined;
         };
         // The board shows a background worker as asking while its question waits. An asking worker gives up its slot, as
         // its answer only comes after the orchestrator's turn, which a foreground call waiting for a slot would hold. Once
-        // answered, it queues for a slot again before it goes on; stopped meanwhile, it holds none and ends.
+        // answered, it queues for a slot again before it goes on; stopped meanwhile, it holds none and ends. The slot goes
+        // through the worker's lease (worker-slots.ts), which stays registered: a later wait of the worker's own, or one
+        // running in parallel with the question, gives up and takes back the same slot.
         const reports: WorkerReports = question === undefined ? callReports : { ...callReports, async question(delegationId, text, questionSignal) {
           const index = backgroundCall?.delegationIds.indexOf(delegationId) ?? -1;
+          const itemSignal = index < 0 ? undefined : itemSignals[index];
+          const signal = itemSignal === undefined ? questionSignal : questionSignal === undefined ? itemSignal : AbortSignal.any([itemSignal, questionSignal]);
           board.asking(delegationId, true);
-          if (index >= 0) giveUpSlot(index);
-          let answer: string;
-          try { answer = await question(delegationId, text, questionSignal); } finally { board.asking(delegationId, false); }
-          if (index < 0 || heldSlots[index] !== undefined) return answer;
-          const signal = questionSignal === undefined ? itemSignals[index]! : AbortSignal.any([itemSignals[index]!, questionSignal]);
-          const release = await slots.acquire(signal);
-          if (release === undefined) throw new Error("the worker was stopped while it waited for a worker slot");
-          heldSlots[index] = release;
+          const answer = await withoutWorkerSlot(delegationId, signal, async () => {
+            try { return await question(delegationId, text, questionSignal); } finally { board.asking(delegationId, false); }
+          });
+          if (signal?.aborted) throw new Error("the worker was stopped while it waited for a worker slot");
           return answer;
         } };
         // An editing run's gate requirement, at the gate level in force as it ends (quality-gate.ts). A worker's
@@ -520,9 +570,11 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               showProgress(index, { ...item, status: "running" });
               feeds[index]!.started(prepared.namedModel ? preservedModel(prepared.namedModel)
                 : prepared.fork ? { kind: "fork", ...prepared.pin } : { kind: "routed", pin: prepared.pin });
+              // A worker's resume is still one level down: it keeps its parent, so it never gets subagents (ADR 0016).
               const worker = await runWorker({ task, resume: prepared, cwd: ctx.cwd, agentDir, ...workerTrust, orchestratorSession: ctx.sessionManager,
+                ...(parentDelegationId === undefined ? {} : { parentDelegationId }),
                 signal: itemSignals[index], extensionFactories: deps.workerExtensions, instructions: prepared.instructions, tools: prepared.tools,
-                onActivity: backgroundCall?.onActivity[index], reports, onSession: feeds[index]!.session,
+                onActivity: backgroundCall?.onActivity[index], reports, onSession: onWorkerSession(index),
                 onTool: (tool) => showProgress(index, { ...item, status: "running", ...(tool === undefined ? {} : { tool }) }),
                 ...(backgroundCall === undefined ? {} : { onMessageReady: (receive) => backgroundCalls.registerWorker(backgroundCall.delegationIds[index]!, receive) }),
               });
@@ -563,7 +615,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
             showProgress(index, results[index]);
             return;
           }
-          // Forked workers never delegate (ADR 0008), whatever their definition lists.
+          // Forked and nested workers never delegate (ADR 0016), whatever their definition lists.
           const resolution = resolveAgent(retried?.agent ?? agent, definitions, orchestratorTools, parentDelegationId === undefined && !preparedFork,
             undeclaredTools);
           if (!resolution.ok) {
@@ -576,7 +628,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
             warnOnce(ctx, "pi-orchestrator subagents: agent definition model and thinking are ignored under route mode");
           }
           let namedModel: NonNullable<WorkerSetup["namedModel"]> | undefined;
-          // A worker's own workers are always routed (ADR 0008).
+          // A worker's own ordinary workers are routed; its fork items use the calling worker's rung.
           if (!preparedFork && target === undefined && retried === undefined && modelSettings.use === "preserve" && definition?.model && parentDelegationId === undefined) {
             const { baseModel, thinkingSuffix } = splitKnownThinkingSuffix(definition.model);
             // The provider ends at the first slash; a model id may hold more.
@@ -637,7 +689,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
             ...(target === undefined || reviewing === undefined ? {} : { routingConstraints: target.constraints, review: reviewing }),
             ...(climb?.constraints === undefined ? {} : { routingConstraints: climb.constraints }),
             ...(climb?.classification === undefined ? {} : { carriedClassification: climb.classification }),
-            onActivity: backgroundCall?.onActivity[index], reports, onSession: feeds[index]!.session,
+            onActivity: backgroundCall?.onActivity[index], reports, onSession: onWorkerSession(index),
             onTool: (tool) => showProgress(index, { ...item, ...workerModel, status: "running", ...(tool === undefined ? {} : { tool }) }),
             ...(backgroundCall === undefined ? {} : { onMessageReady: (receive) => backgroundCalls.registerWorker(backgroundCall.delegationIds[index]!, receive) }),
           });
@@ -690,7 +742,10 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
             "A completion notice with the results follows when every item has finished."].join("\n");
           return { content: [{ type: "text", text }], details };
         }
-        const { text, details } = await finishCall();
+        // A foreground worker releases its own slot while its children finish.
+        // Background calls return at once, leaving queued children for a later slot.
+        const { text, details } = parentDelegationId === undefined ? await finishCall()
+          : await withoutWorkerSlot(ctx.sessionManager.getSessionId(), signal, finishCall);
         return { content: [{ type: "text", text }], details };
       },
       renderCall: (args, theme) => renderSubagentsCall(args, theme),
@@ -716,7 +771,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
       while (browsed !== undefined && widget === browsed) {
         const result = await browsed.focus(ctx.ui, { select });
         if (result.workerId === undefined) return;
-        const exit = await openWorker(ctx, result.workerId, userSteering);
+        const exit = await openWorker(ctx, result.workerId, userSteering, fullscreenScrollbar(pi));
         if (exit === "main") return;
         select = result.workerId;
       }
@@ -744,7 +799,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
             return;
           }
           const workerId = await pickWorker(ctx.ui, board);
-          if (workerId !== undefined) await openWorker(ctx, workerId, userSteering);
+          if (workerId !== undefined) await openWorker(ctx, workerId, userSteering, fullscreenScrollbar(pi));
           return;
         }
         // `stop ...` is unchanged from before the picker (background.ts's own `command`);
@@ -753,7 +808,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
         const [verb] = trimmed.split(/\s+/);
         if (verb === "stop") { ctx.ui.notify(backgroundCalls.command(args), "info"); return; }
         const found = findWorker(workerBoard(), trimmed);
-        if (found.workerId !== undefined) { await openWorker(ctx, found.workerId, userSteering); return; }
+        if (found.workerId !== undefined) { await openWorker(ctx, found.workerId, userSteering, fullscreenScrollbar(pi)); return; }
         ctx.ui.notify(found.refusal, "warning");
       },
     });
@@ -767,7 +822,8 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
     });
     registerSubagentsStatusTool(pi, backgroundCalls);
     registerSubagentsVerdictTool(pi, gateLevels);
-    pi.on("session_shutdown", () => {
+    pi.on("session_shutdown", (_event, ctx) => {
+      if (!isWorkerSession(ctx)) forgetWorkerSlots(ctx.sessionManager.getSessionId());
       // First, so the workers stopped below never reach the ending session's UI.
       stopDownEntry?.();
       stopDownEntry = undefined;

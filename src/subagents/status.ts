@@ -1,16 +1,17 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { BackgroundCalls, CallSnapshot, CompletionNoticeDetails, WorkerSnapshot } from "./background.ts";
 import { workerBoard } from "./worker-board.ts";
+import { withoutWorkerSlot } from "./worker-slots.ts";
 import { compactLines, rungText, workerRows } from "./worker-widget.ts";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 
-// The subagents_status tool (ADR 0008): the orchestrator's view of its
+// The subagents_status tool (ADR 0008, ADR 0016): the caller's view of its
 // background calls. Without an id it lists them; with a call id it gives a
 // snapshot of each item, with a delegation id one item's snapshot. With a call
 // id and `wait: true` it blocks until the call has ended and returns its
 // results, which then take the place of the call's completion notice. Ctrl+C
-// fires the tool's abort signal, which stops only the wait. Workers never get
-// this tool: an agent definition's `tools:` list cannot give it to them.
+// fires the tool's abort signal, which stops only the wait. A delegating worker
+// gets it unless its agent definition narrows its tools.
 
 export const SUBAGENTS_STATUS_TOOL = "subagents_status";
 
@@ -83,11 +84,11 @@ export function registerSubagentsStatusTool(pi: ExtensionAPI, backgroundCalls: B
     label: "Subagents status",
     description: DESCRIPTION,
     parameters: PARAMETERS,
-    async execute(_toolCallId, params, signal): Promise<{ content: { type: "text"; text: string }[]; details: CompletionNoticeDetails | SubagentsStatusDetails }> {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx): Promise<{ content: { type: "text"; text: string }[]; details: CompletionNoticeDetails | SubagentsStatusDetails }> {
       const { id, wait = false } = params as { id?: string; wait?: boolean };
       if (wait) {
         if (id === undefined) throw new Error("wait needs a background call id");
-        const notice = await backgroundCalls.wait(id, signal);
+        const notice = await withoutWorkerSlot(ctx.sessionManager.getSessionId(), signal, () => backgroundCalls.wait(id, signal));
         if (notice.details === undefined) throw new Error(notice.text);
         return { content: [{ type: "text", text: notice.text }], details: notice.details };
       }

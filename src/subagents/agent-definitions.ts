@@ -104,10 +104,9 @@ export const DISCOVERY_TOOLS: readonly string[] = ["codemode", "tool_search"];
 
 /** Resolve a task item's `agent` against the definitions. No agent gives the
  *  worker no instructions and the default tools. A definition's `tools:` list
- *  keeps only tools in `orchestratorTools`, and the subagents tool only when
- *  `mayDelegate` (ADR 0008: the orchestrator's workers, not theirs). It never
- *  keeps `subagents_status`, `subagents_message` or `subagents_verdict`, which
- *  are the orchestrator's alone.
+ *  keeps only tools in `orchestratorTools`. The delegation and background
+ *  controls are kept only when `mayDelegate` (ADR 0016); verdict remains the
+ *  orchestrator's alone.
  *
  *  `undeclaredTools` are the orchestrator's registered tools pi does not
  *  declare on registration, which codemode or tool_search reach: MCP tools with
@@ -126,7 +125,7 @@ export function resolveAgent(
     return { ok: false, error: `unknown agent "${agent}"; ${known}` };
   }
   const discovery = DISCOVERY_TOOLS.filter((tool) => orchestratorTools.includes(tool));
-  const kept = definition.tools?.filter((tool) => (mayDelegate || tool !== SUBAGENTS_TOOL) && tool !== SUBAGENTS_STATUS_TOOL && tool !== "subagents_message" &&
+  const kept = definition.tools?.filter((tool) => (mayDelegate || ![SUBAGENTS_TOOL, SUBAGENTS_STATUS_TOOL, "subagents_message"].includes(tool)) &&
     tool !== SUBAGENTS_VERDICT_TOOL &&
     (orchestratorTools.includes(tool) || (discovery.length > 0 && undeclaredTools.includes(tool))));
   const needsDiscovery = kept !== undefined && kept.some((tool) => undeclaredTools.includes(tool)) &&

@@ -38,7 +38,7 @@ export type WorkerModelSetup =
   /** On the auto model: the router picks the rung at its first request. A
    *  resumed worker keeps its original pin, so its rung is known already. */
   | { readonly kind: "routed"; readonly pin?: { readonly model: string; readonly effort: string } }
-  /** A forked worker on the orchestrator's session model and effort (ADR 0008). */
+  /** A forked worker on its delegating agent's model and effort (ADR 0008, ADR 0016). */
   | { readonly kind: "fork"; readonly model: string; readonly effort: string }
   /** A preserved agent definition model (ADR 0007). Without an effort pi's
    *  default applies, which the board learns from the worker's session. */

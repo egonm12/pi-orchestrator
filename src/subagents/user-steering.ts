@@ -57,13 +57,14 @@ export function userSteeringNote(steers: readonly UserSteer[]): string {
 export class UserSteering implements WorkerSteering {
   readonly #pi: Pick<ExtensionAPI, "sendMessage">;
   readonly #calls: BackgroundCalls;
-  readonly #board: Pick<WorkerBoardView, "workers">;
   readonly #byEntry = new Map<string, UserSteer[]>();
+  readonly #byDelegation = new Map<string, Set<string>>();
 
   constructor(pi: Pick<ExtensionAPI, "sendMessage">, calls: BackgroundCalls, board: Pick<WorkerBoardView, "workers">) {
     this.#pi = pi;
     this.#calls = calls;
-    this.#board = board;
+    // Kept in the constructor for callers that still supply the board; lookups never snapshot it.
+    void board;
   }
 
   accepts(worker: BoardWorker): boolean {
@@ -77,6 +78,9 @@ export class UserSteering implements WorkerSteering {
     await sendWorkerMessage(this.#calls, id, text, mode);
     const steer: UserSteer = { text, mode, answer };
     this.#byEntry.set(worker.id, [...this.#byEntry.get(worker.id) ?? [], steer]);
+    const texts = this.#byDelegation.get(id) ?? new Set<string>();
+    texts.add(text.trim());
+    this.#byDelegation.set(id, texts);
     const label = agentLabel(worker);
     const details: UserSteerDetails = { delegationId: id, label, ...steer };
     // Without a turn: an idle orchestrator sees it at its next turn, a busy one
@@ -85,10 +89,8 @@ export class UserSteering implements WorkerSteering {
   }
 
   sentByUser(worker: BoardWorker, text: string): boolean {
-    const runs = worker.delegationId === undefined ? [worker.id]
-      : this.#board.workers().filter((other) => other.delegationId === worker.delegationId).map((other) => other.id);
-    const trimmed = text.trim();
-    return [worker.id, ...runs].some((id) => this.#byEntry.get(id)?.some((steer) => steer.text.trim() === trimmed) === true);
+    if (worker.delegationId !== undefined) return this.#byDelegation.get(worker.delegationId)?.has(text.trim()) === true;
+    return this.#byEntry.get(worker.id)?.some((steer) => steer.text.trim() === text.trim()) === true;
   }
 
   /** What the user sent the board entry `entryId`, in order. */

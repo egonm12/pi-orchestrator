@@ -409,6 +409,7 @@ export interface AgentModelRecord extends RecordCommon {
 
 export interface ForkRecord extends RecordCommon {
   readonly recordType: "fork";
+  readonly parentDelegationId?: string;
   readonly model: string;
   readonly effort: string;
   readonly parentSession: string;
@@ -759,7 +760,8 @@ export function validateRoutingRecord(value: unknown): RoutingRecord {
     stringAt(value, "taskTextPrefix", "");
   } else if (recordType === "fork") {
     if (value.schemaVersion !== DECISION_RECORD_SCHEMA_VERSION) throw new RoutingRecordError("schemaVersion", `is unsupported for ${recordType} records`);
-    checkKeys(value, "", [...COMMON_KEYS, "model", "effort", "parentSession", "forkPoint", "banListException"]);
+    checkKeys(value, "", [...COMMON_KEYS, "model", "effort", "parentSession", "forkPoint", "banListException"], ["parentDelegationId"]);
+    if (value.parentDelegationId !== undefined) stringAt(value, "parentDelegationId", "", { nonBlank: true });
     checkCommon(value);
     for (const key of ["model", "effort", "parentSession"]) stringAt(value, key, "", { nonBlank: true });
     if (value.forkPoint !== null) stringAt(value, "forkPoint", "", { nonBlank: true });
@@ -996,6 +998,7 @@ export function buildForkRecord(input: {
   readonly parentSession: string;
   readonly forkPoint: string | null;
   readonly banListException: boolean;
+  readonly parentDelegationId?: string;
   readonly at?: Date;
 }): ForkRecord {
   return checkedRecord({
@@ -1003,6 +1006,7 @@ export function buildForkRecord(input: {
     delegationId: input.delegationId, timestamp: (input.at ?? new Date()).toISOString(),
     model: input.model, effort: input.effort, parentSession: input.parentSession,
     forkPoint: input.forkPoint, banListException: input.banListException,
+    ...(input.parentDelegationId === undefined ? {} : { parentDelegationId: input.parentDelegationId }),
   });
 }
 

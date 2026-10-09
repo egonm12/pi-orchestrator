@@ -21,6 +21,8 @@ const WORKER_SESSIONS = Symbol.for("pi-orchestrator.subagents.worker-sessions");
 interface WorkerSession {
   readonly parentDelegationId?: string;
   readonly reviewedDelegationId?: string;
+  readonly rootSessionId?: string;
+  readonly stopSignal?: AbortSignal;
 }
 
 type ProcessGlobal = typeof globalThis & { [WORKER_SESSIONS]?: Map<string, WorkerSession> };
@@ -31,11 +33,28 @@ function workerSessions(): Map<string, WorkerSession> {
 
 /** Marks `sessionId` as a worker's session until the returned function is
  *  called. `parentDelegationId` names the worker that started it, if any, and
- *  `reviewedDelegationId` the delegation it reviews, if it is a reviewer. */
-export function markWorkerSession(sessionId: string, parentDelegationId?: string, reviewedDelegationId?: string): () => void {
+ *  `reviewedDelegationId` the delegation it reviews, if it is a reviewer.
+ *  `delegatingSessionId` is the session that started it, and `stopSignal` the
+ *  signal that stops it. */
+export function markWorkerSession(sessionId: string, parentDelegationId?: string, reviewedDelegationId?: string, delegatingSessionId?: string,
+  stopSignal?: AbortSignal): () => void {
+  const rootSessionId = delegatingSessionId === undefined ? undefined : rootSessionOf(delegatingSessionId) ?? delegatingSessionId;
   workerSessions().set(sessionId, { ...(parentDelegationId === undefined ? {} : { parentDelegationId }),
-    ...(reviewedDelegationId === undefined ? {} : { reviewedDelegationId }) });
+    ...(reviewedDelegationId === undefined ? {} : { reviewedDelegationId }),
+    ...(rootSessionId === undefined ? {} : { rootSessionId }), ...(stopSignal === undefined ? {} : { stopSignal }) });
   return () => { workerSessions().delete(sessionId); };
+}
+
+/** The signal that stops the worker `sessionId`: a stop, an abort of its
+ *  call or the orchestrator's session end. pi clears a run's own signal before
+ *  agent_before_settle, so a wait there listens to this one. */
+export function workerStopSignal(sessionId: string): AbortSignal | undefined {
+  return workerSessions().get(sessionId)?.stopSignal;
+}
+
+/** The orchestrator session whose worker limit owns this worker. */
+export function rootSessionOf(sessionId: string): string | undefined {
+  return workerSessions().get(sessionId)?.rootSessionId;
 }
 
 /** Whether this process is currently running the delegation. */

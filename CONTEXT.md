@@ -14,7 +14,7 @@ An agent the orchestrator hands one bounded piece of investigation, implementati
 _Avoid_: Execution agent, subagent (that is the tool that starts workers, not the role)
 
 **Forked worker**:
-A worker whose context starts as a copy of the orchestrator's conversation up to the delegating call. The only worker that runs on the orchestrator's own session model and effort, unrouted.
+A worker whose context starts as a copy of the delegating conversation up to the delegating call: the orchestrator's, or that of a worker that forks. It runs unrouted where the delegating agent runs: on the orchestrator's session model and effort, or on the rung or preserved agent model serving the delegating worker. It never delegates.
 _Avoid_: Clone, branch, fork (alone)
 
 **Result**:
@@ -48,7 +48,7 @@ Where a worker is in its life: *queued* (held back until a parallel slot frees),
 _Avoid_: Status (that is the tool that reports worker states), waiting
 
 **Agent definition**:
-A named, owner-written description of a kind of worker: its instructions and the tools it may use. Read from the owner's and the project's agent folders; pi-orchestrator ships none. Its tools list names MCP tools, `codemode` and `tool_search` like any other tool; a worker without one gets them as the orchestrator does.
+A named, owner-written description of a kind of worker: how it works (its instructions and the tools it may use), never how much care its task needs, which stays the classifier's tier. Read from the owner's and the project's agent folders; pi-orchestrator ships none. Only a definition from the owner's folder may pin a model, as the owner's preference; a project's definition is always routed. Its tools list names MCP tools, `codemode` and `tool_search` like any other tool; a worker without one gets them as the orchestrator does.
 _Avoid_: Role (that is the orchestrator/worker split), persona
 
 **Delegation**:
@@ -79,7 +79,7 @@ An experimental routing recommendation recorded for evaluation but not controlli
 ## Watching workers
 
 **Worker widget**:
-The list below the editor, in Claude Code's agent list style: `main`, the orchestrator's own agent, then one row per worker on the board: label · tier · rung · elapsed time · worker state, and while the worker runs its activity. The rung is short, the model without its provider plus the effort (`opus-5-5:xhigh`); the transcript view and the status snapshot show the full rung. A row that is not running ends with its worker state, never with task text. The label takes the room the rest of the row leaves and is shortened only when the row does not fit. The /subagents picker, the transcript view's nested workers and the status output use the same rows.
+The list below the editor, in Claude Code's agent list style: `main`, the orchestrator's own agent, then one row per worker on the board: label · tier · rung · elapsed time · worker state, and while the worker runs its activity. The rung is short, the model without its provider plus the effort (`opus-5-5:xhigh`); the transcript view and the status snapshot show the full rung. A row that is not running ends with its worker state, never with task text. The label takes the room the rest of the row leaves and is shortened only when the row does not fit. The /subagents picker, the transcript view's main-plus-workers picker below its editor and the status output use the same rows.
 _Avoid_: Status line, subagent list
 
 **Activity**:
@@ -87,8 +87,19 @@ What a worker is doing right now, in a word: `thinking…`, `writing…`, the na
 _Avoid_: Current action, live status
 
 **Transcript view**:
-One worker's whole session, shown in place of the orchestrator's view until the user leaves it. For a running background worker it has a message input for user steering.
+One worker's whole session, shown in place of the orchestrator's view until the user leaves it. Its chat uses terminal scrollback in regular tuiMode and pi's chat-style ScrollView in fullscreen tuiMode. The chat is built one message at a time and kept, so a finished message is not rebuilt as the worker runs. In fullscreen tuiMode a left click expands or collapses a tool result or a thinking block, as in pi's chat. Worker metadata scrolls with the chat; the message input for a running background worker and the main-plus-workers picker sit in the dock, with the picker below the input.
 _Avoid_: Subagent view, worker view
+
+**Tool box**:
+A tool call as the transcript view draws it: a box with its arguments and its result, tinted by the call's state. When the call completes in fullscreen tuiMode, the box turns pi's green if the call succeeds and red if it fails. In regular tuiMode it keeps the steady tint instead.
+_Avoid_: Tool call (the call is the worker's action; the box is how the transcript shows it)
+
+**Steady tint**:
+The tint regular tuiMode keeps on a tool box for its whole life: the pending tint stays after the call completes, so a finished call changes only its last line, its elapsed time, and the terminal is not reprinted above it. A failed call still shows its error text.
+
+**Frame trace**:
+A debug file of the transcript view's frames, switched on by `PI_ORCHESTRATOR_TRANSCRIPT_TRACE=<file>`. Each frame appends one JSON line: its time since the view opened, its render time, its rows, its scroll position, whether it follows the end, and the events since the last frame. Once a second a line gives that second's frame count. The trace writes only to its file, never to the terminal; without the variable no file is made.
+_Avoid_: Trace (alone: a trace is ticket 18's delegation record)
 
 **User steering**:
 A message the user sends a running background worker from its transcript view: a steer, a follow-up or the answer to its question, delivered as the orchestrator's messages are. The orchestrator is told of each one in its session, and the worker's result lists them as the user's.
@@ -121,7 +132,7 @@ Bounded recovery's retry order after a changes-requested review: one supported e
 _Avoid_: Reclassification, suitability-score escalation
 
 **Unplaced climb**:
-A retry of an attempt the effort ladder cannot position: routing is off, the attempt was a fork or named-model worker, its route refused, its rung is no longer in the tier map, or the climb failed with an error, which its record names. Its effort-ladder record has step `unplaced` and no rung. It counts toward the two-climb limit; with routing on it routes normally, without a forced rung.
+A retry of an attempt the effort ladder cannot position: routing is off, the attempt was a fork, a named-model worker whose one effort step on its pinned model is spent, its route refused, its rung is no longer in the tier map, or the climb failed with an error, which its record names. Its effort-ladder record has step `unplaced` and no rung. It counts toward the two-climb limit; with routing on it routes normally, without a forced rung.
 
 **Verdict**:
 The quality gate's outcome for a delegated task: accepted or changes requested, recorded by the orchestrator whether it came from its own check or an independent reviewer. The only feedback signal the router learns from.
