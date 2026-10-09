@@ -11,10 +11,11 @@ Changing the top-level effort restarts the prompt cache on every provider and mo
 
 Only models where a live request pair shows the cache surviving an effort change may carry a dynamic rung. Documentation and effortless (github.com/HeyCubit/effortless, the precedent for per-prompt judging) disagree on which models qualify, so we measure. A dynamic rung on an unmeasured model is a load error. A model qualifies when pi flags it `supportsMidConvoEffort` and our probe (docs/research/effort-cache-probe.md) measured its cache kept. On 2026-10-09 that was Haiku 5.5, Sonnet 5.5 and Opus 5.5. GPT-6 on the Codex subscription formed no prompt cache at all, so it gets no dynamic rung; we do not use OpenAI API keys for agents.
 
-Rules taken from effortless: a higher effort applies at once, a lower one waits until the running turn ends; a follow-up of at most 12 characters and 2 words keeps the current effort without a judgement. A failed judgement runs the turn at the top of the band. A retry on a dynamic rung raises the band's floor one step before the ladder moves to another rung.
+Rules adapted from effortless: a higher effort applies at once. A lower one chosen while a run is in progress is declined rather than deferred: pi's `turn_end` fires after every reply, so a deferral either applied on the very next request or was overwritten by the next judgement, and could stay pending forever. A short reply of at most 12 characters and 2 words keeps the current effort without a judgement. A failed judgement runs the turn at the top of the band. A retry on a dynamic rung raises the band's floor one step before the ladder moves to another rung.
 
 ## Considered options
 
+- **Defer a lower effort to the end of the running turn**, as effortless does. Built first, then replaced by declining (see above). Rejected.
 - **Re-judge in the background after each turn and apply it to the next request.** In a tool loop the next request holds only tool results. Claude reportedly defers a per-message change on such requests, and a top-level change restarts the cache. Effortless does not do it either. Rejected.
 - **Deterministic rules on the turn's shape** (low after a read, high after a failed test). Cheap but brittle. Rejected in favour of a model judgement per message.
 - **Let the worker set its own effort with a tool.** Gives the worker a lever over its own budget. Rejected.

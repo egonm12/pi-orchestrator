@@ -134,7 +134,7 @@ The range a dynamic rung's effort may move within, written `low-high`, both ends
 Choosing a dynamic rung's effort anew for each turn, inside its effort band, while the model stays pinned. Applies to workers and the orchestrator alike. A rung with one effort keeps that effort pinned.
 
 **Effort judge**:
-The step that picks a dynamic rung's effort. It judges every incoming message (a user prompt, a task, a steer, a follow-up, retry feedback) before that turn starts, never between tool calls. A short follow-up keeps the current effort without a judgement. A higher effort applies at once; a lower one waits until the running turn ends. When the judge fails, the turn runs at the top of the band. Distinct from the classifier, which assigns a tier once per delegation.
+The step that picks a dynamic rung's effort. It judges every incoming message (a user prompt, a task, a steer, a follow-up, retry feedback) before that turn starts, never between tool calls. A short reply keeps the current effort without a judgement. A higher effort applies at once; a lower one chosen while a run is in progress is declined, and the next incoming message is judged afresh. When the judge fails, the turn runs at the top of the band. Distinct from the classifier, which assigns a tier once per delegation.
 _Avoid_: Classifier (for this step), effort router
 
 **Effort ladder**:
