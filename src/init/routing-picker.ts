@@ -1,8 +1,10 @@
-import { getSupportedThinkingLevels, splitKnownThinkingSuffix, type ModelInfo, type ThinkingLevel } from "../models/model-info.ts";
+import { getSupportedThinkingLevels, type ModelInfo, type ThinkingLevel } from "../models/model-info.ts";
 import { RISK_TIERS, type RiskTier } from "../routing/tiers.ts";
 import { type PickerUi } from "./ban-list-picker.ts";
 import { canUseCustomCheckbox, checkboxSelect, checkboxSelectWithValues, type CheckboxRowValueConfig } from "./checkbox-select.ts";
 import { publishedOutputPrice, starterRungFor, type StarterTierMap } from "./setup.ts";
+import { modelIdFromRung, thinkingLevelFromRung } from "./rungs.ts";
+export { modelIdFromRung, thinkingLevelFromRung };
 
 // Interactive routing choices for `/pi-orchestrator init`. In the TUI, tier
 // model picking uses a checkbox list with inline thinking-level cycling; other
@@ -39,15 +41,6 @@ export interface RoutingPickerDefaults {
   readonly tiers?: Partial<Record<RiskTier, readonly string[]>>;
   /** Existing classifier rung, used as the rebuild default when present. */
   readonly classifier?: string;
-}
-
-export function modelIdFromRung(rung: string): string {
-  return splitKnownThinkingSuffix(rung).baseModel;
-}
-
-export function thinkingLevelFromRung(rung: string): ThinkingLevel | undefined {
-  const suffix = splitKnownThinkingSuffix(rung).thinkingSuffix;
-  return suffix ? suffix.slice(1) as ThinkingLevel : undefined;
 }
 
 function modelByFullId(models: readonly ModelInfo[], fullId: string): ModelInfo | undefined {
@@ -123,7 +116,7 @@ export function defaultTierModelIds(defaults: RoutingPickerDefaults, tier: RiskT
 
 export function starterThinkingLevel(starter: StarterTierMap, tier: RiskTier, model: ModelInfo): ThinkingLevel {
   const rung = starter.tiers[tier]?.find((entry) => modelIdFromRung(entry) === model.fullId);
-  const fromRung = rung ? thinkingLevelFromRung(rung) : undefined;
+  const fromRung = rung ? thinkingLevelFromRung(rung, model) : undefined;
   const supported = getSupportedThinkingLevels(model);
   if (fromRung && supported.includes(fromRung)) return fromRung;
   return thinkingLevelFromRung(starterRungFor(model, tier)) ?? supported[0] ?? "off";
@@ -131,7 +124,7 @@ export function starterThinkingLevel(starter: StarterTierMap, tier: RiskTier, mo
 
 export function defaultThinkingLevel(defaults: RoutingPickerDefaults, tier: RiskTier, model: ModelInfo): ThinkingLevel {
   const rung = defaultTierRungs(defaults, tier).find((entry) => modelIdFromRung(entry) === model.fullId);
-  const fromRung = rung ? thinkingLevelFromRung(rung) : undefined;
+  const fromRung = rung ? thinkingLevelFromRung(rung, model) : undefined;
   const supported = getSupportedThinkingLevels(model);
   if (fromRung && supported.includes(fromRung)) return fromRung;
   return starterThinkingLevel(defaults.starter, tier, model);
@@ -145,10 +138,10 @@ export function classifierDefault(defaults: RoutingPickerDefaults, eligible: rea
 
 export function classifierThinkingDefault(defaults: RoutingPickerDefaults, model: ModelInfo): ThinkingLevel {
   const existing = defaults.classifier && modelIdFromRung(defaults.classifier) === model.fullId
-    ? thinkingLevelFromRung(defaults.classifier)
+    ? thinkingLevelFromRung(defaults.classifier, model)
     : undefined;
   const starter = modelIdFromRung(defaults.starter.classifier) === model.fullId
-    ? thinkingLevelFromRung(defaults.starter.classifier)
+    ? thinkingLevelFromRung(defaults.starter.classifier, model)
     : undefined;
   const supported = getSupportedThinkingLevels(model);
   if (existing && supported.includes(existing)) return existing;

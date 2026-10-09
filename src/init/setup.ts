@@ -15,6 +15,7 @@ import { RISK_TIERS, type RiskTier } from "../routing/tiers.ts";
 import { tierMapFromSettings } from "../routing/tier-map.ts";
 import { checkModelScope } from "../models/model-scope.ts";
 import { getSupportedThinkingLevels, type ModelInfo, type ThinkingLevel } from "../models/model-info.ts";
+import { isDynamicRung, modelIdFromRung } from "./rungs.ts";
 import { isAutoModel } from "../router/auto-model.ts";
 
 // Fresh-install support: what is missing at session start, and the pieces
@@ -223,14 +224,26 @@ function setClassifierModel(routing: Record<string, unknown>, model: string, cha
   changes.push(`orchestrator.routing.classifier.model = ${model}`);
 }
 
+function pickedRungsPreservingDynamic(existing: unknown, picked: readonly string[]): string[] {
+  const dynamicByModel = new Map<string, string>();
+  for (const rung of tierRungsFrom(existing) ?? []) {
+    if (isDynamicRung(rung)) {
+      const model = modelIdFromRung(rung);
+      if (!dynamicByModel.has(model)) dynamicByModel.set(model, rung);
+    }
+  }
+  return picked.map((rung) => dynamicByModel.get(modelIdFromRung(rung)) ?? rung);
+}
+
 function withPickedTiersPreservingOrders(existing: unknown, picked: Record<RiskTier, string[]>): Record<RiskTier, string[] | { order?: unknown; rungs: string[] }> {
   const result = {} as Record<RiskTier, string[] | { order?: unknown; rungs: string[] }>;
   const current = isPlainObject(existing) ? existing : {};
   for (const tier of RISK_TIERS) {
     const value = current[tier];
+    const rungs = pickedRungsPreservingDynamic(value, picked[tier]);
     result[tier] = isPlainObject(value) && value.order !== undefined
-      ? { order: value.order, rungs: picked[tier] }
-      : picked[tier];
+      ? { order: value.order, rungs }
+      : rungs;
   }
   return result;
 }
