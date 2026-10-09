@@ -4,6 +4,19 @@ All notable changes to this package are listed here. The format follows [Keep a 
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-09
+
+### Added
+
+- **Review gate:** `subagents_verdict` takes a `verdicts` list, so several verdicts can be recorded in one call. The single form still works.
+
+### Changed
+
+- **Router:** a routed worker's tier classification starts when its session starts, overlapping the MCP connection wait, not at its first request.
+- **Router:** the classifier is asked for a `why` of one short sentence, at most 120 characters (rubric `tier-rubric-4`).
+- **Review gate:** working-tree snapshots run asynchronously, so they no longer stall other workers, and reuse a file's hash when its stat is unchanged.
+- **Routing records:** parsed record files are cached by stat, and appended lines are parsed on their own, so repeat reads take under a millisecond.
+
 ## [0.1.0] - 2026-10-09
 
 First tagged release.
@@ -17,5 +30,6 @@ First tagged release.
 - **Setup:** `/pi-orchestrator init` walks through the ban list, gate level, worker limit, tier map and providers.
 - **Worker view:** a live transcript of each worker, opened with alt+a or `/subagents`. It looks and scrolls like pi's chat, with a session picker, a message input to steer a running worker, and `PI_ORCHESTRATOR_TRANSCRIPT_TRACE` to log frame times.
 
-[Unreleased]: https://github.com/egonm12/pi-orchestrator/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/egonm12/pi-orchestrator/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/egonm12/pi-orchestrator/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/egonm12/pi-orchestrator/releases/tag/v0.1.0
