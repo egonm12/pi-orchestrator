@@ -14,8 +14,10 @@ Workers need the subagents extension: it is the supported way to start them. You
 ## Install
 
 ```sh
-pi install git:github.com/egonm12/pi-orchestrator
+pi install git:github.com/egonm12/pi-orchestrator@v0.1.0
 ```
+
+That pins a release; see [releases](https://github.com/egonm12/pi-orchestrator/releases) and [CHANGELOG.md](CHANGELOG.md). To move to a newer release, install again with its tag. To follow `main` instead, install without `@v...` and update with `pi update git:github.com/egonm12/pi-orchestrator`. How releases are made is in [docs/releasing.md](docs/releasing.md).
 
 ## Set up the orchestrator
 
