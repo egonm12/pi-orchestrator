@@ -1171,11 +1171,19 @@ test("a dynamic worker rung judges its first task and keeps the model pinned", a
     const first = await firstRequest(auto, FIX_README, "band-worker");
     assert.equal(first.rung, "anthropic/claude-opus-5-5:low");
     assert.deepEqual((first.state as { band?: unknown }).band, { min: "low", max: "high" });
+    const effortRecord = h.records().find((record) => record.recordType === "effort-decision");
+    assert.ok(effortRecord, "the worker effort judgement is persisted");
+    assert.equal(effortRecord.scope, "worker");
+    assert.equal(effortRecord.sessionId, "band-worker");
+    assert.equal(effortRecord.from, "high");
+    assert.equal(effortRecord.to, "low");
   } finally { h.cleanup(); }
 });
 
 test("a dynamic worker judges a steer, defers a decrease, and reuses effort for continuations", async () => {
   const h = harness({ ...LIVE, tiers: { ...TEST_TIERS, mechanical: ["anthropic/claude-opus-5-5:low-high"] } });
+  const events: { stage: string; timestamp: string; decisionTimestamp?: string }[] = [];
+  const unsubscribe = onEffortDecision((event) => events.push(event));
   try {
     const answers = ["high", "low"];
     const auto = await loadAutoModel(h, fakeSessionRegistry([]), {
@@ -1196,7 +1204,11 @@ test("a dynamic worker judges a steer, defers a decrease, and reuses effort for 
     await auto.handlers.get("turn_end")?.({ type: "turn_end" }, workerContext(h, "band-steer", fakeSessionRegistry([])));
     const after = await auto.route("band-steer", messages, { reason: "continuation", state: withinTurn.state });
     assert.equal(after.thinkingLevel, "low");
-  } finally { h.cleanup(); }
+    assert.deepEqual(events.map((event) => event.stage), ["judged", "judged", "applied"]);
+    assert.equal(events[2]?.decisionTimestamp, events[1]?.timestamp);
+    assert.deepEqual(h.records().filter((record) => record.recordType === "effort-decision").map((record) => record.stage),
+      ["judged", "judged", "applied"]);
+  } finally { unsubscribe(); h.cleanup(); }
 });
 
 test("a worker follow-up is judged as a follow-up and a short one keeps its effort", async () => {
@@ -1225,7 +1237,8 @@ test("a failed worker judge uses the band maximum and exposes its decision", asy
     const routed = await auto.route("failed-judge", FIX_README);
     assert.equal(routed.thinkingLevel, "high");
     assert.deepEqual(events, [{ sessionId: "failed-judge", scope: "worker", kind: "task", from: "high", to: "high",
-      applyAt: "none", reason: "effort judge fallback to band maximum: offline", judgeModel: "fallback" }]);
+      applyAt: "none", reason: "effort judge fallback to band maximum: offline", judgeModel: "fallback",
+      timestamp: NOW.toISOString(), band: { min: "low", max: "high" }, stage: "judged" }]);
   } finally { unsubscribe(); h.cleanup(); }
 });
 
@@ -1249,6 +1262,14 @@ test("session effort judges an owner prompt and manual selection disables it", a
     await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
     await handlers.get("before_agent_start")?.({ type: "before_agent_start", prompt: "Fix the typo in the documentation" }, ctx);
     assert.deepEqual(selected, ["low"]);
+    const effortRecord = h.records().find((record) => record.recordType === "effort-decision");
+    assert.ok(effortRecord, "the orchestrator effort judgement is persisted");
+    assert.equal(effortRecord.scope, "orchestrator");
+    assert.equal(effortRecord.sessionId, "owner");
+    assert.equal(effortRecord.kind, "user-prompt");
+    assert.equal(effortRecord.from, "high");
+    assert.equal(effortRecord.to, "low");
+    assert.deepEqual(effortRecord.band, { min: "low", max: "high" });
     await handlers.get("thinking_level_select")?.({ type: "thinking_level_select", level: "low", previousLevel: "high" }, ctx);
     judged = "high";
     await handlers.get("before_agent_start")?.({ type: "before_agent_start", prompt: "Fix a difficult multi-file regression" }, ctx);

@@ -9,7 +9,7 @@ import type { ActiveRouter } from "./route-task.ts";
 import { newTaskLedger, TaskAllowanceOwner } from "../budget/task-allowance.ts";
 import { banListsFromSettings, configureBanLists, loadBanListsOrDefaults, personalAgentDir, personalOrchestrator, readSettingsFile } from "../policy/ban-lists.ts";
 import { isPlainObject } from "../guard/boundaries.ts";
-import { ROUTING_MODES, type RoutingMode } from "../routing/decision-record.ts";
+import { ROUTING_MODES, writeEffortDecisionRecord, type RoutingMode } from "../routing/decision-record.ts";
 import { sessionClassifierModelCall, type SessionClassifierCallReport } from "../routing/session-classifier-call.ts";
 import {
   classifierConfigFromSettings,
@@ -30,7 +30,7 @@ import type { SessionModelRegistry } from "../routing/model-stream.ts";
 import { sessionEffortBandFromSettings } from "../routing/session-effort.ts";
 import { dynamicRungRefusal } from "../models/effort-capability.ts";
 import { getSupportedThinkingLevels, type ThinkingLevel } from "../models/model-info.ts";
-import { emitEffortDecision } from "../routing/effort-decisions.ts";
+import { emitEffortDecision, onEffortDecision, type EffortDecisionEvent } from "../routing/effort-decisions.ts";
 
 export type { RoutingEvidence, RoutingEvidenceSource, EvidenceSetup } from "./evidence.ts";
 
@@ -44,6 +44,7 @@ export const ROUTER_DISABLED_PREFIX = "pi-orchestrator router disabled:";
 /** pi loads each extension with a fresh module copy (jiti moduleCache: false),
  *  so the once-per-process disabled line is kept on the process's global object. */
 export const DISABLED_LINE_REPORTED = Symbol.for("pi-orchestrator.router.disabled-line-reported");
+const EFFORT_DECISION_RECORDER = Symbol.for("pi-orchestrator.effort-decision-recorder");
 export const ROUTER_WARNING_PREFIX = "pi-orchestrator router warning:";
 /** The oldest supported pi version for cache-safe per-message effort. */
 export const REQUIRED_PI_VERSION = "1.1.0";
@@ -52,7 +53,11 @@ export const REQUIRED_PI_VERSION = "1.1.0";
 export const PI_TOO_OLD_MESSAGE = `pi-orchestrator requires pi v${REQUIRED_PI_VERSION} or later: this pi has no registerVirtualModel. Upgrade pi to v${REQUIRED_PI_VERSION} or later.`;
 /** The keys of the warnings this process printed, each once, like the disabled line. */
 const WARNINGS_REPORTED = Symbol.for("pi-orchestrator.router.warnings-reported");
-type ProcessGlobal = typeof globalThis & { [DISABLED_LINE_REPORTED]?: boolean; [WARNINGS_REPORTED]?: Set<string> };
+type ProcessGlobal = typeof globalThis & {
+  [DISABLED_LINE_REPORTED]?: boolean;
+  [WARNINGS_REPORTED]?: Set<string>;
+  [EFFORT_DECISION_RECORDER]?: true;
+};
 
 /** The state folder when `PI_ORCHESTRATOR_STATE_DIR` is not set: under the agent
  *  directory, never inside the package checkout. */
@@ -63,6 +68,32 @@ export function defaultStateDir(): string {
 /** The state folder this session uses. */
 export function stateDir(): string {
   return resolve(process.env.PI_ORCHESTRATOR_STATE_DIR ?? defaultStateDir());
+}
+
+function recordEffortDecisionEvents(warn: (key: string, message: string) => void): void {
+  const processGlobal = globalThis as ProcessGlobal;
+  if (processGlobal[EFFORT_DECISION_RECORDER]) return;
+  processGlobal[EFFORT_DECISION_RECORDER] = true;
+  onEffortDecision((event: EffortDecisionEvent) => {
+    try {
+      writeEffortDecisionRecord(join(stateDir(), "routing"), {
+        at: new Date(event.timestamp),
+        sessionId: event.sessionId,
+        scope: event.scope,
+        kind: event.kind,
+        from: event.from,
+        to: event.to,
+        applyAt: event.applyAt,
+        reason: event.reason,
+        judgeModel: event.judgeModel,
+        band: event.band,
+        stage: event.stage,
+        ...(event.decisionTimestamp === undefined ? {} : { decisionTimestamp: event.decisionTimestamp }),
+      });
+    } catch (error) {
+      warn(`effort-decision-record:${event.sessionId}`, `could not save effort decision for ${event.sessionId}: ${String(error).split(/\r?\n/, 1)[0]}`);
+    }
+  });
 }
 
 export interface RouterDependencies {
@@ -203,6 +234,7 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
     let sessionEffortOff = false;
     let ourThinkingSelection: ThinkingLevel | undefined;
     let pendingSessionEffort: ThinkingLevel | undefined;
+    let pendingSessionDecision: EffortDecisionEvent | undefined;
     let effortPersonal: unknown = {};
     const selectEffort = (level: ThinkingLevel) => {
       if (pi.getThinkingLevel() === level) return;
@@ -226,6 +258,7 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
         process.stderr.write(`${ROUTER_WARNING_PREFIX} ${message}\n`);
       },
     };
+    recordEffortDecisionEvents(autoDeps.warn);
     const autoModel = createAutoModelRouter(autoDeps);
     // Registering again replaces the virtual model; its route keeps no pins of its own.
     const registerAutoModel = (limits: AutoModelLimits = {}) => pi.registerVirtualModel<AutoModelState>({
@@ -288,6 +321,7 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
     pi.on("session_start", (_event, ctx) => {
       sessionEffortOff = false;
       pendingSessionEffort = undefined;
+      pendingSessionDecision = undefined;
       sessionBand = undefined;
       try {
         effortPersonal = readSettingsFile(join(personalAgentDir(), "settings.json")) ?? {};
@@ -363,16 +397,24 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
         decision = { from: currentEffort, to: band.max, applyAt: "now" as const,
           reason: `effort judge fallback to band maximum: ${String(error)}`, judgeModel: "fallback" as const };
       }
-      emitEffortDecision({ ...decision, sessionId: id, kind: "user-prompt", scope: "orchestrator" });
+      const effortDecision: EffortDecisionEvent = { ...decision, timestamp: deps.now().toISOString(), band,
+        sessionId: id, kind: "user-prompt", scope: "orchestrator", stage: "judged" };
+      emitEffortDecision(effortDecision);
       if (decision.applyAt === "now") selectEffort(decision.to);
-      else if (decision.applyAt === "turn-end") pendingSessionEffort = decision.to;
+      else if (decision.applyAt === "turn-end") {
+        pendingSessionEffort = decision.to;
+        pendingSessionDecision = effortDecision;
+      }
     });
     pi.on("turn_end", (_event, ctx) => {
       const id = ctx.sessionManager?.getSessionId();
       if (id && isAutoModel(ctx.model)) autoModel.turnEnded(id);
       if (id && isOrchestratorSession(ctx) && pendingSessionEffort && !sessionEffortOff) {
         selectEffort(pendingSessionEffort);
+        if (pendingSessionDecision !== undefined) emitEffortDecision({ ...pendingSessionDecision, timestamp: deps.now().toISOString(),
+          stage: "applied", decisionTimestamp: pendingSessionDecision.timestamp });
         pendingSessionEffort = undefined;
+        pendingSessionDecision = undefined;
       }
     });
 
@@ -436,6 +478,7 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
       else if (sessionBand && isOrchestratorSession(ctx)) {
         sessionEffortOff = true;
         pendingSessionEffort = undefined;
+        pendingSessionDecision = undefined;
       }
     });
 

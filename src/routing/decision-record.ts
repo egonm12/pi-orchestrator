@@ -45,6 +45,7 @@ import { RISK_TIERS, type RiskTier } from "./tiers.ts";
 import type { HopOutcome, TierClassification } from "./tier-classifier.ts";
 import type { ResolvedTierMap, TierMapDrop, TierOrder, TierRung } from "./tier-map.ts";
 import type { LadderSkippedRung } from "./effort-ladder.ts";
+import type { EffortJudgeKind } from "./effort-judge.ts";
 import { LADDER_SKIP_REASONS } from "./skip-reasons.ts";
 import type { RemovedRung, RoutingConstraints, TierRouteDecision } from "./tier-router.ts";
 
@@ -475,9 +476,32 @@ export interface FailoverRecord extends RecordCommon {
   readonly rung: string;
 }
 
+export const EFFORT_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export const EFFORT_DECISION_KINDS = ["user-prompt", "task", "steer", "follow-up", "retry-feedback"] as const;
+export const EFFORT_DECISION_STAGES = ["judged", "applied"] as const;
+export type EffortDecisionStage = (typeof EFFORT_DECISION_STAGES)[number];
+export type EffortLevel = (typeof EFFORT_LEVELS)[number];
+
+export interface EffortDecisionRecord extends RecordCommon {
+  readonly recordType: "effort-decision";
+  /** The pi session id that identifies a worker delegation or the orchestrator. */
+  readonly sessionId: string;
+  readonly scope: "worker" | "orchestrator";
+  readonly kind: EffortJudgeKind;
+  readonly from: EffortLevel;
+  readonly to: EffortLevel;
+  readonly applyAt: "now" | "turn-end" | "none";
+  readonly reason: string;
+  readonly judgeModel: string | "skipped" | "fallback";
+  readonly band: { readonly min: EffortLevel; readonly max: EffortLevel };
+  readonly stage: EffortDecisionStage;
+  /** Timestamp of the judged record confirmed by this later application event. */
+  readonly decisionTimestamp?: string;
+}
+
 export type RoutedDecisionRecord = DecisionRecord | EffortLadderRecord;
 export type RoutingRecord = RoutedDecisionRecord | ForkRecord | AgentModelRecord | ExplicitModelRecord | VerdictRecord | OrphanedVerdictRecord | EditRecord |
-  GateRequirementRecord | FailoverRecord;
+  GateRequirementRecord | FailoverRecord | EffortDecisionRecord;
 
 /** A routed decision for the routing report. Forks accept verdicts but are not routed. */
 export function isRoutedDecision(record: RoutingRecord): record is RoutedDecisionRecord {
@@ -682,6 +706,7 @@ function checkConstraints(record: Json): void {
 }
 
 const DAY_FILE = /^\d{4}-\d{2}-\d{2}\.jsonl$/;
+const RECORD_TYPES = ["decision", "effort-ladder", "agent-model", "fork", "explicit", "verdict", "orphaned-verdict", "edit", "gate-requirement", "failover", "effort-decision"] as const;
 const COMMON_KEYS = ["recordType", "schemaVersion", "delegationId", "timestamp"] as const;
 
 /** First of all checks: a record of another version may have other fields
@@ -706,8 +731,7 @@ function checkCommon(record: Json): void {
 export function validateRoutingRecord(value: unknown): RoutingRecord {
   if (!isObject(value)) throw new RoutingRecordError("(record)", `must be a JSON object; got ${JSON.stringify(value)}`);
   checkSchemaVersion(value);
-  const recordType = oneOf(value, "recordType", "",
-    ["decision", "effort-ladder", "agent-model", "fork", "explicit", "verdict", "orphaned-verdict", "edit", "gate-requirement", "failover"] as const);
+  const recordType = oneOf(value, "recordType", "", RECORD_TYPES);
   if (value.schemaVersion === DECISION_RECORD_SCHEMA_VERSION && recordType === "explicit") {
     throw new RoutingRecordError("schemaVersion", `is unsupported for ${recordType} records`);
   }
@@ -837,6 +861,42 @@ export function validateRoutingRecord(value: unknown): RoutingRecord {
     stringAt(value, "detail", "", { nonBlank: true });
     stringAt(value, "rung", "", { nonBlank: true });
     if (value.rung === refused.rung) throw new RoutingRecordError("rung", "must name a different rung than the refused attempt");
+  } else if (recordType === "effort-decision") {
+    if (value.schemaVersion !== DECISION_RECORD_SCHEMA_VERSION) throw new RoutingRecordError("schemaVersion", `is unsupported for ${recordType} records`);
+    checkKeys(value, "", [...COMMON_KEYS, "sessionId", "scope", "kind", "from", "to", "applyAt", "reason", "judgeModel", "band", "stage"], ["decisionTimestamp"]);
+    checkCommon(value);
+    stringAt(value, "sessionId", "", { nonBlank: true });
+    if (value.sessionId !== value.delegationId) throw new RoutingRecordError("sessionId", "must match delegationId");
+    oneOf(value, "scope", "", ["worker", "orchestrator"] as const);
+    oneOf(value, "kind", "", EFFORT_DECISION_KINDS);
+    oneOf(value, "from", "", EFFORT_LEVELS);
+    oneOf(value, "to", "", EFFORT_LEVELS);
+    oneOf(value, "applyAt", "", ["now", "turn-end", "none"] as const);
+    stringAt(value, "reason", "", { nonBlank: true });
+    const judgeModel = stringAt(value, "judgeModel", "", { nonBlank: true });
+    if (judgeModel !== "skipped" && judgeModel !== "fallback" && !judgeModel.includes("/")) {
+      throw new RoutingRecordError("judgeModel", "must name a judge rung, skipped or fallback");
+    }
+    const band = objectAt(value, "band", "");
+    checkKeys(band, "band", ["min", "max"]);
+    const min = oneOf(band, "min", "band", EFFORT_LEVELS);
+    const max = oneOf(band, "max", "band", EFFORT_LEVELS);
+    if (EFFORT_LEVELS.indexOf(min) > EFFORT_LEVELS.indexOf(max)) throw new RoutingRecordError("band", "min must not be above max");
+    if (judgeModel !== "skipped" && (EFFORT_LEVELS.indexOf(value.to as EffortLevel) < EFFORT_LEVELS.indexOf(min) ||
+      EFFORT_LEVELS.indexOf(value.to as EffortLevel) > EFFORT_LEVELS.indexOf(max))) {
+      throw new RoutingRecordError("to", "must be inside the effort band");
+    }
+    if (value.applyAt === "none" && value.from !== value.to) throw new RoutingRecordError("applyAt", "none requires the effort to stay unchanged");
+    const stage = oneOf(value, "stage", "", EFFORT_DECISION_STAGES);
+    if (stage === "applied") {
+      const decisionTimestamp = stringAt(value, "decisionTimestamp", "", { nonBlank: true });
+      if (Number.isNaN(Date.parse(decisionTimestamp))) throw new RoutingRecordError("decisionTimestamp", `must be an ISO-8601 time; got ${JSON.stringify(decisionTimestamp)}`);
+      if (value.applyAt !== "turn-end" || EFFORT_LEVELS.indexOf(value.to as EffortLevel) >= EFFORT_LEVELS.indexOf(value.from as EffortLevel)) {
+        throw new RoutingRecordError("stage", "applied requires a lower turn-end effort");
+      }
+    } else if (value.decisionTimestamp !== undefined) {
+      throw new RoutingRecordError("decisionTimestamp", "is only valid for an applied event");
+    }
   } else {
     checkKeys(value, "", [...COMMON_KEYS, "verdict"]);
     checkCommon(value);
@@ -1141,6 +1201,52 @@ export function writeDecisionRecord(dir: string, input: DecisionRecordInput): Wr
   return { path: appendRoutingRecord(dir, record), record };
 }
 
+export interface EffortDecisionRecordInput {
+  readonly sessionId: string;
+  readonly scope: EffortDecisionRecord["scope"];
+  readonly kind: EffortDecisionRecord["kind"];
+  readonly from: EffortLevel;
+  readonly to: EffortLevel;
+  readonly applyAt: EffortDecisionRecord["applyAt"];
+  readonly reason: string;
+  readonly judgeModel: EffortDecisionRecord["judgeModel"];
+  readonly band: EffortDecisionRecord["band"];
+  readonly stage?: EffortDecisionStage;
+  readonly decisionTimestamp?: string;
+  readonly at?: Date;
+}
+
+export function buildEffortDecisionRecord(input: EffortDecisionRecordInput): EffortDecisionRecord {
+  const record: EffortDecisionRecord = {
+    recordType: "effort-decision",
+    schemaVersion: DECISION_RECORD_SCHEMA_VERSION,
+    delegationId: input.sessionId,
+    sessionId: input.sessionId,
+    timestamp: (input.at ?? new Date()).toISOString(),
+    scope: input.scope,
+    kind: input.kind,
+    from: input.from,
+    to: input.to,
+    applyAt: input.applyAt,
+    reason: input.reason,
+    judgeModel: input.judgeModel,
+    band: { min: input.band.min, max: input.band.max },
+    stage: input.stage ?? "judged",
+    ...(input.decisionTimestamp === undefined ? {} : { decisionTimestamp: input.decisionTimestamp }),
+  };
+  return checkedRecord(record);
+}
+
+export interface WrittenEffortDecisionRecord {
+  readonly path: string;
+  readonly record: EffortDecisionRecord;
+}
+
+export function writeEffortDecisionRecord(dir: string, input: EffortDecisionRecordInput): WrittenEffortDecisionRecord {
+  const record = buildEffortDecisionRecord(input);
+  return { path: appendRoutingRecord(dir, record), record };
+}
+
 /** The two reads the record folder needs. Injected so a test can prove what
  *  was read. */
 export interface RecordFolderReader {
@@ -1223,6 +1329,8 @@ function parseRecordLines(file: string, text: string, firstLine: number): Parsed
       parsedLines.push({ file, line, text: lineText, error: new RoutingRecordError("(record)", `is not valid JSON (${(error as Error).message})`, location) });
       return;
     }
+    if (isObject(parsed) && typeof parsed.recordType === "string" && parsed.recordType.length > 0 &&
+      !RECORD_TYPES.includes(parsed.recordType as (typeof RECORD_TYPES)[number])) return;
     try {
       parsedLines.push(Object.freeze({ file, line, record: deepFreeze(validateRoutingRecord(parsed)) }));
     } catch (error) {

@@ -170,6 +170,8 @@ At the end of each orchestrator turn with delegations waiting, a notice names th
 
 When a run of an editing delegation ends, the orchestrator's copy of the extension writes its gate requirement into the routing record folder: the delegation id, the gate level in force at that moment and the gate action at it (`none`, `spot-check` or `reviewer`). A resume that edits again writes a fresh one, and the latest counts; a run that did not edit writes none, and a worker's own worker leaves it to the delegation its edits count for. The requirement is written when the worker ends, not at pi's `session_shutdown`, which also fires for a reload, a resume, a new session and a fork.
 
+### Routing report
+
 The routing report, `node src/routing/routing-report.ts <state dir>/routing`, counts per tier and rung, for each delegation once:
 
 - `accept` and `request_changes`: its latest verdict, unless that verdict rests on a same-rung review;
@@ -184,6 +186,16 @@ tier standard, rung anthropic/claude-sonnet-5:medium: decisions 3, accept 1, req
 unclassified decisions: 1
 unrouted delegations: accept 1, request_changes 0, same-rung accept 1, same-rung request_changes 0, ungated 1, missing 1
 classification 01a0f3c2-...: standard, model:anthropic/claude-haiku-4-5:off: a read-only investigation of one queue; it changes nothing
+```
+
+The report also summarizes effort decisions from the same routing folder. It gives totals for judged messages, short follow-ups skipped by the judge, judge fallbacks, and actual effort changes. The judged-message total excludes skipped follow-ups. It then lists each changed effort by worker delegation or orchestrator session, with its reason. A lower effort chosen for turn end is marked pending until an `applied` record confirms that the turn-end change happened. A short follow-up is counted as skipped, not as an effort change.
+
+For example:
+
+```text
+effort totals: judged messages 3, skipped (short follow-up) 1, fallbacks 1, changes 2
+effort worker 01a0f3c2-...: changes 1; high -> low (turn-end, applied): a simple lookup
+effort orchestrator 01a0f3c2-...: changes 1; medium -> high (now): a difficult multi-file regression
 ```
 
 A verdict is only ever `accept` or `request_changes`, recorded by the orchestrator with `subagents_verdict`. Verdicts are never read from a reviewer's structured output, and the pi-subagents `verdict-reviewer` agent is no longer shipped.
@@ -536,7 +548,7 @@ A rung names a model and an effort. There are three forms:
 
 A dynamic rung is allowed only on a model whose prompt cache survives an effort change. The model must be flagged `supportsMidConvoEffort` by pi and measured by the effort cache probe (`docs/research/effort-cache-probe.md`). On 2026-10-09 the probe measured `anthropic/claude-haiku-5-5`, `anthropic/claude-sonnet-5-5` and `anthropic/claude-opus-5-5`, and their cache was kept. A flag alone is not enough: `anthropic/claude-opus-5` is flagged but not measured. A dynamic rung on any other model is a load error that says why: "not cache-safe" when pi does not flag the model, "not measured" when the probe has not measured it. The load fails, so routing stays off for the session and the message names the key, as for any other bad rung.
 
-A dynamic rung starts at the top of its band and the effort judge chooses a level for the first task, retry feedback and each later steer or follow-up. Pi calls the virtual model with reason `user` for an incoming user message and `continuation` after tool results. The worker's message delivery mode distinguishes a steer from a follow-up. Continuations reuse the chosen effort. An increase applies immediately; a decrease during a running turn waits until that turn ends. A short follow-up (at most 12 characters and two words) keeps the current level. If the judge fails, the band maximum is used. The model stays pinned, and one-effort rungs do not use the judge. Shadow decisions and refused routes do not use it either. The initial routing decision's `ranOn` names the band maximum chosen before the judge; subsequent effort choices are available through `onEffortDecision` in `src/routing/effort-decisions.ts` for logging.
+A dynamic rung starts at the top of its band and the effort judge chooses a level for the first task, retry feedback and each later steer or follow-up. Pi calls the virtual model with reason `user` for an incoming user message and `continuation` after tool results. The worker's message delivery mode distinguishes a steer from a follow-up. Continuations reuse the chosen effort. An increase applies immediately; a decrease during a running turn waits until that turn ends. A short follow-up (at most 12 characters and two words) keeps the current level. If the judge fails, the band maximum is used. The model stays pinned, and one-effort rungs do not use the judge. Shadow decisions and refused routes do not use it either. The initial routing decision's `ranOn` names the band maximum chosen before the judge; each subsequent judgement is written as an `effort-decision` record and appears in the routing report. A deferred decrease gets an `applied` record only when the turn-end change takes effect.
 
 When `routing.sessionEffort` is set, the orchestrator judges each prompt on its selected physical model and changes the level through pi. Its judge sees the latest user message (first 400 characters) and the tail of the latest assistant reply (last 2,000 characters). A manual thinking-level selection stops dynamic effort for the rest of the session. Without the setting, the owner keeps full control. Pi 1.1.0 fixes the top-level effort for cache-safe Claude models and sends per-message effort messages; this extension never rewrites provider payloads. Wherever a rung is named as text, such as the tier map in a decision record, a drop or a removed rung, the text shows the band: `anthropic/claude-opus-5-5:medium-xhigh`. A rung with one effort shows that effort.
 
@@ -581,10 +593,14 @@ Runtime state lives in `${PI_CODING_AGENT_DIR:-~/.pi/agent}/pi-orchestrator/`, o
 | File | Contents | When absent |
 |------|----------|-------------|
 | `authorized-recipients.json` | Providers you approved as data recipients | No provider is approved, so every route refuses |
-| `routing/*.jsonl` | One decision record per classified worker session (delegation id), fork and agent-model records, effort-ladder links for retries, failover records (each linked to the refused attempt's decision by its time and rung, with the limit, the reset when stated and the rung the worker moved to, next to the decision for that rung), verdicts, and the edit records and gate requirements of editing delegations, one file per day | Created on the first record |
+| `routing/*.jsonl` | One decision record per classified worker session (delegation id), fork and agent-model records, effort-ladder links for retries, effort-decision records, failover records (each linked to the refused attempt's decision by its time and rung, with the limit, the reset when stated and the rung the worker moved to, next to the decision for that rung), verdicts, and the edit records and gate requirements of editing delegations, one file per day | Created on the first record |
 | `model-catalog.json` | Prices, context windows and usage headroom | Built from installed models and a pinned models.dev snapshot |
 | `refresh-state.json` | Throttling observations | No throttle |
 | `usage-observations.json` | The latest usage observation per provider: state, percentage left and reset time when known, when it was observed, and whether it came from an error or response headers. Shared by all sessions and projects; a write holds `usage-observations.json.lock` for a moment. A lock whose writer no longer runs, or older than 10 seconds, is broken, and temporary files that dead or hung writers left are removed on the next write | No limit known |
+
+### Decision records
+
+Routing, effort-ladder, verdict, edit, gate-requirement, failover and effort-decision records share append-only daily JSONL files in `routing/`. An effort-decision record stores the session id, scope (`worker` or `orchestrator`), incoming message kind, the judge's `from` and chosen `to` effort, when the change applies, its reason, judge model, and the effort band. The chosen effort comes from the judge decision, not a provider response. A lower effort deferred to turn end gets a second record with `stage: "applied"` only when the change actually takes effect; it links to the judgement by its timestamp. Unknown record kinds are skipped by readers, so a newer kind does not stop the routing report from reading records it understands.
 
 Decision records keep the first 200 characters of the task text, with credential-shaped text redacted. The redaction is best effort.
 

@@ -1,7 +1,7 @@
 import { VIRTUAL_MODEL_STATE_ENTRY, type ExtensionContext, type ModelRoute, type ModelRouteRequest } from "@earendil-works/pi-coding-agent";
 import { judgeEffort, type JudgeEffortOptions, type EffortJudgeKind } from "../routing/effort-judge.ts";
 import type { EffortBand } from "../routing/effort-rubric.ts";
-import { emitEffortDecision } from "../routing/effort-decisions.ts";
+import { emitEffortDecision, type EffortDecisionEvent } from "../routing/effort-decisions.ts";
 import { mkdirSync } from "node:fs";
 import { appendRoutingRecord, buildDecisionRecord, buildFailoverRecord } from "../routing/decision-record.ts";
 import type { TierClassification } from "../routing/tier-classifier.ts";
@@ -154,6 +154,7 @@ export interface AutoModelState {
   readonly failedOver: boolean;
   readonly band?: EffortBand;
   readonly pendingEffort?: ThinkingLevel;
+  readonly pendingEffortDecision?: EffortDecisionEvent;
 }
 
 export interface AutoModelDependencies {
@@ -602,10 +603,14 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
         try { decision = await judgeEffort(input, deps.effortJudge(registry)); }
         catch (error) { decision = { from: state.rung.effort, to: state.band.max, applyAt: "now" as const,
           reason: `effort judge fallback to band maximum: ${String(error)}`, judgeModel: "fallback" as const }; }
-        emitEffortDecision({ ...decision, sessionId, kind, scope: "worker" });
+        const effortDecision: EffortDecisionEvent = { ...decision, timestamp: deps.now().toISOString(), band: state.band,
+          sessionId, kind, scope: "worker", stage: "judged" };
+        emitEffortDecision(effortDecision);
         const effort = decision.applyAt === "now" ? decision.to : state.rung.effort;
         const next: AutoModelState = { ...state, rung: { ...state.rung, effort },
-          ...(decision.applyAt === "turn-end" ? { pendingEffort: decision.to } : { pendingEffort: undefined }) };
+          ...(decision.applyAt === "turn-end"
+            ? { pendingEffort: decision.to, pendingEffortDecision: effortDecision }
+            : { pendingEffort: undefined, pendingEffortDecision: undefined }) };
         return to(servedPinOf(next), next, pinKind);
       };
 
@@ -623,7 +628,10 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
 
       let state = storedPin(request.state);
       if (state && endedTurns.delete(sessionId) && state.pendingEffort !== undefined) {
-        state = { ...state, rung: { ...state.rung, effort: state.pendingEffort }, pendingEffort: undefined };
+        const pending = state.pendingEffortDecision;
+        if (pending !== undefined) emitEffortDecision({ ...pending, timestamp: deps.now().toISOString(),
+          stage: "applied", decisionTimestamp: pending.timestamp });
+        state = { ...state, rung: { ...state.rung, effort: state.pendingEffort }, pendingEffort: undefined, pendingEffortDecision: undefined };
       }
       // The worker runtime continued the session after a first-request limit
       // error pi does not retry. The request goes to a surviving rung on

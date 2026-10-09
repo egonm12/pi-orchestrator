@@ -23,6 +23,7 @@ import {
   buildGateRequirementRecord,
   NODE_RECORD_FOLDER_READER,
   writeDecisionRecord,
+  writeEffortDecisionRecord,
   type DecisionRecord,
   type DecisionRecordInput,
   type GateAction,
@@ -163,6 +164,35 @@ function expectedReport(folder: string): string {
     "",
   ].join("\n");
 }
+
+test("the report summarizes effort decisions by delegation and orchestrator, including deferred application", () => {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), "pi-harness-routing-report-effort-")));
+  const records = join(home, "routing");
+  const start = new Date("2026-10-09T09:00:00.000Z");
+  const later = (seconds: number) => new Date(start.getTime() + seconds * 1_000);
+  const band = { min: "low" as const, max: "high" as const };
+  const decision = (input: Parameters<typeof writeEffortDecisionRecord>[1]) => writeEffortDecisionRecord(records, input);
+  try {
+    decision({ at: start, sessionId: "worker-1", scope: "worker", kind: "task", from: "high", to: "medium", applyAt: "now",
+      reason: "simple task", judgeModel: "anthropic/claude-haiku-5-5:low", band });
+    decision({ at: later(1), sessionId: "worker-1", scope: "worker", kind: "follow-up", from: "medium", to: "medium", applyAt: "none",
+      reason: "short follow-up kept the current effort", judgeModel: "skipped", band });
+    const deferred = decision({ at: later(2), sessionId: "worker-1", scope: "worker", kind: "steer", from: "medium", to: "low", applyAt: "turn-end",
+      reason: "check a small detail", judgeModel: "anthropic/claude-haiku-5-5:low", band }).record;
+    decision({ at: later(3), sessionId: "worker-1", scope: "worker", kind: "steer", from: "medium", to: "low", applyAt: "turn-end",
+      reason: "check a small detail", judgeModel: "anthropic/claude-haiku-5-5:low", band, stage: "applied", decisionTimestamp: deferred.timestamp });
+    decision({ at: later(4), sessionId: "owner-1", scope: "orchestrator", kind: "user-prompt", from: "low", to: "high", applyAt: "now",
+      reason: "effort judge fallback to band maximum: offline", judgeModel: "fallback", band });
+    decision({ at: later(5), sessionId: "worker-2", scope: "worker", kind: "task", from: "low", to: "low", applyAt: "none",
+      reason: "current effort is enough", judgeModel: "anthropic/claude-haiku-5-5:low", band });
+
+    const output = renderRoutingReport(records, buildRoutingReport(records));
+    assert.ok(output.includes("effort totals: judged messages 4, skipped (short follow-up) 1, fallbacks 1, changes 3"), output);
+    assert.ok(output.includes("effort worker worker-1: changes 2; high -> medium (now): simple task; medium -> low (turn-end, applied): check a small detail"), output);
+    assert.ok(output.includes("effort orchestrator owner-1: changes 1; low -> high (now): effort judge fallback to band maximum: offline"), output);
+    assert.ok(output.includes("effort worker worker-2: changes 0"), output);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
 
 test("the report on a folder of known records prints decisions, verdicts by kind, same-rung verdicts, ungated, missing, orphans and shadow agreement per tier and rung", async () => {
   const known = await knownFolder();

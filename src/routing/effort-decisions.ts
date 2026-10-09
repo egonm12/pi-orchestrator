@@ -1,10 +1,15 @@
 import type { EffortJudgeDecision, EffortJudgeKind } from "./effort-judge.ts";
+import type { EffortBand } from "./effort-rubric.ts";
 
-/** An observation of a judged incoming message. Subscribers must not affect routing. */
+/** An observation of a judged incoming message or its deferred application. Subscribers must not affect routing. */
 export type EffortDecisionEvent = EffortJudgeDecision & {
+  readonly timestamp: string;
+  readonly band: EffortBand;
   readonly sessionId: string;
   readonly kind: EffortJudgeKind;
   readonly scope: "worker" | "orchestrator";
+  readonly stage: "judged" | "applied";
+  readonly decisionTimestamp?: string;
 };
 
 const KEY = Symbol.for("pi-orchestrator.effort-decisions.listeners");
