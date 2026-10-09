@@ -1,4 +1,7 @@
 import { VIRTUAL_MODEL_STATE_ENTRY, type ExtensionContext, type ModelRoute, type ModelRouteRequest } from "@earendil-works/pi-coding-agent";
+import { judgeEffort, type JudgeEffortOptions, type EffortJudgeKind } from "../routing/effort-judge.ts";
+import type { EffortBand } from "../routing/effort-rubric.ts";
+import { emitEffortDecision } from "../routing/effort-decisions.ts";
 import { mkdirSync } from "node:fs";
 import { appendRoutingRecord, buildDecisionRecord, buildFailoverRecord } from "../routing/decision-record.ts";
 import type { TierClassification } from "../routing/tier-classifier.ts";
@@ -55,9 +58,11 @@ const ROUTING_CONSTRAINTS = Symbol.for("pi-orchestrator.router.routing-constrain
 const FAILOVER_REQUESTS = Symbol.for("pi-orchestrator.router.failover-requests");
 const CARRIED_CLASSIFICATIONS = Symbol.for("pi-orchestrator.router.carried-classifications");
 const PENDING_TASKS = Symbol.for("pi-orchestrator.router.pending-tasks");
+const INCOMING_MESSAGES = Symbol.for("pi-orchestrator.router.incoming-messages");
 type Pin = { readonly model: string; readonly effort: ThinkingLevel };
 type ProcessGlobal = typeof globalThis & { [ROUTING_CONSTRAINTS]?: Map<string, RoutingConstraints>; [FAILOVER_REQUESTS]?: Map<string, FailedFirstRequest>;
-  [CARRIED_CLASSIFICATIONS]?: Map<string, TierClassification>; [PENDING_TASKS]?: Map<string, string> };
+  [CARRIED_CLASSIFICATIONS]?: Map<string, TierClassification>; [PENDING_TASKS]?: Map<string, string>;
+  [INCOMING_MESSAGES]?: Map<string, { text: string; mode: "steer" | "followUp" }[]> };
 
 // Constraints are set by the orchestrator's extension copy and read by the
 // worker's, so they are kept on the process's global object.
@@ -89,6 +94,15 @@ function pendingTasks(): Map<string, string> { return (globalThis as ProcessGlob
 export function setPendingTask(id: string, task: string): () => void {
   pendingTasks().set(id, task);
   return () => { if (pendingTasks().get(id) === task) pendingTasks().delete(id); };
+}
+
+function incomingMessages(): Map<string, { text: string; mode: "steer" | "followUp" }[]> {
+  return (globalThis as ProcessGlobal)[INCOMING_MESSAGES] ??= new Map();
+}
+
+/** Preserve the delivery mode pi's route reason `user` does not distinguish. */
+export function markIncomingWorkerMessage(id: string, text: string, mode: "steer" | "followUp"): void {
+  incomingMessages().set(id, [...(incomingMessages().get(id) ?? []), { text, mode }]);
 }
 
 const ACTIVE_AGENT = /<active_agent\s+name=["']([^"']+)["']/;
@@ -138,6 +152,8 @@ export interface AutoModelState {
   readonly escalatedFrom?: RiskTier;
   readonly decisionId?: string;
   readonly failedOver: boolean;
+  readonly band?: EffortBand;
+  readonly pendingEffort?: ThinkingLevel;
 }
 
 export interface AutoModelDependencies {
@@ -148,6 +164,7 @@ export interface AutoModelDependencies {
   readonly disable: (error: unknown) => void;
   /** Prints `message` once per process for `key`, leaving routing on. */
   readonly warn: (key: string, message: string) => void;
+  readonly effortJudge?: (registry: NonNullable<Registry>) => JudgeEffortOptions;
 }
 
 type Request = ModelRouteRequest<AutoModelState>;
@@ -325,6 +342,9 @@ function storedPin(state: unknown): AutoModelState | undefined {
   if (tier !== undefined && !isRiskTier(tier)) return undefined;
   if (escalatedFrom !== undefined && !isRiskTier(escalatedFrom)) return undefined;
   if (decisionId !== undefined && typeof decisionId !== "string") return undefined;
+  const { band, pendingEffort } = state as AutoModelState;
+  if (band !== undefined && (typeof band !== "object" || band === null || !isThinkingLevel(band.min) || !isThinkingLevel(band.max))) return undefined;
+  if (pendingEffort !== undefined && !isThinkingLevel(pendingEffort)) return undefined;
   return state as AutoModelState;
 }
 
@@ -333,8 +353,9 @@ function servedPinOf(state: AutoModelState): ServedPin {
   return { ...rung, ...(escalatedFrom !== undefined && tier !== undefined ? { escalation: { from: escalatedFrom, to: tier } } : {}) };
 }
 
-function stateOf(pin: ServedPin, extra: { tier?: RiskTier; decisionId?: string; failedOver: boolean }): AutoModelState {
-  return { rung: { model: pin.model, effort: pin.effort }, ...(extra.tier === undefined ? {} : { tier: extra.tier }),
+function stateOf(pin: ServedPin, extra: { tier?: RiskTier; decisionId?: string; failedOver: boolean; band?: EffortBand }): AutoModelState {
+  return { rung: { model: pin.model, effort: pin.effort }, ...(extra.band === undefined ? {} : { band: extra.band }),
+    ...(extra.tier === undefined ? {} : { tier: extra.tier }),
     ...(pin.escalation === undefined ? {} : { escalatedFrom: pin.escalation.from }),
     ...(extra.decisionId === undefined ? {} : { decisionId: extra.decisionId }), failedOver: extra.failedOver };
 }
@@ -382,6 +403,8 @@ export interface AutoModelRouter {
   classifyEarly(sessionId: string, agentRole: string): void;
   /** Drops session `sessionId`'s early classification, when its session ends unrouted. */
   dropEarlyClassification(sessionId: string): void;
+  /** Mark that the running turn ended, so a deferred lower effort can apply. */
+  turnEnded(sessionId: string): void;
 }
 
 /** A classification started before a worker's first request, with what it classifies. */
@@ -399,6 +422,7 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
   const routedProviders = new Map<string, string>();
   const failovers = new Map<string, FailoverContext>();
   const earlyClassifications = new Map<string, EarlyClassification>();
+  const endedTurns = new Set<string>();
 
   function physical(registry: Registry, pin: Pin) {
     const slash = pin.model.indexOf("/");
@@ -467,7 +491,7 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
         const live = router.mode === "live" && route.ok;
         // Only a new live choice can fail over: routing picked its rung.
         if (live) failovers.set(sessionId, { router, taskText, agentRole, classification, constraints });
-        return { pin, state: stateOf(pin, { ...(live ? { tier: route.tier } : {}), decisionId: decision.timestamp, failedOver: false }) };
+        return { pin, state: stateOf(pin, { ...(live ? { tier: route.tier, band: route.rung.band } : {}), decisionId: decision.timestamp, failedOver: false }) };
       } catch (error) {
         // An unavailable or banned session model is a refusal, not a router bug.
         if (error instanceof SessionModelError || error instanceof MissingRungError) throw error;
@@ -521,7 +545,7 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
         deps.disable(error);
         throw error;
       }
-      return { pin: next, state: stateOf(next, { tier: route.tier, decisionId: decision.timestamp, failedOver: true }) };
+      return { pin: next, state: stateOf(next, { tier: route.tier, band: route.rung.band, decisionId: decision.timestamp, failedOver: true }) };
     });
   }
 
@@ -538,7 +562,8 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
       classification.catch(() => undefined);
       earlyClassifications.set(sessionId, { router, taskText, agentRole, classification });
     },
-    dropEarlyClassification: (sessionId) => { earlyClassifications.delete(sessionId); },
+    dropEarlyClassification: (sessionId) => { earlyClassifications.delete(sessionId); incomingMessages().delete(sessionId); endedTurns.delete(sessionId); },
+    turnEnded: (sessionId) => { endedTurns.add(sessionId); },
     async route(request, ctx) {
       const started = performance.now();
       const sessionId = ctx.sessionManager?.getSessionId();
@@ -567,6 +592,23 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
         return { model, thinkingLevel: effort };
       };
 
+      const judged = async (state: AutoModelState, kind: EffortJudgeKind, message: string, turnRunning: boolean,
+        pinKind: "new" | "reused" = "reused"): Promise<Route> => {
+        if (!state.band || !deps.effortJudge) return to(servedPinOf(state), state, pinKind);
+        const input = { message, kind, tier: state.tier ?? "standard", band: state.band,
+          currentEffort: state.rung.effort, turnRunning,
+          ...(kind === "steer" || kind === "follow-up" ? { taskPrefix: firstTaskAndRole(messages).taskText.slice(0, 400) } : {}) } as const;
+        let decision;
+        try { decision = await judgeEffort(input, deps.effortJudge(registry)); }
+        catch (error) { decision = { from: state.rung.effort, to: state.band.max, applyAt: "now" as const,
+          reason: `effort judge fallback to band maximum: ${String(error)}`, judgeModel: "fallback" as const }; }
+        emitEffortDecision({ ...decision, sessionId, kind, scope: "worker" });
+        const effort = decision.applyAt === "now" ? decision.to : state.rung.effort;
+        const next: AutoModelState = { ...state, rung: { ...state.rung, effort },
+          ...(decision.applyAt === "turn-end" ? { pendingEffort: decision.to } : { pendingEffort: undefined }) };
+        return to(servedPinOf(next), next, pinKind);
+      };
+
       // A direct request (a compaction summary, an extension's streamSimple)
       // carries no state: it goes to the model that answered last, else to
       // the pin the branch stores. With neither it routes as a first request,
@@ -579,7 +621,10 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
         return to(first.pin, undefined, "new", false);
       }
 
-      const state = storedPin(request.state);
+      let state = storedPin(request.state);
+      if (state && endedTurns.delete(sessionId) && state.pendingEffort !== undefined) {
+        state = { ...state, rung: { ...state.rung, effort: state.pendingEffort }, pendingEffort: undefined };
+      }
       // The worker runtime continued the session after a first-request limit
       // error pi does not retry. The request goes to a surviving rung on
       // another provider, or nowhere: resending it to the pin's provider
@@ -588,7 +633,7 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
       if (requested !== undefined) {
         const next = state === undefined || requested.model !== state.rung.model ? undefined
           : await failOver(sessionId, state, request, { errorText: requested.errorMessage, producedOutput: false }, registry);
-        if (next) return to(next.pin, next.state, "new");
+        if (next) return next.state?.band ? judged(next.state, "task", firstTaskAndRole(messages).taskText, false, "new") : to(next.pin, next.state, "new");
         throw new Error(`no other provider's rung is left to fail over to: ${requested.errorMessage}`);
       }
       if (state) {
@@ -596,17 +641,28 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
           const failed = request.failed.message;
           const next = await failOver(sessionId, state, request, { errorText: failed.errorMessage,
             producedOutput: producedOutput(failed as { content?: readonly Part[] }) }, registry);
-          if (next) return to(next.pin, next.state, "new");
+          if (next) return next.state?.band ? judged(next.state, "task", firstTaskAndRole(messages).taskText, false, "new") : to(next.pin, next.state, "new");
           return back(request.failed, state.rung.effort);
         }
         // A worker that answered once can no longer fail over.
         if (request.previous !== undefined) failovers.delete(sessionId);
-        return to(servedPinOf(state), request.state, "reused");
+        if (request.reason === "user" && state.band) {
+          const latest = [...messages].reverse().find((message) => message.role === "user");
+          const message = contentText(latest?.content);
+          const queue = incomingMessages().get(sessionId) ?? [];
+          const found = queue.findIndex((item) => item.text === message);
+          const mode = found < 0 ? undefined : queue.splice(found, 1)[0]?.mode;
+          if (queue.length === 0) incomingMessages().delete(sessionId);
+          const kind = mode === "steer" ? "steer" : "follow-up";
+          return judged(state, kind, message, mode === "steer");
+        }
+        return to(servedPinOf(state), state, "reused");
       }
       // pi retries a failed request that has no pin stored on the model it failed on.
       if (request.reason === "retry" && request.failed) return back(request.failed, request.thinkingLevel);
       const first = await firstRoute(sessionId, messages, registry);
-      return to(first.pin, first.state, "new");
+      return first.state?.band ? judged(first.state, carriedClassifications().has(sessionId) ? "retry-feedback" : "task",
+        firstTaskAndRole(messages).taskText, false, "new") : to(first.pin, first.state, "new");
     },
   };
 }

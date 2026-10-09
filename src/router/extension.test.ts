@@ -24,9 +24,10 @@ import { SettingsManager, type ExtensionAPI } from "@earendil-works/pi-coding-ag
 import type { TestContext as ExtensionContext } from "../fixtures/extension-context.ts";
 import type { SessionModelRegistry } from "../routing/model-stream.ts";
 import { createRouterExtension, type RouterDependencies, type RoutingEvidence } from "./extension.ts";
-import { requestFailover, setCarriedClassification, setPendingTask, setRoutingConstraints } from "./auto-model.ts";
+import { markIncomingWorkerMessage, requestFailover, setCarriedClassification, setPendingTask, setRoutingConstraints } from "./auto-model.ts";
 import { readUsageObservations, recordUsageObservation, usageObservationsPath, type UsageObservation } from "./usage-observations.ts";
 import { useOwnerBanLists } from "../fixtures/owner-ban-lists.ts";
+import { onEffortDecision } from "../routing/effort-decisions.ts";
 
 type VirtualModel = Parameters<ExtensionAPI["registerVirtualModel"]>[0];
 type RouteRequest = Parameters<VirtualModel["route"]>[0];
@@ -353,7 +354,7 @@ test("text another extension appends after the delegated prompt does not reach t
   } finally { h.cleanup(); }
 });
 
-test("on a pi host without registerVirtualModel the router extension fails to load with an error naming pi v0.99", () => {
+test("on a pi host without registerVirtualModel the router extension fails to load with an error naming pi v1.1.0", () => {
   const registered: string[] = [];
   const handlers = piHandlers();
   assert.throws(() => createRouterExtension()({
@@ -361,7 +362,7 @@ test("on a pi host without registerVirtualModel the router extension fails to lo
     on(event: string, handler: Handler) { handlers.on(event, handler); },
   } as unknown as ExtensionAPI), (error: unknown) => {
     assert.ok(error instanceof Error);
-    assert.match(error.message, /requires pi v0\.99 or later/);
+    assert.match(error.message, /requires pi v1\.1\.0 or later/);
     assert.match(error.message, /registerVirtualModel/);
     return true;
   });
@@ -1158,6 +1159,127 @@ test("a startup routing failure still routes the auto model to the session model
     assert.match(stderr, /pi-orchestrator router disabled: classifier rung/);
     assert.equal(routed?.rung, `${HAIKU}:medium`);
     assert.deepEqual(h.records(), []);
+  } finally { h.cleanup(); }
+});
+
+test("a dynamic worker rung judges its first task and keeps the model pinned", async () => {
+  const h = harness({ ...LIVE, tiers: { ...TEST_TIERS, mechanical: ["anthropic/claude-opus-5-5:low-high"] } });
+  try {
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]), {
+      effortJudgeCall: () => async () => JSON.stringify({ effort: "low", why: "simple task" }),
+    });
+    const first = await firstRequest(auto, FIX_README, "band-worker");
+    assert.equal(first.rung, "anthropic/claude-opus-5-5:low");
+    assert.deepEqual((first.state as { band?: unknown }).band, { min: "low", max: "high" });
+  } finally { h.cleanup(); }
+});
+
+test("a dynamic worker judges a steer, defers a decrease, and reuses effort for continuations", async () => {
+  const h = harness({ ...LIVE, tiers: { ...TEST_TIERS, mechanical: ["anthropic/claude-opus-5-5:low-high"] } });
+  try {
+    const answers = ["high", "low"];
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]), {
+      effortJudgeCall: () => async () => JSON.stringify({ effort: answers.shift() ?? "low", why: "chosen" }),
+    });
+    const first = await auto.route("band-steer", FIX_README);
+    assert.equal(first.thinkingLevel, "high");
+    const continuation = await auto.route("band-steer", FIX_README, { reason: "continuation", state: first.state });
+    assert.equal(continuation.thinkingLevel, "high");
+    const message = "Check one typo";
+    markIncomingWorkerMessage("band-steer", message, "steer");
+    const messages = [...FIX_README, { role: "assistant", content: [{ type: "text", text: "Working" }] }, { role: "user", content: message }];
+    const steer = await auto.route("band-steer", messages, { reason: "user", state: continuation.state });
+    assert.equal(steer.thinkingLevel, "high");
+    assert.equal((steer.state as { pendingEffort?: string }).pendingEffort, "low");
+    const withinTurn = await auto.route("band-steer", messages, { reason: "continuation", state: steer.state });
+    assert.equal(withinTurn.thinkingLevel, "high");
+    await auto.handlers.get("turn_end")?.({ type: "turn_end" }, workerContext(h, "band-steer", fakeSessionRegistry([])));
+    const after = await auto.route("band-steer", messages, { reason: "continuation", state: withinTurn.state });
+    assert.equal(after.thinkingLevel, "low");
+  } finally { h.cleanup(); }
+});
+
+test("a worker follow-up is judged as a follow-up and a short one keeps its effort", async () => {
+  const h = harness({ ...LIVE, tiers: { ...TEST_TIERS, mechanical: ["anthropic/claude-opus-5-5:low-high"] } });
+  const events: unknown[] = [];
+  const unsubscribe = onEffortDecision((event) => events.push(event));
+  try {
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]), { effortJudgeCall: () => async () => JSON.stringify({ effort: "low", why: "easy" }) });
+    const first = await auto.route("follow-up-worker", FIX_README);
+    markIncomingWorkerMessage("follow-up-worker", "yes", "followUp");
+    const follow = await auto.route("follow-up-worker", [...FIX_README, { role: "assistant", content: "Done" }, { role: "user", content: "yes" }],
+      { reason: "user", state: first.state });
+    assert.equal(follow.thinkingLevel, "low");
+    assert.deepEqual(events.map((event) => (event as { kind: string; judgeModel: string }).kind), ["task", "follow-up"]);
+    assert.equal((events[1] as { judgeModel: string }).judgeModel, "skipped");
+  } finally { unsubscribe(); h.cleanup(); }
+});
+
+test("a failed worker judge uses the band maximum and exposes its decision", async () => {
+  const h = harness({ ...LIVE, tiers: { ...TEST_TIERS, mechanical: ["anthropic/claude-opus-5-5:low-high"] },
+    effortJudge: { model: "anthropic/claude-opus-5-5:low", fallback: [] } });
+  const events: unknown[] = [];
+  const unsubscribe = onEffortDecision((event) => events.push(event));
+  try {
+    const auto = await loadAutoModel(h, fakeSessionRegistry([]), { effortJudgeCall: () => async () => { throw new Error("offline"); } });
+    const routed = await auto.route("failed-judge", FIX_README);
+    assert.equal(routed.thinkingLevel, "high");
+    assert.deepEqual(events, [{ sessionId: "failed-judge", scope: "worker", kind: "task", from: "high", to: "high",
+      applyAt: "none", reason: "effort judge fallback to band maximum: offline", judgeModel: "fallback" }]);
+  } finally { unsubscribe(); h.cleanup(); }
+});
+
+test("session effort judges an owner prompt and manual selection disables it", async () => {
+  const h = harness({ enabled: false, sessionEffort: "low-high" });
+  try {
+    const handlers = piHandlers();
+    let level = "high";
+    let judged = "low";
+    const selected: string[] = [];
+    const create = await isolatedRouterExtension();
+    create({ effortJudgeCall: () => async () => JSON.stringify({ effort: judged, why: "chosen" }) })({
+      registerVirtualModel() {},
+      on(event: string, handler: Handler) { handlers.on(event, handler); },
+      getThinkingLevel: () => level,
+      setThinkingLevel(next: string) { selected.push(next); level = next; },
+    } as unknown as ExtensionAPI);
+    const registry = fakeSessionRegistry([]);
+    const ctx = { cwd: h.projectDir, hasUI: false, model: registry.find("anthropic", "claude-opus-5-5"),
+      modelRegistry: registry, thinkingLevel: "high", sessionManager: { getSessionId: () => "owner", getBranch: () => [] } } as unknown as ExtensionContext;
+    await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
+    await handlers.get("before_agent_start")?.({ type: "before_agent_start", prompt: "Fix the typo in the documentation" }, ctx);
+    assert.deepEqual(selected, ["low"]);
+    await handlers.get("thinking_level_select")?.({ type: "thinking_level_select", level: "low", previousLevel: "high" }, ctx);
+    judged = "high";
+    await handlers.get("before_agent_start")?.({ type: "before_agent_start", prompt: "Fix a difficult multi-file regression" }, ctx);
+    assert.deepEqual(selected, ["low", "high"]);
+    await handlers.get("thinking_level_select")?.({ type: "thinking_level_select", level: "high", previousLevel: "low" }, ctx);
+    await handlers.get("thinking_level_select")?.({ type: "thinking_level_select", level: "medium", previousLevel: "high" }, ctx);
+    await handlers.get("before_agent_start")?.({ type: "before_agent_start", prompt: "Fix the typo again" }, ctx);
+    assert.deepEqual(selected, ["low", "high"]);
+  } finally { h.cleanup(); }
+});
+
+test("session effort leaves an unsafe model alone and warns once", async () => {
+  const h = harness({ enabled: false, sessionEffort: "low-high" });
+  try {
+    const handlers = piHandlers();
+    let calls = 0;
+    const create = await isolatedRouterExtension();
+    create({ effortJudgeCall: () => async () => { calls++; return JSON.stringify({ effort: "low", why: "easy" }); } })({
+      registerVirtualModel() {}, on(event: string, handler: Handler) { handlers.on(event, handler); },
+      getThinkingLevel: () => "high", setThinkingLevel() { assert.fail("unsafe model must not change level"); },
+    } as unknown as ExtensionAPI);
+    const registry = fakeSessionRegistry([]);
+    const ctx = { cwd: h.projectDir, hasUI: false, model: registry.find("anthropic", "claude-opus-5"),
+      modelRegistry: registry, thinkingLevel: "high", sessionManager: { getSessionId: () => "unsafe-owner", getBranch: () => [] } } as unknown as ExtensionContext;
+    const warning = await stderrOf(async () => {
+      await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
+      await handlers.get("before_agent_start")?.({ type: "before_agent_start", prompt: "Fix this multi-file regression" }, ctx);
+      await handlers.get("before_agent_start")?.({ type: "before_agent_start", prompt: "Fix another multi-file regression" }, ctx);
+    });
+    assert.equal(calls, 0);
+    assert.equal(warning.split("dynamic session effort is unavailable").length - 1, 1);
   } finally { h.cleanup(); }
 });
 

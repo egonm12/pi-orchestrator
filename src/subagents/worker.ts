@@ -9,7 +9,7 @@ import type { BackgroundMessageMode } from "./background.ts";
 import { REPORT_TOOL, reportExtension, type WorkerReports } from "./report.ts";
 import { SUBAGENTS_VERDICT_TOOL } from "./verdict.ts";
 import { missingResultSections, REPORTING_RULES, type ResultSection } from "./result-format.ts";
-import { AUTO_MODEL_ID, AUTO_PROVIDER, requestFailover, setCarriedClassification, setPendingTask, setRoutingConstraints } from "../router/auto-model.ts";
+import { AUTO_MODEL_ID, AUTO_PROVIDER, markIncomingWorkerMessage, requestFailover, setCarriedClassification, setPendingTask, setRoutingConstraints } from "../router/auto-model.ts";
 import { limitErrorObservation } from "../router/limit-errors.ts";
 import type { TierClassification } from "../routing/tier-classifier.ts";
 import type { RoutingConstraints } from "../routing/tier-router.ts";
@@ -436,7 +436,8 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
     if (setup.signal?.aborted) return { status: "aborted", sessionId, sessionFile: saved(), finalText: "" };
     unregisterMessage = setup.onMessageReady?.((text, mode) => {
       if (!session.isStreaming) throw new Error("subagents_message: the background worker is no longer running");
-      // pi 0.99 answers with a disposition (handled or queued); the caller needs none.
+      // Pi's route reason `user` does not distinguish steer from follow-up.
+      if (!setup.fork && !setup.namedModel && !setup.resume?.namedModel && !setup.resume?.fork) markIncomingWorkerMessage(sessionId, text, mode);
       return session[mode](text).then(() => undefined);
     });
     await session.prompt(setup.task);
