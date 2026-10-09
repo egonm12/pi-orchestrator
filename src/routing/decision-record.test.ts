@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import {
   FIXTURE_PROJECT_SETTINGS,
+  FIXTURE_TIERS,
   fixtureClassification,
   fixturePersonalSettings,
   fixtureRefusal,
@@ -41,6 +42,9 @@ import {
   type RoutingRecord,
 } from "./decision-record.ts";
 import { useOwnerBanLists } from "../fixtures/owner-ban-lists.ts";
+import { INSTALLED_MODEL_INFO } from "../fixtures/installed-model-info.ts";
+import { HARNESS_MODEL_SCOPE } from "../policy/model-resolution.ts";
+import { tierMapFromSettings } from "./tier-map.ts";
 
 useOwnerBanLists();
 
@@ -971,4 +975,58 @@ test("a day file is parsed once while its stat is unchanged, an appended tail pa
     readUsableRoutingRecords(dir, plain);
     assert.equal(reads.length, before + 2, "a reader without stat parses every time");
   } finally { cleanup(); }
+});
+
+// ---------------------------------------------------------------------------
+// Dynamic rungs (ADR 0018): the record names a band where the rung is named
+// ---------------------------------------------------------------------------
+
+test("a record names a dynamic rung by its band in the chosen rung and the tier map, and the effort it ran at", async () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    const personal = {
+      orchestrator: { subagentBanList: ["fable", "astra"], routing: { enabled: true, tiers: { ...FIXTURE_TIERS, elevated: ["anthropic/claude-opus-5-5:medium-xhigh", "openai-codex/gpt-6-sol:high"] } } },
+    };
+    const tierMap = fixtureTierMap(personal, {});
+    const route = fixtureRoute("elevated", tierMap, {}, { "openai-codex": 1, anthropic: 0 });
+    assert.ok(route.ok);
+    writeDecisionRecord(dir, await liveInput({
+      tierMap,
+      route,
+      ranOn: "anthropic/claude-opus-5-5:xhigh",
+      classification: await fixtureClassification(TASK, "elevated"),
+    }));
+    const [record] = readRoutingRecords(dir);
+    assert.ok(record?.recordType === "decision");
+    assert.deepEqual(record.route.outcome === "chosen" && record.route.rung, {
+      rung: "anthropic/claude-opus-5-5:medium-xhigh",
+      model: "anthropic/claude-opus-5-5",
+      effort: "xhigh",
+      origin: "personal",
+    });
+    assert.equal(record.ranOn, "anthropic/claude-opus-5-5:xhigh");
+    assert.equal(record.tierMap.tiers.elevated[0]?.rung, "anthropic/claude-opus-5-5:medium-xhigh");
+  } finally {
+    cleanup();
+  }
+});
+
+test("a record's drops name a banned dynamic rung by its band text", async () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    // Sonnet 5.5 is measured, so its band loads, then the ban list drops it.
+    const personal = {
+      orchestrator: { subagentBanList: ["fable", "astra", "sonnet-5-5"], routing: { enabled: true, tiers: { ...FIXTURE_TIERS, critical: ["anthropic/claude-sonnet-5-5:low-high", "openai-codex/gpt-6-sol:xhigh"] } } },
+    };
+    const tierMap = tierMapFromSettings(personal, {}, { installedModels: INSTALLED_MODEL_INFO, modelScope: HARNESS_MODEL_SCOPE });
+    assert.ok(tierMap);
+    writeDecisionRecord(dir, await liveInput({ tierMap, classification: await fixtureClassification(TASK, "elevated") }));
+    const [record] = readRoutingRecords(dir);
+    assert.ok(record?.recordType === "decision");
+    assert.deepEqual(record.tierMap.drops, [
+      { tier: "critical", rung: "anthropic/claude-sonnet-5-5:low-high", origin: "personal", reason: "subagent ban list" },
+    ]);
+  } finally {
+    cleanup();
+  }
 });

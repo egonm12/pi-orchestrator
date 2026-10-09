@@ -63,7 +63,7 @@ Running it again starts from your current values. Escape at any step keeps what 
 }
 ```
 
-Each rung is `provider/model:effort`. Add `sessionBanList` entries if the orchestrator itself must never run on some models. A project's `.pi/settings.json` may replace single tiers, and `orchestrator.subagents` keys when you allow project overrides; it can never change either ban list.
+Each rung is `provider/model:effort`. On a model whose cache survives an effort change, a rung may instead give a band, `provider/model:low-high`, or no effort at all; its effort then moves within the band (see [Tier map](docs/reference.md#tier-map)). Add `sessionBanList` entries if the orchestrator itself must never run on some models. A project's `.pi/settings.json` may replace single tiers, and `orchestrator.subagents` keys when you allow project overrides; it can never change either ban list.
 
 ### 3. Start a new session
 

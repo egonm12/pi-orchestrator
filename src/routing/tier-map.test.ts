@@ -323,10 +323,10 @@ const FAIL_CLOSED_CASES: ReadonlyArray<{ name: string; tiers: Record<string, unk
     says: /non-empty/,
   },
   {
-    name: "a rung without :effort",
+    name: "a rung with no effort on a model pi does not flag as cache-safe",
     tiers: { ...EXAMPLE_TIERS, elevated: ["openai-codex/gpt-6-sol:high", "anthropic/claude-sonnet-5"] },
     key: "orchestrator.routing.tiers.elevated[1]",
-    says: /no ':effort'/,
+    says: /is not cache-safe for effort changes/,
   },
   {
     name: "an effort outside pi's levels",
@@ -516,7 +516,7 @@ test("fails closed naming the key: malformed project tiers", () => {
   const cases: ReadonlyArray<{ tiers: Record<string, unknown>; expected: RegExp }> = [
     { tiers: { standard: [] }, expected: /project settings key 'orchestrator\.routing\.tiers\.standard'.*non-empty/ },
     { tiers: { standard: "anthropic/claude-sonnet-5:medium" }, expected: /project settings key 'orchestrator\.routing\.tiers\.standard'.*non-empty/ },
-    { tiers: { elevated: ["anthropic/claude-sonnet-5"] }, expected: /project settings key 'orchestrator\.routing\.tiers\.elevated\[0\]'.*no ':effort'/ },
+    { tiers: { elevated: ["anthropic/claude-sonnet-5"] }, expected: /project settings key 'orchestrator\.routing\.tiers\.elevated\[0\]'.*is not cache-safe for effort changes/ },
     { tiers: { elevated: ["anthropic/claude-sonnet-5:ultra"] }, expected: /project settings key 'orchestrator\.routing\.tiers\.elevated\[0\]'.*not one of pi's levels/ },
     { tiers: { mechanical: ["anthropic/claude-haiku-4-5:max"] }, expected: /project settings key 'orchestrator\.routing\.tiers\.mechanical\[0\]'.*does not support effort 'max'/ },
     { tiers: { mechanical: ["claude-haiku-4-5:low"] }, expected: /project settings key 'orchestrator\.routing\.tiers\.mechanical\[0\]'.*provider\/model/ },
@@ -568,4 +568,187 @@ test("the resolved map is a plain frozen value with per-rung origin and the full
     { tier: "critical", rung: "openai-codex/gpt-6-astra:high", origin: "project", reason: "subagent ban list" },
   ]);
   assert.deepEqual(map.ignoredProjectKeys, ["orchestrator.routing.tiers.experimental"]);
+});
+
+// ---------------------------------------------------------------------------
+// Dynamic rungs (ADR 0018): an effort band, or no effort, on a measured model
+// ---------------------------------------------------------------------------
+
+const OPUS_5_5 = "anthropic/claude-opus-5-5";
+
+/** Pi 1.1.0's registry entries for the two measured 5.5 models that the
+ *  installed snapshot does not list. Their maps and flags are as pi 1.1.0
+ *  ships them (`providers/data/anthropic.json`). */
+const HAIKU_5_5: ModelInfo = {
+  provider: "anthropic",
+  id: "claude-haiku-5-5",
+  fullId: "anthropic/claude-haiku-5-5",
+  reasoning: true,
+  thinkingLevelMap: { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" },
+  compat: { supportsMidConvoEffort: true },
+};
+const SONNET_5_5: ModelInfo = { ...HAIKU_5_5, id: "claude-sonnet-5-5", fullId: "anthropic/claude-sonnet-5-5" };
+const WITH_5_5_INSTALLED: TierMapInputs = { ...INPUTS, installedModels: [...INSTALLED_MODEL_INFO, HAIKU_5_5, SONNET_5_5] };
+
+test("a band rung on a measured model loads as a dynamic rung: both ends kept, effort at the top, text as written", () => {
+  const map = tierMapFromSettings(withPersonalTiers({ ...EXAMPLE_TIERS, elevated: [`${OPUS_5_5}:medium-xhigh`] }), undefined, INPUTS);
+  assert.deepEqual(map!.tiers.elevated, [
+    { rung: `${OPUS_5_5}:medium-xhigh`, model: OPUS_5_5, effort: "xhigh", band: { min: "medium", max: "xhigh" }, origin: "personal" },
+  ]);
+});
+
+test("a rung with no effort on a measured model takes its supported range below max as its band, so max is never implied", () => {
+  // Opus 5.5 supports low through max; the no-effort band stops below max.
+  const map = tierMapFromSettings(withPersonalTiers({ ...EXAMPLE_TIERS, elevated: [OPUS_5_5] }), undefined, INPUTS);
+  assert.deepEqual(map!.tiers.elevated, [
+    { rung: `${OPUS_5_5}:low-xhigh`, model: OPUS_5_5, effort: "xhigh", band: { min: "low", max: "xhigh" }, origin: "personal" },
+  ]);
+});
+
+test("a dynamic rung on a model pi does not flag is a load error naming the key and why: not cache-safe", () => {
+  for (const rung of ["anthropic/claude-sonnet-5", "anthropic/claude-sonnet-5:low-high", "openai-codex/gpt-6-sol:low-high"]) {
+    assert.throws(
+      () => tierMapFromSettings(withPersonalTiers({ ...EXAMPLE_TIERS, elevated: [rung] }), undefined, INPUTS),
+      /personal settings key 'orchestrator\.routing\.tiers\.elevated\[0\]'.*is not cache-safe for effort changes: pi does not flag it supportsMidConvoEffort/,
+      rung,
+    );
+  }
+});
+
+test("a dynamic rung on a flagged model the probe did not measure is a load error naming the key: not measured", () => {
+  for (const rung of ["anthropic/claude-opus-5", "anthropic/claude-opus-5:low-high"]) {
+    assert.throws(
+      () => tierMapFromSettings(withPersonalTiers({ ...EXAMPLE_TIERS, elevated: [rung] }), undefined, INPUTS),
+      /personal settings key 'orchestrator\.routing\.tiers\.elevated\[0\]'.*is not measured for effort changes/,
+      rung,
+    );
+  }
+});
+
+test("a band end the installed model does not support is a load error naming the key, the rung and the supported levels", () => {
+  assert.throws(
+    () => tierMapFromSettings(withPersonalTiers({ ...EXAMPLE_TIERS, critical: [`${OPUS_5_5}:off-high`] }), undefined, INPUTS),
+    /personal settings key 'orchestrator\.routing\.tiers\.critical\[0\]' gives the dynamic rung "anthropic\/claude-opus-5-5:off-high", but model 'anthropic\/claude-opus-5-5' does not support effort 'off' \(supported: low, medium, high, xhigh, max\)/,
+  );
+  assert.throws(
+    () => tierMapFromSettings(withPersonalTiers({ ...EXAMPLE_TIERS, critical: [`${OPUS_5_5}:high-minimal`] }), undefined, INPUTS),
+    /does not support effort 'minimal'/,
+  );
+});
+
+test("a band whose low end is above its high end is a load error naming the key and the rung", () => {
+  assert.throws(
+    () => tierMapFromSettings(withPersonalTiers({ ...EXAMPLE_TIERS, critical: [`${OPUS_5_5}:xhigh-medium`] }), undefined, INPUTS),
+    /personal settings key 'orchestrator\.routing\.tiers\.critical\[0\]' gives the dynamic rung "anthropic\/claude-opus-5-5:xhigh-medium", whose low end is above its high end; write low-high/,
+  );
+});
+
+test("a written band on a measured model that is not installed is dropped as not installed, like any rung", () => {
+  const personal = withPersonalTiers({ ...EXAMPLE_TIERS, mechanical: ["anthropic/claude-haiku-5-5:low-high", "openai-codex/gpt-6-luna:low"] });
+  const map = tierMapFromSettings(personal, undefined, INPUTS);
+  assert.deepEqual(rungsByTier(map).mechanical, personalRungs(["openai-codex/gpt-6-luna:low"]));
+  assert.deepEqual(map!.drops, [
+    { tier: "mechanical", rung: "anthropic/claude-haiku-5-5:low-high", origin: "personal", reason: "not installed" },
+  ]);
+});
+
+test("a rung with no effort whose model is not installed is a load error: its band cannot be worked out", () => {
+  assert.throws(
+    () => tierMapFromSettings(withPersonalTiers({ ...EXAMPLE_TIERS, mechanical: ["anthropic/claude-haiku-5-5"] }), undefined, INPUTS),
+    /personal settings key 'orchestrator\.routing\.tiers\.mechanical\[0\]' gives the dynamic rung "anthropic\/claude-haiku-5-5", which has no effort, but model 'anthropic\/claude-haiku-5-5' is not installed, so its band cannot be worked out/,
+  );
+});
+
+test("a dynamic rung on a model the probe did not measure is a load error whether or not the model is installed", () => {
+  assert.throws(
+    () => tierMapFromSettings(withPersonalTiers({ ...EXAMPLE_TIERS, mechanical: ["anthropic/claude-haiku-9:low-high"] }), undefined, INPUTS),
+    /personal settings key 'orchestrator\.routing\.tiers\.mechanical\[0\]' gives the dynamic rung "anthropic\/claude-haiku-9:low-high", but model 'anthropic\/claude-haiku-9' is not measured/,
+  );
+});
+
+test("a rung with no effort on a model whose only level is max is a load error: there is no band below max", () => {
+  // Every level below max is unsupported here, so the no-effort band is empty.
+  const onlyMax: ModelInfo = { ...INSTALLED_MODEL_INFO.find((model) => model.fullId === OPUS_5_5)!, thinkingLevelMap: { off: null, minimal: null, low: null, medium: null, high: null, xhigh: null, max: "max" } };
+  assert.throws(
+    () => tierMapFromSettings(withPersonalTiers({ ...EXAMPLE_TIERS, critical: [OPUS_5_5] }), undefined, { ...INPUTS, installedModels: [...INSTALLED_MODEL_INFO.filter((model) => model.fullId !== OPUS_5_5), onlyMax] }),
+    /personal settings key 'orchestrator\.routing\.tiers\.critical\[0\]' gives the dynamic rung "anthropic\/claude-opus-5-5", which has no effort, but model 'anthropic\/claude-opus-5-5' supports no effort below max, so it has no band; write provider\/model:effort/,
+  );
+});
+
+test("an explicit band may end at max, which only a listed band does", () => {
+  const map = tierMapFromSettings(withPersonalTiers({ ...EXAMPLE_TIERS, critical: [`${OPUS_5_5}:medium-max`] }), undefined, INPUTS);
+  assert.deepEqual(map!.tiers.critical[0], { rung: `${OPUS_5_5}:medium-max`, model: OPUS_5_5, effort: "max", band: { min: "medium", max: "max" }, origin: "personal" });
+});
+
+test("a band with equal ends is a dynamic rung whose one level is its effort", () => {
+  const map = tierMapFromSettings(withPersonalTiers({ ...EXAMPLE_TIERS, elevated: [`${OPUS_5_5}:high-high`] }), undefined, INPUTS);
+  assert.deepEqual(map!.tiers.elevated[0], { rung: `${OPUS_5_5}:high-high`, model: OPUS_5_5, effort: "high", band: { min: "high", max: "high" }, origin: "personal" });
+});
+
+test("a rung with no effort starts its band at off only where the model supports off", () => {
+  // A stand-in for a measured model whose map supports off: the band starts there.
+  const withOff: ModelInfo = { ...INSTALLED_MODEL_INFO.find((model) => model.fullId === OPUS_5_5)!, thinkingLevelMap: { off: "off", minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" } };
+  const map = tierMapFromSettings(withPersonalTiers({ ...EXAMPLE_TIERS, elevated: [OPUS_5_5] }), undefined, { ...INPUTS, installedModels: [...INSTALLED_MODEL_INFO.filter((model) => model.fullId !== OPUS_5_5), withOff] });
+  assert.deepEqual(map!.tiers.elevated[0], { rung: `${OPUS_5_5}:off-xhigh`, model: OPUS_5_5, effort: "xhigh", band: { min: "off", max: "xhigh" }, origin: "personal" });
+});
+
+test("a dynamic rung on a banned model is dropped with its band text, like any rung", () => {
+  const personal = { orchestrator: { subagentBanList: ["opus-5-5"], routing: { enabled: true, tiers: { ...EXAMPLE_TIERS, critical: [`${OPUS_5_5}:medium-xhigh`, "openai-codex/gpt-6-sol:xhigh"] } } } };
+  const map = tierMapFromSettings(personal, undefined, INPUTS);
+  assert.deepEqual(rungsByTier(map).critical, personalRungs(["openai-codex/gpt-6-sol:xhigh"]));
+  assert.deepEqual(map!.drops, [{ tier: "critical", rung: `${OPUS_5_5}:medium-xhigh`, origin: "personal", reason: "subagent ban list" }]);
+});
+
+test("the seeded Haiku 5.5 and Sonnet 5.5 take dynamic rungs, personal and project alike", () => {
+  const personal = withPersonalTiers({ ...EXAMPLE_TIERS, mechanical: ["anthropic/claude-haiku-5-5:low-high"] });
+  const project = projectTiers({ standard: ["anthropic/claude-sonnet-5-5"] });
+  const map = tierMapFromSettings(personal, project, WITH_5_5_INSTALLED);
+  assert.deepEqual(map!.tiers.mechanical[0], { rung: "anthropic/claude-haiku-5-5:low-high", model: "anthropic/claude-haiku-5-5", effort: "high", band: { min: "low", max: "high" }, origin: "personal" });
+  assert.deepEqual(map!.tiers.standard[0], { rung: "anthropic/claude-sonnet-5-5:low-xhigh", model: "anthropic/claude-sonnet-5-5", effort: "xhigh", band: { min: "low", max: "xhigh" }, origin: "project" });
+});
+
+test("a project override takes the same band syntax, and a bad project band names the project key", () => {
+  const map = tierMapFromSettings(examplePersonal(), projectTiers({ elevated: [`${OPUS_5_5}:medium-xhigh`] }), INPUTS);
+  assert.deepEqual(map!.tiers.elevated, [{ rung: `${OPUS_5_5}:medium-xhigh`, model: OPUS_5_5, effort: "xhigh", band: { min: "medium", max: "xhigh" }, origin: "project" }]);
+  assert.deepEqual(loadFromFiles(examplePersonal(), projectTiers({ elevated: [OPUS_5_5] })), tierMapFromSettings(examplePersonal(), projectTiers({ elevated: [OPUS_5_5] }), INPUTS));
+  assert.throws(
+    () => tierMapFromSettings(examplePersonal(), projectTiers({ critical: [`${OPUS_5_5}:xhigh-medium`] }), INPUTS),
+    /project settings key 'orchestrator\.routing\.tiers\.critical\[0\]' gives the dynamic rung/,
+  );
+  assert.throws(
+    () => tierMapFromSettings(examplePersonal(), projectTiers({ critical: ["anthropic/claude-opus-5:low-high"] }), INPUTS),
+    /project settings key 'orchestrator\.routing\.tiers\.critical\[0\]'.*is not measured/,
+  );
+});
+
+test("a dynamic rung is a plain frozen value: its band is frozen and survives a JSON round trip", () => {
+  const map = tierMapFromSettings(withPersonalTiers({ ...EXAMPLE_TIERS, elevated: [OPUS_5_5] }), undefined, INPUTS);
+  const rung = map!.tiers.elevated[0]!;
+  assert.ok(rung.band);
+  assert.equal(Object.isFrozen(rung), true);
+  assert.equal(Object.isFrozen(rung.band), true);
+  assert.deepEqual(JSON.parse(JSON.stringify(map)), map);
+});
+
+test("a written band keeps the owner's spelling of the model in its text, and the canonical id in model", () => {
+  const map = tierMapFromSettings(withPersonalTiers({ ...EXAMPLE_TIERS, elevated: ["ANTHROPIC/Claude-Opus-5-5:medium-xhigh"] }), undefined, INPUTS);
+  assert.equal(map!.tiers.elevated[0]!.rung, "ANTHROPIC/Claude-Opus-5-5:medium-xhigh");
+  assert.equal(map!.tiers.elevated[0]!.model, OPUS_5_5);
+});
+
+test("a band with more than two ends is a load error naming the rung, not a band with its extra end ignored", () => {
+  for (const effort of ["low-high-xhigh", "low-high-", "-high"]) {
+    assert.throws(
+      () => tierMapFromSettings(withPersonalTiers({ ...EXAMPLE_TIERS, critical: [`${OPUS_5_5}:${effort}`] }), undefined, INPUTS),
+      /personal settings key 'orchestrator\.routing\.tiers\.critical\[0\]' gives the dynamic rung "anthropic\/claude-opus-5-5:/,
+      effort,
+    );
+  }
+});
+
+test("a band end that is not one of pi's levels is a load error naming the key and the rung", () => {
+  assert.throws(
+    () => tierMapFromSettings(withPersonalTiers({ ...EXAMPLE_TIERS, critical: [`${OPUS_5_5}:low-ultra`] }), undefined, INPUTS),
+    /personal settings key 'orchestrator\.routing\.tiers\.critical\[0\]' gives the dynamic rung "anthropic\/claude-opus-5-5:low-ultra", but 'ultra' is not one of pi's levels/,
+  );
 });

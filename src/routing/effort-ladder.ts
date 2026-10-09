@@ -48,7 +48,9 @@ export function nextRungAfterFailure(input: EffortLadderInput): LadderDecision {
   const maxListed = RISK_TIERS.some((tier) => tierMap.tiers[tier].some((rung) => rung.model === failed.rung.model && rung.effort === "max"));
   if (next === "max" && !maxListed) skipped.push({ tier: failed.tier, rung: `${failed.rung.model}:max`, model: failed.rung.model, reason: MAX_NOT_LISTED, detail: "max requires an explicitly listed rung for this model in the resolved tier map" });
   if (next !== undefined && (next !== "max" || maxListed)) {
-    const rung: TierRung = { ...failed.rung, effort: next, rung: `${failed.rung.model}:${next}` };
+    // A generated rung has one effort, so it carries no band even when the failed rung was dynamic.
+    const { band: _band, ...base } = failed.rung;
+    const rung: TierRung = { ...base, effort: next, rung: `${failed.rung.model}:${next}` };
     const removal = failedHardFilter(rung, evidence);
     if (removal === undefined) return { ok: true, refused: false, step: "effort", rung, model: rung.model, survivors: [rung], startedAtTier: failed.tier, tier: failed.tier, tiersTried: [failed.tier], removed, skipped, allowanceApplied: evidence.allowance.describe };
     removed.push({ tier: failed.tier, rung: rung.rung, model: rung.model, ...removal });

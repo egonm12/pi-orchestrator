@@ -13,12 +13,19 @@ import type { ModelInfo } from "../models/model-info.ts";
 // print these fields, so ./installed-models.ts cannot carry them; ticket 27's
 // extension will pass pi's live registry instead of this snapshot.
 //
+// `compat.supportsMidConvoEffort` is pi-ai's flag for per-message effort. It is
+// set on the three models below as pi-ai 0.99.1 (the repo's pinned pi) and
+// pi-ai 1.1.0 ship them (`providers/data/anthropic.json`); the other entries
+// carry no flag in either.
+//
 // Examples the tier-map tests rely on:
 //   anthropic/claude-haiku-4-5  no map: off through xhigh, not max.
-//   anthropic/claude-opus-5     `off: null`: every level except off.
+//   anthropic/claude-opus-5     `off: null`: every level except off. Flagged, but
+//                               not measured by the cache probe.
+//   anthropic/claude-opus-5-5   flagged and measured: a dynamic rung may name it.
 export const INSTALLED_MODEL_INFO: readonly ModelInfo[] = [
   { provider: "anthropic", id: "claude-fable-5", fullId: "anthropic/claude-fable-5", reasoning: true, thinkingLevelMap: { off: null, xhigh: "xhigh", max: "max" } },
-  { provider: "anthropic", id: "claude-fable-5-1", fullId: "anthropic/claude-fable-5-1", reasoning: true, thinkingLevelMap: { off: null, xhigh: "xhigh", max: "max" } },
+  { provider: "anthropic", id: "claude-fable-5-1", fullId: "anthropic/claude-fable-5-1", reasoning: true, thinkingLevelMap: { off: null, xhigh: "xhigh", max: "max" }, compat: { supportsMidConvoEffort: true } },
   { provider: "anthropic", id: "claude-haiku-4-5", fullId: "anthropic/claude-haiku-4-5", reasoning: true },
   { provider: "anthropic", id: "claude-haiku-4-5-20251001", fullId: "anthropic/claude-haiku-4-5-20251001", reasoning: true },
   { provider: "anthropic", id: "claude-opus-4-5", fullId: "anthropic/claude-opus-4-5", reasoning: true },
@@ -26,8 +33,8 @@ export const INSTALLED_MODEL_INFO: readonly ModelInfo[] = [
   { provider: "anthropic", id: "claude-opus-4-6", fullId: "anthropic/claude-opus-4-6", reasoning: true, thinkingLevelMap: { max: "max" } },
   { provider: "anthropic", id: "claude-opus-4-7", fullId: "anthropic/claude-opus-4-7", reasoning: true, thinkingLevelMap: { xhigh: "xhigh", max: "max" } },
   { provider: "anthropic", id: "claude-opus-4-8", fullId: "anthropic/claude-opus-4-8", reasoning: true, thinkingLevelMap: { xhigh: "xhigh", max: "max" } },
-  { provider: "anthropic", id: "claude-opus-5", fullId: "anthropic/claude-opus-5", reasoning: true, thinkingLevelMap: { off: null, xhigh: "xhigh", max: "max" } },
-  { provider: "anthropic", id: "claude-opus-5-5", fullId: "anthropic/claude-opus-5-5", reasoning: true, thinkingLevelMap: { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" } },
+  { provider: "anthropic", id: "claude-opus-5", fullId: "anthropic/claude-opus-5", reasoning: true, thinkingLevelMap: { off: null, xhigh: "xhigh", max: "max" }, compat: { supportsMidConvoEffort: true } },
+  { provider: "anthropic", id: "claude-opus-5-5", fullId: "anthropic/claude-opus-5-5", reasoning: true, thinkingLevelMap: { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" }, compat: { supportsMidConvoEffort: true } },
   { provider: "anthropic", id: "claude-sonnet-4-5", fullId: "anthropic/claude-sonnet-4-5", reasoning: true },
   { provider: "anthropic", id: "claude-sonnet-4-5-20250929", fullId: "anthropic/claude-sonnet-4-5-20250929", reasoning: true },
   { provider: "anthropic", id: "claude-sonnet-4-6", fullId: "anthropic/claude-sonnet-4-6", reasoning: true, thinkingLevelMap: { max: "max" } },

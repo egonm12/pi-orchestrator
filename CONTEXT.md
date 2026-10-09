@@ -128,7 +128,7 @@ How much thinking a model is allowed per turn, as pi's levels off through max.
 _Avoid_: Reasoning effort, thinking budget
 
 **Effort band**:
-The range a dynamic rung's effort may move within, written `low-high`, both ends included. A rung with no effort has the model's full supported range as its band. Only a model whose effort can change without restarting the prompt cache, measured rather than taken from documentation, may have a dynamic rung.
+The range a dynamic rung's effort may move within, written `low-high`, both ends included. A rung with no effort has the model's supported range below max as its band; max is only ever reached by listing it. Only a model whose effort can change without restarting the prompt cache, measured rather than taken from documentation, may have a dynamic rung.
 
 **Dynamic effort**:
 Choosing a dynamic rung's effort anew for each turn, inside its effort band, while the model stays pinned. Applies to workers and the orchestrator alike. A rung with one effort keeps that effort pinned.

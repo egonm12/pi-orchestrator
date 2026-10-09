@@ -520,9 +520,21 @@ pi-orchestrator settings live under the `orchestrator` key in personal settings,
 | `routing.enabled` | `true` switches routing on. Absent or `false`: a worker on the auto model runs on the orchestrator's session model without a decision record |
 | `routing.mode` | `shadow` (the default) records a shadow decision while the worker runs on the orchestrator's session model. `live` runs the worker on the chosen rung |
 | `routing.classifier` | The model that classifies each task, with its timeout and fallbacks. Every rung must name an installed model. When none of them answers, the task is unclassified and runs as elevated |
-| `routing.tiers` | Four tiers, each a list of `provider/model:effort` rungs, or an object with `rungs` and optional `order`: `balanced` (default) or `ordered`. A project tier replaces the personal tier, including its order |
+| `routing.tiers` | Four tiers, each a list of rungs (see [Tier map](#tier-map)), or an object with `rungs` and optional `order`: `balanced` (default) or `ordered`. A project tier replaces the personal tier, including its order |
 
 A project's `.pi/settings.json` may replace individual tiers under `orchestrator.routing.tiers`, and, when personal settings switch `orchestrator.subagents.allowProjectOverrides` on, `orchestrator.subagents` keys; nothing else. A project cannot change either ban list. The guard logs each ignored key once.
+
+### Tier map
+
+A rung names a model and an effort. There are three forms:
+
+- `provider/model:effort`, such as `anthropic/claude-opus-5:high`: one effort, pinned for the whole delegation.
+- `provider/model:low-high`, such as `anthropic/claude-opus-5-5:medium-xhigh`: a dynamic rung. Its effort may move within the band, both ends included. Both ends must be levels the model supports, and `low` must not be above `high` in pi's order (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`).
+- `provider/model`, such as `anthropic/claude-opus-5-5`: a dynamic rung over the model's supported levels below `max`, so Opus 5.5 gets `low-xhigh`. `max` is never implied. It needs an explicit rung, `:max` or a band that ends at `max`.
+
+A dynamic rung is allowed only on a model whose prompt cache survives an effort change. The model must be flagged `supportsMidConvoEffort` by pi and measured by the effort cache probe (`docs/research/effort-cache-probe.md`). On 2026-10-09 the probe measured `anthropic/claude-haiku-5-5`, `anthropic/claude-sonnet-5-5` and `anthropic/claude-opus-5-5`, and their cache was kept. A flag alone is not enough: `anthropic/claude-opus-5` is flagged but not measured. A dynamic rung on any other model is a load error that says why: "not cache-safe" when pi does not flag the model, "not measured" when the probe has not measured it. The load fails, so routing stays off for the session and the message names the key, as for any other bad rung.
+
+Until the effort judge exists, a dynamic rung runs at the top of its band: `anthropic/claude-opus-5-5:medium-xhigh` runs at `xhigh`. The worker's pin, the effort ladder and a decision record's `ranOn` use that effort. Wherever a rung is named as text, such as the tier map in a decision record, a drop or a removed rung, the text shows the band: `anthropic/claude-opus-5-5:medium-xhigh`. A rung with one effort shows that effort.
 
 ### How routing decides
 

@@ -1161,6 +1161,23 @@ test("a startup routing failure still routes the auto model to the session model
   } finally { h.cleanup(); }
 });
 
+test("a dynamic rung on a model the effort probe did not measure disables routing at startup, naming the key", async () => {
+  const h = harness({ ...LIVE, tiers: { ...TEST_TIERS, elevated: ["anthropic/claude-opus-5:low-high"] } });
+  try {
+    let routed: Routed | undefined;
+    const stderr = await stderrOf(async () => {
+      const auto = await loadAutoModel(h, fakeSessionRegistry([]));
+      routed = await firstRequest(auto, [{ role: "user", content: "Fix README.md", timestamp: 0 }], "unmeasured-band-worker");
+    });
+    assert.match(
+      stderr,
+      /pi-orchestrator router disabled: tier map: personal settings key 'orchestrator\.routing\.tiers\.elevated\[0\]' gives the dynamic rung "anthropic\/claude-opus-5:low-high", but model 'anthropic\/claude-opus-5' is not measured/,
+    );
+    assert.equal(routed?.rung, `${HAIKU}:medium`);
+    assert.deepEqual(h.records(), []);
+  } finally { h.cleanup(); }
+});
+
 test("the auto model reads the agent role from system prompt sections and text parts", async () => {
   const h = harness(LIVE);
   try {

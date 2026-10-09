@@ -91,3 +91,13 @@ test("getSupportedThinkingLevels needs an explicit map entry for xhigh and max",
     ["off", "minimal", "low", "medium", "high"],
   );
 });
+
+test("toModelInfo keeps pi's supportsMidConvoEffort flag when it is a boolean, and nothing else of compat", () => {
+  const flagged = toModelInfo({ provider: "anthropic", id: "claude-opus-5-5", compat: { supportsMidConvoEffort: true, supportsStrictTools: true } });
+  assert.deepEqual(flagged.compat, { supportsMidConvoEffort: true });
+  assert.deepEqual(toModelInfo({ provider: "anthropic", id: "claude-opus-5", compat: { supportsMidConvoEffort: false } }).compat, { supportsMidConvoEffort: false });
+  assert.equal("compat" in toModelInfo({ provider: "anthropic", id: "claude-sonnet-5", compat: { forceAdaptiveThinking: true } }), false);
+  for (const compat of [undefined, null, "yes", { supportsMidConvoEffort: "true" }, { supportsMidConvoEffort: 1 }]) {
+    assert.equal("compat" in toModelInfo({ provider: "p", id: "m", compat }), false, `compat ${JSON.stringify(compat)} is not read`);
+  }
+});
