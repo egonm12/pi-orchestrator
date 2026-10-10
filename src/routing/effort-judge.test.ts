@@ -130,6 +130,18 @@ test("a short follow-up keeps the current effort without calling the judge", asy
   });
 });
 
+test("a short message containing ultrathink is judged, in any case", async () => {
+  for (const message of ["ultrathink", "UltraThink pls"]) {
+    let calls = 0;
+    const decision = await judgeEffort(judgeInput({ kind: "user-prompt", message, currentEffort: "low" }), {
+      chain: testChain,
+      callModel: async () => { calls += 1; return JSON.stringify({ effort: "high", why: "asked to think" }); },
+    });
+    assert.equal(calls, 1, message);
+    assert.equal(decision.to, "high", message);
+  }
+});
+
 test("a short user prompt or steer keeps the current effort, but a short task or retry feedback is judged", async () => {
   for (const kind of ["user-prompt", "steer"] as const) {
     const decision = await judgeEffort(judgeInput({ kind, message: "thanks", currentEffort: "high" }), {

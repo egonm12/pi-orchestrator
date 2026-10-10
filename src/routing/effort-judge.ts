@@ -243,6 +243,8 @@ function isShortFollowUp(input: EffortJudgeInput): boolean {
   // A short reply from the owner or the orchestrator ("yes", "thanks") keeps
   // the effort; a task or retry feedback is new work and is always judged.
   if (input.kind === "task" || input.kind === "retry-feedback") return false;
+  // "ultrathink" asks for more effort, however short the message.
+  if (/ultrathink/i.test(input.message)) return false;
   const trimmed = input.message.trim();
   const words = trimmed.length === 0 ? [] : trimmed.split(/\s+/);
   return trimmed.length <= 12 && words.length <= 2;
