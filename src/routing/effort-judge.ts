@@ -30,7 +30,7 @@ function classifierFallback(classifier: ClassifierConfig): readonly string[] {
 
 export const DEFAULT_EFFORT_JUDGE_CONFIG: EffortJudgeConfig = Object.freeze({
   model: DEFAULT_EFFORT_JUDGE_MODEL,
-  timeoutMs: 30_000,
+  timeoutMs: 8_000,
   fallback: classifierFallback(DEFAULT_CLASSIFIER_CONFIG),
 });
 
@@ -184,13 +184,49 @@ interface EffortAnswer {
   readonly why: string;
 }
 
-function checkEffortAnswer(text: string): EffortAnswer {
-  let value: unknown;
-  try {
-    value = JSON.parse(text);
-  } catch {
-    throw new Error("effort judge reply was not valid JSON");
+/** The index of the `}` closing the `{` at `start`, skipping braces inside JSON
+ *  strings, or -1 when it never closes. */
+function closingBrace(text: string, start: number): number {
+  let depth = 0;
+  let inString = false;
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index]!;
+    if (inString) {
+      if (char === "\\") index += 1;
+      else if (char === '"') inString = false;
+    } else if (char === '"') {
+      inString = true;
+    } else if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
   }
+  return -1;
+}
+
+/** The first balanced `{...}` in `text` that parses as JSON. Code fences and
+ *  prose around it are ignored; a balanced span that is not JSON, such as
+ *  `{this}` in prose, is skipped. `undefined` when no span parses. */
+function firstJsonValue(text: string): unknown {
+  let from = 0;
+  for (;;) {
+    const start = text.indexOf("{", from);
+    if (start < 0) return undefined;
+    const end = closingBrace(text, start);
+    if (end < 0) return undefined;
+    try {
+      return JSON.parse(text.slice(start, end + 1));
+    } catch {
+      from = start + 1;
+    }
+  }
+}
+
+function checkEffortAnswer(text: string): EffortAnswer {
+  const value = firstJsonValue(text);
+  if (value === undefined) throw new Error("effort judge reply was not valid JSON");
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new Error("effort judge reply must be a JSON object");
   }
@@ -245,6 +281,9 @@ function isShortFollowUp(input: EffortJudgeInput): boolean {
   if (input.kind === "task" || input.kind === "retry-feedback") return false;
   // "ultrathink" asks for more effort, however short the message.
   if (/ultrathink/i.test(input.message)) return false;
+  // A short owner prompt that answers a question ("yes" to "Should I archive
+  // them?") starts whatever the question asked, so it is judged.
+  if (input.kind === "user-prompt" && (input.lastAssistantReply ?? "").trim().endsWith("?")) return false;
   const trimmed = input.message.trim();
   const words = trimmed.length === 0 ? [] : trimmed.split(/\s+/);
   return trimmed.length <= 12 && words.length <= 2;

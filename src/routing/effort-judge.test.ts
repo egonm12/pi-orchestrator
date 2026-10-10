@@ -16,7 +16,7 @@ test("effort judge settings default the model and inherit the classifier chain a
   assert.deepEqual(effortJudgeConfigFromSettings({}), DEFAULT_EFFORT_JUDGE_CONFIG);
   assert.deepEqual(DEFAULT_EFFORT_JUDGE_CONFIG, {
     model: "anthropic/claude-haiku-5-5:low",
-    timeoutMs: 30_000,
+    timeoutMs: 8_000,
     fallback: ["openai-codex/gpt-6-luna:low"],
   });
 
@@ -87,6 +87,61 @@ test("effort judge settings validate the timeout and fallback list", () => {
 const LOW_HIGH = { min: "low", max: "high" } as const;
 const JUDGE_RUNG = "anthropic/claude-haiku-5-5:low";
 const testChain = { timeoutMs: 100, entries: [{ rung: JUDGE_RUNG }], refusals: [] } as const;
+
+test("a short owner reply after an assistant question is judged, and after a statement it keeps the effort", async () => {
+  for (const lastAssistantReply of ["Should I archive the old branches?", "Should I archive them?  \n"]) {
+    let calls = 0;
+    const decision = await judgeEffort(judgeInput({ kind: "user-prompt", message: "yes", currentEffort: "medium", lastAssistantReply }), {
+      chain: testChain,
+      callModel: async () => { calls += 1; return JSON.stringify({ effort: "low", why: "one small action" }); },
+    });
+    assert.equal(calls, 1, lastAssistantReply);
+    assert.equal(decision.judgeModel, JUDGE_RUNG, lastAssistantReply);
+  }
+  for (const lastAssistantReply of ["Done.", "Archived the old branches? No, I left them.", ""]) {
+    const decision = await judgeEffort(judgeInput({ kind: "user-prompt", message: "thanks", currentEffort: "medium", lastAssistantReply }), {
+      chain: testChain,
+      callModel: async () => { throw new Error("the judge must be skipped"); },
+    });
+    assert.equal(decision.judgeModel, "skipped", lastAssistantReply);
+  }
+});
+
+test("a short steer or follow-up after an assistant question keeps the effort", async () => {
+  for (const kind of ["steer", "follow-up"] as const) {
+    const decision = await judgeEffort(judgeInput({ kind, message: "yes", currentEffort: "medium", lastAssistantReply: "Should I continue?" }), {
+      chain: testChain,
+      callModel: async () => { throw new Error("the judge must be skipped"); },
+    });
+    assert.equal(decision.judgeModel, "skipped", kind);
+  }
+});
+
+test("the judge reads the first balanced JSON object, even inside a code fence or surrounded by prose", async () => {
+  const replies = [
+    'Here is my answer:\n```json\n{"effort":"medium","why":"Two files change."}\n```\nThanks.',
+    'I think {this} is it. {"effort":"medium","why":"Use {braces} and \\"quotes\\" in a reason."} Also {"effort":"high"}',
+  ];
+  for (const reply of replies) {
+    const decision = await judgeEffort(judgeInput(), { chain: testChain, callModel: async () => reply });
+    assert.equal(decision.to, "medium", reply);
+    assert.equal(decision.judgeModel, JUDGE_RUNG, reply);
+  }
+  const why = await judgeEffort(judgeInput(), {
+    chain: testChain,
+    callModel: async () => 'Answer: {"effort":"medium","why":"Use {braces} and \\"quotes\\" here."}',
+  });
+  assert.equal(why.reason, 'Use {braces} and "quotes" here.');
+});
+
+test("the tolerant parse still checks the schema of the object it finds", async () => {
+  const decision = await judgeEffort(judgeInput(), {
+    chain: testChain,
+    callModel: async () => 'Sure: {"effort":"medium"} and {"effort":"low","why":"later"}',
+  });
+  assert.equal(decision.judgeModel, "fallback");
+  assert.match(decision.reason, /non-empty why/);
+});
 
 function judgeInput(overrides: Partial<EffortJudgeInput> = {}): EffortJudgeInput {
   return {

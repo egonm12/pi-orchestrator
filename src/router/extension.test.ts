@@ -1231,6 +1231,24 @@ test("a slow effort judge does not hold another worker's routing choice", async 
   } finally { h.cleanup(); }
 });
 
+test("a worker whose effort judge falls back warns once per session, with the reason", async () => {
+  const h = harness(DYNAMIC_MECHANICAL);
+  try {
+    const registry = fakeSessionRegistry([]);
+    const auto = await loadAutoModel(h, registry, { effortJudgeCall: () => async () => { throw new Error("judge offline"); } });
+    await startWorkerSession(h, auto, "fallback-worker", registry);
+    await startWorkerSession(h, auto, "fallback-other", registry);
+    const stderr = await stderrOf(async () => {
+      await auto.worker("fallback-worker").user();
+      await judgeIncomingWorkerMessage("fallback-worker", "Check one typo", "steer", true);
+      await judgeIncomingWorkerMessage("fallback-worker", "Now redesign the whole module", "steer", true);
+      await auto.worker("fallback-other").user();
+    });
+    assert.equal(stderr.split("effort judge fallback to band maximum: judge offline").length - 1, 2, "one warning for each worker session");
+    assert.match(stderr, /pi-orchestrator router warning: .*fallback-worker.*effort judge fallback to band maximum: judge offline/);
+  } finally { h.cleanup(); }
+});
+
 const DYNAMIC_MECHANICAL = { ...LIVE, tiers: { ...TEST_TIERS, mechanical: ["anthropic/claude-opus-5-5:low-high"] } };
 
 test("a dynamic worker judges a steer when it is sent: a lower effort during a run is declined, a higher one applies from its request on", async () => {
@@ -1447,6 +1465,61 @@ test("a failed owner effort judge falls back to the band maximum once the messag
     const effortRecord = h.records().find((record) => record.recordType === "effort-decision");
     assert.equal(effortRecord?.judgeModel, "fallback");
     assert.equal(effortRecord?.reason, "effort judge fallback to band maximum: offline");
+  } finally { h.cleanup(); }
+});
+
+test("a short owner reply is judged when the assistant's last reply asked a question, and kept otherwise", async () => {
+  for (const [sessionId, reply, judged] of [["asked-owner", "Should I archive the old branches?", 1], ["stated-owner", "Archived the old branches.", 0]] as const) {
+    const h = harness({ enabled: false, sessionEffort: "low-high" });
+    try {
+      const handlers = piHandlers();
+      let judgeCalls = 0;
+      const create = await isolatedRouterExtension();
+      create({ effortJudgeCall: () => async () => { judgeCalls += 1; return JSON.stringify({ effort: "low", why: "one small action" }); } })({
+        registerVirtualModel() {},
+        on(event: string, handler: Handler) { handlers.on(event, handler); },
+        getThinkingLevel: () => "medium",
+        setThinkingLevel() {},
+      } as unknown as ExtensionAPI);
+      const registry = fakeSessionRegistry([]);
+      const branch = [{ type: "message", message: { role: "assistant", content: [{ type: "text", text: reply }] } }];
+      const ctx = { cwd: h.projectDir, hasUI: false, model: registry.find("anthropic", "claude-opus-5-5"),
+        modelRegistry: registry, thinkingLevel: "medium", sessionManager: { getSessionId: () => sessionId, getBranch: () => branch } } as unknown as ExtensionContext;
+      await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
+      await handlers.get("before_agent_start")?.({ type: "before_agent_start", prompt: "yes" }, ctx);
+      await handlers.get("message_end")?.({ type: "message_end", message: userMessage("yes") }, ctx);
+      assert.equal(judgeCalls, judged, reply);
+    } finally { h.cleanup(); }
+  }
+});
+
+test("an owner effort judge fallback notifies the owner once per session, with the reason", async () => {
+  const h = harness({ enabled: false, sessionEffort: "low-high" });
+  try {
+    const handlers = piHandlers();
+    let level = "low";
+    const create = await isolatedRouterExtension();
+    create({ effortJudgeCall: () => async () => { throw new Error("offline"); } })({
+      registerVirtualModel() {},
+      on(event: string, handler: Handler) { handlers.on(event, handler); },
+      getThinkingLevel: () => level,
+      setThinkingLevel(next: string) { level = next; },
+    } as unknown as ExtensionAPI);
+    const registry = fakeSessionRegistry([]);
+    const notices: { message: string; type?: string }[] = [];
+    const ctx = { cwd: h.projectDir, hasUI: true, ui: { notify(message: string, type?: string) { notices.push({ message, type }); } },
+      model: registry.find("anthropic", "claude-opus-5-5"), modelRegistry: registry, thinkingLevel: "low",
+      sessionManager: { getSessionId: () => "notified-owner", getBranch: () => [] } } as unknown as ExtensionContext;
+    await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
+    for (const prompt of ["Fix the typo in the documentation", "Also fix the readme"]) {
+      await handlers.get("before_agent_start")?.({ type: "before_agent_start", prompt }, ctx);
+      await handlers.get("message_end")?.({ type: "message_end", message: userMessage(prompt) }, ctx);
+    }
+    assert.equal(h.records().filter((record) => record.recordType === "effort-decision" && record.judgeModel === "fallback").length, 2);
+    const fallbacks = notices.filter((notice) => notice.message.includes("effort judge"));
+    assert.equal(fallbacks.length, 1, "the owner hears about the fallback once, not on every message");
+    assert.equal(fallbacks[0]!.type, "warning");
+    assert.match(fallbacks[0]!.message, /effort judge fallback to band maximum: offline/);
   } finally { h.cleanup(); }
 });
 

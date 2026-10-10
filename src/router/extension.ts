@@ -407,6 +407,8 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
       };
     });
 
+    /** Whether the owner has already been told that its judge fell back, this session. */
+    let fallbackNotified = false;
     /** Judges the pending owner prompt, once. Never throws: a failed judge
      *  applies the band maximum, and any other failure only warns. */
     const judgeOwnerPrompt = async (ctx: ExtensionContext) => {
@@ -425,6 +427,12 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
         } catch (error) {
           decision = { from: currentEffort, to: band.max, applyAt: "now" as const,
             reason: `effort judge fallback to band maximum: ${String(error)}`, judgeModel: "fallback" as const };
+        }
+        if (decision.judgeModel === "fallback" && !fallbackNotified) {
+          fallbackNotified = true;
+          const message = `pi-orchestrator: ${decision.reason}. The orchestrator runs at ${decision.to} for this message.`;
+          if (ctx.hasUI && ctx.ui) ctx.ui.notify(message, "warning");
+          else autoDeps.warn(`effort-judge-fallback:${sessionId}`, `orchestrator ${sessionId}: ${decision.reason}`);
         }
         emitEffortDecision({ ...decision, timestamp: deps.now().toISOString(), band, sessionId, kind: "user-prompt", scope: "orchestrator" });
         if (decision.applyAt === "now") selectEffort(decision.to);

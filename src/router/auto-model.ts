@@ -599,6 +599,8 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
       decision = { from: effort, to: band.max, applyAt: effort === band.max ? "none" : "now",
         reason: `effort judge fallback to band maximum: ${String(error)}`, judgeModel: "fallback" };
     }
+    // The owner hears once per worker session that its judge fell back, with the reason.
+    if (decision.judgeModel === "fallback") deps.warn(`effort-judge-fallback:${sessionId}`, `worker ${sessionId}: ${decision.reason}`);
     const timestamp = deps.now().toISOString();
     emitEffortDecision({ ...decision, timestamp, band, sessionId, kind, scope: "worker" });
     return { effort: decision.applyAt === "now" ? decision.to : effort, decisionId: timestamp };
