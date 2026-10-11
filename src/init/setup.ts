@@ -12,11 +12,12 @@ import {
   type RecipientAuthorization,
 } from "../recipients/authorization.ts";
 import { RISK_TIERS, type RiskTier } from "../routing/tiers.ts";
+import { THINKING_LEVELS, getSupportedThinkingLevels, type ModelInfo, type ThinkingLevel } from "../models/model-info.ts";
+import { dynamicRungRefusal } from "../models/effort-capability.ts";
 import { tierMapFromSettings } from "../routing/tier-map.ts";
 import { checkModelScope } from "../models/model-scope.ts";
-import { getSupportedThinkingLevels, type ModelInfo, type ThinkingLevel } from "../models/model-info.ts";
-import { isDynamicRung, modelIdFromRung } from "./rungs.ts";
 import { isAutoModel } from "../router/auto-model.ts";
+import { isDynamicRung, modelIdFromRung, thinkingLevelFromRung } from "./rungs.ts";
 
 // Fresh-install support: what is missing at session start, and the pieces
 // `/pi-orchestrator init` writes. The package ships no tier map, no ban list
@@ -75,10 +76,39 @@ export const TIER_EFFORT: Record<RiskTier, readonly ThinkingLevel[]> = {
   critical: ["xhigh", "high", "medium", "off"],
 };
 
+export const TIER_AUTO_EFFORT: Record<RiskTier, Readonly<{ min: ThinkingLevel; max: ThinkingLevel }>> = {
+  mechanical: { min: "low", max: "medium" },
+  standard: { min: "low", max: "high" },
+  elevated: { min: "medium", max: "high" },
+  critical: { min: "high", max: "xhigh" },
+};
+
+/** The automatic effort range for a cache-safe model, narrowed to its supported levels. */
+export function autoEffortBand(model: ModelInfo, tier: RiskTier): Readonly<{ min: ThinkingLevel; max: ThinkingLevel }> | undefined {
+  if (dynamicRungRefusal(model.fullId, model) !== undefined) return undefined;
+  const target = TIER_AUTO_EFFORT[tier];
+  const targetMin = THINKING_LEVELS.indexOf(target.min);
+  const targetMax = THINKING_LEVELS.indexOf(target.max);
+  const supported = getSupportedThinkingLevels(model).filter((level) => level !== "max");
+  const withinRange = supported.filter((level) => {
+    const index = THINKING_LEVELS.indexOf(level);
+    return index >= targetMin && index <= targetMax;
+  });
+  if (withinRange.length < 2) return undefined;
+  return { min: withinRange[0]!, max: withinRange.at(-1)! };
+}
+
+/** A fixed-effort starter rung, used for the classifier and when auto is unavailable. */
 export function starterRungFor(model: ModelInfo, tier: RiskTier): string {
   const supported = getSupportedThinkingLevels(model);
   const effort = TIER_EFFORT[tier].find((level) => supported.includes(level)) ?? supported[0] ?? "off";
   return `${model.fullId}:${effort}`;
+}
+
+/** A tier starter rung uses auto when the model supports the tier's useful range. */
+export function starterTierRungFor(model: ModelInfo, tier: RiskTier): string {
+  const band = autoEffortBand(model, tier);
+  return band ? `${model.fullId}:${band.min}-${band.max}` : starterRungFor(model, tier);
 }
 
 export interface StarterTierMap {
@@ -147,10 +177,10 @@ export function starterTierMap(installed: readonly ModelInfo[], banLists: BanLis
   const middle = Math.floor((sorted.length - 1) / 2);
   const top = pick(sorted.length - 2, 2).reverse();
   const tiers: Record<RiskTier, string[]> = {
-    mechanical: pick(0, 2).map((model) => starterRungFor(model, "mechanical")),
-    standard: pick(middle, 2).map((model) => starterRungFor(model, "standard")),
-    elevated: top.map((model) => starterRungFor(model, "elevated")),
-    critical: top.map((model) => starterRungFor(model, "critical")),
+    mechanical: pick(0, 2).map((model) => starterTierRungFor(model, "mechanical")),
+    standard: pick(middle, 2).map((model) => starterTierRungFor(model, "standard")),
+    elevated: top.map((model) => starterTierRungFor(model, "elevated")),
+    critical: top.map((model) => starterTierRungFor(model, "critical")),
   };
   return { tiers, classifier: starterRungFor(sorted[0]!, "mechanical"), skipped };
 }
@@ -183,6 +213,11 @@ export function currentClassifierRung(personal: unknown): string | undefined {
   return classifierModelIn(routingOf(personal));
 }
 
+export function currentSessionEffort(personal: unknown): string | undefined {
+  const value = routingOf(personal).sessionEffort;
+  return typeof value === "string" ? value : undefined;
+}
+
 function tierRungsFrom(value: unknown): string[] | undefined {
   if (Array.isArray(value)) return value.filter((entry): entry is string => typeof entry === "string");
   if (isPlainObject(value) && Array.isArray(value.rungs)) return value.rungs.filter((entry): entry is string => typeof entry === "string");
@@ -200,15 +235,61 @@ export function currentTierRungs(personal: unknown): Partial<Record<RiskTier, st
   return Object.keys(current).length > 0 ? current : undefined;
 }
 
+export function fixedEffortLevelAtDynamicTop(rung: string, model: ModelInfo): ThinkingLevel {
+  const supported = getSupportedThinkingLevels(model);
+  const top = thinkingLevelFromRung(rung, model);
+  if (top && supported.includes(top)) return top;
+  if (top) {
+    const ceiling = THINKING_LEVELS.indexOf(top);
+    const below = supported.filter((level) => THINKING_LEVELS.indexOf(level) <= ceiling);
+    if (below.length > 0) return below.at(-1)!;
+  }
+  return supported.at(-1) ?? "off";
+}
+
+function normalizeUnsafeDynamicTiers(
+  tiersValue: unknown,
+  installed: readonly ModelInfo[],
+): { tiers: unknown; notices: string[]; changed: boolean } {
+  if (!isPlainObject(tiersValue)) return { tiers: tiersValue, notices: [], changed: false };
+  const tiers = { ...tiersValue };
+  const notices: string[] = [];
+  for (const tier of RISK_TIERS) {
+    const original = tiers[tier];
+    const objectValue = isPlainObject(original) ? original : undefined;
+    const values = Array.isArray(original) ? original : objectValue?.rungs;
+    if (!Array.isArray(values) || !values.every((rung): rung is string => typeof rung === "string")) continue;
+    let changed = false;
+    const normalized = values.map((rung) => {
+      if (!isDynamicRung(rung)) return rung;
+      const modelId = modelIdFromRung(rung).toLowerCase();
+      const model = installed.find((candidate) => candidate.fullId.toLowerCase() === modelId);
+      if (!model || dynamicRungRefusal(model.fullId, model) === undefined) return rung;
+      const fixed = `${model.fullId}:${fixedEffortLevelAtDynamicTop(rung, model)}`;
+      notices.push(`pi-orchestrator: existing ${tier} rung ${rung} is no longer cache-safe for effort changes; using fixed effort ${fixed} instead.`);
+      changed = true;
+      return fixed;
+    });
+    if (changed) tiers[tier] = Array.isArray(original) ? normalized : { ...objectValue!, rungs: normalized };
+  }
+  return { tiers, notices, changed: notices.length > 0 };
+}
+
 export interface SettingsPlan {
   /** The settings after init; equal to the input when nothing changes. */
   readonly settings: Record<string, unknown>;
   readonly changes: readonly string[];
+  /** Informational notices, including dynamic rungs converted to fixed effort. */
+  readonly notices: readonly string[];
 }
 
 export interface PlanOptions {
   /** Replace an existing tier map with the picked map; the owner confirmed it. */
   readonly rebuildTiers?: boolean;
+  /** Set a personal session effort range, or remove it with `null`; undefined keeps it. */
+  readonly sessionEffort?: string | null;
+  /** Installed models are used to replace previously dynamic rungs that are no longer cache-safe. */
+  readonly installedModels?: readonly ModelInfo[];
 }
 
 function classifierModelIn(routing: Record<string, unknown>): string | undefined {
@@ -224,23 +305,12 @@ function setClassifierModel(routing: Record<string, unknown>, model: string, cha
   changes.push(`orchestrator.routing.classifier.model = ${model}`);
 }
 
-function pickedRungsPreservingDynamic(existing: unknown, picked: readonly string[]): string[] {
-  const dynamicByModel = new Map<string, string>();
-  for (const rung of tierRungsFrom(existing) ?? []) {
-    if (isDynamicRung(rung)) {
-      const model = modelIdFromRung(rung);
-      if (!dynamicByModel.has(model)) dynamicByModel.set(model, rung);
-    }
-  }
-  return picked.map((rung) => dynamicByModel.get(modelIdFromRung(rung)) ?? rung);
-}
-
 function withPickedTiersPreservingOrders(existing: unknown, picked: Record<RiskTier, string[]>): Record<RiskTier, string[] | { order?: unknown; rungs: string[] }> {
   const result = {} as Record<RiskTier, string[] | { order?: unknown; rungs: string[] }>;
   const current = isPlainObject(existing) ? existing : {};
   for (const tier of RISK_TIERS) {
     const value = current[tier];
-    const rungs = pickedRungsPreservingDynamic(value, picked[tier]);
+    const rungs = picked[tier];
     result[tier] = isPlainObject(value) && value.order !== undefined
       ? { order: value.order, rungs }
       : rungs;
@@ -249,7 +319,8 @@ function withPickedTiersPreservingOrders(existing: unknown, picked: Record<RiskT
 }
 
 /** Add what is missing and keep what is there: an existing tier map is
- *  replaced only with `rebuildTiers`. When rebuilding, the classifier is
+ *  replaced only with `rebuildTiers`, except for dynamic rungs that are no
+ *  longer cache-safe and must become fixed effort. When rebuilding, the classifier is
  *  replaced too because init just asked for it, with the existing classifier
  *  preselected by the UI when it is still eligible. The subagent ban list is
  *  the exception: init's picker starts from the current list, so the picked
@@ -258,8 +329,17 @@ function withPickedTiersPreservingOrders(existing: unknown, picked: Record<RiskT
  *  one keeps the mode and switch already set. */
 export function planSettings(personal: Record<string, unknown>, starter: StarterTierMap | undefined, subagentBanList: readonly string[], options: PlanOptions = {}): SettingsPlan {
   const changes: string[] = [];
+  const notices: string[] = [];
   const orchestrator = { ...orchestratorOf(personal) };
   const routing = { ...routingOf(personal) };
+  if (!options.rebuildTiers && routing.tiers !== undefined && options.installedModels) {
+    const normalized = normalizeUnsafeDynamicTiers(routing.tiers, options.installedModels);
+    if (normalized.changed) {
+      routing.tiers = normalized.tiers;
+      notices.push(...normalized.notices);
+      changes.push("orchestrator.routing.tiers (unsafe dynamic rungs converted to fixed effort)");
+    }
+  }
   if (routing.tiers !== undefined && starter && options.rebuildTiers) {
     routing.tiers = withPickedTiersPreservingOrders(routing.tiers, starter.tiers);
     changes.push("orchestrator.routing.tiers (rebuilt from picked models)");
@@ -281,10 +361,17 @@ export function planSettings(personal: Record<string, unknown>, starter: Starter
     orchestrator.sessionBanList = [];
     changes.push("orchestrator.sessionBanList = []");
   }
-  if (changes.length === 0) return { settings: personal, changes };
+  if (options.sessionEffort === null && Object.hasOwn(routing, "sessionEffort")) {
+    delete routing.sessionEffort;
+    changes.push("orchestrator.routing.sessionEffort removed");
+  } else if (typeof options.sessionEffort === "string" && routing.sessionEffort !== options.sessionEffort) {
+    routing.sessionEffort = options.sessionEffort;
+    changes.push(`orchestrator.routing.sessionEffort = ${options.sessionEffort}`);
+  }
+  if (changes.length === 0) return { settings: personal, changes, notices };
   orchestrator.routing = routing;
   if (Object.keys(routing).length === 0) delete orchestrator.routing;
-  return { settings: { ...personal, orchestrator }, changes };
+  return { settings: { ...personal, orchestrator }, changes, notices };
 }
 
 export function writePersonalSettings(path: string, settings: Record<string, unknown>): void {

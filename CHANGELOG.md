@@ -4,6 +4,10 @@ All notable changes to this package are listed here. The format follows [Keep a 
 
 ## [Unreleased]
 
+### Added
+
+- **Setup:** `/pi-orchestrator init` offers per-message effort for cache-safe tier models, supports custom ranges on rebuild, and configures session effort in personal settings.
+
 ## [0.3.0] - 2026-10-11
 
 ### Added

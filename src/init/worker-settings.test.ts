@@ -30,7 +30,7 @@ function scriptedUi(script: Answer[]) {
   const calls: Call[] = [];
   const answers = [...script];
   const next = (kind: string, title: string) => {
-    if (answers.length === 0 && kind === "select" && title === "Classifier model") return undefined;
+    if (answers.length === 0 && kind === "select" && (title === "Classifier model" || title.startsWith("Let the orchestrator adjust its own thinking level per message?"))) return undefined;
     if (answers.length === 0) throw new Error(`script ran out at ${kind}: ${title}`);
     return answers.shift();
   };

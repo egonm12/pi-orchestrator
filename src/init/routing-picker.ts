@@ -1,9 +1,10 @@
-import { getSupportedThinkingLevels, type ModelInfo, type ThinkingLevel } from "../models/model-info.ts";
+import { getSupportedThinkingLevels, THINKING_LEVELS, type ModelInfo, type ThinkingLevel } from "../models/model-info.ts";
+import { dynamicRungRefusal } from "../models/effort-capability.ts";
 import { RISK_TIERS, type RiskTier } from "../routing/tiers.ts";
 import { type PickerUi } from "./ban-list-picker.ts";
 import { canUseCustomCheckbox, checkboxSelect, checkboxSelectWithValues, type CheckboxRowValueConfig } from "./checkbox-select.ts";
-import { publishedOutputPrice, starterRungFor, type StarterTierMap } from "./setup.ts";
-import { modelIdFromRung, thinkingLevelFromRung } from "./rungs.ts";
+import { autoEffortBand, fixedEffortLevelAtDynamicTop, publishedOutputPrice, starterRungFor, type StarterTierMap } from "./setup.ts";
+import { isDynamicRung, modelIdFromRung, thinkingLevelFromRung } from "./rungs.ts";
 export { modelIdFromRung, thinkingLevelFromRung };
 
 // Interactive routing choices for `/pi-orchestrator init`. In the TUI, tier
@@ -25,6 +26,8 @@ export const CLASSIFIER_MODEL_HINT =
   "The classifier runs on every delegation. A small, fast model is usually enough; larger models add delay and cost to each delegation.";
 export const TIER_MODEL_USAGE_HINT = "More models give routing more choices when usage runs low.";
 export const THINKING_LEVEL_HINT = "Higher thinking levels are slower and costlier.";
+export const AUTO_EFFORT_HINT = "Saves cost on easy messages, thinks harder on hard ones. Same model, cache kept.";
+const AUTO_EFFORT_CHOICE = "auto";
 export const CLASSIFIER_THINKING_HINT =
   "The classifier runs on every delegation; higher thinking levels add delay and cost each time. Low effort is usually enough.";
 
@@ -60,10 +63,20 @@ function defaultTierRungs(defaults: RoutingPickerDefaults, tier: RiskTier): read
   return defaults.tiers?.[tier] ?? defaults.starter.tiers[tier] ?? [];
 }
 
-function tierDefaults(defaults: RoutingPickerDefaults, eligible: readonly ModelInfo[]): Record<RiskTier, string[]> {
+function normalizedTierRung(rung: string, tier: RiskTier, model: ModelInfo, ui?: PickerUi): string {
+  if (!isDynamicRung(rung) || dynamicRungRefusal(model.fullId, model) === undefined) return rung;
+  const fixed = `${model.fullId}:${fixedEffortLevelAtDynamicTop(rung, model)}`;
+  ui?.notify(`pi-orchestrator: existing ${tier} rung ${rung} is no longer cache-safe for effort changes; using fixed effort ${fixed} instead.`, "warning");
+  return fixed;
+}
+
+function tierDefaults(defaults: RoutingPickerDefaults, eligible: readonly ModelInfo[], ui?: PickerUi): Record<RiskTier, string[]> {
   const tiers = {} as Record<RiskTier, string[]>;
   for (const tier of RISK_TIERS) {
-    tiers[tier] = defaultTierRungs(defaults, tier).filter((rung) => modelByFullId(eligible, modelIdFromRung(rung)) !== undefined);
+    tiers[tier] = defaultTierRungs(defaults, tier).flatMap((rung) => {
+      const model = modelByFullId(eligible, modelIdFromRung(rung));
+      return model ? [normalizedTierRung(rung, tier, model, ui)] : [];
+    });
   }
   return tiers;
 }
@@ -130,6 +143,60 @@ export function defaultThinkingLevel(defaults: RoutingPickerDefaults, tier: Risk
   return starterThinkingLevel(defaults.starter, tier, model);
 }
 
+function writtenBand(rung: string, model: ModelInfo): Readonly<{ min: ThinkingLevel; max: ThinkingLevel }> | undefined {
+  const colon = rung.lastIndexOf(":");
+  if (colon === -1) {
+    if (rung !== model.fullId) return undefined;
+    const supported = getSupportedThinkingLevels(model).filter((level) => level !== "max");
+    const min = supported[0];
+    const max = supported.at(-1);
+    return min && max ? { min, max } : undefined;
+  }
+  const ends = rung.slice(colon + 1).split("-");
+  if (ends.length !== 2) return undefined;
+  const min = THINKING_LEVELS.find((level) => level === ends[0]);
+  const max = THINKING_LEVELS.find((level) => level === ends[1]);
+  return min && max ? { min, max } : undefined;
+}
+
+function customEffortChoice(band: Readonly<{ min: ThinkingLevel; max: ThinkingLevel }>): string {
+  return `custom (${band.min}-${band.max})`;
+}
+
+function tierEffortChoices(defaults: RoutingPickerDefaults, tier: RiskTier, model: ModelInfo): { choices: string[]; initial: string } {
+  const supported = getSupportedThinkingLevels(model);
+  const existing = defaultTierRungs(defaults, tier).find((rung) => modelIdFromRung(rung) === model.fullId);
+  const dynamic = existing !== undefined && isDynamicRung(existing);
+  const refusal = dynamic ? dynamicRungRefusal(model.fullId, model) : undefined;
+  const auto = autoEffortBand(model, tier);
+  const currentBand = dynamic && refusal === undefined ? writtenBand(existing!, model) : undefined;
+  const autoMatches = auto !== undefined && currentBand?.min === auto.min && currentBand.max === auto.max;
+  const custom = currentBand && !autoMatches ? customEffortChoice(currentBand) : undefined;
+  const choices = [
+    ...(custom ? [custom] : []),
+    ...(auto ? [AUTO_EFFORT_CHOICE] : []),
+    ...supported,
+  ];
+  const initial = dynamic
+    ? refusal === undefined
+      ? (autoMatches ? AUTO_EFFORT_CHOICE : custom ?? (auto ? AUTO_EFFORT_CHOICE : fixedEffortLevelAtDynamicTop(existing!, model)))
+      : fixedEffortLevelAtDynamicTop(existing!, model)
+    : existing
+      ? defaultThinkingLevel(defaults, tier, model)
+      : auto ? AUTO_EFFORT_CHOICE : defaultThinkingLevel(defaults, tier, model);
+  return { choices, initial };
+}
+
+function tierEffortRung(model: ModelInfo, tier: RiskTier, choice: string, defaults: RoutingPickerDefaults): string {
+  if (choice === AUTO_EFFORT_CHOICE) {
+    const band = autoEffortBand(model, tier);
+    if (band) return `${model.fullId}:${band.min}-${band.max}`;
+  }
+  const custom = /^custom \(([^)]+)\)$/.exec(choice)?.[1];
+  if (custom) return `${model.fullId}:${custom}`;
+  return `${model.fullId}:${choice || defaultThinkingLevel(defaults, tier, model)}`;
+}
+
 export function classifierDefault(defaults: RoutingPickerDefaults, eligible: readonly ModelInfo[]): string {
   const existing = defaults.classifier ? modelIdFromRung(defaults.classifier) : undefined;
   if (existing && modelByFullId(eligible, existing)) return existing;
@@ -158,23 +225,26 @@ async function askThinkingLevel(ui: PickerUi, title: string, model: ModelInfo, p
 }
 
 export function tierThinkingValueConfig(defaults: RoutingPickerDefaults, tier: RiskTier, eligible: readonly ModelInfo[]): CheckboxRowValueConfig {
-  const choices: Record<string, readonly ThinkingLevel[]> = {};
-  const initial: Record<string, ThinkingLevel> = {};
+  const choices: Record<string, readonly string[]> = {};
+  const initial: Record<string, string> = {};
   for (const model of eligible) {
     const label = modelOptionLabel(model);
-    choices[label] = getSupportedThinkingLevels(model);
-    initial[label] = defaultThinkingLevel(defaults, tier, model);
+    const config = tierEffortChoices(defaults, tier, model);
+    choices[label] = config.choices;
+    initial[label] = config.initial;
   }
   return { choices, initial };
 }
 
 async function pickTierModelIds(ui: PickerUi, tier: RiskTier, eligible: readonly ModelInfo[], defaultIds: readonly string[]): Promise<string[] | undefined> {
+  const hasAuto = eligible.some((model) => autoEffortBand(model, tier) !== undefined);
+  const hint = `${TIER_HINTS[tier]} ${TIER_MODEL_USAGE_HINT}${hasAuto ? `\n${AUTO_EFFORT_HINT}` : ""}`;
   const picked = await checkboxSelect(
     ui,
     `${tier} tier models`,
     modelDisplayOptions(eligible),
     defaultIds.map((id) => modelOptionLabel(modelByFullId(eligible, id)!)),
-    `${TIER_HINTS[tier]} ${TIER_MODEL_USAGE_HINT}`,
+    hint,
     { minSelected: 1 },
   );
   return picked?.map(modelIdFromOption);
@@ -187,7 +257,7 @@ async function pickTierRungsInline(ui: PickerUi, defaults: RoutingPickerDefaults
     modelDisplayOptions(eligible),
     defaultIds.map((id) => modelOptionLabel(modelByFullId(eligible, id)!)),
     tierThinkingValueConfig(defaults, tier, eligible),
-    `${TIER_HINTS[tier]} ${TIER_MODEL_USAGE_HINT} ${THINKING_LEVEL_HINT}`,
+    `${TIER_HINTS[tier]} ${TIER_MODEL_USAGE_HINT} ${THINKING_LEVEL_HINT}${eligible.some((model) => autoEffortBand(model, tier) !== undefined) ? `\n${AUTO_EFFORT_HINT}` : ""}`,
     { minSelected: 1 },
   );
   // Escape at a tier keeps that tier's current picks when they exist, else the
@@ -195,7 +265,8 @@ async function pickTierRungsInline(ui: PickerUi, defaults: RoutingPickerDefaults
   // is checked later; left and right do not auto-check rows.
   return picked?.selected.map((option) => {
     const modelId = modelIdFromOption(option);
-    return `${modelId}:${picked.values[option] ?? "off"}`;
+    const model = modelByFullId(eligible, modelId);
+    return model ? tierEffortRung(model, tier, picked.values[option] ?? "off", defaults) : `${modelId}:off`;
   });
 }
 
@@ -204,7 +275,7 @@ export async function pickRoutingMap(ui: PickerUi, eligible: readonly ModelInfo[
   warnUnavailableDefaults(ui, defaults, eligible);
   ui.notify(CLASSIFIER_MODEL_HINT);
   const classifierModelId = classifierDefault(defaults, eligible);
-  const defaultTiers = tierDefaults(defaults, eligible);
+  const defaultTiers = tierDefaults(defaults, eligible, ui);
   const classifierChoice = await ui.select("Classifier model", modelDisplayOptions(eligible, classifierModelId));
   // Escape at the classifier is the fastest safe escape hatch: keep the full
   // current routing map when one exists, otherwise the starter map.
@@ -241,8 +312,11 @@ export async function pickRoutingMap(ui: PickerUi, eligible: readonly ModelInfo[
     for (const modelId of picked) {
       const model = modelByFullId(eligible, modelId);
       if (!model) continue;
-      const level = await askThinkingLevel(ui, `Thinking level for ${tier} model ${model.fullId}. ${THINKING_LEVEL_HINT}`, model, defaultThinkingLevel(defaults, tier, model));
-      rungs.push(`${model.fullId}:${level}`);
+      const config = tierEffortChoices(defaults, tier, model);
+      const options = config.initial ? [config.initial, ...config.choices.filter((choice) => choice !== config.initial)] : config.choices;
+      const hint = `${THINKING_LEVEL_HINT}${options.includes(AUTO_EFFORT_CHOICE) ? ` ${AUTO_EFFORT_HINT}` : ""}`;
+      const choice = await ui.select(`Thinking level for ${tier} model ${model.fullId}. ${hint}`, options);
+      rungs.push(tierEffortRung(model, tier, choice && options.includes(choice) ? choice : config.initial, defaults));
     }
     tiers[tier] = rungs;
   }

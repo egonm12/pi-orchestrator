@@ -1,12 +1,14 @@
 import { join } from "node:path";
 import { personalAgentDir } from "../policy/ban-lists.ts";
 import { tierMapFromSettings } from "../routing/tier-map.ts";
+import { DEFAULT_EFFORT_JUDGE_MODEL, effortJudgeConfigFromSettings, loadEffortJudgeChain } from "../routing/effort-judge.ts";
 import { toModelInfo, type ModelInfo, type RegistryModelLike } from "../models/model-info.ts";
 import { isAutoModel } from "../router/auto-model.ts";
 import { RISK_TIERS, type RiskTier } from "../routing/tiers.ts";
 import {
   approveRecipients,
   currentClassifierRung,
+  currentSessionEffort,
   currentSubagentBanList,
   currentTierRungs,
   eligibleRoutingModels,
@@ -21,6 +23,7 @@ import {
 } from "./setup.ts";
 import { NO_MATCH_NOTE, banListPreview, pickSubagentBanList, type PickerUi } from "./ban-list-picker.ts";
 import { pickRoutingMap } from "./routing-picker.ts";
+import { isDynamicRung } from "./rungs.ts";
 import {
   askGateLevel,
   askTarget,
@@ -65,6 +68,40 @@ export interface InitOptions {
 }
 
 export const INIT_USAGE = `usage: /${INIT_COMMAND} init`;
+
+const SESSION_EFFORT_YES = "Yes, between low and high";
+const SESSION_EFFORT_NO = "No, I'll set it myself";
+const SESSION_EFFORT_QUESTION = "Let the orchestrator adjust its own thinking level per message?";
+const SESSION_EFFORT_HINT = "(Only on cache-safe models. Picking a level by hand turns it off for that session.)";
+
+async function pickSessionEffort(ui: PickerUi, current: string | undefined): Promise<string | null | undefined> {
+  const custom = current && current !== "low-high" ? `Custom (${current})` : undefined;
+  const options = [
+    ...(custom ? [custom] : []),
+    SESSION_EFFORT_YES,
+    SESSION_EFFORT_NO,
+  ];
+  const choice = await ui.select(`${SESSION_EFFORT_QUESTION}\n${SESSION_EFFORT_HINT}`, options);
+  if (choice === SESSION_EFFORT_YES) return "low-high";
+  if (choice === SESSION_EFFORT_NO) return null;
+  if (custom && choice === custom) return current;
+  return undefined;
+}
+
+function missingDefaultJudgeNotice(personal: unknown, installed: readonly ModelInfo[]): string | undefined {
+  try {
+    const config = effortJudgeConfigFromSettings(personal);
+    if (config.model !== DEFAULT_EFFORT_JUDGE_MODEL) return undefined;
+    const defaultModelId = DEFAULT_EFFORT_JUDGE_MODEL.slice(0, DEFAULT_EFFORT_JUDGE_MODEL.lastIndexOf(":"));
+    if (installed.some((model) => model.fullId.toLowerCase() === defaultModelId.toLowerCase())) return undefined;
+    const chain = loadEffortJudgeChain(config, installed);
+    const fallbacks = chain.entries.slice(1).filter((entry) => entry.refusal === undefined).map((entry) => entry.rung);
+    const next = fallbacks.length > 0 ? fallbacks.join(" → ") : "no installed fallback, so the top effort is used";
+    return `pi-orchestrator: default effort judge ${DEFAULT_EFFORT_JUDGE_MODEL} is not installed; using the classifier model/fallback chain: ${next}.`;
+  } catch {
+    return undefined;
+  }
+}
 
 export async function runInit(args: string, ctx: InitContext, options: InitOptions): Promise<string[]> {
   const lines: string[] = [];
@@ -151,7 +188,9 @@ export async function runInit(args: string, ctx: InitContext, options: InitOptio
   const picked = routingDefaults && (!hasTierMap || rebuildTiers)
     ? await pickRoutingMap(pickerUi, eligible, { starter: routingDefaults, ...(hasTierMap ? { tiers: existingTiers, classifier: existingClassifier } : {}) })
     : starter;
-  const plan = planSettings(personal, picked, subagentBanList, { rebuildTiers });
+  const sessionEffort = await pickSessionEffort(pickerUi, currentSessionEffort(personal));
+  const plan = planSettings(personal, picked, subagentBanList, { rebuildTiers, sessionEffort, installedModels: installed });
+  for (const notice of plan.notices) say(notice, "warning");
 
   // The written map, starter or existing, must load: check it the way the
   // router will.
@@ -163,6 +202,16 @@ export async function runInit(args: string, ctx: InitContext, options: InitOptio
       say(`pi-orchestrator: ${map} does not load (${String(error)}); nothing was written.`, "error");
       return lines;
     }
+  }
+  const dynamicRungCount = Object.values(currentTierRungs(plan.settings) ?? {}).flat().filter(isDynamicRung).length;
+  if (dynamicRungCount > 0) {
+    say(`Dynamic effort: ${dynamicRungCount} rung${dynamicRungCount === 1 ? "" : "s"} adjust per message (cache-safe models).`);
+    const routing = (plan.settings.orchestrator as { routing?: { mode?: unknown } } | undefined)?.routing;
+    if (routing?.mode === "shadow") say("Dynamic effort applies once routing is live.");
+  }
+  if (dynamicRungCount > 0 || currentSessionEffort(plan.settings) !== undefined) {
+    const judgeNotice = missingDefaultJudgeNotice(plan.settings, installed);
+    if (judgeNotice) say(judgeNotice);
   }
   const personalChanges = [...plan.changes, ...Object.entries(personalKeys).map(([key, value]) => `orchestrator.subagents.${key} = ${String(value)}`)];
   if (personalChanges.length > 0) {

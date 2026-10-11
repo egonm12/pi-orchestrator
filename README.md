@@ -35,8 +35,9 @@ Run `/pi-orchestrator init` in an interactive session. It walks you through:
 
 1. **Worker ban list:** pick installed model families or type your own, with a preview of the models each entry blocks.
 2. **Gate level and worker limit:** saved to your personal settings or to this project's `.pi/settings.json`.
-3. **Tier map:** a starter map built from your installed models, in shadow mode. An existing map is rebuilt only when you confirm.
-4. **Providers:** which providers may receive task text.
+3. **Tier map:** a starter map built from your installed models, in shadow mode. Cache-safe models start with `auto`, which adjusts effort per message within a tier-specific range. Init summarizes how many rungs adjust per message and notes that shadow routing applies dynamic effort once routing is live. An existing map is rebuilt only when you confirm; custom ranges are shown as choices.
+4. **Effort:** for the orchestrator's own session, choose whether to adjust between low and high per message. This setting is personal. Init does not ask about the effort judge; if its default model is missing, init names the classifier model and fallback chain it will use.
+5. **Providers:** which providers may receive task text.
 
 Running it again starts from your current values. Escape at any step keeps what you had.
 
@@ -65,7 +66,7 @@ Running it again starts from your current values. Escape at any step keeps what 
 }
 ```
 
-Each rung is `provider/model:effort`. On a model whose cache survives an effort change, a rung may instead give a band, `provider/model:low-high`, or no effort at all; its effort then moves within the band (see [Tier map](docs/reference.md#tier-map)). To let the orchestrator's own session move its effort the same way, set `orchestrator.routing.sessionEffort` to a band such as `"low-high"` in your personal settings; picking a thinking level by hand stops it for the rest of the session. `orchestrator.routing.effortJudge` sets the judge model (see [Settings](docs/reference.md#settings)). Add `sessionBanList` entries if the orchestrator itself must never run on some models. A project's `.pi/settings.json` may replace single tiers, and `orchestrator.subagents` keys when you allow project overrides; it can never change either ban list.
+Each rung is `provider/model:effort`. On cache-safe models, init offers `auto` and writes a tier-specific range such as `provider/model:low-high`; its effort can change per message while the model stays the same (see [Tier map](docs/reference.md#tier-map)). Init also asks whether the orchestrator's own session should adjust between low and high per message. Yes writes `orchestrator.routing.sessionEffort` to your personal settings; No removes an existing value, and Escape keeps it. Picking a thinking level by hand stops session effort changes for the rest of that session. `orchestrator.routing.effortJudge` sets the judge model (see [Settings](docs/reference.md#settings)). Add `sessionBanList` entries if the orchestrator itself must never run on some models. A project's `.pi/settings.json` may replace single tiers, and `orchestrator.subagents` keys when you allow project overrides; it can never change either ban list.
 
 ### 3. Start a new session
 
