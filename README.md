@@ -5,7 +5,7 @@ A [pi](https://pi.dev) package for sessions that hand work to subagent workers. 
 ## What it does
 
 - **Subagents:** a `subagents` tool that starts workers in the orchestrator's own process, in the foreground or background, at most `workerLimit` (default 4) running at once and the rest queued. Workers can be resumed, forked from the current branch, reviewed and retried. They get the orchestrator's installed extensions, including its MCP servers, `tool_search` and `codemode`.
-- **Router:** serves the auto model `orchestrator/auto`. It classifies a worker's first request into a tier (mechanical, standard, elevated, critical) and sends it to a model from your tier map.
+- **Router:** serves the auto model `orchestrator/auto`. It classifies a worker's first request into a tier (mechanical, standard, elevated, critical) and sends it to a model from your tier map. On a dynamic rung, an effort judge picks the thinking level for each incoming message within the rung's band.
 - **Guard:** enforces a ban list of models that workers may never use, and an optional ban list for the orchestrator itself.
 - **Review gate:** an editing worker needs a verdict (`subagents_verdict`) from the orchestrator or an independent reviewer, depending on its tier and the gate level (`off`, `low`, `medium`, `high`, `max`).
 
@@ -14,8 +14,10 @@ Workers need the subagents extension: it is the supported way to start them. You
 ## Install
 
 ```sh
-pi install git:github.com/egonm12/pi-orchestrator@v0.1.0
+pi install git:github.com/egonm12/pi-orchestrator@v0.3.0
 ```
+
+It needs pi 1.1.0 or later.
 
 That pins a release; see [releases](https://github.com/egonm12/pi-orchestrator/releases) and [CHANGELOG.md](CHANGELOG.md). To move to a newer release, install again with its tag. To follow `main` instead, install without `@v...` and update with `pi update git:github.com/egonm12/pi-orchestrator`. How releases are made is in [docs/releasing.md](docs/releasing.md).
 
@@ -63,7 +65,7 @@ Running it again starts from your current values. Escape at any step keeps what 
 }
 ```
 
-Each rung is `provider/model:effort`. On a model whose cache survives an effort change, a rung may instead give a band, `provider/model:low-high`, or no effort at all; its effort then moves within the band (see [Tier map](docs/reference.md#tier-map)). Add `sessionBanList` entries if the orchestrator itself must never run on some models. A project's `.pi/settings.json` may replace single tiers, and `orchestrator.subagents` keys when you allow project overrides; it can never change either ban list.
+Each rung is `provider/model:effort`. On a model whose cache survives an effort change, a rung may instead give a band, `provider/model:low-high`, or no effort at all; its effort then moves within the band (see [Tier map](docs/reference.md#tier-map)). To let the orchestrator's own session move its effort the same way, set `orchestrator.routing.sessionEffort` to a band such as `"low-high"` in your personal settings; picking a thinking level by hand stops it for the rest of the session. `orchestrator.routing.effortJudge` sets the judge model (see [Settings](docs/reference.md#settings)). Add `sessionBanList` entries if the orchestrator itself must never run on some models. A project's `.pi/settings.json` may replace single tiers, and `orchestrator.subagents` keys when you allow project overrides; it can never change either ban list.
 
 ### 3. Start a new session
 
