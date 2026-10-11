@@ -172,6 +172,32 @@ test("Escape at a tier keeps existing tier picks", async () => {
   assert.deepEqual(picked.tiers.mechanical, ["p/top:medium"]);
 });
 
+test("dynamic band and no-effort rungs stay available as picker defaults", async () => {
+  const existing = { mechanical: ["p/top:low-high"], standard: ["p/top"] };
+  const { ui, calls } = scriptedUi([undefined]);
+  const picked = await pickRoutingMap(ui, MODELS, { starter: STARTER, tiers: existing });
+  assert.deepEqual(picked.tiers.mechanical, ["p/top:low-high"]);
+  assert.deepEqual(picked.tiers.standard, ["p/top"]);
+  const notes = calls.filter((call) => call.kind === "notify").map((call) => call.title).join("\n");
+  assert.doesNotMatch(notes, /existing (mechanical|standard) rung .* is not available or eligible/);
+});
+
+test("editing dynamic rungs defaults to the band ceiling and still picks one effort", async () => {
+  const existing = { mechanical: ["p/top:low-high"], standard: ["p/top"] };
+  const { ui, calls } = scriptedUi([
+    optionFor("p/cheap"), "low",
+    DONE, "high",
+    DONE, "xhigh",
+    undefined,
+    undefined,
+  ]);
+  const picked = await pickRoutingMap(ui, MODELS, { starter: STARTER, tiers: existing });
+  assert.deepEqual(picked.tiers.mechanical, ["p/top:high"]);
+  assert.deepEqual(picked.tiers.standard, ["p/top:xhigh"]);
+  assert.equal(calls.find((call) => call.kind === "select" && call.title.startsWith("Thinking level for mechanical model p/top"))?.options?.[0], "high");
+  assert.equal(calls.find((call) => call.kind === "select" && call.title.startsWith("Thinking level for standard model p/top"))?.options?.[0], "xhigh");
+});
+
 test("unavailable existing rungs warn and stay out of picker defaults", async () => {
   const existing = { mechanical: ["p/missing:high"] };
   const { ui, calls } = scriptedUi([undefined]);

@@ -14,7 +14,7 @@ import {
 } from "../recipients/authorized-delegation.ts";
 import { RISK_TIERS, type RiskTier } from "./tiers.ts";
 import type { RemovalReason } from "./skip-reasons.ts";
-import type { ResolvedTierMap, TierRung } from "./tier-map.ts";
+import { rungEffortLabel, type EffortBand, type ResolvedTierMap, type TierRung } from "./tier-map.ts";
 
 // Ticket 24, ADR 0001 and ADR 0012: the router core.
 //
@@ -75,10 +75,12 @@ export interface RouterEvidence {
 }
 
 /** One model at one effort, as a routing constraint names it. A recorded
- *  rung fits, so a worker's rung can be taken from its decision record. */
+ *  rung fits, so a worker's rung can be taken from its decision record. A
+ *  tier map's dynamic rung also carries its band, for the text it is named by. */
 export interface ConstraintRung {
   readonly model: string;
   readonly effort: string;
+  readonly band?: EffortBand;
 }
 
 /** The rung a worker must run on and the tier it stands for, as the effort
@@ -246,7 +248,7 @@ export function failedHardFilter(rung: ConstraintRung, evidence: RouterEvidence)
   const recipient = checkRecipient(provider, evidence.authorization);
   if (!recipient.ok) return { reason: "unapproved recipient", detail: recipient.message };
   if (isExcluded(rung, evidence.excludedRung)) {
-    return { reason: "excluded rung", detail: `the worker's routing constraints exclude ${rung.model}:${rung.effort}` };
+    return { reason: "excluded rung", detail: `the worker's routing constraints exclude ${rung.model}:${rungEffortLabel(rung)}` };
   }
   return undefined;
 }

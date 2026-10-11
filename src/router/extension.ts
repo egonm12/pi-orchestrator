@@ -2,14 +2,14 @@ import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { toModelInfo, splitKnownThinkingSuffix, type ModelInfo } from "../models/model-info.ts";
 import { agentRoleOf, AUTO_MODEL_ID, AUTO_MODEL_THINKING_LEVELS, AUTO_PROVIDER, createAutoModelRouter, isAutoModel, isVirtualModel, recordLimitError, recordQuotaHeaders,
-  SESSION_MODEL_ENV, SESSION_VIRTUAL_MODEL_ENV, type AutoModelDependencies, type AutoModelState } from "./auto-model.ts";
+  registerIncomingJudge, SESSION_MODEL_ENV, SESSION_VIRTUAL_MODEL_ENV, type AutoModelDependencies, type AutoModelState } from "./auto-model.ts";
 import { autoModelLimits, type AutoModelLimits } from "./auto-model-limits.ts";
 import { refuseAutoModelForMainThread } from "./main-thread.ts";
 import type { ActiveRouter } from "./route-task.ts";
 import { newTaskLedger, TaskAllowanceOwner } from "../budget/task-allowance.ts";
 import { banListsFromSettings, configureBanLists, loadBanListsOrDefaults, personalAgentDir, personalOrchestrator, readSettingsFile } from "../policy/ban-lists.ts";
 import { isPlainObject } from "../guard/boundaries.ts";
-import { ROUTING_MODES, type RoutingMode } from "../routing/decision-record.ts";
+import { ROUTING_MODES, writeEffortDecisionRecord, type RoutingMode } from "../routing/decision-record.ts";
 import { sessionClassifierModelCall, type SessionClassifierCallReport } from "../routing/session-classifier-call.ts";
 import {
   classifierConfigFromSettings,
@@ -24,6 +24,13 @@ import { stateFolderEvidence, type EvidenceSetup, type RoutingEvidenceSource } f
 import { usageObservationsPath } from "./usage-observations.ts";
 import { isOrchestratorSession } from "../subagents/orchestrator-session.ts";
 import { publishOrchestratorRouter } from "./orchestrator-router.ts";
+import { effortJudgeConfigFromSettings, loadEffortJudgeChain, judgeEffort, type EffortBand, type EffortJudgeModelCall } from "../routing/effort-judge.ts";
+import { sessionEffortJudgeModelCall } from "../routing/session-effort-judge-call.ts";
+import type { SessionModelRegistry } from "../routing/model-stream.ts";
+import { sessionEffortBandFromSettings } from "../routing/session-effort.ts";
+import { dynamicRungRefusal } from "../models/effort-capability.ts";
+import { getSupportedThinkingLevels, type ThinkingLevel } from "../models/model-info.ts";
+import { emitEffortDecision, onEffortDecision, type EffortDecisionEvent } from "../routing/effort-decisions.ts";
 
 export type { RoutingEvidence, RoutingEvidenceSource, EvidenceSetup } from "./evidence.ts";
 
@@ -37,15 +44,20 @@ export const ROUTER_DISABLED_PREFIX = "pi-orchestrator router disabled:";
 /** pi loads each extension with a fresh module copy (jiti moduleCache: false),
  *  so the once-per-process disabled line is kept on the process's global object. */
 export const DISABLED_LINE_REPORTED = Symbol.for("pi-orchestrator.router.disabled-line-reported");
+const EFFORT_DECISION_RECORDER = Symbol.for("pi-orchestrator.effort-decision-recorder");
 export const ROUTER_WARNING_PREFIX = "pi-orchestrator router warning:";
-/** The oldest pi the router loads on: the first with `registerVirtualModel` (ADR 0014). */
-export const REQUIRED_PI_VERSION = "0.99";
+/** The oldest supported pi version for cache-safe per-message effort. */
+export const REQUIRED_PI_VERSION = "1.1.0";
 /** The load error on a pi host without `registerVirtualModel`. pi reports a
  *  throwing extension factory as a failed extension load. */
 export const PI_TOO_OLD_MESSAGE = `pi-orchestrator requires pi v${REQUIRED_PI_VERSION} or later: this pi has no registerVirtualModel. Upgrade pi to v${REQUIRED_PI_VERSION} or later.`;
 /** The keys of the warnings this process printed, each once, like the disabled line. */
 const WARNINGS_REPORTED = Symbol.for("pi-orchestrator.router.warnings-reported");
-type ProcessGlobal = typeof globalThis & { [DISABLED_LINE_REPORTED]?: boolean; [WARNINGS_REPORTED]?: Set<string> };
+type ProcessGlobal = typeof globalThis & {
+  [DISABLED_LINE_REPORTED]?: boolean;
+  [WARNINGS_REPORTED]?: Set<string>;
+  [EFFORT_DECISION_RECORDER]?: true;
+};
 
 /** The state folder when `PI_ORCHESTRATOR_STATE_DIR` is not set: under the agent
  *  directory, never inside the package checkout. */
@@ -58,9 +70,35 @@ export function stateDir(): string {
   return resolve(process.env.PI_ORCHESTRATOR_STATE_DIR ?? defaultStateDir());
 }
 
+function recordEffortDecisionEvents(warn: (key: string, message: string) => void): void {
+  const processGlobal = globalThis as ProcessGlobal;
+  if (processGlobal[EFFORT_DECISION_RECORDER]) return;
+  processGlobal[EFFORT_DECISION_RECORDER] = true;
+  onEffortDecision((event: EffortDecisionEvent) => {
+    try {
+      writeEffortDecisionRecord(join(stateDir(), "routing"), {
+        at: new Date(event.timestamp),
+        sessionId: event.sessionId,
+        scope: event.scope,
+        kind: event.kind,
+        from: event.from,
+        to: event.to,
+        applyAt: event.applyAt,
+        reason: event.reason,
+        judgeModel: event.judgeModel,
+        band: event.band,
+      });
+    } catch (error) {
+      warn(`effort-decision-record:${event.sessionId}`, `could not save effort decision for ${event.sessionId}: ${String(error).split(/\r?\n/, 1)[0]}`);
+    }
+  });
+}
+
 export interface RouterDependencies {
   /** The classifier model call for this session. */
   readonly classifierCall: (ctx: ExtensionContext) => ClassifierModelCall;
+  /** The in-session judge call, replaceable at the provider boundary in tests. */
+  readonly effortJudgeCall: (registry: SessionModelRegistry) => EffortJudgeModelCall;
   /** Where the hard filters' evidence comes from. */
   readonly evidence: (setup: EvidenceSetup) => RoutingEvidenceSource;
   readonly now: () => Date;
@@ -92,6 +130,7 @@ const DEFAULT_DEPENDENCIES: RouterDependencies = {
     if (ctx.modelRegistry === undefined) throw new Error("pi supplied no model registry");
     return sessionClassifierModelCall(ctx.modelRegistry, process.env.PI_ORCHESTRATOR_ROUTER_PROBE === "1" ? { onCallEnd: printClassifierProbe } : {});
   },
+  effortJudgeCall: (registry) => sessionEffortJudgeModelCall(registry),
   evidence: stateFolderEvidence,
   now: () => new Date(),
 };
@@ -178,6 +217,15 @@ function latestPhysicalAnswer(branch: readonly unknown[]): string | undefined {
   return undefined;
 }
 
+/** An owner prompt waiting for its user message to be shown, the judge's input captured at `before_agent_start`. */
+interface PendingOwnerPrompt {
+  readonly sessionId: string;
+  readonly band: EffortBand;
+  readonly prompt: string;
+  readonly lastUserMessage: string;
+  readonly lastAssistantReply: string;
+}
+
 export function createRouterExtension(overrides: Partial<RouterDependencies> = {}) {
   const deps: RouterDependencies = { ...DEFAULT_DEPENDENCIES, ...overrides };
   return function router(pi: ExtensionAPI): void {
@@ -189,11 +237,25 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
     let active: ActiveRouter | undefined;
     /** This copy's session when it is the orchestrator's, whose router retries climb through (./orchestrator-router.ts). */
     let orchestratorSessionId: string | undefined;
+    let sessionBand: ReturnType<typeof sessionEffortBandFromSettings>;
+    let sessionEffortOff = false;
+    let ourThinkingSelection: ThinkingLevel | undefined;
+    let effortPersonal: unknown = {};
+    const selectEffort = (level: ThinkingLevel) => {
+      if (pi.getThinkingLevel() === level) return;
+      ourThinkingSelection = level;
+      pi.setThinkingLevel(level);
+    };
     const autoDeps: AutoModelDependencies = {
       router: () => active, now: deps.now,
       banLists: () => active?.banLists ?? loadBanListsOrDefaults().banLists,
       disabled: () => disabled,
       disable: (error) => disable(error),
+      effortJudge: (registry) => {
+        const models = registry.getAvailable().map((model) => toModelInfo(model));
+        return { chain: loadEffortJudgeChain(effortJudgeConfigFromSettings(effortPersonal), models),
+          callModel: deps.effortJudgeCall(registry) };
+      },
       warn: (key, message) => {
         const reported = (globalThis as ProcessGlobal)[WARNINGS_REPORTED] ??= new Set();
         if (reported.has(key)) return;
@@ -201,6 +263,7 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
         process.stderr.write(`${ROUTER_WARNING_PREFIX} ${message}\n`);
       },
     };
+    recordEffortDecisionEvents(autoDeps.warn);
     const autoModel = createAutoModelRouter(autoDeps);
     // Registering again replaces the virtual model; its route keeps no pins of its own.
     const registerAutoModel = (limits: AutoModelLimits = {}) => pi.registerVirtualModel<AutoModelState>({
@@ -260,7 +323,16 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
       if (answered) process.env[SESSION_MODEL_ENV] = answered;
     };
     let noticeShown = false;
+    // Each worker session on the auto model this copy serves, with the
+    // function that removes its incoming-message judge.
+    const incomingJudges = new Map<string, () => void>();
     pi.on("session_start", (_event, ctx) => {
+      sessionEffortOff = false;
+      sessionBand = undefined;
+      try {
+        effortPersonal = readSettingsFile(join(personalAgentDir(), "settings.json")) ?? {};
+        sessionBand = sessionEffortBandFromSettings(effortPersonal);
+      } catch (error) { autoDeps.warn("session-effort-settings", String(error)); }
       rememberSessionModel(ctx.model, ctx.thinkingLevel ?? "off", ctx);
       if (orchestratorSessionId !== undefined) publishOrchestratorRouter(orchestratorSessionId, undefined);
       orchestratorSessionId = isOrchestratorSession(ctx) ? ctx.sessionManager?.getSessionId() : undefined;
@@ -284,6 +356,11 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
       // A newly routed worker's classification starts now, while the rest of
       // its startup runs (MCP servers connecting), not at its first request.
       const workerId = ctx.sessionManager?.getSessionId();
+      // Its steers and follow-ups are judged when the worker runtime sends them (ADR 0018).
+      if (workerId !== undefined && isAutoModel(ctx.model)) {
+        incomingJudges.get(workerId)?.();
+        incomingJudges.set(workerId, registerIncomingJudge(workerId, (text, mode, running) => autoModel.judgeIncoming(workerId, text, mode, running, ctx)));
+      }
       if (workerId !== undefined && !disabled && isAutoModel(ctx.model)) {
         let systemPrompt = "";
         try { systemPrompt = ctx.getSystemPrompt?.() ?? ""; } catch { /* The first request classifies again if the role differs. */ }
@@ -291,9 +368,86 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
       }
     });
 
+    // The owner's prompt is judged once its user message is shown (message_end
+    // below), not here: the judge's call must not hold the message back, and
+    // the first request reads the level the judge chose.
+    let pendingPrompt: PendingOwnerPrompt | undefined;
+    pi.on("before_agent_start", (event, ctx) => {
+      pendingPrompt = undefined;
+      if (!sessionBand || sessionEffortOff || !isOrchestratorSession(ctx)) return;
+      const id = ctx.sessionManager?.getSessionId();
+      const model = ctx.model;
+      if (!id || !model) return;
+      if (isVirtualModel(model)) {
+        autoDeps.warn(`session-effort-unsupported:${id}`, `dynamic session effort is unavailable for ${model.provider}/${model.id}: a virtual model cannot guarantee cache-safe effort changes.`);
+        return;
+      }
+      const installed = ctx.modelRegistry?.find(model.provider, model.id);
+      if (dynamicRungRefusal(`${model.provider}/${model.id}`, installed ? toModelInfo(installed) : undefined) || !installed) {
+        autoDeps.warn(`session-effort-unsupported:${id}`, `dynamic session effort is unavailable for ${model.provider}/${model.id}: model is not cache-safe.`);
+        return;
+      }
+      const supported = getSupportedThinkingLevels(toModelInfo(installed));
+      const band = sessionBand;
+      if (!supported.includes(band.min) || !supported.includes(band.max)) {
+        autoDeps.warn(`session-effort-unsupported:${id}`, `dynamic session effort is unavailable for ${model.provider}/${model.id}: effort band is not supported.`);
+        return;
+      }
+      const branch = ctx.sessionManager?.getBranch?.() ?? [];
+      const userEntry = [...branch].reverse().find((entry) => entry.type === "message" && entry.message.role === "user");
+      const assistantEntry = [...branch].reverse().find((entry) => entry.type === "message" && entry.message.role === "assistant");
+      const lastUser = userEntry?.type === "message" ? userEntry.message : undefined;
+      const lastAssistant = assistantEntry?.type === "message" ? assistantEntry.message : undefined;
+      const textOf = (value: unknown): string => typeof value === "string" ? value : Array.isArray(value)
+        ? value.filter((part) => part.type === "text").map((part) => part.text ?? "").join("\n") : "";
+      pendingPrompt = {
+        sessionId: id, band, prompt: event.prompt,
+        lastUserMessage: textOf(lastUser && "content" in lastUser ? lastUser.content : undefined).slice(0, 400),
+        lastAssistantReply: textOf(lastAssistant && "content" in lastAssistant ? lastAssistant.content : undefined).slice(-2_000),
+      };
+    });
+
+    /** Whether the owner has already been told that its judge fell back, this session. */
+    let fallbackNotified = false;
+    /** Judges the pending owner prompt, once. Never throws: a failed judge
+     *  applies the band maximum, and any other failure only warns. */
+    const judgeOwnerPrompt = async (ctx: ExtensionContext) => {
+      const pending = pendingPrompt;
+      pendingPrompt = undefined;
+      if (pending === undefined) return;
+      try {
+        const { band, sessionId } = pending;
+        const currentEffort = pi.getThinkingLevel();
+        let decision;
+        try {
+          decision = await judgeEffort({ message: pending.prompt, kind: "user-prompt", tier: "orchestrator", band, currentEffort,
+            turnRunning: false, lastUserMessage: pending.lastUserMessage, lastAssistantReply: pending.lastAssistantReply },
+          { chain: loadEffortJudgeChain(effortJudgeConfigFromSettings(effortPersonal), ctx.modelRegistry!.getAvailable().map(toModelInfo)),
+            callModel: deps.effortJudgeCall(ctx.modelRegistry!) });
+        } catch (error) {
+          decision = { from: currentEffort, to: band.max, applyAt: "now" as const,
+            reason: `effort judge fallback to band maximum: ${String(error)}`, judgeModel: "fallback" as const };
+        }
+        if (decision.judgeModel === "fallback" && !fallbackNotified) {
+          fallbackNotified = true;
+          const message = `pi-orchestrator: ${decision.reason}. The orchestrator runs at ${decision.to} for this message.`;
+          if (ctx.hasUI && ctx.ui) ctx.ui.notify(message, "warning");
+          else autoDeps.warn(`effort-judge-fallback:${sessionId}`, `orchestrator ${sessionId}: ${decision.reason}`);
+        }
+        emitEffortDecision({ ...decision, timestamp: deps.now().toISOString(), band, sessionId, kind: "user-prompt", scope: "orchestrator" });
+        if (decision.applyAt === "now") selectEffort(decision.to);
+      } catch (error) {
+        autoDeps.warn("session-effort-judge", `could not apply the effort judgement: ${String(error).split(/\r?\n/, 1)[0]}`);
+      }
+    };
+
     pi.on("session_shutdown", (_event, ctx) => {
       const id = ctx?.sessionManager?.getSessionId();
-      if (id !== undefined) autoModel.dropEarlyClassification(id);
+      if (id !== undefined) {
+        autoModel.dropEarlyClassification(id);
+        incomingJudges.get(id)?.();
+        incomingJudges.delete(id);
+      }
       if (orchestratorSessionId !== undefined) publishOrchestratorRouter(orchestratorSessionId, undefined);
       orchestratorSessionId = undefined;
     });
@@ -336,6 +490,9 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
     pi.on("message_end", async (event, ctx) => {
       rememberPhysicalAnswer(event.message, ctx);
       const message = event.message as { role?: string; stopReason?: string; errorMessage?: string; provider?: string };
+      // A queued steer or follow-up also shows a user message; only the pending
+      // owner prompt is judged, so the judgement is one-shot per prompt.
+      if (message.role === "user") { await judgeOwnerPrompt(ctx); return undefined; }
       if (message.role !== "assistant" || message.stopReason !== "error" || !isAutoModel(ctx.model)) return undefined;
       if (message.provider === undefined || message.provider === AUTO_PROVIDER) return undefined;
       await recordLimitError(autoDeps, message.provider, message.errorMessage);
@@ -347,6 +504,8 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
     });
     pi.on("thinking_level_select", (event, ctx) => {
       rememberSessionModel(ctx.model, event.level, ctx);
+      if (ourThinkingSelection === event.level) ourThinkingSelection = undefined;
+      else if (sessionBand && isOrchestratorSession(ctx)) sessionEffortOff = true;
     });
 
     if (probe) process.stderr.write(`${ROUTER_PREFIX} loaded\n`);

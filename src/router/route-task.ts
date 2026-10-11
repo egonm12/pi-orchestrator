@@ -1,5 +1,5 @@
 import { allowanceConstraint, type TaskAllowanceOwner } from "../budget/task-allowance.ts";
-import type { ModelInfo } from "../models/model-info.ts";
+import { splitKnownThinkingSuffix, THINKING_LEVELS, type ModelInfo, type ThinkingLevel } from "../models/model-info.ts";
 import type { BanLists } from "../policy/ban-lists.ts";
 import { classifyTier, type ClassifierModelCall, type LoadedClassifierChain, type TierClassification } from "../routing/tier-classifier.ts";
 import type { ResolvedTierMap } from "../routing/tier-map.ts";
@@ -8,7 +8,7 @@ import { nextRungAfterFailure, type FailedDecision, type LadderDecision } from "
 import { isAtLeastTier } from "../routing/tiers.ts";
 import { deriveProviderUsage, type RoutingEvidence, type RoutingEvidenceSource } from "./evidence.ts";
 import { lowOnUsage, readUsageObservations, usageLimits, type UsageObservations } from "./usage-observations.ts";
-import { readUsableRoutingRecords, type RoutingMode } from "../routing/decision-record.ts";
+import { readUsableRoutingRecords, type DecisionRecord, type RoutingMode } from "../routing/decision-record.ts";
 import { providerOf } from "../recipients/authorized-delegation.ts";
 import { pendingRoutingChoices } from "./routing-choice-reservations.ts";
 
@@ -20,14 +20,28 @@ const BALANCING_WINDOW_MS = 5 * 60 * 60 * 1000;
  * its latest pin: after a failover that is the rung it ran on, not the rung
  * that refused its first request. Both stores are shared across projects and
  * sessions; the in-process queue makes a fan-out's choices sequential. */
+/** Whether a chosen decision ran on its chosen rung: the rung itself, or for
+ *  a dynamic rung (`model:min-max`) its model at the effort the judge chose. */
+function ranOnChosenRung(record: DecisionRecord): boolean {
+  if (record.route.outcome !== "chosen") return false;
+  const { rung } = record.route;
+  if (record.ranOn === undefined) return record.schemaVersion === "decision-record/2";
+  if (record.ranOn === `${rung.model}:${rung.effort}`) return true;
+  const band = /:([a-z]+)-([a-z]+)$/.exec(rung.rung);
+  if (band === null) return false;
+  const { baseModel, thinkingSuffix } = splitKnownThinkingSuffix(record.ranOn);
+  const effort = thinkingSuffix.slice(1) as ThinkingLevel;
+  const index = THINKING_LEVELS.indexOf(effort);
+  return baseModel === rung.model && index >= THINKING_LEVELS.indexOf(band[1] as ThinkingLevel) && index <= THINKING_LEVELS.indexOf(band[2] as ThinkingLevel);
+}
+
 function pinnedProviderCounts(dir: string, at: Date): Readonly<Record<string, number>> {
   const pinned = new Map<string, string>();
   for (const record of readUsableRoutingRecords(dir)) {
     if (record.recordType !== "decision" || record.mode !== "live" || record.route.outcome !== "chosen") continue;
     const timestamp = Date.parse(record.timestamp);
     if (timestamp < at.getTime() - BALANCING_WINDOW_MS || timestamp > at.getTime()) continue;
-    const rung = `${record.route.rung.model}:${record.route.rung.effort}`;
-    if (record.ranOn !== rung && !(record.ranOn === undefined && record.schemaVersion === "decision-record/2")) continue;
+    if (!ranOnChosenRung(record)) continue;
     pinned.set(record.delegationId, providerOf(record.route.rung.model));
   }
   // A choice in flight is newer than any decision its delegation committed.

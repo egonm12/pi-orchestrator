@@ -71,6 +71,17 @@ test("a routed delegation has its routed tier and the rung it ran on; a fork, an
   assert.deepEqual(delegationRouting(records, "unknown"), {});
 });
 
+test("a delegation on a dynamic rung names the whole rung, whatever effort the judge chose, so a reviewer is kept off it", async () => {
+  const tierMap = fixtureTierMap();
+  const route = fixtureRoute("standard", tierMap);
+  assert.ok(route.ok);
+  const band = { min: "low", max: "high" } as const;
+  const dynamic = { ...route, rung: { ...route.rung, rung: `${SONNET}:low-high`, model: SONNET, effort: "high" as const, band } };
+  const record = buildDecisionRecord({ delegationId: "dynamic", at: AT, taskText: "Fix it", agentRole: "worker",
+    classification: await fixtureClassification("Fix it", "standard"), tierMap, route: dynamic, ranOn: `${SONNET}:low`, mode: "live" });
+  assert.deepEqual(delegationRouting([record], "dynamic"), { tier: "standard", rung: { model: SONNET, effort: "high", band } });
+});
+
 test("the latest decision of a delegation counts", async () => {
   const records = [await decision("twice", "mechanical"), await decision("twice", "critical")];
   assert.equal(delegationRouting(records, "twice").tier, "critical");

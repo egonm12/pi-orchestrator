@@ -514,3 +514,28 @@ test("the suitability floor and the promotion bar are named only by the observat
     assert.ok(!source.includes("routing-policy"), `${file} imports ticket 06's legacy path`);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Dynamic rungs (ADR 0018): the band text is what a removal names
+// ---------------------------------------------------------------------------
+
+const OPUS_5_5 = "anthropic/claude-opus-5-5";
+
+test("a dynamic rung a hard filter removes is listed under its band text, and the rung after it is chosen", () => {
+  const tiers = { ...TIERS, elevated: [`${OPUS_5_5}:medium-xhigh`, `${SOL}:high`] };
+  const decision = routeTier(input("elevated", { providerUsage: { anthropic: { state: "out-of-usage", detail: "test" } } }, tiers));
+  assert.equal(decision.ok && decision.rung.rung, `${SOL}:high`);
+  assert.deepEqual(
+    decision.removed.map(({ tier, rung, reason }) => ({ tier, rung, reason })),
+    [{ tier: "elevated", rung: `${OPUS_5_5}:medium-xhigh`, reason: "provider out of usage" }],
+  );
+});
+
+test("a dynamic rung a worker's routing constraints exclude is named by its band text, with the effort that matched", () => {
+  const tiers = { ...TIERS, elevated: [`${OPUS_5_5}:medium-xhigh`, `${SOL}:high`] };
+  const excluded = routeTier(input("elevated", { excludedRung: { model: OPUS_5_5, effort: "xhigh" } }, tiers));
+  assert.deepEqual(
+    excluded.removed.map(({ rung, reason, detail }) => ({ rung, reason, detail })),
+    [{ rung: `${OPUS_5_5}:medium-xhigh`, reason: "excluded rung", detail: `the worker's routing constraints exclude ${OPUS_5_5}:medium-xhigh` }],
+  );
+});

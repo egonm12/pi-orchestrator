@@ -599,7 +599,7 @@ export async function openTranscript(ui: TranscriptUI, board: TranscriptBoard, w
     const view = new TranscriptView(tui, theme, keybindings, board, workerId, (exit) => { restore(); done(exit); }, { ...options, expanded });
     if (tui.mode === "regular") restore = swapRoot(tui as unknown as RootTui, view);
     else {
-      const viewport = tui as ViewportTUI & { readonly layoutRoot?: Component };
+      const viewport = tui as unknown as ViewportTUI & { readonly layoutRoot?: Component };
       const original = viewport.layoutRoot;
       viewport.setLayoutRoot(view.layoutRoot);
       restore = () => { viewport.setLayoutRoot(original); viewport.requestRender(true); };

@@ -24,6 +24,9 @@ export interface ModelInfo {
   maxTokens?: number;
   input?: string[];
   cost?: ModelCost;
+  /** pi's `compat`, as far as this package reads it: present only when pi
+   *  sets `supportsMidConvoEffort` to a boolean. */
+  compat?: { readonly supportsMidConvoEffort: boolean };
 }
 
 export interface RegistryModelLike {
@@ -36,13 +39,23 @@ export interface RegistryModelLike {
   maxTokens?: number;
   input?: readonly string[];
   cost?: { input: number; output: number; tiers?: readonly object[] };
+  /** pi's `compat`, of a shape that differs by API: read defensively. */
+  compat?: unknown;
 }
 
 const positiveFinite = (value: unknown): value is number =>
   typeof value === "number" && Number.isFinite(value) && value > 0;
 
+/** pi's `compat.supportsMidConvoEffort`, `undefined` unless it is a boolean. */
+function supportsMidConvoEffort(compat: unknown): boolean | undefined {
+  if (typeof compat !== "object" || compat === null || !("supportsMidConvoEffort" in compat)) return undefined;
+  const flag = compat.supportsMidConvoEffort;
+  return typeof flag === "boolean" ? flag : undefined;
+}
+
 export function toModelInfo(model: RegistryModelLike): ModelInfo {
   const cost = model.cost;
+  const midConvoEffort = supportsMidConvoEffort(model.compat);
   return {
     provider: model.provider,
     id: model.id,
@@ -56,6 +69,7 @@ export function toModelInfo(model: RegistryModelLike): ModelInfo {
     ...(cost && Number.isFinite(cost.input) && Number.isFinite(cost.output)
       ? { cost: { ...cost, ...(cost.tiers ? { tiers: cost.tiers.map((tier) => ({ ...tier })) } : {}) } as ModelCost }
       : {}),
+    ...(midConvoEffort === undefined ? {} : { compat: { supportsMidConvoEffort: midConvoEffort } }),
   };
 }
 

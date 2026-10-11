@@ -178,7 +178,8 @@ function taskPart(task: string, theme: Theme): Part {
 /** The worker's `report` tool, marked: its call shows the kind and text, and a
  *  question's result the orchestrator's answer. */
 const REPORT_RENDERERS: ToolRenderers = {
-  renderCall: (args: { kind?: unknown; text?: unknown } | undefined, theme: Theme) => {
+  renderCall: (value: unknown, theme: Theme) => {
+    const args = value as { kind?: unknown; text?: unknown } | undefined;
     const label = args?.kind === "question" ? "◆ Report: question" : "◆ Report: progress";
     return textComponent([theme.fg("warning", theme.bold(label)), typeof args?.text === "string" ? args.text : ""].join("\n"));
   },

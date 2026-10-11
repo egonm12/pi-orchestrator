@@ -56,6 +56,7 @@ import {
   readRoutingRecords,
   RoutingRecordError,
   type DecisionRecord,
+  type EffortDecisionRecord,
   type EffortLadderRecord,
   type GateRequirementRecord,
   type RecordFolderReader,
@@ -95,6 +96,34 @@ export interface ReportedClassification {
   readonly floor?: string;
 }
 
+export interface EffortReportTotals {
+  readonly judgedMessages: number;
+  readonly skipped: number;
+  /** Lower efforts judged while a run was in progress, which left the effort unchanged (ADR 0018). */
+  readonly declined: number;
+  readonly fallbacks: number;
+  /** Judgements that changed the effort; declined ones do not count. */
+  readonly changes: number;
+}
+
+export interface EffortReportChange {
+  readonly from: string;
+  readonly to: string;
+  /** `turn-end` only on records written before the declined rule. */
+  readonly applyAt: EffortDecisionRecord["applyAt"];
+  readonly reason: string;
+}
+
+export interface EffortReportSession {
+  readonly sessionId: string;
+  readonly scope: EffortDecisionRecord["scope"];
+  readonly changes: readonly EffortReportChange[];
+}
+
+export interface EffortReport extends EffortReportTotals {
+  readonly sessions: readonly EffortReportSession[];
+}
+
 export interface RoutingReport {
   readonly rows: readonly RoutingReportRow[];
   readonly totals: Omit<RoutingReportRow, "tier" | "rung">;
@@ -106,6 +135,7 @@ export interface RoutingReport {
   /** The same counts for delegations without a routing decision. */
   readonly unrouted: GateCounts;
   readonly ladders: readonly EffortLadderRecord[];
+  readonly effort: EffortReport;
 }
 
 interface MutableGateCounts {
@@ -156,10 +186,34 @@ function countGate(counts: MutableGateCounts, gate: DelegationGate | undefined):
   else if (gate.requirement !== undefined && !gate.judgedSinceEdit) counts.missing += 1;
 }
 
+function effortReport(records: readonly EffortDecisionRecord[]): EffortReport {
+  // An `applied` record, written before the declined rule, repeats a judged one.
+  const judged = records.filter((record) => record.stage === "judged");
+  const sessions = new Map<string, { sessionId: string; scope: EffortDecisionRecord["scope"]; changes: EffortReportChange[] }>();
+  let changes = 0;
+  for (const record of judged) {
+    const key = `${record.scope}\u0000${record.sessionId}`;
+    const session = sessions.get(key) ?? { sessionId: record.sessionId, scope: record.scope, changes: [] };
+    sessions.set(key, session);
+    if (record.from === record.to) continue;
+    if (record.applyAt !== "declined") changes += 1;
+    session.changes.push({ from: record.from, to: record.to, applyAt: record.applyAt, reason: record.reason });
+  }
+  return {
+    judgedMessages: judged.filter((record) => record.judgeModel !== "skipped").length,
+    skipped: judged.filter((record) => record.judgeModel === "skipped").length,
+    declined: judged.filter((record) => record.applyAt === "declined").length,
+    fallbacks: judged.filter((record) => record.judgeModel === "fallback").length,
+    changes,
+    sessions: [...sessions.values()],
+  };
+}
+
 export function buildRoutingReport(folder: string, reader?: RecordFolderReader): RoutingReport {
   const records = readRoutingRecords(folder, reader);
   const decisions = new Map<string, DecisionRecord>();
   const ladders: EffortLadderRecord[] = [];
+  const effortDecisions: EffortDecisionRecord[] = [];
   const gates = new Map<string, DelegationGate>();
   const gateOf = (delegationId: string): DelegationGate => {
     const gate = gates.get(delegationId) ?? { judgedSinceEdit: false };
@@ -170,6 +224,7 @@ export function buildRoutingReport(folder: string, reader?: RecordFolderReader):
   for (const record of records) {
     if (record.recordType === "decision") decisions.set(record.delegationId, record);
     else if (record.recordType === "effort-ladder") ladders.push(record);
+    else if (record.recordType === "effort-decision") effortDecisions.push(record);
     else if (record.recordType === "verdict") {
       const gate = gateOf(record.delegationId);
       gate.verdict = record;
@@ -210,7 +265,8 @@ export function buildRoutingReport(folder: string, reader?: RecordFolderReader):
   const classifications = [...decisions.values()].map(({ delegationId, classification: { tier, cause, why, floor } }): ReportedClassification =>
     ({ delegationId, tier, cause, why, ...(floor === undefined || floor === "none" ? {} : { floor }) }));
   const unclassified = classifications.filter((classification) => classification.cause === "unclassified").length;
-  return { rows: ordered, totals, unclassified, classifications, orphanedVerdicts: orphans.size, unrouted, ladders };
+  const effort = effortReport(effortDecisions);
+  return { rows: ordered, totals, unclassified, classifications, orphanedVerdicts: orphans.size, unrouted, ladders, effort };
 }
 
 function agreement(shadowDecisions: number, shadowAgreements: number): string {
@@ -246,6 +302,17 @@ export function renderRoutingReport(folder: string, report: RoutingReport): stri
   for (const ladder of report.ladders) {
     const climb = ladder.step === "unplaced" ? `unplaced (${ladder.detail})` : `${ladder.step}; ${ladder.route.tier} ${ladder.route.rung.rung}`;
     lines.push(`effort ladder: ${ladder.previousDecisionId} -> ${ladder.delegationId}; ${climb}${ladder.mode === "live" ? "" : `; ${ladder.mode}`}`);
+  }
+  if (report.effort.judgedMessages > 0 || report.effort.skipped > 0) {
+    const { effort } = report;
+    lines.push(`effort totals: judged messages ${effort.judgedMessages}, skipped (short follow-up) ${effort.skipped}, declined ${effort.declined}, ` +
+      `fallbacks ${effort.fallbacks}, changes ${effort.changes}`);
+    for (const session of effort.sessions) {
+      const declined = session.changes.filter((change) => change.applyAt === "declined").length;
+      const changes = session.changes.map((change) => `${change.from} -> ${change.to} (${change.applyAt}): ${change.reason.replace(/\s+/g, " ").trim()}`);
+      lines.push(`effort ${session.scope} ${session.sessionId}: changes ${session.changes.length - declined}${declined === 0 ? "" : `, declined ${declined}`}` +
+        `${changes.length === 0 ? "" : `; ${changes.join("; ")}`}`);
+    }
   }
   return `${lines.join("\n")}\n`;
 }

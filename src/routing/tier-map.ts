@@ -5,6 +5,7 @@ import {
   type ModelInfo,
   type ThinkingLevel,
 } from "../models/model-info.ts";
+import { dynamicRungRefusal } from "../models/effort-capability.ts";
 import {
   checkModelScope,
   type ModelScopeCheckRule,
@@ -25,7 +26,7 @@ import { RISK_TIERS, type RiskTier } from "./tiers.ts";
 //
 //   orchestrator.routing.tiers   personal settings: all four tiers, each a
 //                           non-empty ordered list of rungs written
-//                           `provider/model:effort`.
+//                           `provider/model:effort`, or as a dynamic rung (below).
 //
 // A project settings file (`<cwd>/.pi/settings.json`) may carry only
 // `orchestrator.routing.tiers`. A project tier replaces the personal tier of the
@@ -44,19 +45,44 @@ import { RISK_TIERS, type RiskTier } from "./tiers.ts";
 // Efforts are pi's levels; an installed model must support the effort by
 // pi's own rule (`getSupportedThinkingLevels`). A malformed rung fails closed.
 //
+// A dynamic rung (ADR 0018) has an effort band instead of one effort:
+//   `provider/model:low-high`   both ends included, low at or below high
+//   `provider/model`            the model's supported levels below max
+// Its `effort` is the band's top until the effort judge exists. Only a model
+// that pi flags for per-message effort and the effort cache probe measured may
+// carry one (`src/models/effort-capability.ts`); anything else fails closed.
+// A dynamic rung's text (`rung`) spells out its band, so records and reports
+// show the band too.
+//
 // The result is a plain frozen value. The loader logs nothing: ticket 27's
 // extension puts the value unchanged in the decision record.
 
 export type RungOrigin = "personal" | "project";
 export type TierOrder = "balanced" | "ordered";
 
+/** A dynamic rung's effort range, both ends included (ADR 0018). */
+export interface EffortBand {
+  readonly min: ThinkingLevel;
+  readonly max: ThinkingLevel;
+}
+
+/** The effort as a rung's text names it: the level, or the band `low-high`. */
+export function rungEffortLabel(rung: { readonly effort: string; readonly band?: EffortBand }): string {
+  return rung.band === undefined ? rung.effort : `${rung.band.min}-${rung.band.max}`;
+}
+
 export interface TierRung {
-  /** As written in settings, trimmed: `provider/model:effort`. */
+  /** As written in settings, trimmed: `provider/model:effort`, or the band
+   *  form `provider/model:low-high`. */
   readonly rung: string;
   /** `provider/model`, spelled as the installed registry spells it (the
    *  lookup ignores case, so `rung` may differ from `model` in case only). */
   readonly model: string;
+  /** The pinned effort. A dynamic rung's is the top of its band until the
+   *  effort judge exists. */
   readonly effort: ThinkingLevel;
+  /** Present on a dynamic rung only: the range its effort may move within. */
+  readonly band?: EffortBand;
   readonly origin: RungOrigin;
 }
 
@@ -100,34 +126,81 @@ type ParsedRung = Omit<TierRung, "origin">;
 
 function parsedRung(file: SettingsFile, key: string, value: unknown, installedModels: readonly ModelInfo[]): ParsedRung {
   if (typeof value !== "string" || value.trim().length === 0) {
-    throw keyError(file, key, `must be a rung written provider/model:effort; got ${JSON.stringify(value)}.`);
+    throw keyError(file, key, `must be a rung written provider/model, provider/model:effort or provider/model:low-high; got ${JSON.stringify(value)}.`);
   }
   const rung = value.trim();
   const colon = rung.lastIndexOf(":");
-  if (colon === -1) {
-    throw keyError(file, key, `has no ':effort' in ${JSON.stringify(rung)}; write it as provider/model:effort.`);
-  }
-  const model = rung.slice(0, colon);
-  const effort = rung.slice(colon + 1);
+  const model = colon === -1 ? rung : rung.slice(0, colon);
   const slash = model.indexOf("/");
   if (slash <= 0 || slash === model.length - 1) {
     throw keyError(file, key, `does not name a provider/model in ${JSON.stringify(rung)}.`);
   }
-  const level = THINKING_LEVELS.find((candidate) => candidate === effort);
-  if (level === undefined) {
-    throw keyError(file, key, `effort '${effort}' is not one of pi's levels (${THINKING_LEVELS.join(", ")}).`);
-  }
   // A model that is not installed has no levels to check against; the rung
   // is dropped as `not installed` by `failedHardFilter` instead.
   const installed = installedModel(model, installedModels);
+  // The canonical id, so exact-match consumers downstream find the entry.
+  const canonical = installed?.fullId ?? model;
+  const effort = colon === -1 ? undefined : rung.slice(colon + 1);
+  if (effort !== undefined && !effort.includes("-")) {
+    const level = THINKING_LEVELS.find((candidate) => candidate === effort);
+    if (level === undefined) {
+      throw keyError(file, key, `effort '${effort}' is not one of pi's levels (${THINKING_LEVELS.join(", ")}).`);
+    }
+    if (installed !== undefined) {
+      const supported = getSupportedThinkingLevels(installed);
+      if (!supported.includes(level)) {
+        throw keyError(file, key, `model '${model}' does not support effort '${level}' (supported: ${supported.join(", ")}).`);
+      }
+    }
+    return { rung, model: canonical, effort: level };
+  }
+  // A dynamic rung needs a model whose cache survives an effort change (ADR 0018).
+  const refusal = dynamicRungRefusal(canonical, installed);
+  if (refusal !== undefined) throw keyError(file, key, `gives the dynamic rung ${JSON.stringify(rung)}, but model '${canonical}' ${refusal}.`);
+  const band = effort === undefined ? noEffortBand(file, key, rung, canonical, installed) : writtenBand(file, key, rung, effort);
+  // A model that is not installed has no levels to check the ends against.
   if (installed !== undefined) {
     const supported = getSupportedThinkingLevels(installed);
-    if (!supported.includes(level)) {
-      throw keyError(file, key, `model '${model}' does not support effort '${level}' (supported: ${supported.join(", ")}).`);
+    for (const end of [band.min, band.max]) {
+      if (!supported.includes(end)) {
+        throw keyError(file, key, `gives the dynamic rung ${JSON.stringify(rung)}, but model '${canonical}' does not support effort '${end}' (supported: ${supported.join(", ")}).`);
+      }
     }
   }
-  // The canonical id, so exact-match consumers downstream find the entry.
-  return { rung, model: installed?.fullId ?? model, effort: level };
+  if (THINKING_LEVELS.indexOf(band.min) > THINKING_LEVELS.indexOf(band.max)) {
+    throw keyError(file, key, `gives the dynamic rung ${JSON.stringify(rung)}, whose low end is above its high end; write low-high.`);
+  }
+  return { rung: `${model}:${band.min}-${band.max}`, model: canonical, effort: band.max, band };
+}
+
+/** A written band `low-high`: exactly two ends, both pi's levels. */
+function writtenBand(file: SettingsFile, key: string, rung: string, effort: string): EffortBand {
+  const ends = effort.split("-");
+  if (ends.length !== 2) {
+    throw keyError(file, key, `gives the dynamic rung ${JSON.stringify(rung)}, whose band is not two levels joined by a dash; write low-high.`);
+  }
+  const [minText = "", maxText = ""] = ends;
+  const min = THINKING_LEVELS.find((candidate) => candidate === minText);
+  const max = THINKING_LEVELS.find((candidate) => candidate === maxText);
+  if (min === undefined || max === undefined) {
+    throw keyError(file, key, `gives the dynamic rung ${JSON.stringify(rung)}, but '${min === undefined ? minText : maxText}' is not one of pi's levels (${THINKING_LEVELS.join(", ")}).`);
+  }
+  return Object.freeze({ min, max });
+}
+
+/** A rung with no effort: the installed model's supported levels below max.
+ *  Max is never implied: it needs an explicit listing (CONTEXT.md, Effort ladder). */
+function noEffortBand(file: SettingsFile, key: string, rung: string, canonical: string, installed: ModelInfo | undefined): EffortBand {
+  if (installed === undefined) {
+    throw keyError(file, key, `gives the dynamic rung ${JSON.stringify(rung)}, which has no effort, but model '${canonical}' is not installed, so its band cannot be worked out; write provider/model:low-high.`);
+  }
+  const below = getSupportedThinkingLevels(installed).filter((level) => level !== "max");
+  const min = below[0];
+  const max = below.at(-1);
+  if (min === undefined || max === undefined) {
+    throw keyError(file, key, `gives the dynamic rung ${JSON.stringify(rung)}, which has no effort, but model '${canonical}' supports no effort below max, so it has no band; write provider/model:effort.`);
+  }
+  return Object.freeze({ min, max });
 }
 
 /** Case-insensitive on the full `provider/id`, as pi's own model resolver

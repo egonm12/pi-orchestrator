@@ -4,6 +4,19 @@ All notable changes to this package are listed here. The format follows [Keep a 
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-11
+
+### Added
+
+- **Router:** dynamic rungs. A rung may give an effort band (`provider/model:low-high`) or no effort on a cache-safe model, and an effort judge picks the level for each incoming message within the band. Retries climb the band before the next rung.
+- **Router:** `routing.sessionEffort` lets the orchestrator's own session move its effort within a band. `routing.effortJudge` sets the judge model, timeout and fallbacks.
+- **Routing report:** effort decisions are logged as `effort-decision` records and summarized in the report.
+- **Effort cache probe:** measures which models keep their prompt cache across an effort change.
+
+### Changed
+
+- **Breaking:** requires pi 1.1.0 or later.
+
 ## [0.2.0] - 2026-10-09
 
 ### Added
@@ -30,6 +43,7 @@ First tagged release.
 - **Setup:** `/pi-orchestrator init` walks through the ban list, gate level, worker limit, tier map and providers.
 - **Worker view:** a live transcript of each worker, opened with alt+a or `/subagents`. It looks and scrolls like pi's chat, with a session picker, a message input to steer a running worker, and `PI_ORCHESTRATOR_TRANSCRIPT_TRACE` to log frame times.
 
-[Unreleased]: https://github.com/egonm12/pi-orchestrator/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/egonm12/pi-orchestrator/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/egonm12/pi-orchestrator/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/egonm12/pi-orchestrator/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/egonm12/pi-orchestrator/releases/tag/v0.1.0

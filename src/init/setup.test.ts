@@ -92,6 +92,36 @@ test("planSettings adds what is missing, starts in shadow mode, never replaces a
   assert.deepEqual((replaced.settings.orchestrator as Record<string, any>).routing, kept.orchestrator.routing);
 });
 
+test("rebuilding tiers keeps selected dynamic rungs verbatim and new picks single-effort", () => {
+  const picked = {
+    classifier: "anthropic/claude-haiku-4-5:low",
+    tiers: {
+      mechanical: ["anthropic/claude-opus-5-5:medium"],
+      standard: ["anthropic/claude-opus-5-5:high"],
+      elevated: ["anthropic/claude-haiku-4-5:medium"],
+      critical: ["anthropic/claude-opus-5:xhigh"],
+    },
+    skipped: [],
+  };
+  const personal = {
+    orchestrator: {
+      routing: {
+        tiers: {
+          mechanical: { order: "ordered", rungs: ["anthropic/claude-opus-5-5:low-high"] },
+          standard: ["anthropic/claude-opus-5-5"],
+          elevated: ["anthropic/claude-haiku-4-5:high"],
+          critical: ["anthropic/claude-opus-5:xhigh"],
+        },
+      },
+    },
+  };
+  const rebuilt = planSettings(personal, picked, [], { rebuildTiers: true });
+  const tiers = (rebuilt.settings.orchestrator as any).routing.tiers;
+  assert.deepEqual(tiers.mechanical.rungs, ["anthropic/claude-opus-5-5:low-high"]);
+  assert.deepEqual(tiers.standard, ["anthropic/claude-opus-5-5"]);
+  assert.deepEqual(tiers.elevated, ["anthropic/claude-haiku-4-5:medium"]);
+});
+
 test("rebuilding tiers preserves existing per-tier order fields and reads existing rungs", () => {
   const starter = starterTierMap(INSTALLED_MODEL_INFO, NO_BANS)!;
   const personal = {

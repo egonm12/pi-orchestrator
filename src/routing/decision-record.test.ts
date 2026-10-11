@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import {
   FIXTURE_PROJECT_SETTINGS,
+  FIXTURE_TIERS,
   fixtureClassification,
   fixturePersonalSettings,
   fixtureRefusal,
@@ -36,11 +37,15 @@ import {
   UnreadableDelegationRecordError,
   validateRoutingRecord,
   writeDecisionRecord,
+  writeEffortDecisionRecord,
   type DecisionRecord,
   type DecisionRecordInput,
   type RoutingRecord,
 } from "./decision-record.ts";
 import { useOwnerBanLists } from "../fixtures/owner-ban-lists.ts";
+import { INSTALLED_MODEL_INFO } from "../fixtures/installed-model-info.ts";
+import { HARNESS_MODEL_SCOPE } from "../policy/model-resolution.ts";
+import { tierMapFromSettings } from "./tier-map.ts";
 
 useOwnerBanLists();
 
@@ -82,9 +87,87 @@ function linesOf(path: string): Record<string, unknown>[] {
   return readFileSync(path, "utf8").trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
+test("an effort judgement is written as its own validated record with the chosen effort and its band", () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    const { path, record } = writeEffortDecisionRecord(dir, {
+      at: NOW,
+      sessionId: "worker-1",
+      scope: "worker",
+      kind: "task",
+      from: "high",
+      to: "medium",
+      applyAt: "now",
+      reason: "straightforward documentation change, api_key=sk-ant-123456789abc",
+      judgeModel: "anthropic/claude-haiku-5-5:low",
+      band: { min: "low", max: "high" },
+    });
+    assert.equal(path, decisionRecordPath(dir, NOW));
+    assert.equal(record.recordType, "effort-decision");
+    assert.equal(record.timestamp, NOW.toISOString());
+    assert.equal(record.sessionId, "worker-1");
+    assert.equal(record.scope, "worker");
+    assert.equal(record.kind, "task");
+    assert.equal(record.from, "high");
+    assert.equal(record.to, "medium");
+    assert.equal(record.applyAt, "now");
+    assert.equal(record.reason, "straightforward documentation change, api_key=[redacted]");
+    assert.equal(record.judgeModel, "anthropic/claude-haiku-5-5:low");
+    assert.deepEqual(record.band, { min: "low", max: "high" });
+    assert.deepEqual(readRoutingRecords(dir), [record]);
+  } finally { cleanup(); }
+});
+
 // ---------------------------------------------------------------------------
 // Checkbox 1 (story 28): two writes, two complete records, validation on read
 // ---------------------------------------------------------------------------
+
+test("a skipped short follow-up may retain the current effort outside the configured band", () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    const { record } = writeEffortDecisionRecord(dir, {
+      at: NOW,
+      sessionId: "owner-1",
+      scope: "orchestrator",
+      kind: "user-prompt",
+      from: "max",
+      to: "max",
+      applyAt: "none",
+      reason: "short follow-up kept the current effort",
+      judgeModel: "skipped",
+      band: { min: "low", max: "high" },
+    });
+    assert.equal(record.to, "max");
+    assert.deepEqual(readRoutingRecords(dir), [record]);
+  } finally { cleanup(); }
+});
+
+test("a declined effort decision names a lower effort; a higher one is refused", () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    const input = { at: NOW, sessionId: "worker-1", scope: "worker", kind: "steer", applyAt: "declined", reason: "a one-line check",
+      judgeModel: "anthropic/claude-haiku-5-5:low", band: { min: "low", max: "high" } } as const;
+    const { record } = writeEffortDecisionRecord(dir, { ...input, from: "high", to: "low" });
+    assert.equal(record.applyAt, "declined");
+    assert.equal(record.stage, "judged");
+    assert.throws(() => writeEffortDecisionRecord(dir, { ...input, from: "low", to: "high" }), /field 'applyAt' declined requires a lower effort/);
+  } finally { cleanup(); }
+});
+
+test("routing readers skip unknown record kinds without blocking known records", async () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    const known = writeDecisionRecord(dir, await liveInput()).record;
+    appendFileSync(decisionRecordPath(dir, NOW), `${JSON.stringify({
+      recordType: "future-effort-observation",
+      schemaVersion: DECISION_RECORD_SCHEMA_VERSION,
+      timestamp: NOW.toISOString(),
+      sessionId: "future-worker",
+    })}\n`);
+    assert.deepEqual(readRoutingRecords(dir), [known]);
+    assert.deepEqual(readUsableRoutingRecordEntries(dir).skipped, []);
+  } finally { cleanup(); }
+});
 
 test("one shadow write and one live write leave exactly two records, each carrying every field the spec lists", async () => {
   const { dir, cleanup } = tempDir();
@@ -347,7 +430,7 @@ test("every record type the extension writes reads back; the usable reader skips
     assert.deepEqual(readable.map((record) => record.recordType),
       ["decision", "effort-ladder", "effort-ladder", "fork", "agent-model", "edit", "gate-requirement", "verdict", "orphaned-verdict", "failover"]);
 
-    // What an older reader cannot validate: a newer ladder step, a record type it does not know, a newer schema version, a torn line.
+    // A newer ladder step, a newer schema version and a torn line are invalid; an unknown record kind is ignored.
     const unplaced = written[2]!;
     appendFileSync(path, [
       JSON.stringify({ ...unplaced, step: "sideways" }),
@@ -366,8 +449,8 @@ test("every record type the extension writes reads back; the usable reader skips
     assert.deepEqual(entries.map((entry) => [entry.line, entry.record.recordType]),
       [...readable.map((record, index) => [index + 1, record.recordType]), [15, "edit"]], "every valid line, the one after the bad ones too");
     assert.deepEqual(skipped.map((line) => [line.file, line.line, line.error.field]),
-      [["2026-09-25.jsonl", 11, "step"], ["2026-09-25.jsonl", 12, "recordType"], ["2026-09-25.jsonl", 13, "schemaVersion"], ["2026-09-25.jsonl", 14, "(record)"]]);
-    assert.match(skipped[3]!.error.message, /^routing record 2026-09-25\.jsonl:14: field '\(record\)' is not valid JSON/);
+      [["2026-09-25.jsonl", 11, "step"], ["2026-09-25.jsonl", 13, "schemaVersion"], ["2026-09-25.jsonl", 14, "(record)"]]);
+    assert.match(skipped[2]!.error.message, /^routing record 2026-09-25\.jsonl:14: field '\(record\)' is not valid JSON/);
     assert.deepEqual(readUsableRoutingRecords(dir), entries.map((entry) => entry.record));
     assert.deepEqual(readUsableRoutingRecordEntries(join(dir, "none")), { entries: [], skipped: [] }, "a folder that does not exist holds no records");
   } finally { cleanup(); }
@@ -971,4 +1054,58 @@ test("a day file is parsed once while its stat is unchanged, an appended tail pa
     readUsableRoutingRecords(dir, plain);
     assert.equal(reads.length, before + 2, "a reader without stat parses every time");
   } finally { cleanup(); }
+});
+
+// ---------------------------------------------------------------------------
+// Dynamic rungs (ADR 0018): the record names a band where the rung is named
+// ---------------------------------------------------------------------------
+
+test("a record names a dynamic rung by its band in the chosen rung and the tier map, and the effort it ran at", async () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    const personal = {
+      orchestrator: { subagentBanList: ["fable", "astra"], routing: { enabled: true, tiers: { ...FIXTURE_TIERS, elevated: ["anthropic/claude-opus-5-5:medium-xhigh", "openai-codex/gpt-6-sol:high"] } } },
+    };
+    const tierMap = fixtureTierMap(personal, {});
+    const route = fixtureRoute("elevated", tierMap, {}, { "openai-codex": 1, anthropic: 0 });
+    assert.ok(route.ok);
+    writeDecisionRecord(dir, await liveInput({
+      tierMap,
+      route,
+      ranOn: "anthropic/claude-opus-5-5:xhigh",
+      classification: await fixtureClassification(TASK, "elevated"),
+    }));
+    const [record] = readRoutingRecords(dir);
+    assert.ok(record?.recordType === "decision");
+    assert.deepEqual(record.route.outcome === "chosen" && record.route.rung, {
+      rung: "anthropic/claude-opus-5-5:medium-xhigh",
+      model: "anthropic/claude-opus-5-5",
+      effort: "xhigh",
+      origin: "personal",
+    });
+    assert.equal(record.ranOn, "anthropic/claude-opus-5-5:xhigh");
+    assert.equal(record.tierMap.tiers.elevated[0]?.rung, "anthropic/claude-opus-5-5:medium-xhigh");
+  } finally {
+    cleanup();
+  }
+});
+
+test("a record's drops name a banned dynamic rung by its band text", async () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    // Sonnet 5.5 is measured, so its band loads, then the ban list drops it.
+    const personal = {
+      orchestrator: { subagentBanList: ["fable", "astra", "sonnet-5-5"], routing: { enabled: true, tiers: { ...FIXTURE_TIERS, critical: ["anthropic/claude-sonnet-5-5:low-high", "openai-codex/gpt-6-sol:xhigh"] } } },
+    };
+    const tierMap = tierMapFromSettings(personal, {}, { installedModels: INSTALLED_MODEL_INFO, modelScope: HARNESS_MODEL_SCOPE });
+    assert.ok(tierMap);
+    writeDecisionRecord(dir, await liveInput({ tierMap, classification: await fixtureClassification(TASK, "elevated") }));
+    const [record] = readRoutingRecords(dir);
+    assert.ok(record?.recordType === "decision");
+    assert.deepEqual(record.tierMap.drops, [
+      { tier: "critical", rung: "anthropic/claude-sonnet-5-5:low-high", origin: "personal", reason: "subagent ban list" },
+    ]);
+  } finally {
+    cleanup();
+  }
 });

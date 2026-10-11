@@ -11,7 +11,7 @@ import {
   type RoutingRecord,
 } from "../routing/decision-record.ts";
 import type { ConstraintRung } from "../routing/tier-router.ts";
-import { splitKnownThinkingSuffix } from "../models/model-info.ts";
+import { splitKnownThinkingSuffix, THINKING_LEVELS, type ThinkingLevel } from "../models/model-info.ts";
 import { delegationEdits, type DelegationEdits } from "./editing.ts";
 import { hasEnded, workerBoard } from "./worker-board.ts";
 import { isRunningWorkerSession } from "./worker-sessions.ts";
@@ -92,6 +92,17 @@ export interface DelegationRouting {
   readonly rung?: ConstraintRung;
 }
 
+/** The dynamic rung `chosen` (`model:min-max`) as a constraint, when `ran` is its model at an effort inside its band. */
+function dynamicRungRan(chosen: { readonly rung: string; readonly model: string; readonly effort: string }, ran: ConstraintRung): ConstraintRung | undefined {
+  const ends = /:([a-z]+)-([a-z]+)$/.exec(chosen.rung);
+  const min = THINKING_LEVELS.find((level) => level === ends?.[1]);
+  const max = THINKING_LEVELS.find((level) => level === ends?.[2]);
+  if (min === undefined || max === undefined || ran.model !== chosen.model) return undefined;
+  const at = THINKING_LEVELS.indexOf(ran.effort as ThinkingLevel);
+  if (at < THINKING_LEVELS.indexOf(min) || at > THINKING_LEVELS.indexOf(max)) return undefined;
+  return { model: chosen.model, effort: chosen.effort, band: { min, max } };
+}
+
 function rungOf(rung: string): ConstraintRung | undefined {
   const { baseModel, thinkingSuffix } = splitKnownThinkingSuffix(rung);
   return thinkingSuffix === "" ? undefined : { model: baseModel, effort: thinkingSuffix.slice(1) };
@@ -116,7 +127,9 @@ export function delegationRouting(records: readonly RoutingRecord[], delegationI
   const tier = route.outcome === "chosen" ? route.tier : route.startedAtTier;
   // A decision-record/2 record has no ranOn; in live mode its chosen rung ran.
   const ranOn = latest.ranOn ?? (latest.mode === "live" && route.outcome === "chosen" ? route.rung.rung : undefined);
-  const rung = ranOn === undefined ? undefined : rungOf(ranOn);
+  const ran = ranOn === undefined ? undefined : rungOf(ranOn);
+  // On a dynamic rung the judge chose the effort ranOn names; the rung is the whole band.
+  const rung = ran !== undefined && route.outcome === "chosen" ? dynamicRungRan(route.rung, ran) ?? ran : ran;
   return { tier, ...(rung === undefined ? {} : { rung }) };
 }
 

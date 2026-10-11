@@ -35,8 +35,16 @@ export function nextRungAfterFailure(input: EffortLadderInput): LadderDecision {
   const current = levels.indexOf(failed.rung.effort);
   const listed = tierMap.tiers[failed.tier];
   let index = listed.findIndex((rung) => rung.rung === failed.rung.rung);
-  // Generated efforts retain the position of the latest listed effort they
-  // climbed from. No earlier listed rung is retried.
+  // A generated dynamic band retains the position of the listed band whose
+  // floor it raised. A generated single effort retains the latest listed
+  // effort it climbed from. No earlier listed rung is retried.
+  if (index < 0 && failed.rung.band !== undefined) {
+    const floor = levels.indexOf(failed.rung.band.min);
+    for (let position = 0; position < listed.length; position++) {
+      const rung = listed[position]!;
+      if (rung.model === failed.rung.model && rung.band?.max === failed.rung.band.max && levels.indexOf(rung.band.min) <= floor) index = position;
+    }
+  }
   if (index < 0) {
     for (let position = 0; position < listed.length; position++) {
       const rung = listed[position]!;
@@ -44,11 +52,16 @@ export function nextRungAfterFailure(input: EffortLadderInput): LadderDecision {
     }
   }
   if (index < 0) return { step: "no-position" };
-  const next = current < 0 ? undefined : levels[current + 1];
+  const band = failed.rung.band;
+  const nextBandMin = band === undefined ? undefined : levels[levels.indexOf(band.min) + 1];
+  const next = band === undefined ? (current < 0 ? undefined : levels[current + 1]) : nextBandMin;
+  const canStep = band === undefined || (next !== undefined && levels.indexOf(next) <= levels.indexOf(band.max));
   const maxListed = RISK_TIERS.some((tier) => tierMap.tiers[tier].some((rung) => rung.model === failed.rung.model && rung.effort === "max"));
-  if (next === "max" && !maxListed) skipped.push({ tier: failed.tier, rung: `${failed.rung.model}:max`, model: failed.rung.model, reason: MAX_NOT_LISTED, detail: "max requires an explicitly listed rung for this model in the resolved tier map" });
-  if (next !== undefined && (next !== "max" || maxListed)) {
-    const rung: TierRung = { ...failed.rung, effort: next, rung: `${failed.rung.model}:${next}` };
+  if (canStep && next === "max" && !maxListed) skipped.push({ tier: failed.tier, rung: `${failed.rung.model}:max`, model: failed.rung.model, reason: MAX_NOT_LISTED, detail: "max requires an explicitly listed rung for this model in the resolved tier map" });
+  if (next !== undefined && canStep && (next !== "max" || maxListed)) {
+    const rung: TierRung = band === undefined
+      ? { ...failed.rung, effort: next, rung: `${failed.rung.model}:${next}` }
+      : { ...failed.rung, effort: band.max, band: { min: next, max: band.max }, rung: `${failed.rung.model}:${next}-${band.max}` };
     const removal = failedHardFilter(rung, evidence);
     if (removal === undefined) return { ok: true, refused: false, step: "effort", rung, model: rung.model, survivors: [rung], startedAtTier: failed.tier, tier: failed.tier, tiersTried: [failed.tier], removed, skipped, allowanceApplied: evidence.allowance.describe };
     removed.push({ tier: failed.tier, rung: rung.rung, model: rung.model, ...removal });
