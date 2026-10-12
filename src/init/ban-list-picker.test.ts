@@ -25,6 +25,7 @@ function scriptedUi(script: (string | undefined)[]) {
   const calls: { kind: "select" | "input" | "notify"; title: string; options?: string[] }[] = [];
   const answers = [...script];
   const next = (kind: string, title: string) => {
+    if (answers.length === 0 && kind === "select" && title.startsWith("Let the orchestrator adjust its own thinking level per message?")) return undefined;
     if (answers.length === 0) throw new Error(`script ran out at ${kind}: ${title}`);
     return answers.shift();
   };
