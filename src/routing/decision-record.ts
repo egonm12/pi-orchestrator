@@ -270,6 +270,8 @@ export interface RecordedRouteChoice extends RecordedRouteCommon {
   readonly providerCounts?: Readonly<Record<string, number>>;
   /** Candidate providers a balanced choice weighted as under 10% left. */
   readonly lowUsageProviders?: readonly string[];
+  /** Known effective headroom for candidate providers in a balanced choice. */
+  readonly providerPercentLeft?: Readonly<Record<string, number>>;
 }
 
 export interface RecordedRouteRefusal extends RecordedRouteCommon {
@@ -668,7 +670,7 @@ function checkRoute(record: Json): void {
   const outcome = oneOf(value, "outcome", path, ["chosen", "refused"] as const);
   const common = ["outcome", "startedAtTier", "tiersTried", "removed", "allowanceApplied"];
   if (outcome === "chosen") {
-    checkKeys(value, path, [...common, "tier", "rung", "survivors"], ["tierOrder", "providerCounts", "lowUsageProviders"]);
+    checkKeys(value, path, [...common, "tier", "rung", "survivors"], ["tierOrder", "providerCounts", "lowUsageProviders", "providerPercentLeft"]);
     oneOf(value, "tier", path, RISK_TIERS);
     if (value.tierOrder !== undefined) oneOf(value, "tierOrder", path, ["balanced", "ordered"] as const);
     if (value.providerCounts !== undefined) {
@@ -680,6 +682,14 @@ function checkRoute(record: Json): void {
       }
     }
     if (value.lowUsageProviders !== undefined) checkStrings(value, "lowUsageProviders", path);
+    if (value.providerPercentLeft !== undefined) {
+      const percentages = objectAt(value, "providerPercentLeft", path);
+      for (const [provider, percentLeft] of Object.entries(percentages)) {
+        if (!provider || typeof percentLeft !== "number" || !Number.isFinite(percentLeft) || percentLeft < 0 || percentLeft > 100) {
+          throw new RoutingRecordError(`${path}.providerPercentLeft.${provider}`, "must be a percentage from 0 to 100");
+        }
+      }
+    }
     checkRung(objectAt(value, "rung", path), `${path}.rung`);
     eachObject(value, "survivors", path, checkRung);
   } else {
@@ -1011,6 +1021,7 @@ function recordedRoute(route: TierRouteDecision): RecordedRoute {
       ...(route.tierOrder === undefined ? {} : { tierOrder: route.tierOrder }),
       ...(route.providerCounts === undefined ? {} : { providerCounts: { ...route.providerCounts } }),
       ...(route.lowUsageProviders === undefined ? {} : { lowUsageProviders: [...route.lowUsageProviders] }),
+      ...(route.providerPercentLeft === undefined ? {} : { providerPercentLeft: { ...route.providerPercentLeft } }),
     };
   }
   return { outcome: "refused", ...common, code: route.code, message: route.message };

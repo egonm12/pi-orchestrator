@@ -8,6 +8,10 @@ All notable changes to this package are listed here. The format follows [Keep a 
 
 - **Setup:** `/pi-orchestrator init` offers per-message effort for cache-safe tier models, supports custom ranges on rebuild, and configures session effort in personal settings.
 
+### Changed
+
+- **Router:** balanced tiers now weigh effective quota headroom, including a tighter weekly window, as well as recent provider usage counts.
+
 ## [0.3.0] - 2026-10-11
 
 ### Added

@@ -7,7 +7,7 @@ import { routeForcedRung, routeTier, type ProviderUsage, type RouterEvidence, ty
 import { nextRungAfterFailure, type FailedDecision, type LadderDecision } from "../routing/effort-ladder.ts";
 import { isAtLeastTier } from "../routing/tiers.ts";
 import { deriveProviderUsage, type RoutingEvidence, type RoutingEvidenceSource } from "./evidence.ts";
-import { lowOnUsage, readUsageObservations, usageLimits, type UsageObservations } from "./usage-observations.ts";
+import { lowOnUsage, readUsageObservations, usageLimits, usagePercentLeft, type UsageObservations } from "./usage-observations.ts";
 import { readUsableRoutingRecords, type DecisionRecord, type RoutingMode } from "../routing/decision-record.ts";
 import { providerOf } from "../recipients/authorized-delegation.ts";
 import { pendingRoutingChoices } from "./routing-choice-reservations.ts";
@@ -96,9 +96,11 @@ function hardFilterEvidence(router: ActiveRouter, taskText: string, at: Date, ev
   const estimatedPromptTokens = Buffer.byteLength(taskText, "utf8");
   const observations = readUsageObservations(router.usagePath, at);
   const lowUsageProviders = lowOnUsage(observations, at);
+  const providerPercentLeft = usagePercentLeft(observations, at);
   return {
     providerUsage: providerUsageAt(observations, evidence, at), catalog: evidence.catalog, estimatedPromptTokens,
     ...(lowUsageProviders.length === 0 ? {} : { lowUsageProviders }),
+    ...(Object.keys(providerPercentLeft).length === 0 ? {} : { providerPercentLeft }),
     allowance: allowanceConstraint(router.owner, evidence.catalog, { role: "subtask", maxInputTokens: estimatedPromptTokens }),
     authorization: evidence.authorization, banLists: router.banLists,
     ...(constraints.excludedRung === undefined ? {} : { excludedRung: constraints.excludedRung }),

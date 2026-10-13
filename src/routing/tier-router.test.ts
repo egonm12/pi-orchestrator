@@ -151,6 +151,25 @@ test("low usage never removes a rung, leaves an ordered tier alone and weighs no
   if (notCandidate.ok) assert.equal(notCandidate.lowUsageProviders, undefined, "only candidates' low usage is recorded");
 });
 
+test("balanced routing prefers greater effective weekly headroom when delegation counts tie", () => {
+  const decision = routeTier(input("standard", {
+    providerCounts: { "openai-codex": 0, anthropic: 0 },
+    providerPercentLeft: { "openai-codex": 100, anthropic: 77 },
+  }, { ...TIERS, standard: [`${SONNET}:medium`, `${LUNA}:medium`] }));
+  assert.equal(decision.ok && decision.rung.model, LUNA);
+  if (decision.ok) assert.deepEqual(decision.providerPercentLeft, { "openai-codex": 100, anthropic: 77 });
+});
+
+test("near-exhausted effective weekly headroom weighs five extra delegations", () => {
+  const decision = routeTier(input("standard", {
+    providerCounts: { "openai-codex": 4, anthropic: 0 },
+    providerPercentLeft: { "openai-codex": 90, anthropic: 5 },
+    lowUsageProviders: ["anthropic"],
+  }, { ...TIERS, standard: [`${SONNET}:medium`, `${LUNA}:medium`] }));
+  assert.equal(decision.ok && decision.rung.model, LUNA, "Anthropic scores 0 + 5 while Codex scores 4 + 0.5");
+  if (decision.ok) assert.deepEqual(decision.providerPercentLeft, { "openai-codex": 90, anthropic: 5 });
+});
+
 // ---------------------------------------------------------------------------
 // Story 23: the first surviving rung of the classified tier
 // ---------------------------------------------------------------------------

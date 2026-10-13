@@ -235,12 +235,16 @@ test("a balanced choice records the provider counts that selected it", async () 
   const { dir, cleanup } = tempDir();
   try {
     const map = fixtureTierMap();
-    const route = fixtureRoute("standard", map, {}, { "openai-codex": 4, anthropic: 1 });
-    const { record } = writeDecisionRecord(dir, await liveInput({ tierMap: map, route, ranOn: route.ok ? route.rung.rung : SONNET }));
+    const baseRoute = fixtureRoute("standard", map, {}, { "openai-codex": 4, anthropic: 1 });
+    assert.equal(baseRoute.ok, true);
+    if (!baseRoute.ok) return;
+    const route = { ...baseRoute, providerPercentLeft: { "openai-codex": 100, anthropic: 77 } };
+    const { record } = writeDecisionRecord(dir, await liveInput({ tierMap: map, route, ranOn: route.rung.rung }));
     assert.equal(record.route.outcome, "chosen");
     if (record.route.outcome === "chosen") {
       assert.equal(record.route.tierOrder, "balanced");
       assert.deepEqual(record.route.providerCounts, { "openai-codex": 4, anthropic: 1 });
+      assert.deepEqual(record.route.providerPercentLeft, { "openai-codex": 100, anthropic: 77 });
     }
     assert.deepEqual(readRoutingRecords(dir), [record]);
   } finally { cleanup(); }

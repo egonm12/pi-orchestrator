@@ -325,17 +325,26 @@ export function usageLimits(observations: UsageObservations, now: Date): Record<
 /** Below this percentage left a provider is low on usage (PRD cml8, story 51). */
 export const LOW_USAGE_PERCENT = 10;
 
-/** The providers whose observations hold under LOW_USAGE_PERCENT left at
- *  `now`, for balancing to weigh. An exhausted or throttled observation is
- *  the hard filters' (usageLimits), not this. A percentage holds until the
- *  earlier of its window reset and five hours after it was observed. */
-export function lowOnUsage(observations: UsageObservations, now: Date): string[] {
+/** Current percentages left by provider, for balancing to weigh. An
+ *  exhausted or throttled observation is the hard filters' (usageLimits), not
+ *  this. A percentage holds until the earlier of its window reset and five
+ *  hours after it was observed. */
+export function usagePercentLeft(observations: UsageObservations, now: Date): Record<string, number> {
   const at = now.getTime();
-  return Object.keys(observations).sort().filter((provider) => {
-    const observation = observations[provider]!;
-    if (limitLiftsAt(observation) !== undefined || observation.percentLeft === undefined || !(observation.percentLeft < LOW_USAGE_PERCENT)) return false;
-    return at < percentHoldsUntil(observation);
-  });
+  const percentages: Record<string, number> = {};
+  for (const [provider, observation] of Object.entries(observations)) {
+    if (limitLiftsAt(observation) !== undefined || observation.percentLeft === undefined || !(at < percentHoldsUntil(observation))) continue;
+    percentages[provider] = observation.percentLeft;
+  }
+  return percentages;
+}
+
+/** Providers whose current percentage left is under LOW_USAGE_PERCENT. */
+export function lowOnUsage(observations: UsageObservations, now: Date): string[] {
+  return Object.entries(usagePercentLeft(observations, now))
+    .filter(([, percentLeft]) => percentLeft < LOW_USAGE_PERCENT)
+    .map(([provider]) => provider)
+    .sort();
 }
 
 /** When a percentage-left observation stops saying anything: the earlier of

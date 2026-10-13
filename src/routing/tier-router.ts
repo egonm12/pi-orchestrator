@@ -20,10 +20,11 @@ import { rungEffortLabel, type EffortBand, type ResolvedTierMap, type TierRung }
 //
 //   stage 1  the classified tier's rungs, in map order, through the hard
 //            filters. Every removed rung carries its reason and a detail.
-//   stage 2  the least-used provider among survivors in balanced order, with
-//            list order breaking ties; ordered tiers take the first survivor.
-//            A provider under 10% left counts LOW_USAGE_WEIGHT extra
-//            delegations there (PRD cml8, story 51): a weight, never a filter.
+//   stage 2  the lowest-scoring provider among survivors in balanced order,
+//            with list order breaking ties; ordered tiers take the first
+//            survivor. Known headroom adds proportional usage pressure, up to
+//            LOW_USAGE_WEIGHT extra delegations; under 10% left gets the full
+//            weight (PRD cml8, story 51). This is a weight, never a filter.
 //
 // A worker's routing constraints narrow this: a minimum tier raises the tier
 // stage 1 starts at, an excluded rung fails stage 1 in every tier, an avoided
@@ -53,6 +54,9 @@ export interface RouterEvidence {
   /** Providers the usage store holds under 10% left for. Each counts
    *  LOW_USAGE_WEIGHT extra delegations in a balanced choice; none is removed. */
   readonly lowUsageProviders?: readonly string[];
+  /** Current effective percentage left per provider, when known. A balanced
+   *  choice weighs lower headroom as usage pressure; missing values add none. */
+  readonly providerPercentLeft?: Readonly<Record<string, number>>;
   /** Read for `contextWindow` only. */
   readonly catalog: ModelCatalog;
   readonly estimatedPromptTokens: number;
@@ -141,6 +145,8 @@ export interface TierRouteChoice {
   /** The candidate providers of a balanced choice that were weighted as low
    *  on usage; absent when none was. */
   readonly lowUsageProviders?: readonly string[];
+  /** Known effective headroom for candidate providers in a balanced choice. */
+  readonly providerPercentLeft?: Readonly<Record<string, number>>;
   readonly model: string;
   /** Every survivor of `tier`, in map order. */
   readonly survivors: readonly TierRung[];
@@ -183,10 +189,9 @@ export type TierRouteDecision = TierRouteChoice | TierRouteRefusal;
 /** The context window must hold the estimated prompt plus this share. */
 export const CONTEXT_WINDOW_HEADROOM_PERCENT = 5;
 
-/** The extra delegations a provider under 10% left counts for in a balanced
- *  choice: the other provider takes the next five delegations before the low
- *  one is chosen again, and a low provider is still chosen when it is the
- *  only survivor or the other is used far more. */
+/** The maximum extra-delegation penalty for low effective headroom in a
+ *  balanced choice. A known percentage left scales it from zero to this value;
+ *  under 10% left retains the full weight. */
 export const LOW_USAGE_WEIGHT = 5;
 
 function neededTokens(estimated: number): number {
@@ -332,19 +337,27 @@ export function routeTier(input: TierRouteInput): TierRouteDecision {
       const first = candidates[0]!;
       const tierOrder = input.tierMap.orders[tier];
       const providerCounts: Record<string, number> = {};
+      const providerPercentLeft: Record<string, number> = {};
       const low: string[] = [];
       if (tierOrder === "balanced") {
         for (const rung of candidates) {
           const provider = providerOf(rung.model);
           if (Object.hasOwn(providerCounts, provider)) continue;
           providerCounts[provider] = evidence.providerCounts?.[provider] ?? 0;
+          const percentLeft = evidence.providerPercentLeft?.[provider];
+          if (percentLeft !== undefined) providerPercentLeft[provider] = percentLeft;
           if (evidence.lowUsageProviders?.includes(provider)) low.push(provider);
         }
       }
-      // The weight only orders candidates: filtering and tier escalation never see it.
+      // Usage pressure is proportional to effective headroom, with the existing
+      // under-10% weight retained at its full value. It only orders candidates.
       const score = (rung: TierRung) => {
         const provider = providerOf(rung.model);
-        return (providerCounts[provider] ?? 0) + (low.includes(provider) ? LOW_USAGE_WEIGHT : 0);
+        const percentLeft = providerPercentLeft[provider];
+        const lowPenalty = low.includes(provider) ? LOW_USAGE_WEIGHT : 0;
+        const usagePenalty = percentLeft === undefined ? lowPenalty
+          : Math.max(lowPenalty, LOW_USAGE_WEIGHT * (100 - percentLeft) / 100);
+        return (providerCounts[provider] ?? 0) + usagePenalty;
       };
       const chosen = tierOrder === "ordered" ? first : candidates.reduce((best, rung) => score(rung) < score(best) ? rung : best, first);
       return Object.freeze({
@@ -354,6 +367,7 @@ export function routeTier(input: TierRouteInput): TierRouteDecision {
         tierOrder,
         ...(tierOrder === "balanced" ? { providerCounts: Object.freeze(providerCounts) } : {}),
         ...(low.length > 0 ? { lowUsageProviders: Object.freeze(low) } : {}),
+        ...(Object.keys(providerPercentLeft).length > 0 ? { providerPercentLeft: Object.freeze(providerPercentLeft) } : {}),
         model: chosen.model,
         survivors: Object.freeze(survivors),
         startedAtTier: input.tier,
