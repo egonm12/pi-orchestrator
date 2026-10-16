@@ -6,7 +6,7 @@ import { markWorkerSession } from "./worker-sessions.ts";
 // The protocol's two hooks, fed plain events: before_agent_start for a run a
 // prompt starts, context_with_system for every request of every run.
 
-const PROTOCOL = orchestratorProtocol(3, "medium");
+const PROTOCOL = orchestratorProtocol(8, "medium");
 
 test("the protocol carries known context in short delegation tasks", () => {
   assert.match(PROTOCOL, /concise, structured Markdown with the relevant paths, facts and project rules you already know/);
@@ -37,7 +37,7 @@ const user = (text: string): Message => ({ role: "user", content: text, timestam
 const custom = (text: string): Message => ({ role: "custom", content: text, timestamp: 3 });
 
 function keep(messages: readonly Message[], ctx = orchestrator) {
-  return keepOrchestratorProtocol({ messages: messages as never }, ctx, 3, "medium")?.messages as Message[] | undefined;
+  return keepOrchestratorProtocol({ messages: messages as never }, ctx, 8, "medium")?.messages as Message[] | undefined;
 }
 
 test("a request whose prompt lost the protocol gets it back, after the transcript's last system message", () => {
@@ -80,7 +80,7 @@ test("a worker's request and a request without any system prompt are left alone"
 
 function start(forceSystemPrompt: string | undefined, ctx = orchestrator) {
   const event = { systemPromptOptions: { sections: {} as Record<string, string>, ...(forceSystemPrompt === undefined ? {} : { forceSystemPrompt }) } };
-  const result = addOrchestratorProtocol(event as never, ctx, 3, "medium");
+  const result = addOrchestratorProtocol(event as never, ctx, 8, "medium");
   return { section: event.systemPromptOptions.sections[ORCHESTRATOR_PROTOCOL_SECTION], result };
 }
 
@@ -108,7 +108,7 @@ test("a worker's prompt gets no protocol, forced or not", () => {
 
 test("the protocol text opens with its heading, so a section patch is self-delimiting", () => {
   assert.ok(PROTOCOL.startsWith("# Orchestrator protocol\n\n"), PROTOCOL);
-  assert.ok(PROTOCOL.includes("After 3 exploratory calls in one user prompt"), PROTOCOL);
+  assert.ok(PROTOCOL.includes("past 8 exploratory calls in one prompt"), PROTOCOL);
   assert.ok(PROTOCOL.includes("Your gate level is medium."), PROTOCOL);
   assert.ok(PROTOCOL.includes("No call is denied"), PROTOCOL);
 });
@@ -138,10 +138,20 @@ test("the protocol says what makes a delegation editing: the working tree in a r
 });
 
 test("at gate level off the protocol says nothing of verdicts, the gate or reviewers", () => {
-  const off = orchestratorProtocol(3, "off");
+  const off = orchestratorProtocol(8, "off");
   assert.ok(off.startsWith("# Orchestrator protocol\n\n"), off);
-  assert.ok(off.includes("After 3 exploratory calls in one user prompt"), off);
+  assert.ok(off.includes("past 8 exploratory calls in one prompt"), off);
   assert.ok(off.includes("Check it before you act on it"), off);
   assert.doesNotMatch(off, /verdict|\bgate\b|reviewer|retry|request_changes|effort ladder/i);
-  assert.ok(orchestratorProtocol(3, "low").includes("Your gate level is low."), "every other level keeps the gate's entries");
+  assert.ok(orchestratorProtocol(8, "low").includes("Your gate level is low."), "every other level keeps the gate's entries");
+});
+
+test("the protocol explains the handling line and the 8-call safety limit, and carries the prompt's verdict as its own paragraph", () => {
+  const judged = orchestratorProtocol(8, "medium", "usage: anthropic 71% left", "Handling: delegate (three independent edits)");
+  assert.ok(judged.includes("\n\nHandling: delegate (three independent edits)\n\n"), judged);
+  assert.ok(judged.indexOf("Handling: delegate") < judged.indexOf("usage: anthropic 71% left"), "the verdict comes before the usage line");
+  assert.ok(judged.includes("handling line"), judged);
+  assert.ok(judged.includes("past 8 exploratory calls in one prompt"), judged);
+  assert.doesNotMatch(judged, /After 3 exploratory call/);
+  assert.doesNotMatch(orchestratorProtocol(8, "medium"), /\n\nHandling: delegate \(/, "no verdict, no line");
 });

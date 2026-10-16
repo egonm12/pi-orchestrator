@@ -64,8 +64,18 @@ A delegation whose worker, or a worker it started, changed files in the working 
 _Avoid_: Implementation delegation (the kind of work is the classifier's, editing is what the worker did)
 
 **Exploration nudge**:
-A reminder added to the result of each exploratory call the orchestrator makes beyond a set number in one user prompt, suggesting it hand the rest to a worker. Guidance, never a denial.
+A reminder added to the result of an exploratory call the orchestrator makes, suggesting it hand the work to a worker. On a `self` prompt it comes after a safety limit of 8 exploratory calls in that prompt; on a `delegate` prompt it comes with the first exploratory call. Guidance, never a denial (ADR 0020 amends ADR 0013).
 _Avoid_: Exploration budget (the earlier hard limit), call limit
+
+**Handling judge**:
+The small model call that gives each owner prompt in the orchestrator's session a verdict, `self` (one lookup, edit or check) or `delegate` (several independent things, open research, or work likely to run for minutes), with a short reason. It runs once per prompt before the first request and never for a worker or another extension's message. A failed judgement is `self`. When the effort judge also runs for the prompt, one reply carries both verdicts. Distinct from the effort judge, which picks effort, and from the classifier, which assigns a worker's tier.
+_Avoid_: Routing judge, mode judge
+
+**Handling line**:
+The protocol line that carries a prompt's verdict, such as `Handling: delegate (three independent edits)`, in the orchestrator's system prompt. An owner override appears in it as a forced verdict.
+
+**Handling override**:
+The owner's `/pi-orchestrator self` or `/pi-orchestrator delegate` command, which forces the handling for one prompt and skips the handling judge. With a prompt argument it sends that prompt; without one it applies to the next owner prompt. It never lasts beyond one prompt.
 
 **Label**:
 A short text the orchestrator gives one delegation to say what it is for, such as `research: budget code`. Shown wherever the worker is listed, falling back to its agent definition and then to `worker`. A retry keeps the label of the delegation it retries. A reviewer is shown as `reviewer: <label>`, with its own label or else the reviewed delegation's, and as plain `reviewer` when neither has one.

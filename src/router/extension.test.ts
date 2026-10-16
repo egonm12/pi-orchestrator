@@ -27,7 +27,8 @@ import { createRouterExtension, type RouterDependencies, type RoutingEvidence } 
 import { judgeIncomingWorkerMessage, requestFailover, setCarriedClassification, setPendingTask, setRoutingConstraints } from "./auto-model.ts";
 import { readUsageObservations, recordUsageObservation, usageObservationsPath, type UsageObservation } from "./usage-observations.ts";
 import { useOwnerBanLists } from "../fixtures/owner-ban-lists.ts";
-import { onEffortDecision } from "../routing/effort-decisions.ts";
+import { onEffortDecision, onHandlingDecision } from "../routing/effort-decisions.ts";
+import { markWorkerSession } from "../subagents/worker-sessions.ts";
 
 type VirtualModel = Parameters<ExtensionAPI["registerVirtualModel"]>[0];
 type RouteRequest = Parameters<VirtualModel["route"]>[0];
@@ -186,7 +187,7 @@ async function stderrOf(run: () => Promise<unknown>): Promise<string> {
 }
 
 const CLASSIFIER = { model: `${HAIKU}:low`, timeoutMs: 1_000, fallback: [] };
-/** Pins the classifier to LUNA: the effort judge inherits it as its fallback, and its tests expect that rung. */
+/** Pins the classifier to LUNA: the effort judge and handling judge inherit it as their fallback, and their tests expect that rung. */
 const LUNA_CLASSIFIER = { model: "openai-codex/gpt-6-luna:low", timeoutMs: 1_000 };
 const LIVE = { enabled: true, mode: "live", classifier: CLASSIFIER, tiers: TEST_TIERS };
 const SHADOW = { enabled: true, mode: "shadow", classifier: CLASSIFIER, tiers: TEST_TIERS };
@@ -448,12 +449,12 @@ test("/pi-orchestrator dispatches init and prints the usage for an unknown subco
   const h = harness(undefined);
   try {
     const command = orchestratorCommand();
-    assert.match(command.description ?? "", /^pi-orchestrator: init \(/);
+    assert.match(command.description ?? "", /^pi-orchestrator: delegate \(hand the next prompt to workers, skipping the judge\), self \(handle the next prompt yourself, skipping the judge\), init \(/);
     const notices: { message: string; type?: string }[] = [];
     await command.handler("frobnicate", { hasUI: true, ui: { notify: (message: string, type?: string) => { notices.push({ message, type }); } } } as never);
     assert.equal(notices.length, 1);
     assert.equal(notices[0]!.type, "warning");
-    assert.match(notices[0]!.message, /^pi-orchestrator: unknown subcommand 'frobnicate'\.\nusage: \/pi-orchestrator <subcommand>\n {2}init: /);
+    assert.match(notices[0]!.message, /^pi-orchestrator: unknown subcommand 'frobnicate'\.\nusage: \/pi-orchestrator <subcommand>\n {2}delegate: .*\n {2}self: .*\n {2}init: /);
     assert.equal(await runWithoutUI(command, "init"), "pi-orchestrator: /pi-orchestrator init asks for approvals and needs an interactive session; nothing was written.\n");
     assert.equal(await runWithoutUI(command, "init extra"), "usage: /pi-orchestrator init\n", "init keeps refusing extra arguments");
     assert.equal(readFileSync(join(h.agentDir, "settings.json"), "utf8"), JSON.stringify({ orchestrator: {} }), "personal settings are unchanged");
@@ -3005,4 +3006,220 @@ test("synthetic: a later response with the same reading does not write the store
       { status: 200, headers: anthropicHeaders({ "anthropic-ratelimit-unified-7d-utilization": "0.4" }) }, later);
     assert.deepEqual([changed.observations.anthropic?.percentLeft, changed.observations.anthropic?.observedAt], [60, later.toISOString()]);
   } finally { h.cleanup(); }
+});
+
+test("an orchestrator prompt is judged for handling once its message is shown, whether or not dynamic effort is set", async () => {
+  const h = harness({ enabled: false, classifier: LUNA_CLASSIFIER });
+  const verdicts: unknown[] = [];
+  const stop = onHandlingDecision((event) => { verdicts.push(event); });
+  try {
+    const handlers = piHandlers();
+    let judgeCalls = 0;
+    const create = await isolatedRouterExtension();
+    create({ effortJudgeCall: () => async () => { judgeCalls++; return JSON.stringify({ handling: "delegate", why: "three independent edits" }); } })({
+      registerVirtualModel() {},
+      on(event: string, handler: Handler) { handlers.on(event, handler); },
+      getThinkingLevel: () => "low",
+      setThinkingLevel() {},
+    } as unknown as ExtensionAPI);
+    const registry = fakeSessionRegistry([]);
+    const ctx = { cwd: h.projectDir, hasUI: false, model: registry.find("anthropic", "claude-opus-5-5"),
+      modelRegistry: registry, thinkingLevel: "low", sessionManager: { getSessionId: () => "handling-owner", getBranch: () => [] } } as unknown as ExtensionContext;
+    await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
+    await handlers.get("input")?.({ type: "input", text: "Rename the helper in three modules", source: "interactive" }, ctx);
+    await handlers.get("before_agent_start")?.({ type: "before_agent_start", prompt: "Rename the helper in three modules" }, ctx);
+    assert.equal(judgeCalls, 0, "no judge call before the user message is shown");
+    await handlers.get("message_end")?.({ type: "message_end", message: userMessage("Rename the helper in three modules") }, ctx);
+    assert.equal(judgeCalls, 1);
+    assert.deepEqual(verdicts, [{
+      sessionId: "handling-owner", timestamp: verdicts[0] && (verdicts[0] as { timestamp: string }).timestamp,
+      // The fixture registry has no Haiku 5.5, so the chain skips that refused rung and the next rung answers.
+      handling: "delegate", source: "judged", reason: "three independent edits", judgeModel: "openai-codex/gpt-6-luna:low",
+    }]);
+  } finally { stop(); h.cleanup(); }
+});
+
+test("an extension's user message and a worker's prompt are never handling-judged", async () => {
+  const h = harness({ enabled: false, classifier: LUNA_CLASSIFIER });
+  try {
+    const handlers = piHandlers();
+    let judgeCalls = 0;
+    const create = await isolatedRouterExtension();
+    create({ effortJudgeCall: () => async () => { judgeCalls++; return JSON.stringify({ handling: "delegate", why: "x" }); } })({
+      registerVirtualModel() {},
+      on(event: string, handler: Handler) { handlers.on(event, handler); },
+      getThinkingLevel: () => "low",
+      setThinkingLevel() {},
+    } as unknown as ExtensionAPI);
+    const registry = fakeSessionRegistry([]);
+    const owner = { cwd: h.projectDir, hasUI: false, model: registry.find("anthropic", "claude-opus-5-5"),
+      modelRegistry: registry, thinkingLevel: "low", sessionManager: { getSessionId: () => "guard-owner", getBranch: () => [] } } as unknown as ExtensionContext;
+    await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, owner);
+    await handlers.get("input")?.({ type: "input", text: "A worker finished", source: "extension" }, owner);
+    await handlers.get("message_end")?.({ type: "message_end", message: userMessage("A worker finished") }, owner);
+    assert.equal(judgeCalls, 0, "an extension's message is not judged");
+    const worker = "guard-worker";
+    markWorkerSession(worker);
+    const workerCtx = { ...owner, sessionManager: { getSessionId: () => worker, getBranch: () => [] } } as unknown as ExtensionContext;
+    await handlers.get("input")?.({ type: "input", text: "Work on it", source: "interactive" }, workerCtx);
+    await handlers.get("message_end")?.({ type: "message_end", message: userMessage("Work on it") }, workerCtx);
+    assert.equal(judgeCalls, 0, "a worker's prompt is not judged");
+  } finally { h.cleanup(); }
+});
+
+test("when the effort judge also runs for a prompt, one model call returns both the effort and the handling verdict", async () => {
+  const h = harness({ enabled: false, sessionEffort: "low-high", classifier: LUNA_CLASSIFIER });
+  const verdicts: { handling: string; source: string; reason: string; judgeModel: string }[] = [];
+  const stop = onHandlingDecision((event) => { verdicts.push(event); });
+  try {
+    const handlers = piHandlers();
+    let level = "high";
+    let judgeCalls = 0;
+    const selected: string[] = [];
+    const create = await isolatedRouterExtension();
+    create({ effortJudgeCall: () => async () => {
+      judgeCalls++;
+      return JSON.stringify({ effort: "low", why: "chosen", handling: "delegate", handlingWhy: "three independent edits" });
+    } })({
+      registerVirtualModel() {},
+      on(event: string, handler: Handler) { handlers.on(event, handler); },
+      getThinkingLevel: () => level,
+      setThinkingLevel(next: string) { selected.push(next); level = next; },
+    } as unknown as ExtensionAPI);
+    const registry = fakeSessionRegistry([]);
+    const ctx = { cwd: h.projectDir, hasUI: false, model: registry.find("anthropic", "claude-opus-5-5"),
+      modelRegistry: registry, thinkingLevel: "high", sessionManager: { getSessionId: () => "shared-owner", getBranch: () => [] } } as unknown as ExtensionContext;
+    await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
+    await handlers.get("input")?.({ type: "input", text: "Rename the helper in three modules", source: "interactive" }, ctx);
+    await handlers.get("before_agent_start")?.({ type: "before_agent_start", prompt: "Rename the helper in three modules" }, ctx);
+    await handlers.get("message_end")?.({ type: "message_end", message: userMessage("Rename the helper in three modules") }, ctx);
+    stop();
+    assert.equal(judgeCalls, 1, "one call judges both");
+    assert.deepEqual(selected, ["low"]);
+    // The rung that answered is the effort judge's: the verdict names the same one its decision record does.
+    const answeredBy = h.records().find((record) => record.recordType === "effort-decision")?.judgeModel;
+    assert.ok(answeredBy && answeredBy !== "fallback", "the effort judge answered");
+    assert.deepEqual(verdicts.map(({ handling, source, reason, judgeModel }) => ({ handling, source, reason, judgeModel })), [{
+      handling: "delegate", source: "judged", reason: "three independent edits", judgeModel: answeredBy,
+    }]);
+  } finally { stop(); h.cleanup(); }
+});
+
+/** The `/pi-orchestrator` command a router loads with, and the pi calls its overrides make. */
+async function orchestratorOverrides(h: Harness, judged: { calls: number }) {
+  const handlers = piHandlers();
+  const commands = new Map<string, { handler: (args: string, ctx: ExtensionContext) => Promise<void> }>();
+  const sent: string[] = [];
+  const create = await isolatedRouterExtension();
+  create({ effortJudgeCall: () => async () => { judged.calls++; return JSON.stringify({ handling: "self", why: "a lookup" }); } })({
+    registerVirtualModel() {},
+    on(event: string, handler: Handler) { handlers.on(event, handler); },
+    registerCommand(name: string, options: { handler: (args: string, ctx: ExtensionContext) => Promise<void> }) { commands.set(name, options); },
+    sendUserMessage(text: string) { sent.push(text); },
+    getThinkingLevel: () => "low",
+    setThinkingLevel() {},
+  } as unknown as ExtensionAPI);
+  const registry = fakeSessionRegistry([]);
+  const ctx = { cwd: h.projectDir, hasUI: false, model: registry.find("anthropic", "claude-opus-5-5"), isIdle: () => true,
+    modelRegistry: registry, thinkingLevel: "low", sessionManager: { getSessionId: () => "override-owner", getBranch: () => [] } } as unknown as ExtensionContext;
+  await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
+  return {
+    ctx, sent,
+    command: (args: string) => commands.get("pi-orchestrator")!.handler(args, ctx),
+    prompt: async (text: string, source: "interactive" | "extension" = "interactive") => {
+      await handlers.get("input")?.({ type: "input", text, source }, ctx);
+      await handlers.get("before_agent_start")?.({ type: "before_agent_start", prompt: text }, ctx);
+      await handlers.get("message_end")?.({ type: "message_end", message: userMessage(text) }, ctx);
+    },
+  };
+}
+
+test("/pi-orchestrator delegate with no prompt forces delegate for the next owner prompt only, and skips the judge", async () => {
+  const h = harness({ enabled: false, classifier: LUNA_CLASSIFIER });
+  const verdicts: { sessionId: string; handling: string; source: string }[] = [];
+  const stop = onHandlingDecision((event) => { verdicts.push(event); });
+  try {
+    const judged = { calls: 0 };
+    const o = await orchestratorOverrides(h, judged);
+    await o.command("delegate");
+    await o.prompt("Rename the helper in three modules");
+    assert.equal(judged.calls, 0, "the override skips the judge");
+    await o.prompt("Fix the typo in the readme");
+    assert.equal(judged.calls, 1, "the prompt after is judged again");
+    assert.deepEqual(verdicts.map(({ sessionId, handling, source }) => ({ sessionId, handling, source })), [
+      { sessionId: "override-owner", handling: "delegate", source: "forced" },
+      { sessionId: "override-owner", handling: "self", source: "judged" },
+    ]);
+  } finally { stop(); h.cleanup(); }
+});
+
+test("/pi-orchestrator self with a prompt sends it with the forced mode, and that prompt is not judged", async () => {
+  const h = harness({ enabled: false, classifier: LUNA_CLASSIFIER });
+  const verdicts: { handling: string; source: string }[] = [];
+  const stop = onHandlingDecision((event) => { verdicts.push(event); });
+  try {
+    const judged = { calls: 0 };
+    const o = await orchestratorOverrides(h, judged);
+    await o.command("self Fix the typo in the readme");
+    assert.deepEqual(o.sent, ["Fix the typo in the readme"]);
+    assert.deepEqual(verdicts.map(({ handling, source }) => ({ handling, source })), [{ handling: "self", source: "forced" }]);
+    // The message the command sent arrives from an extension, as pi reports extension messages.
+    await o.prompt("Fix the typo in the readme", "extension");
+    assert.equal(judged.calls, 0);
+  } finally { stop(); h.cleanup(); }
+});
+
+test("a handling verdict is persisted in the routing log, with the source it was judged from", async () => {
+  const h = harness({ enabled: false, classifier: LUNA_CLASSIFIER });
+  try {
+    const handlers = piHandlers();
+    const create = await isolatedRouterExtension();
+    create({ effortJudgeCall: () => async () => JSON.stringify({ handling: "self", why: "a single lookup" }) })({
+      registerVirtualModel() {},
+      on(event: string, handler: Handler) { handlers.on(event, handler); },
+      getThinkingLevel: () => "low",
+      setThinkingLevel() {},
+    } as unknown as ExtensionAPI);
+    const registry = fakeSessionRegistry([]);
+    const ctx = { cwd: h.projectDir, hasUI: false, model: registry.find("anthropic", "claude-opus-5-5"),
+      modelRegistry: registry, thinkingLevel: "low", sessionManager: { getSessionId: () => "logged-owner", getBranch: () => [] } } as unknown as ExtensionContext;
+    await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
+    await handlers.get("input")?.({ type: "input", text: "Where is the logger defined?", source: "interactive" }, ctx);
+    await handlers.get("message_end")?.({ type: "message_end", message: userMessage("Where is the logger defined?") }, ctx);
+    const logged = h.records().filter((record) => record.recordType === "handling-decision");
+    assert.equal(logged.length, 1);
+    assert.equal(logged[0]!.sessionId, "logged-owner");
+    assert.equal(logged[0]!.handling, "self");
+    assert.equal(logged[0]!.source, "judged");
+    assert.equal(logged[0]!.reason, "a single lookup");
+  } finally { h.cleanup(); }
+});
+
+test("a failed handling judgement falls back to self, and is warned about once per session, not per prompt", async () => {
+  const h = harness({ enabled: false, classifier: LUNA_CLASSIFIER });
+  const written: string[] = [];
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk: string | Uint8Array) => { written.push(String(chunk)); return true; }) as typeof process.stderr.write;
+  try {
+    const handlers = piHandlers();
+    const create = await isolatedRouterExtension();
+    create({ effortJudgeCall: () => async () => { throw new Error("offline"); } })({
+      registerVirtualModel() {},
+      on(event: string, handler: Handler) { handlers.on(event, handler); },
+      getThinkingLevel: () => "low",
+      setThinkingLevel() {},
+    } as unknown as ExtensionAPI);
+    const registry = fakeSessionRegistry([]);
+    const ctx = { cwd: h.projectDir, hasUI: false, model: registry.find("anthropic", "claude-opus-5-5"),
+      modelRegistry: registry, thinkingLevel: "low", sessionManager: { getSessionId: () => "fallback-owner", getBranch: () => [] } } as unknown as ExtensionContext;
+    await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
+    for (const text of ["First prompt", "Second prompt"]) {
+      await handlers.get("input")?.({ type: "input", text, source: "interactive" }, ctx);
+      await handlers.get("message_end")?.({ type: "message_end", message: userMessage(text) }, ctx);
+    }
+    const warnings = written.filter((line) => line.includes("handling judge fallback to self"));
+    assert.equal(warnings.length, 1, JSON.stringify(written));
+    const logged = h.records().filter((record) => record.recordType === "handling-decision");
+    assert.deepEqual(logged.map((record) => [record.handling, record.source]), [["self", "fallback"], ["self", "fallback"]]);
+  } finally { process.stderr.write = originalWrite; h.cleanup(); }
 });

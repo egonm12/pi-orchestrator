@@ -60,35 +60,41 @@ function rungSetting(value: unknown, dotted: string): string {
 /** Pure: read the effort judge only from personal settings. When its fallback
  *  is omitted, it follows the classifier's configured primary and fallbacks. */
 export function effortJudgeConfigFromSettings(personal: unknown): EffortJudgeConfig {
+  return judgeConfigFromSettings(personal, SETTINGS_KEY);
+}
+
+/** The judge at `settingsKey`, one of the orchestrator.routing judges: the effort judge and the handling judge (ADR 0020). */
+export function judgeConfigFromSettings(personal: unknown, settingsKey: string): EffortJudgeConfig {
+  const name = settingsKey.slice("orchestrator.routing.".length);
   const classifier = classifierConfigFromSettings(personal);
   if (!isPlainObject(personal)) throw new Error("personal settings must be a JSON object.");
   const orchestrator = objectAt(personal, "orchestrator", "orchestrator");
   const routing = orchestrator && objectAt(orchestrator, "routing", "orchestrator.routing");
-  const judge = routing && objectAt(routing, "effortJudge", SETTINGS_KEY);
+  const judge = routing && objectAt(routing, name, settingsKey);
   if (!judge) {
     return Object.freeze({ ...DEFAULT_EFFORT_JUDGE_CONFIG, fallback: classifierFallback(classifier, DEFAULT_EFFORT_JUDGE_MODEL) });
   }
 
   const unknownKeys = Object.keys(judge).filter((key) => !(EFFORT_JUDGE_KEYS as readonly string[]).includes(key));
   if (unknownKeys.length > 0) {
-    throw new Error(`${SETTINGS_KEY} has unknown key(s) ${unknownKeys.map((key) => `${SETTINGS_KEY}.${key}`).join(", ")}.`);
+    throw new Error(`${settingsKey} has unknown key(s) ${unknownKeys.map((key) => `${settingsKey}.${key}`).join(", ")}.`);
   }
 
   const model = judge.model === undefined
     ? DEFAULT_EFFORT_JUDGE_CONFIG.model
-    : rungSetting(judge.model, `${SETTINGS_KEY}.model`);
+    : rungSetting(judge.model, `${settingsKey}.model`);
   const { timeoutMs: rawTimeout } = judge;
   if (rawTimeout !== undefined && (typeof rawTimeout !== "number" || !Number.isInteger(rawTimeout) || rawTimeout <= 0)) {
-    throw new Error(`${SETTINGS_KEY}.timeoutMs must be a positive integer of milliseconds; got ${JSON.stringify(rawTimeout)}.`);
+    throw new Error(`${settingsKey}.timeoutMs must be a positive integer of milliseconds; got ${JSON.stringify(rawTimeout)}.`);
   }
   const timeoutMs = rawTimeout ?? DEFAULT_EFFORT_JUDGE_CONFIG.timeoutMs;
   const { fallback: rawFallback } = judge;
   if (rawFallback !== undefined && !Array.isArray(rawFallback)) {
-    throw new Error(`${SETTINGS_KEY}.fallback must be an array of rung strings; got ${JSON.stringify(rawFallback)}.`);
+    throw new Error(`${settingsKey}.fallback must be an array of rung strings; got ${JSON.stringify(rawFallback)}.`);
   }
   const fallback = rawFallback === undefined
     ? classifierFallback(classifier, model)
-    : Object.freeze(rawFallback.map((rung, index) => rungSetting(rung, `${SETTINGS_KEY}.fallback[${index}]`)));
+    : Object.freeze(rawFallback.map((rung, index) => rungSetting(rung, `${settingsKey}.fallback[${index}]`)));
 
   return Object.freeze({ model, timeoutMs, fallback });
 }
@@ -156,6 +162,8 @@ export interface EffortJudgeDecision {
   readonly applyAt: "now" | "declined" | "none";
   readonly reason: string;
   readonly judgeModel: string | "skipped" | "fallback";
+  /** The handling verdict, when the judge's reply carried one (ADR 0020): one call judges both. */
+  readonly handling?: { readonly handling: "self" | "delegate"; readonly reason: string };
 }
 
 export interface JudgeEffortOptions {
@@ -183,6 +191,7 @@ function decision(
 interface EffortAnswer {
   readonly effort: ThinkingLevel;
   readonly why: string;
+  readonly handling?: { readonly handling: "self" | "delegate"; readonly reason: string };
 }
 
 /** The index of the `}` closing the `{` at `start`, skipping braces inside JSON
@@ -232,7 +241,8 @@ function checkEffortAnswer(text: string): EffortAnswer {
     throw new Error("effort judge reply must be a JSON object");
   }
   const answer = value as Record<string, unknown>;
-  if (Object.keys(answer).some((key) => key !== "effort" && key !== "why")) {
+  // handling and handlingWhy are optional: a shared call (ADR 0020) answers both, an effort-only reply just effort and why.
+  if (Object.keys(answer).some((key) => !["effort", "why", "handling", "handlingWhy"].includes(key))) {
     throw new Error("effort judge reply has an unknown property");
   }
   if (typeof answer.effort !== "string" || !THINKING_LEVELS.includes(answer.effort as ThinkingLevel)) {
@@ -241,7 +251,16 @@ function checkEffortAnswer(text: string): EffortAnswer {
   if (typeof answer.why !== "string" || answer.why.trim().length === 0) {
     throw new Error("effort judge reply needs a non-empty why");
   }
-  return { effort: answer.effort as ThinkingLevel, why: answer.why.trim() };
+  if (answer.handling === undefined) return { effort: answer.effort as ThinkingLevel, why: answer.why.trim() };
+  if (answer.handling !== "self" && answer.handling !== "delegate") throw new Error("effort judge reply has an unknown handling");
+  if (typeof answer.handlingWhy !== "string" || answer.handlingWhy.trim().length === 0) {
+    throw new Error("effort judge reply needs a non-empty handlingWhy");
+  }
+  return {
+    effort: answer.effort as ThinkingLevel,
+    why: answer.why.trim(),
+    handling: { handling: answer.handling, reason: answer.handlingWhy.trim() },
+  };
 }
 
 class EffortJudgeTimeout extends Error {}
@@ -309,7 +328,8 @@ export async function judgeEffort(
       const reply = await callWithTimeout(options.callModel, prompt, entry.rung, options.chain.timeoutMs);
       const text = typeof reply === "string" ? reply : reply.text;
       const answer = checkEffortAnswer(text);
-      return decision(input, clampToBand(answer.effort, input.band), answer.why, entry.rung);
+      const judged = decision(input, clampToBand(answer.effort, input.band), answer.why, entry.rung);
+      return answer.handling === undefined ? judged : { ...judged, handling: answer.handling };
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
     }

@@ -351,3 +351,18 @@ test("a follow-up outside either shortness limit is judged", async () => {
   assert.equal(calls, 1);
   assert.equal(decision.judgeModel, JUDGE_RUNG);
 });
+
+test("one judge reply can carry the handling verdict beside the effort, and the decision keeps it", async () => {
+  const decision = await judgeEffort(judgeInput({ turnRunning: false }), {
+    chain: testChain,
+    callModel: async () => JSON.stringify({
+      effort: "high",
+      why: "The change spans several files.",
+      handling: "delegate",
+      handlingWhy: "three independent edits",
+    }),
+  });
+
+  assert.equal(decision.to, "high");
+  assert.deepEqual(decision.handling, { handling: "delegate", reason: "three independent edits" });
+});

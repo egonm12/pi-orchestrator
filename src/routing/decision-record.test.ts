@@ -38,6 +38,7 @@ import {
   validateRoutingRecord,
   writeDecisionRecord,
   writeEffortDecisionRecord,
+  writeHandlingDecisionRecord,
   type DecisionRecord,
   type DecisionRecordInput,
   type RoutingRecord,
@@ -1112,4 +1113,27 @@ test("a record's drops name a banned dynamic rung by its band text", async () =>
   } finally {
     cleanup();
   }
+});
+
+test("a handling verdict is written as its own validated record, and read back", () => {
+  const { dir, cleanup } = tempDir();
+  try {
+    const { path, record } = writeHandlingDecisionRecord(dir, {
+      at: NOW,
+      sessionId: "owner-1",
+      handling: "delegate",
+      source: "judged",
+      reason: "three independent edits, token=abc123",
+      judgeModel: "anthropic/claude-haiku-5-5:low",
+    });
+    assert.equal(path, decisionRecordPath(dir, NOW));
+    assert.equal(record.recordType, "handling-decision");
+    assert.equal(record.timestamp, NOW.toISOString());
+    assert.equal(record.sessionId, "owner-1");
+    assert.equal(record.scope, "orchestrator");
+    assert.equal(record.handling, "delegate");
+    assert.equal(record.source, "judged");
+    assert.equal(record.reason, "three independent edits, token=[redacted]");
+    assert.deepEqual(readRoutingRecords(dir), [record]);
+  } finally { cleanup(); }
 });

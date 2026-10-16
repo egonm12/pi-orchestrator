@@ -27,7 +27,8 @@ import { openTranscript, type TranscriptViewExit } from "./transcript-view.ts";
 import { UserSteering, userSteeringNote, type UserSteer, type WorkerSteering } from "./user-steering.ts";
 import { isWorkerSession, rootSessionOf, workerStopSignal } from "./worker-sessions.ts";
 import { isOrchestratorSession } from "./orchestrator-session.ts";
-import { addOrchestratorProtocol, keepOrchestratorProtocol } from "./orchestrator-protocol.ts";
+import { addOrchestratorProtocol, handlingLine, keepOrchestratorProtocol } from "./orchestrator-protocol.ts";
+import { onHandlingDecision } from "../routing/effort-decisions.ts";
 import { registerCommitGate } from "./commit-gate.ts";
 import { registerExplorationNudge } from "./exploration-nudge.ts";
 import { registerSubagentsVerdictTool } from "./verdict.ts";
@@ -898,10 +899,14 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
     // prompt starts its run, and put back into any request whose prompt lost it, as in a run a message started
     // (orchestrator-protocol.ts). It ends with the usage line, read from the shared usage store for each request (usage-line.ts).
     const currentUsageLine = () => { const now = deps.now(); return usageLine(readUsageObservations(usageObservationsPath(stateDir()), now), now); };
+    // Each orchestrator session's latest handling verdict, as its protocol line (ADR 0020). A run a message starts keeps the last prompt's line.
+    const handlingLines = new Map<string, string>();
+    onHandlingDecision((event) => { handlingLines.set(event.sessionId, handlingLine(event)); });
+    const currentHandlingLine = (ctx: Parameters<typeof isOrchestratorSession>[0]) => handlingLines.get(ctx?.sessionManager?.getSessionId() ?? "");
     pi.on("before_agent_start", (event, ctx) => isOrchestratorSession(ctx)
-      ? addOrchestratorProtocol(event, ctx, explorationNudge.threshold, gateLevels.inForce(ctx).level, currentUsageLine()) : undefined);
+      ? addOrchestratorProtocol(event, ctx, explorationNudge.threshold, gateLevels.inForce(ctx).level, currentUsageLine(), currentHandlingLine(ctx)) : undefined);
     pi.on("context_with_system", (event, ctx) => isOrchestratorSession(ctx)
-      ? keepOrchestratorProtocol(event, ctx, explorationNudge.threshold, gateLevels.inForce(ctx).level, currentUsageLine()) : undefined);
+      ? keepOrchestratorProtocol(event, ctx, explorationNudge.threshold, gateLevels.inForce(ctx).level, currentUsageLine(), currentHandlingLine(ctx)) : undefined);
   };
 }
 

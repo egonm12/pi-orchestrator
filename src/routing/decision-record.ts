@@ -508,9 +508,22 @@ export interface EffortDecisionRecord extends RecordCommon {
   readonly decisionTimestamp?: string;
 }
 
+/** The handling judge's verdict for one owner prompt (ADR 0020), or the owner's override of it. */
+export interface HandlingDecisionRecord extends RecordCommon {
+  readonly recordType: "handling-decision";
+  /** The orchestrator session whose prompt was judged. */
+  readonly sessionId: string;
+  readonly scope: "orchestrator";
+  readonly handling: "self" | "delegate";
+  /** `judged` by the handling judge, `fallback` after a failed judgement, `forced` by the owner's override. */
+  readonly source: "judged" | "fallback" | "forced";
+  readonly reason: string;
+  readonly judgeModel: string;
+}
+
 export type RoutedDecisionRecord = DecisionRecord | EffortLadderRecord;
 export type RoutingRecord = RoutedDecisionRecord | ForkRecord | AgentModelRecord | ExplicitModelRecord | VerdictRecord | OrphanedVerdictRecord | EditRecord |
-  GateRequirementRecord | FailoverRecord | EffortDecisionRecord;
+  GateRequirementRecord | FailoverRecord | EffortDecisionRecord | HandlingDecisionRecord;
 
 /** A routed decision for the routing report. Forks accept verdicts but are not routed. */
 export function isRoutedDecision(record: RoutingRecord): record is RoutedDecisionRecord {
@@ -723,7 +736,7 @@ function checkConstraints(record: Json): void {
 }
 
 const DAY_FILE = /^\d{4}-\d{2}-\d{2}\.jsonl$/;
-const RECORD_TYPES = ["decision", "effort-ladder", "agent-model", "fork", "explicit", "verdict", "orphaned-verdict", "edit", "gate-requirement", "failover", "effort-decision"] as const;
+const RECORD_TYPES = ["decision", "effort-ladder", "agent-model", "fork", "explicit", "verdict", "orphaned-verdict", "edit", "gate-requirement", "failover", "effort-decision", "handling-decision"] as const;
 const COMMON_KEYS = ["recordType", "schemaVersion", "delegationId", "timestamp"] as const;
 
 /** First of all checks: a record of another version may have other fields
@@ -883,6 +896,17 @@ export function validateRoutingRecord(value: unknown): RoutingRecord {
     stringAt(value, "detail", "", { nonBlank: true });
     stringAt(value, "rung", "", { nonBlank: true });
     if (value.rung === refused.rung) throw new RoutingRecordError("rung", "must name a different rung than the refused attempt");
+  } else if (recordType === "handling-decision") {
+    if (value.schemaVersion !== DECISION_RECORD_SCHEMA_VERSION) throw new RoutingRecordError("schemaVersion", `is unsupported for ${recordType} records`);
+    checkKeys(value, "", [...COMMON_KEYS, "sessionId", "scope", "handling", "source", "reason", "judgeModel"]);
+    checkCommon(value);
+    stringAt(value, "sessionId", "", { nonBlank: true });
+    if (value.sessionId !== value.delegationId) throw new RoutingRecordError("sessionId", "must match delegationId");
+    oneOf(value, "scope", "", ["orchestrator"] as const);
+    oneOf(value, "handling", "", ["self", "delegate"] as const);
+    oneOf(value, "source", "", ["judged", "fallback", "forced"] as const);
+    stringAt(value, "reason", "", { nonBlank: true });
+    stringAt(value, "judgeModel", "", { nonBlank: true });
   } else if (recordType === "effort-decision") {
     if (value.schemaVersion !== DECISION_RECORD_SCHEMA_VERSION) throw new RoutingRecordError("schemaVersion", `is unsupported for ${recordType} records`);
     checkKeys(value, "", [...COMMON_KEYS, "sessionId", "scope", "kind", "from", "to", "applyAt", "reason", "judgeModel", "band", "stage"], ["decisionTimestamp"]);
@@ -1266,6 +1290,36 @@ export function buildEffortDecisionRecord(input: EffortDecisionRecordInput): Eff
 export interface WrittenEffortDecisionRecord {
   readonly path: string;
   readonly record: EffortDecisionRecord;
+}
+
+export interface HandlingDecisionRecordInput {
+  readonly sessionId: string;
+  readonly handling: HandlingDecisionRecord["handling"];
+  readonly source: HandlingDecisionRecord["source"];
+  readonly reason: string;
+  readonly judgeModel: string;
+  readonly at?: Date;
+}
+
+export function buildHandlingDecisionRecord(input: HandlingDecisionRecordInput): HandlingDecisionRecord {
+  const record: HandlingDecisionRecord = {
+    recordType: "handling-decision",
+    schemaVersion: DECISION_RECORD_SCHEMA_VERSION,
+    delegationId: input.sessionId,
+    sessionId: input.sessionId,
+    timestamp: (input.at ?? new Date()).toISOString(),
+    scope: "orchestrator",
+    handling: input.handling,
+    source: input.source,
+    reason: input.reason,
+    judgeModel: input.judgeModel,
+  };
+  return checkedRecord(record);
+}
+
+export function writeHandlingDecisionRecord(dir: string, input: HandlingDecisionRecordInput): { readonly path: string; readonly record: HandlingDecisionRecord } {
+  const record = buildHandlingDecisionRecord(input);
+  return { path: appendRoutingRecord(dir, record), record };
 }
 
 export function writeEffortDecisionRecord(dir: string, input: EffortDecisionRecordInput): WrittenEffortDecisionRecord {

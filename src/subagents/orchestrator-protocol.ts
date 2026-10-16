@@ -82,11 +82,14 @@ const paragraphs = (explorationNudge: number, gateLevel: GateLevel): readonly st
     "holds your turn just the same: wait only when you cannot go on without the result, and otherwise let the notices bring it.",
   "Keep small known actions yourself: a single lookup, a small edit you can already see, a build or test run, a commit, " +
     "or a decision only you can make.",
-  `After ${explorationNudge} exploratory call${explorationNudge === 1 ? "" : "s"} in one user prompt, the result of each further one ends ` +
-    "with an exploration nudge that counts your exploratory calls so far. Exploratory calls are reads, searches, listings, diffs, web " +
+  "Each user prompt comes with a handling line from the handling judge, such as \"Handling: delegate (three independent edits)\", " +
+    "or one the owner forced. On a self prompt, handle it yourself: a single lookup, edit or check. The result of each exploratory call " +
+    `past ${explorationNudge} exploratory call${explorationNudge === 1 ? "" : "s"} in one prompt ends with an exploration nudge that counts ` +
+    "your exploratory calls so far. On a delegate prompt, hand the work to workers with `subagents`; " +
+    "the result of your first exploratory call ends with a reminder to do so. Exploratory calls are reads, searches, listings, diffs, web " +
     "lookups, ctx and MCP calls, and any bash command that is not a build, test run or commit. Checking a worker's Result counts too. " +
     "Edits, builds, test runs, commits and the subagents tools never count. No call is denied: a quick lookup, or a check of what a " +
-    "worker changed, is yours to make. When the nudge appears, hand the rest of the research to a worker with `subagents`.",
+    "worker changed, is yours to make.",
   `A worker's Result is evidence, not ${hasQualityGate(gateLevel) ? "a verdict" : "proof"}. Check it before you act on it: does every claim carry file:line evidence, ` +
     "does it say what it could not verify, does anything contradict what you already know? Do not build on a claim without " +
     "evidence: check that claim yourself, or resume the worker with the `subagents` tool and ask for it.",
@@ -132,8 +135,14 @@ const qualityGateParagraphs = (gateLevel: GateLevel): readonly string[] => [
 /** The protocol text, as the orchestrator's system prompt carries it, for an
  *  exploration nudge after `explorationNudge` exploratory calls per user prompt, at the gate level `gateLevel`,
  *  ending with the usage line (usage-line.ts) when there is one. */
-export function orchestratorProtocol(explorationNudge: number, gateLevel: GateLevel, usage?: string): string {
-  return `# Orchestrator protocol\n\n${[...paragraphs(explorationNudge, gateLevel), ...(usage === undefined ? [] : [usage])].join("\n\n")}`;
+/** The handling line of one verdict (ADR 0020): `Handling: delegate (three independent edits)`. */
+export function handlingLine(verdict: { readonly handling: "self" | "delegate"; readonly reason: string }): string {
+  return verdict.reason.trim() === "" ? `Handling: ${verdict.handling}` : `Handling: ${verdict.handling} (${verdict.reason.trim()})`;
+}
+
+export function orchestratorProtocol(explorationNudge: number, gateLevel: GateLevel, usage?: string, handling?: string): string {
+  const tail = [...(handling === undefined ? [] : [handling]), ...(usage === undefined ? [] : [usage])];
+  return `# Orchestrator protocol\n\n${[...paragraphs(explorationNudge, gateLevel), ...tail].join("\n\n")}`;
 }
 
 /** The protocol as a section of a system message, delimited as pi renders a named section. */
@@ -146,9 +155,9 @@ function protocolSection(protocol: string): string {
  *  alone. Returns the forced prompt with the protocol appended when an earlier
  *  handler forced one without it. */
 export function addOrchestratorProtocol(event: Pick<BeforeAgentStartEvent, "systemPromptOptions">,
-  ctx: Pick<ExtensionContext, "sessionManager">, explorationNudge: number, gateLevel: GateLevel, usage?: string): BeforeAgentStartEventResult | undefined {
+  ctx: Pick<ExtensionContext, "sessionManager">, explorationNudge: number, gateLevel: GateLevel, usage?: string, handling?: string): BeforeAgentStartEventResult | undefined {
   if (!isOrchestratorSession(ctx)) return undefined;
-  const protocol = orchestratorProtocol(explorationNudge, gateLevel, usage);
+  const protocol = orchestratorProtocol(explorationNudge, gateLevel, usage, handling);
   event.systemPromptOptions.sections[ORCHESTRATOR_PROTOCOL_SECTION] = protocol;
   const forced = event.systemPromptOptions.forceSystemPrompt;
   if (forced === undefined || forced.includes(protocol)) return undefined;
@@ -168,7 +177,7 @@ interface PromptMessage {
  *  stable across the run's requests. Leaves a request without any system
  *  message alone: pi sent it no prompt, and the protocol alone is not one. */
 export function keepOrchestratorProtocol(event: Pick<ContextWithSystemEvent, "messages">,
-  ctx: Pick<ExtensionContext, "sessionManager">, explorationNudge: number, gateLevel: GateLevel, usage?: string): ContextEventResult | undefined {
+  ctx: Pick<ExtensionContext, "sessionManager">, explorationNudge: number, gateLevel: GateLevel, usage?: string, handling?: string): ContextEventResult | undefined {
   if (!isOrchestratorSession(ctx)) return undefined;
   const messages = event.messages as readonly PromptMessage[];
   let lastSystem = -1;
@@ -179,7 +188,7 @@ export function keepOrchestratorProtocol(event: Pick<ContextWithSystemEvent, "me
     const section = message.sections?.[ORCHESTRATOR_PROTOCOL_SECTION];
     if (section !== undefined) current = section;
   });
-  const protocol = orchestratorProtocol(explorationNudge, gateLevel, usage);
+  const protocol = orchestratorProtocol(explorationNudge, gateLevel, usage, handling);
   // Exactly the current section: the protocol without a usage line is a prefix of one with it, so a
   // containment check would keep a line whose limit has lifted. A patch replaces the section by name, never adds one.
   if (lastSystem < 0 || current === protocolSection(protocol) || current === protocol) return undefined;

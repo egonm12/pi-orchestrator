@@ -48,7 +48,7 @@ export type WorkerLimitSource = "project" | "personal" | "default";
 
 const SUBAGENTS_KEY = "orchestrator.subagents";
 /** `explorationNudge` when the owner sets none. */
-export const DEFAULT_EXPLORATION_NUDGE = 3;
+export const DEFAULT_EXPLORATION_NUDGE = 8;
 /** `gateLevel` when the owner sets none (ADR 0011). */
 export const DEFAULT_GATE_LEVEL: GateLevel = "medium";
 const FLAG = "allowProjectOverrides";

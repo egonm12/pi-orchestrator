@@ -23,6 +23,8 @@ export interface EffortJudgeInput {
   readonly lastAssistantReply?: string;
   /** The task prefix, included only for a worker steer or follow-up. */
   readonly taskPrefix?: string;
+  /** Also judge the handling of this owner prompt, in the same reply (ADR 0020). */
+  readonly withHandling?: boolean;
 }
 
 export const EFFORT_JUDGE_SYSTEM_PROMPT =
@@ -44,6 +46,22 @@ export const EFFORT_JUDGE_ANSWER_SCHEMA = {
   additionalProperties: false,
 } as const;
 
+/** The answer schema when one reply also judges the handling (ADR 0020). */
+export const EFFORT_AND_HANDLING_ANSWER_SCHEMA = {
+  type: "object",
+  properties: {
+    effort: { type: "string", enum: [...THINKING_LEVELS] },
+    why: { type: "string" },
+    handling: { type: "string", enum: ["self", "delegate"] },
+    handlingWhy: { type: "string" },
+  },
+  required: ["effort", "why", "handling", "handlingWhy"],
+  additionalProperties: false,
+} as const;
+
+/** The handling question added to the rubric when one reply also judges the handling. */
+const HANDLING_QUESTION = "Also judge the handling of this message. Answer self for one lookup, edit or check. Answer delegate for several independent things, open research, or work likely to run for minutes. Give handling and a short handlingWhy with your effort answer.";
+
 function firstCharacters(value: string | undefined, limit: number): string {
   return (value ?? "").slice(0, limit);
 }
@@ -60,7 +78,7 @@ export function effortJudgePrompt(input: EffortJudgeInput): string {
     "",
     `Effort judge rubric version: ${RUBRIC_VERSION}`,
     "JSON schema:",
-    JSON.stringify(EFFORT_JUDGE_ANSWER_SCHEMA),
+    JSON.stringify(input.withHandling ? EFFORT_AND_HANDLING_ANSWER_SCHEMA : EFFORT_JUDGE_ANSWER_SCHEMA),
     "",
     "Incoming message (first 2000 characters):",
     "<<<",
@@ -71,6 +89,8 @@ export function effortJudgePrompt(input: EffortJudgeInput): string {
     `Effort band, inclusive: ${input.band.min}-${input.band.max}`,
     `Current effort: ${input.currentEffort}`,
   ];
+
+  if (input.withHandling) lines.push(HANDLING_QUESTION);
 
   if (input.tier === "orchestrator") {
     lines.push(

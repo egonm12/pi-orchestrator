@@ -9,7 +9,7 @@ import type { ActiveRouter } from "./route-task.ts";
 import { newTaskLedger, TaskAllowanceOwner } from "../budget/task-allowance.ts";
 import { banListsFromSettings, configureBanLists, loadBanListsOrDefaults, personalAgentDir, personalOrchestrator, readSettingsFile } from "../policy/ban-lists.ts";
 import { isPlainObject } from "../guard/boundaries.ts";
-import { ROUTING_MODES, writeEffortDecisionRecord, type RoutingMode } from "../routing/decision-record.ts";
+import { ROUTING_MODES, writeEffortDecisionRecord, writeHandlingDecisionRecord, type RoutingMode } from "../routing/decision-record.ts";
 import { sessionClassifierModelCall, type SessionClassifierCallReport } from "../routing/session-classifier-call.ts";
 import {
   classifierConfigFromSettings,
@@ -20,7 +20,8 @@ import {
 import { tierMapFromSettings } from "../routing/tier-map.ts";
 import { runInit } from "../init/command.ts";
 import { setupNotice, setupStatus } from "../init/setup.ts";
-import { registerSubcommands, type Subcommand } from "../init/subcommands.ts";
+import { INIT_COMMAND } from "../init/setup.ts";
+import { registerSubcommands, showOwner, type Subcommand } from "../init/subcommands.ts";
 import { stateFolderEvidence, type EvidenceSetup, type RoutingEvidenceSource } from "./evidence.ts";
 import { usageObservationsPath } from "./usage-observations.ts";
 import { isOrchestratorSession } from "../subagents/orchestrator-session.ts";
@@ -31,7 +32,8 @@ import type { SessionModelRegistry } from "../routing/model-stream.ts";
 import { sessionEffortBandFromSettings } from "../routing/session-effort.ts";
 import { dynamicRungRefusal } from "../models/effort-capability.ts";
 import { getSupportedThinkingLevels, type ThinkingLevel } from "../models/model-info.ts";
-import { emitEffortDecision, onEffortDecision, type EffortDecisionEvent } from "../routing/effort-decisions.ts";
+import { emitEffortDecision, emitHandlingDecision, onEffortDecision, onHandlingDecision, type EffortDecisionEvent } from "../routing/effort-decisions.ts";
+import { handlingJudgeConfigFromSettings, judgeHandling } from "../routing/handling-judge.ts";
 
 export type { RoutingEvidence, RoutingEvidenceSource, EvidenceSetup } from "./evidence.ts";
 
@@ -91,6 +93,25 @@ function recordEffortDecisionEvents(warn: (key: string, message: string) => void
       });
     } catch (error) {
       warn(`effort-decision-record:${event.sessionId}`, `could not save effort decision for ${event.sessionId}: ${String(error).split(/\r?\n/, 1)[0]}`);
+    }
+  });
+}
+
+const HANDLING_DECISION_RECORDER = Symbol.for("pi-orchestrator.handling-decision-recorder");
+
+/** Writes each handling verdict to the routing log (ADR 0020), once per process, as the effort decisions are. */
+function recordHandlingDecisionEvents(warn: (key: string, message: string) => void): void {
+  const processGlobal = globalThis as unknown as Record<symbol, true | undefined>;
+  if (processGlobal[HANDLING_DECISION_RECORDER]) return;
+  processGlobal[HANDLING_DECISION_RECORDER] = true;
+  onHandlingDecision((event) => {
+    try {
+      writeHandlingDecisionRecord(join(stateDir(), "routing"), {
+        at: new Date(event.timestamp), sessionId: event.sessionId, handling: event.handling,
+        source: event.source, reason: event.reason, judgeModel: event.judgeModel,
+      });
+    } catch (error) {
+      warn(`handling-decision-record:${event.sessionId}`, `could not save handling decision for ${event.sessionId}: ${String(error).split(/\r?\n/, 1)[0]}`);
     }
   });
 }
@@ -269,6 +290,7 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
       },
     };
     recordEffortDecisionEvents(autoDeps.warn);
+    recordHandlingDecisionEvents(autoDeps.warn);
     const autoModel = createAutoModelRouter(autoDeps);
     // Registering again replaces the virtual model; its route keeps no pins of its own.
     const registerAutoModel = (limits: AutoModelLimits = {}) => pi.registerVirtualModel<AutoModelState>({
@@ -290,18 +312,6 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
     };
     const probe = process.env.PI_ORCHESTRATOR_ROUTER_PROBE === "1";
 
-    // `/pi-orchestrator <subcommand>`. `init` sets up a fresh install. Its
-    // failures are reported by the command and never disable routing. Other
-    // extensions add their subcommands to the same command (subcommands.ts).
-    const subcommands: Subcommand<ExtensionCommandContext>[] = [{
-      name: "init",
-      summary: "set up a starter tier map, ban list and approved recipients",
-      run: async (rest, ctx) => {
-        try { await runInit(`init ${rest}`, ctx, { stateDir: stateDir() }); }
-        catch (error) { ctx.ui.notify(`pi-orchestrator init failed: ${String(error).split(/\r?\n/, 1)[0]}`, "error"); }
-      },
-    }];
-    if (typeof pi.registerCommand === "function") registerSubcommands(pi, subcommands);
 
     // The orchestrator's session model, for workers to fall back to. A
     // worker's or a child process's session model is not remembered. A
@@ -426,7 +436,8 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
         let decision;
         try {
           decision = await judgeEffort({ message: pending.prompt, kind: "user-prompt", tier: "orchestrator", band, currentEffort,
-            turnRunning: false, lastUserMessage: pending.lastUserMessage, lastAssistantReply: pending.lastAssistantReply },
+            turnRunning: false, lastUserMessage: pending.lastUserMessage, lastAssistantReply: pending.lastAssistantReply,
+            withHandling: pendingHandling !== undefined },
           { chain: loadEffortJudgeChain(effortJudgeConfigFromSettings(effortPersonal), ctx.modelRegistry!.getAvailable().map(toModelInfo)),
             callModel: deps.effortJudgeCall(ctx.modelRegistry!) });
         } catch (error) {
@@ -441,10 +452,94 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
         }
         emitEffortDecision({ ...decision, timestamp: deps.now().toISOString(), band, sessionId, kind: "user-prompt", scope: "orchestrator" });
         if (decision.applyAt === "now") selectEffort(decision.to);
+        return decision;
       } catch (error) {
         autoDeps.warn("session-effort-judge", `could not apply the effort judgement: ${String(error).split(/\r?\n/, 1)[0]}`);
       }
     };
+
+    // The handling judge (ADR 0020) judges each orchestrator user prompt once,
+    // when its user message is shown. `input` runs before the run starts, and
+    // says whether the prompt came from the owner (an extension's message does not).
+    let pendingHandling: { readonly sessionId: string; readonly text: string } | undefined;
+    /** The owner's override for the next prompt, from `/pi-orchestrator self|delegate` with no prompt (ADR 0020). */
+    let handlingOverride: "self" | "delegate" | undefined;
+    pi.on("input", (event, ctx) => {
+      pendingHandling = undefined;
+      if (event.source === "extension" || !isOrchestratorSession(ctx)) return;
+      // A command is not a prompt: it neither takes the override nor is judged.
+      if (event.text.trimStart().startsWith(`/${INIT_COMMAND}`)) return;
+      const sessionId = ctx.sessionManager?.getSessionId();
+      if (sessionId === undefined) return;
+      if (handlingOverride !== undefined) {
+        emitForcedHandling(sessionId, handlingOverride);
+        handlingOverride = undefined;
+        return;
+      }
+      pendingHandling = { sessionId, text: event.text };
+    });
+    const emitForcedHandling = (sessionId: string, handling: "self" | "delegate") => {
+      emitHandlingDecision({ sessionId, timestamp: deps.now().toISOString(), handling, source: "forced",
+        reason: `owner override: /${INIT_COMMAND} ${handling}`, judgeModel: "forced" });
+    };
+    // `/pi-orchestrator self|delegate`: with a prompt, sends it with the forced mode; without, the mode applies to the next prompt.
+    const overrideSubcommand = (handling: "self" | "delegate"): Subcommand<ExtensionCommandContext> => ({
+      name: handling,
+      summary: handling === "delegate" ? "hand the next prompt to workers, skipping the judge" : "handle the next prompt yourself, skipping the judge",
+      run: (rest, ctx) => {
+        if (!isOrchestratorSession(ctx)) return;
+        if (rest === "") {
+          handlingOverride = handling;
+          showOwner(ctx, `pi-orchestrator: the next prompt is judged ${handling}, without the handling judge`, "info");
+          return;
+        }
+        const sessionId = ctx.sessionManager?.getSessionId();
+        if (sessionId !== undefined) emitForcedHandling(sessionId, handling);
+        pi.sendUserMessage(rest, ctx.isIdle() ? undefined : { deliverAs: "followUp" });
+      },
+    });
+    /** Judges the pending owner prompt's handling, once. Never throws: a failed judgement is self. */
+    const judgeHandlingPrompt = async (ctx: ExtensionContext, judged?: { readonly judgeModel: string; readonly handling?: { readonly handling: "self" | "delegate"; readonly reason: string } }) => {
+      const pending = pendingHandling;
+      pendingHandling = undefined;
+      if (pending === undefined) return;
+      // The effort judge's reply already judged the handling: one model call, not two.
+      if (judged?.handling !== undefined) {
+        emitHandlingDecision({
+          sessionId: pending.sessionId, timestamp: deps.now().toISOString(), handling: judged.handling.handling,
+          source: "judged", reason: judged.handling.reason, judgeModel: judged.judgeModel,
+        });
+        return;
+      }
+      let verdict;
+      try {
+        verdict = await judgeHandling({ message: pending.text }, {
+          chain: loadEffortJudgeChain(handlingJudgeConfigFromSettings(effortPersonal), ctx.modelRegistry!.getAvailable().map(toModelInfo)),
+          callModel: deps.effortJudgeCall(ctx.modelRegistry!),
+        });
+      } catch (error) {
+        verdict = { handling: "self" as const, reason: `handling judge fallback to self: ${String(error)}`, judgeModel: "fallback" };
+      }
+      emitHandlingDecision({
+        sessionId: pending.sessionId, timestamp: deps.now().toISOString(), handling: verdict.handling,
+        source: verdict.judgeModel === "fallback" ? "fallback" : "judged", reason: verdict.reason, judgeModel: verdict.judgeModel,
+      });
+      // Warned once per session, not per prompt: the routing log keeps every fallback.
+      if (verdict.judgeModel === "fallback") autoDeps.warn(`handling-judge-fallback:${pending.sessionId}`, `orchestrator ${pending.sessionId}: ${verdict.reason}`);
+    };
+
+    // `/pi-orchestrator <subcommand>`. `init` sets up a fresh install. Its
+    // failures are reported by the command and never disable routing. Other
+    // extensions add their subcommands to the same command (subcommands.ts).
+    const subcommands: Subcommand<ExtensionCommandContext>[] = [overrideSubcommand("delegate"), overrideSubcommand("self"), {
+      name: "init",
+      summary: "set up a starter tier map, ban list and approved recipients",
+      run: async (rest, ctx) => {
+        try { await runInit(`init ${rest}`, ctx, { stateDir: stateDir() }); }
+        catch (error) { ctx.ui.notify(`pi-orchestrator init failed: ${String(error).split(/\r?\n/, 1)[0]}`, "error"); }
+      },
+    }];
+    if (typeof pi.registerCommand === "function") registerSubcommands(pi, subcommands);
 
     pi.on("session_shutdown", (_event, ctx) => {
       const id = ctx?.sessionManager?.getSessionId();
@@ -497,7 +592,7 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
       const message = event.message as { role?: string; stopReason?: string; errorMessage?: string; provider?: string };
       // A queued steer or follow-up also shows a user message; only the pending
       // owner prompt is judged, so the judgement is one-shot per prompt.
-      if (message.role === "user") { await judgeOwnerPrompt(ctx); return undefined; }
+      if (message.role === "user") { const judged = await judgeOwnerPrompt(ctx); await judgeHandlingPrompt(ctx, judged); return undefined; }
       if (message.role !== "assistant" || message.stopReason !== "error" || !isAutoModel(ctx.model)) return undefined;
       if (message.provider === undefined || message.provider === AUTO_PROVIDER) return undefined;
       await recordLimitError(autoDeps, message.provider, message.errorMessage);

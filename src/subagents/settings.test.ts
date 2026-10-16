@@ -5,7 +5,7 @@ import { DEFAULT_CHECK_IN } from "./check-in.ts";
 
 test("without personal settings the defaults apply and allowProjectOverrides is off", () => {
   assert.deepEqual(subagentsSettingsFromSettings({}), {
-    settings: { workerLimit: 4, agentDefinitionModel: { use: "route", allowBanned: false }, explorationNudge: 3, gateLevel: "medium", checkIn: DEFAULT_CHECK_IN },
+    settings: { workerLimit: 4, agentDefinitionModel: { use: "route", allowBanned: false }, explorationNudge: 8, gateLevel: "medium", checkIn: DEFAULT_CHECK_IN },
     allowProjectOverrides: false,
     ignoredProjectKeys: [],
     warnings: [],
@@ -17,7 +17,7 @@ test("with allowProjectOverrides a project key replaces the personal value and t
   const personal = { orchestrator: { subagents: { allowProjectOverrides: true, maxParallel: 3, agentDefinitionModel: { use: "preserve" } } } };
   const project = { orchestrator: { subagents: { maxParallel: 6, allowProjectOverrides: false } } };
   assert.deepEqual(subagentsSettingsFromSettings(personal, project), {
-    settings: { workerLimit: 6, agentDefinitionModel: { use: "preserve", allowBanned: false }, explorationNudge: 3, gateLevel: "medium", checkIn: DEFAULT_CHECK_IN },
+    settings: { workerLimit: 6, agentDefinitionModel: { use: "preserve", allowBanned: false }, explorationNudge: 8, gateLevel: "medium", checkIn: DEFAULT_CHECK_IN },
     allowProjectOverrides: true,
     ignoredProjectKeys: ["orchestrator.subagents.allowProjectOverrides"],
     warnings: [],
@@ -110,10 +110,10 @@ test("workerLimitSource names where the worker limit comes from: project, person
   assert.equal(source({}, { workerLimit: 2 }), "default");
 });
 
-test("explorationNudge defaults to 3, takes a positive integer, and a project may replace it only with allowProjectOverrides", () => {
+test("explorationNudge defaults to 8, takes a positive integer, and a project may replace it only with allowProjectOverrides", () => {
   assert.equal(subagentsSettingsFromSettings({ orchestrator: { subagents: { explorationNudge: 5 } } }).settings.explorationNudge, 5);
   const project = { orchestrator: { subagents: { explorationNudge: 20 } } };
-  assert.equal(subagentsSettingsFromSettings({}, project).settings.explorationNudge, 3);
+  assert.equal(subagentsSettingsFromSettings({}, project).settings.explorationNudge, 8);
   assert.deepEqual(subagentsSettingsFromSettings({}, project).ignoredProjectKeys, ["orchestrator.subagents.explorationNudge"]);
   assert.equal(subagentsSettingsFromSettings({ orchestrator: { subagents: { allowProjectOverrides: true } } }, project).settings.explorationNudge, 20);
   for (const value of [0, 2.5, "3", -1]) {

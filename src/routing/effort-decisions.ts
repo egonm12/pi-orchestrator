@@ -25,3 +25,30 @@ export function emitEffortDecision(event: EffortDecisionEvent): void {
     try { listener(event); } catch { /* Observation cannot alter a route. */ }
   }
 }
+
+/** The handling judge's verdict for one orchestrator user prompt (ADR 0020).
+ *  `forced` is an owner override, `fallback` a failed judgement. */
+export interface HandlingDecisionEvent {
+  readonly sessionId: string;
+  readonly timestamp: string;
+  readonly handling: "self" | "delegate";
+  readonly source: "judged" | "fallback" | "forced";
+  readonly reason: string;
+  readonly judgeModel: string;
+}
+
+const HANDLING_KEY = Symbol.for("pi-orchestrator.handling-decisions.listeners");
+type SharedHandling = typeof globalThis & { [HANDLING_KEY]?: Set<(event: HandlingDecisionEvent) => void> };
+
+/** Subscribe to handling verdicts across extension module copies. Returns an unsubscribe function. */
+export function onHandlingDecision(listener: (event: HandlingDecisionEvent) => void): () => void {
+  const listeners = (globalThis as SharedHandling)[HANDLING_KEY] ??= new Set();
+  listeners.add(listener);
+  return () => { listeners.delete(listener); };
+}
+
+export function emitHandlingDecision(event: HandlingDecisionEvent): void {
+  for (const listener of (globalThis as SharedHandling)[HANDLING_KEY] ?? []) {
+    try { listener(event); } catch { /* Observation cannot alter a route. */ }
+  }
+}
