@@ -22,6 +22,7 @@ import { workerSlotPaused } from "./worker-slots.ts";
 import { readUsageObservations, recordUsageObservation, usageObservationsPath, type UsageObservation } from "../router/usage-observations.ts";
 import { COMPLETION_NOTICE, createSubagentsExtension, MAX_TEXT_BYTES, type SubagentResult, type SubagentsDependencies, type SubagentsDetails, type SubagentsProgressDetails } from "./extension.ts";
 import { USER_STEER } from "./user-steering.ts";
+import { CHECK_IN_ENDS_RUN, FOREGROUND_CHECK_IN } from "./check-in.ts";
 import { markWorkerSession } from "./worker-sessions.ts";
 import { isOrchestratorSession } from "./orchestrator-session.ts";
 import { orchestratorProtocol } from "./orchestrator-protocol.ts";
@@ -6213,5 +6214,133 @@ test("in shadow mode a worker of an orchestrator on another extension's virtual 
     assert.equal(record.mode, "shadow");
     assert.equal(record.route.outcome === "chosen" && record.route.rung.rung, RUNG, "the rung live routing would choose");
     assert.equal(record.ranOn, `${LUNA}:high`);
+  } finally { h.cleanup(); }
+});
+
+// Check-ins (check-in.ts): after `afterModelCalls` model calls the harness
+// steers the worker to check in. A foreground worker's run ends with its
+// partial Result; a background worker's check-in waits for the orchestrator's
+// decision, or goes on after the reply timeout.
+
+/** Settings whose workers check in after two model calls, with a reply timeout of `replyTimeoutMinutes`, or never. */
+function checkInHarness(checkIn: Record<string, unknown> | false) {
+  return harness({ orchestrator: { routing: ROUTING, subagents: { checkIn } } });
+}
+
+const PARTIAL_RESULT = "## Result\nHalf done.\n\n## Changed\nNone\n\n## Not verified\nNone";
+
+/** A worker that reads until it is asked to check in. Asked to end its run, it tries one more read, then gives its partial
+ *  Result. Asked to check in, it reports its status with kind check-in, then replies with the answer. It stops after six reads. */
+function checkingInAnthropic() {
+  return scriptedAnthropic((request) => {
+    const lastUser = request.userMessages.at(-1) ?? "";
+    const last = request.toolResults.at(-1);
+    if (last?.text.startsWith("Check-in: your run ends")) return { text: PARTIAL_RESULT };
+    if (lastUser.startsWith("Check-in: you have run for a while, so your run ends")) {
+      return { toolCall: { name: "read", arguments: { path: "after-check-in.txt" } } };
+    }
+    if (last !== undefined && /^(The orchestrator (read your check-in|accepts|stopped)|No reply to your check-in)/.test(last.text)) {
+      return { text: `after check-in: ${last.text}` };
+    }
+    if (lastUser.startsWith("Check-in: you have run for a while.")) {
+      return { toolCall: { name: "report", arguments: { kind: "check-in", text: "Read two files; no blocker; next I read a third." } } };
+    }
+    if (request.toolResults.length >= 6) return { text: "done without a check-in" };
+    return { toolCall: { name: "read", arguments: { path: `file-${request.toolResults.length}.txt` } } };
+  });
+}
+
+test("a foreground worker's check-in ends its run: further tool calls are blocked and it returns its partial Result, resumable", async () => {
+  const h = checkInHarness({ afterModelCalls: 2 });
+  try {
+    const provider = checkingInAnthropic();
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const { text, worker } = await callSubagents(subagents.tool(), orchestrator(h).ctx, "Read files");
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.equal(worker.checkIn, "ended");
+    assert.equal(worker.finalText, PARTIAL_RESULT);
+    assert.equal(provider.requests.length, 4, "two model calls, the check-in's, and the reply after the blocked read");
+    assert.equal(provider.requests[2]!.userMessages.at(-1), FOREGROUND_CHECK_IN, "the steer arrives after the second model call");
+    assert.equal(provider.requests[3]!.toolResults.at(-1)?.text, CHECK_IN_ENDS_RUN);
+    assert.match(text, new RegExp(`It ended at a check-in: this Result is partial\\. To go on, resume ${worker.sessionId}`));
+    assert.deepEqual(subagents.messages, [], "a foreground check-in sends the orchestrator nothing");
+  } finally { h.cleanup(); }
+});
+
+/** Starts one background worker that checks in, waits for its check-in, replies `reply`, and returns its notice's result. */
+async function backgroundCheckIn(reply: string) {
+  const h = checkInHarness({ afterModelCalls: 2 });
+  const provider = checkingInAnthropic();
+  const subagents = loadSubagents([routerExtension(), provider.extension]);
+  const ctx = orchestrator(h).ctx;
+  try {
+    const start = (await subagents.tool().execute("call-1", { items: [{ task: "Read files" }] } as never, undefined, undefined, ctx)).details as BackgroundStart;
+    const id = start.delegationIds[0]!;
+    await waitFor(() => subagents.messages.length === 1, "the check-in is in");
+    const { message, options } = subagents.messages[0]!;
+    assert.deepEqual(options, { triggerTurn: true, deliverAs: "steer" });
+    assert.deepEqual(message.details, { delegationId: id, kind: "check-in", text: "Read two files; no blocker; next I read a third." });
+    assert.match(message.content as string, /checks in, and waits for your decision[\s\S]*`continue`[\s\S]*`accept`[\s\S]*`stop`[\s\S]*`hint: <text>`/);
+    await subagents.tool("subagents_message").execute("message-1", { id, text: reply } as never, undefined, undefined, ctx);
+    await waitFor(() => subagents.messages.length === 2, "the worker's notice");
+    return { result: (subagents.messages[1]!.message.details as NoticeDetails).results[0]!, provider };
+  } finally { h.cleanup(); }
+}
+
+test("a background worker's check-in waits for the orchestrator: continue goes on", async () => {
+  const { result } = await backgroundCheckIn("continue");
+  assert.equal(result.status, "completed", JSON.stringify(result));
+  assert.equal(result.checkIn, undefined);
+  assert.equal(result.finalText, "after check-in: The orchestrator read your check-in: go on with your task.");
+});
+
+test("a background worker's check-in: hint goes on with the hint", async () => {
+  const { result } = await backgroundCheckIn("hint: read config.json first");
+  assert.equal(result.status, "completed", JSON.stringify(result));
+  assert.match(result.finalText, /^after check-in: The orchestrator read your check-in and adds:\n\nread config\.json first\n\nGo on/);
+});
+
+test("a background worker's check-in: accept ends its run with its Result as it stands", async () => {
+  const { result } = await backgroundCheckIn("Accept.");
+  assert.equal(result.status, "completed", JSON.stringify(result));
+  assert.equal(result.checkIn, "accepted");
+  assert.match(result.finalText, /^after check-in: The orchestrator accepts your work as it stands/);
+});
+
+test("a background worker's check-in: stop aborts it", async () => {
+  const { result } = await backgroundCheckIn("stop");
+  assert.equal(result.status, "aborted", JSON.stringify(result));
+});
+
+test("a background worker's check-in without a reply goes on after the reply timeout, and the orchestrator gets a note", async () => {
+  const h = checkInHarness({ afterModelCalls: 2, replyTimeoutMinutes: 0.001 });
+  try {
+    const provider = checkingInAnthropic();
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h).ctx;
+    const start = (await subagents.tool().execute("call-1", { items: [{ task: "Read files" }] } as never, undefined, undefined, ctx)).details as BackgroundStart;
+    const id = start.delegationIds[0]!;
+    await waitFor(() => subagents.messages.length === 3, "the check-in, the note and the notice");
+    const note = subagents.messages[1]!;
+    assert.equal(note.message.content, `Worker ${id}'s check-in got no reply within 0.001 minutes, so it goes on with its task.`);
+    assert.deepEqual(note.options, { triggerTurn: false });
+    const [result] = (subagents.messages[2]!.message.details as NoticeDetails).results;
+    assert.equal(result?.status, "completed", JSON.stringify(result));
+    assert.equal(result?.finalText, "after check-in: No reply to your check-in in time: go on with your task.");
+    await assert.rejects(subagents.tool("subagents_message").execute("message-1", { id, text: "continue" } as never, undefined, undefined, ctx),
+      /no running background worker/, "a late reply finds no worker");
+  } finally { h.cleanup(); }
+});
+
+test("with check-ins off a worker is never asked to check in", async () => {
+  const h = checkInHarness(false);
+  try {
+    const provider = checkingInAnthropic();
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const { worker } = await callSubagents(subagents.tool(), orchestrator(h).ctx, "Read files");
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    assert.equal(worker.finalText, "done without a check-in");
+    assert.equal(worker.checkIn, undefined);
+    assert.ok(provider.requests.every((request) => !request.userMessages.some((message) => message.startsWith("Check-in"))));
   } finally { h.cleanup(); }
 });

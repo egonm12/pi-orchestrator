@@ -13,6 +13,7 @@ import { renderSubagentsCall, renderSubagentsResult, shortTask } from "./render.
 import { forkSession } from "./fork-session.ts";
 import { prepareResume, savedWorkerIdentity, saveWorkerOutcome } from "./resume.ts";
 import { UNANSWERED_QUESTION, workerReports, type WorkerReports } from "./report.ts";
+import type { CheckInOutcome } from "./check-in.ts";
 export { UNANSWERED_QUESTION };
 import { missingSectionsNote } from "./result-format.ts";
 import { DEFAULT_WORKER_LIMIT, loadSubagentsSettings, WORKER_LIMIT_CEILING } from "./settings.ts";
@@ -201,6 +202,12 @@ function editedNote(id: string, level: GateLevel): string {
   }
 }
 
+/** The line a Result gets when its worker's run ended at a check-in (check-in.ts). */
+function checkInNote(outcome: CheckInOutcome, id: string): string {
+  return outcome === "accepted" ? "Its work was accepted at a check-in: this Result is as it stood."
+    : `It ended at a check-in: this Result is partial. To go on, resume ${id} with a subagents item whose resume is that id.`;
+}
+
 /** One item's text in the tool result, at the gate level `level`. `forOrchestrator` is false in a
  *  worker's own call, whose workers' edits count for the worker's delegation. At off there is no
  *  quality gate, so an editing delegation's Result gets no gate line. */
@@ -212,6 +219,7 @@ function resultText(result: SubagentResult, forOrchestrator: boolean, level: Gat
     `Worker ${result.sessionId} ${outcome}`,
     `Session file: ${result.sessionFile ?? "none, the session was not saved"}`,
     ...(result.climb === undefined ? [] : [result.climb]),
+    ...(result.checkIn === undefined ? [] : [checkInNote(result.checkIn, result.sessionId)]),
     ...(result.edited && forOrchestrator && hasQualityGate(level) ? [editedNote(result.sessionId, level)] : []),
     "",
     result.finalText,
@@ -525,8 +533,10 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
           }
         }
         // Only a background call's workers may ask a question (ADR 0008).
-        const callReports = workerReports(pi, ctx, backgroundCall === undefined ? undefined : backgroundCalls);
-        const { question } = callReports;
+        const checkInSettings = settings.checkIn === false ? undefined : settings.checkIn;
+        const callReports = workerReports(pi, ctx, backgroundCall === undefined ? undefined : backgroundCalls, checkInSettings);
+        const { question, checkIn } = callReports;
+        const checkInSetup = checkInSettings === undefined ? {} : { checkIn: { settings: checkInSettings, now: () => deps.now().getTime() } };
         // Each item's worker slot while it holds one (runSlot below).
         const heldSlots: (ReleaseSlot | undefined)[] = new Array(items.length);
         const slotRegistrations: ((() => void) | undefined)[] = new Array(items.length);
@@ -545,17 +555,26 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
         // answered, it queues for a slot again before it goes on; stopped meanwhile, it holds none and ends. The slot goes
         // through the worker's lease (worker-slots.ts), which stays registered: a later wait of the worker's own, or one
         // running in parallel with the question, gives up and takes back the same slot.
-        const reports: WorkerReports = question === undefined ? callReports : { ...callReports, async question(delegationId, text, questionSignal) {
+        const waitWithoutSlot = async <T,>(delegationId: string, questionSignal: AbortSignal | undefined, ask: () => Promise<T>): Promise<T> => {
           const index = backgroundCall?.delegationIds.indexOf(delegationId) ?? -1;
           const itemSignal = index < 0 ? undefined : itemSignals[index];
           const signal = itemSignal === undefined ? questionSignal : questionSignal === undefined ? itemSignal : AbortSignal.any([itemSignal, questionSignal]);
           board.asking(delegationId, true);
           const answer = await withoutWorkerSlot(delegationId, signal, async () => {
-            try { return await question(delegationId, text, questionSignal); } finally { board.asking(delegationId, false); }
+            try { return await ask(); } finally { board.asking(delegationId, false); }
           });
           if (signal?.aborted) throw new Error("the worker was stopped while it waited for a worker slot");
           return answer;
-        } };
+        };
+        // A check-in waits as a question does; a stop decision stops the item as `/subagents stop` does.
+        const reports: WorkerReports = question === undefined ? callReports : { ...callReports,
+          question: (delegationId, text, questionSignal) => waitWithoutSlot(delegationId, questionSignal, () => question(delegationId, text, questionSignal)),
+          ...(checkIn === undefined ? {} : { async checkIn(delegationId: string, text: string, questionSignal: AbortSignal | undefined) {
+            const answer = await waitWithoutSlot(delegationId, questionSignal, () => checkIn(delegationId, text, questionSignal));
+            const index = backgroundCall?.delegationIds.indexOf(delegationId) ?? -1;
+            if (answer.decision === "stop" && index >= 0) stopItem(index);
+            return answer;
+          } }) };
         // An editing run's gate requirement, at the gate level in force as it ends (quality-gate.ts). A worker's
         // own call leaves it to the delegation its workers' edits count for.
         const recordRequirement = (worker: WorkerResult) => {
@@ -587,7 +606,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               const worker = await runWorker({ task, resume: prepared, cwd: ctx.cwd, agentDir, ...workerTrust, orchestratorSession: ctx.sessionManager,
                 ...(parentDelegationId === undefined ? {} : { parentDelegationId }),
                 signal: itemSignals[index], extensionFactories: deps.workerExtensions, instructions: prepared.instructions, tools: prepared.tools,
-                onActivity: backgroundCall?.onActivity[index], reports, onSession: onWorkerSession(index),
+                onActivity: backgroundCall?.onActivity[index], reports, ...checkInSetup, onSession: onWorkerSession(index),
                 onTool: (tool) => showProgress(index, { ...item, status: "running", ...(tool === undefined ? {} : { tool }) }),
                 ...(backgroundCall === undefined ? {} : { onMessageReady: (receive) => backgroundCalls.registerWorker(backgroundCall.delegationIds[index]!, receive) }),
               });
@@ -702,7 +721,7 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
             ...(target === undefined || reviewing === undefined ? {} : { routingConstraints: target.constraints, review: reviewing }),
             ...(climb?.constraints === undefined ? {} : { routingConstraints: climb.constraints }),
             ...(climb?.classification === undefined ? {} : { carriedClassification: climb.classification }),
-            onActivity: backgroundCall?.onActivity[index], reports, onSession: onWorkerSession(index),
+            onActivity: backgroundCall?.onActivity[index], reports, ...checkInSetup, onSession: onWorkerSession(index),
             onTool: (tool) => showProgress(index, { ...item, ...workerModel, status: "running", ...(tool === undefined ? {} : { tool }) }),
             ...(backgroundCall === undefined ? {} : { onMessageReady: (receive) => backgroundCalls.registerWorker(backgroundCall.delegationIds[index]!, receive) }),
           });

@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { personalOrchestrator, readSettingsFile } from "../policy/ban-lists.ts";
 import { GATE_LEVELS, type GateLevel } from "../routing/decision-record.ts";
+import { DEFAULT_CHECK_IN, type CheckInSettings } from "./check-in.ts";
 
 // The subagents extension's settings (ADR 0007), under `orchestrator.subagents`
 // in personal settings. `allowProjectOverrides` is read from personal settings
@@ -24,6 +25,8 @@ export interface SubagentsSettings {
   readonly explorationNudge: number;
   /** How strictly the quality gate treats each tier (ADR 0011); the owner's floor. */
   readonly gateLevel: GateLevel;
+  /** The check-in budget (check-in.ts), or false when the owner turned check-ins off. */
+  readonly checkIn: CheckInSettings | false;
 }
 
 export interface LoadedSubagentsSettings {
@@ -126,13 +129,31 @@ export function subagentsSettingsFromSettings(personal: unknown, project?: unkno
   const allowBanned = agentDefinitionModel?.allowBanned ?? false;
   if (typeof allowBanned !== "boolean") throw new Error(`${SUBAGENTS_KEY}.agentDefinitionModel.allowBanned must be a boolean`);
 
+  const checkIn = checkInSettings(options.checkIn);
+
   return {
-    settings: { workerLimit, agentDefinitionModel: { use, allowBanned }, explorationNudge, gateLevel: gateLevel as GateLevel },
+    settings: { workerLimit, agentDefinitionModel: { use, allowBanned }, explorationNudge, gateLevel: gateLevel as GateLevel, checkIn },
     allowProjectOverrides,
     ignoredProjectKeys,
     warnings,
     workerLimitSource,
   };
+}
+
+/** `checkIn`: false turns check-ins off; an object sets any of its numbers, each a positive number, the rest default. */
+function checkInSettings(value: unknown): CheckInSettings | false {
+  if (value === undefined || value === true) return DEFAULT_CHECK_IN;
+  if (value === false) return false;
+  if (!isPlainObject(value)) throw new Error(`${SUBAGENTS_KEY}.checkIn must be false or an object`);
+  const settings: Record<string, number> = { ...DEFAULT_CHECK_IN };
+  for (const [key, setValue] of Object.entries(value)) {
+    if (!(key in DEFAULT_CHECK_IN)) throw new Error(`${SUBAGENTS_KEY}.checkIn.${key} is not a check-in setting`);
+    if (typeof setValue !== "number" || !Number.isFinite(setValue) || setValue <= 0) {
+      throw new Error(`${SUBAGENTS_KEY}.checkIn.${key} must be a positive number`);
+    }
+    settings[key] = setValue;
+  }
+  return settings as unknown as CheckInSettings;
 }
 
 /** The effective settings from `<agentDir>/settings.json` and `<cwd>/.pi/settings.json`. */

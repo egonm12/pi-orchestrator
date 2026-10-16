@@ -30,3 +30,13 @@ Version 2 of the `subagents` tool (ADR 0007) adds forked workers, background wor
 A background call no longer sends one completion notice after all its items finish. Each worker's result is delivered once, as soon as that worker finishes: to a pending `subagents_status` wait on its call, otherwise as its own notice. The last item's notice also says the call finished and names the workers whose results came earlier. A wait on a call still blocks until the call finishes, and returns the results not yet delivered with the call-finished line; results delivered earlier are named by id, not repeated. A result that finished while a wait was pending gets its own notice if the wait stops early. Notices are still held until the orchestrator settles.
 
 The reason is the speed benchmark (bean pi-orchestrator-2gri). 38% of delegated turns had several workers, and the slowest finished a median of 4 minutes (p90 20 minutes) after the fastest. The orchestrator waited for it before it could act on any result.
+
+## Amendment, 2026-10-13: forced check-in and a reply timeout
+
+Questions still wait without a time limit, but a worker no longer runs for an hour without reporting back. After 15 minutes or 40 model calls, whichever comes first, and every 15 minutes after that (owner settings under `orchestrator.subagents.checkIn`, which can turn it off), the harness steers the worker to check in: what it has done, what blocks it and its planned next step.
+
+- A background worker's check-in takes the question's path: it waits, and the orchestrator answers with `subagents_message`: `continue`, `accept` (the worker ends with its Result as it stands), `stop` (it aborts) or `hint: <text>`. Any other text counts as a hint, so a reply cannot stop a worker by accident. Unlike a question, a check-in has a reply timeout, 5 minutes by default: without a reply the worker goes on and the orchestrator gets a note. A worker must not stall on an orchestrator that is busy elsewhere.
+- A foreground worker cannot wait for a reply, since its caller's turn waits on it. Its check-in ends its run: its tool calls are blocked and it returns its partial Result, which a resume continues.
+- Accepted or ended work that edited still goes through the quality gate.
+
+This replaces a separate pause and abort control (bean pi-orchestrator-mfli): stop and accept are the check-in's answers.

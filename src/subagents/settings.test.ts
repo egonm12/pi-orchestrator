@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { subagentsSettingsFromSettings } from "./settings.ts";
+import { DEFAULT_CHECK_IN } from "./check-in.ts";
 
 test("without personal settings the defaults apply and allowProjectOverrides is off", () => {
   assert.deepEqual(subagentsSettingsFromSettings({}), {
-    settings: { workerLimit: 4, agentDefinitionModel: { use: "route", allowBanned: false }, explorationNudge: 3, gateLevel: "medium" },
+    settings: { workerLimit: 4, agentDefinitionModel: { use: "route", allowBanned: false }, explorationNudge: 3, gateLevel: "medium", checkIn: DEFAULT_CHECK_IN },
     allowProjectOverrides: false,
     ignoredProjectKeys: [],
     warnings: [],
@@ -16,7 +17,7 @@ test("with allowProjectOverrides a project key replaces the personal value and t
   const personal = { orchestrator: { subagents: { allowProjectOverrides: true, maxParallel: 3, agentDefinitionModel: { use: "preserve" } } } };
   const project = { orchestrator: { subagents: { maxParallel: 6, allowProjectOverrides: false } } };
   assert.deepEqual(subagentsSettingsFromSettings(personal, project), {
-    settings: { workerLimit: 6, agentDefinitionModel: { use: "preserve", allowBanned: false }, explorationNudge: 3, gateLevel: "medium" },
+    settings: { workerLimit: 6, agentDefinitionModel: { use: "preserve", allowBanned: false }, explorationNudge: 3, gateLevel: "medium", checkIn: DEFAULT_CHECK_IN },
     allowProjectOverrides: true,
     ignoredProjectKeys: ["orchestrator.subagents.allowProjectOverrides"],
     warnings: [],
@@ -151,4 +152,14 @@ test("gateLevel takes off, and a project's level may be lower or higher than the
   assert.equal(subagentsSettingsFromSettings(personal("off"), project("max")).settings.gateLevel, "max", "higher");
   assert.equal(subagentsSettingsFromSettings({ orchestrator: { subagents: { gateLevel: "high" } } }, project("off")).settings.gateLevel, "high",
     "without allowProjectOverrides the personal level stays");
+});
+
+test("checkIn defaults to 15 minutes, 40 model calls, every 15 minutes and a 5 minute reply timeout, takes any of them, and false turns it off", () => {
+  const checkIn = (value: unknown) => subagentsSettingsFromSettings({ orchestrator: { subagents: { checkIn: value } } }).settings.checkIn;
+  assert.deepEqual(subagentsSettingsFromSettings({}).settings.checkIn, { afterMinutes: 15, afterModelCalls: 40, everyMinutes: 15, replyTimeoutMinutes: 5 });
+  assert.deepEqual(checkIn({ afterModelCalls: 10, replyTimeoutMinutes: 2 }), { ...DEFAULT_CHECK_IN, afterModelCalls: 10, replyTimeoutMinutes: 2 });
+  assert.equal(checkIn(false), false);
+  for (const value of [0, -1, "5"]) assert.throws(() => checkIn({ afterMinutes: value }), /checkIn.afterMinutes must be a positive number/);
+  assert.throws(() => checkIn({ afterTurns: 3 }), /checkIn.afterTurns is not a check-in setting/);
+  assert.throws(() => checkIn("off"), /checkIn must be false or an object/);
 });

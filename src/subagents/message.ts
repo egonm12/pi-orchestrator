@@ -17,7 +17,7 @@ export function registerSubagentsMessageTool(pi: ExtensionAPI, calls: Background
   pi.registerTool({
     name: "subagents_message",
     label: "Subagents message",
-    description: "Send text to one running background worker by delegation id. steer (default) arrives after its current tool call; followUp arrives when it would stop. Use this to answer a worker's question.",
+    description: "Send text to one running background worker by delegation id. steer (default) arrives after its current tool call; followUp arrives when it would stop. Use this to answer a worker's question or check-in. Answer a check-in with `continue`, `accept` (it stops and returns its Result as it stands), `stop` (it is aborted) or `hint: <text>` (it goes on with your hint).",
     parameters: {
       type: "object",
       properties: {

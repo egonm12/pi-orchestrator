@@ -97,7 +97,7 @@ The user can message a running background worker too, from its transcript view (
 
 ### Reports
 
-Every worker has a `report` tool, `{ "kind": "progress" | "question", "text": string }`, to message the agent that delegated to it on its own, whatever its agent definition's `tools:` list says:
+Every worker has a `report` tool, `{ "kind": "progress" | "question" | "check-in", "text": string }`, to message the agent that delegated to it on its own, whatever its agent definition's `tools:` list says:
 
 - `progress` is a short note, and the worker goes on at once. It is recorded in the session as a `subagents-report` message without starting a turn, so the orchestrator reads it at its next turn. An idle orchestrator's TUI shows the message at once; while the orchestrator is busy, pi records the message when the current turn ends, so the TUI shows the note at once as a notification.
 - `question` is only for background workers; a foreground worker's `report` has no question kind. The question starts an orchestrator turn when the orchestrator is idle, and is steered in after its current tool call when it is busy. The worker waits for the answer without a time limit: the next `subagents_message` to its delegation id is the answer and the `report` tool's result. `/subagents stop`, stopping its call or ending the session releases the worker, which then aborts.
@@ -105,6 +105,16 @@ Every worker has a `report` tool, `{ "kind": "progress" | "question", "text": st
 A question ends a pending `subagents_status` wait on its call, which would otherwise hold the orchestrator's turn until the call ends: the wait fails with a hint to answer with `subagents_message` and wait again. A new wait on a call with an unanswered question is refused with the same hint. The call runs on, and its results go to a later wait or to the session as notices, as usual.
 
 A worker started by another worker reports to that worker, progress only, since a worker's calls are foreground.
+
+### Check-ins
+
+A worker does not run for long without reporting back. Once it has run `orchestrator.subagents.checkIn.afterMinutes` minutes (default 15) or made `afterModelCalls` model calls (default 40), whichever comes first, and every `everyMinutes` minutes (default 15) after its last check-in, the harness steers it to check in: what it has done so far, what blocks it and its planned next step. The steer arrives after its current model call's tool calls.
+
+- A background worker sends its check-in with `report` kind `check-in` and waits, as for a question. The check-in reaches the orchestrator as a `subagents-report` message of kind `check-in`, which starts a turn when it is idle and ends a pending `subagents_status` wait on the call. The orchestrator answers with `subagents_message` and one of these texts: `continue` (the worker goes on), `accept` (the worker ends its run with its Result as it stands, and makes no more tool calls), `stop` (the worker is aborted, as by `/subagents stop`), or `hint: <text>` (the worker goes on with the hint). `continue`, `accept` and `stop` count only alone, in any case and with an optional full stop; any other text counts as a hint, so a reply never stops a worker by accident.
+- Without a reply within `replyTimeoutMinutes` (default 5) the worker goes on by itself, and the orchestrator gets a note, `Worker <id>'s check-in got no reply within <n> minutes, so it goes on with its task.`, which does not start a turn. A later reply finds no waiting check-in and goes to the worker as an ordinary steer.
+- A foreground worker cannot wait, as its caller's turn waits on it: its check-in ends its run. From its next model call on its tool calls are blocked, and its reply is its Result as it stands. Its result says `It ended at a check-in: this Result is partial.` and how to resume it; `resume` with its delegation id goes on.
+
+An accepted or ended worker's result is `completed` with `checkIn` `"accepted"` or `"ended"` in its details. A worker that edited still needs its verdict under the quality gate, like any editing delegation. `"checkIn": false` turns check-ins off.
 
 ### Results
 
@@ -486,6 +496,7 @@ A worker's calls share the orchestrator's worker slots. A worker gives its slot 
       "agentDefinitionModel": { "use": "route", "allowBanned": false },
       "explorationNudge": 3,
       "gateLevel": "medium",
+      "checkIn": { "afterMinutes": 15, "afterModelCalls": 40, "everyMinutes": 15, "replyTimeoutMinutes": 5 },
       "allowProjectOverrides": false
     }
   }
@@ -500,6 +511,7 @@ A worker's calls share the orchestrator's worker slots. A worker gives its slot 
 | `subagents.agentDefinitionModel.allowBanned` | Default `false`. With `"preserve"`, a worker whose agent definition names a model on the subagent ban list runs on it; with `false`, that item fails before a worker starts. For a definition from the project's `.pi/agents/` this also needs `allowProjectOverrides` in personal settings. With that flag on, a project's `agentDefinitionModel` replaces the personal one, `allowBanned` included. When the exception lets a worker run, its agent-model record gets `banListException: true`, its item result gets `banListException: true`, and its line is marked `(ban-list exception)`. The guard and the router extension do not stop such a worker. Under `"route"`, a `true` value has no effect and warns once per session. Every other path still refuses a banned model: the tier map drops its rungs, and the guard refuses a tool call that names it |
 | `subagents.explorationNudge` | Exploratory calls the orchestrator's own session makes per user prompt before each further one's result carries the exploration nudge (see Exploration nudge above). A positive integer, default 3. Read at the session's start and at each user prompt. Without it, the old key `subagents.explorationBudget` is read in its place |
 | `subagents.gateLevel` | How strictly the quality gate treats each tier: `off`, `low`, `medium`, `high` or `max`, default `medium` (see Gate level above). `off` removes the quality gate. A project's value, under `allowProjectOverrides`, may be higher or lower than the personal one. `/pi-orchestrator gate <level>` replaces it for one session. Read each time the gate level is needed; a malformed value keeps the default, and the failure is logged once to stderr |
+| `subagents.checkIn` | When workers check in (see Check-ins above): `afterMinutes` (default 15) and `afterModelCalls` (default 40) for the first check-in, whichever comes first, `everyMinutes` (default 15) between later ones, and `replyTimeoutMinutes` (default 5) for a background worker's wait on the orchestrator's decision. Each a positive number; a key left out keeps its default, and an unknown key fails the call. `false` turns check-ins off. Read on every call |
 | `subagents.allowProjectOverrides` | Personal settings only, default `false`. Lets a project's `.pi/settings.json` set every `orchestrator.subagents` key except this one. A project key replaces the personal value whole: a project's `agentDefinitionModel` replaces the personal object, it is not merged into it. Without the flag every project `orchestrator.subagents` key is ignored; with it, a project value for the flag itself is ignored. Each ignored key is logged once to stderr, as `pi-orchestrator subagents: ignored project settings key <key>`, the way the guard logs ignored ban-list keys |
 
 ## Settings

@@ -70,7 +70,10 @@ const paragraphs = (explorationNudge: number, gateLevel: GateLevel): readonly st
     "Decide before your first command, not after the fifth. Give each worker one bounded task. Write each `subagents` task as concise, structured Markdown with the relevant paths, facts and project rules you already know; " +
     "keep short requests short instead of expanding them into a long step list. Name the checks the result must pass instead of an open-ended quality list, " +
     "and keep the facts and decisions the worker needs. Use bullets and sections only when helpful. " +
-    "Check on a background worker with `subagents_status`, and steer it or answer the question in its Report with `subagents_message`.",
+    "Check on a background worker with `subagents_status`, and steer it or answer the question in its Report with `subagents_message`. " +
+    "A worker that has run for a while checks in with what it has done, what blocks it and its next step. Answer a background worker's check-in " +
+    "with `subagents_message` and `continue`, `accept` (it ends with its Result as it stands), `stop` (it aborts) or `hint: <text>`; " +
+    "without a reply it goes on after a few minutes. A foreground worker's check-in ends its run with a partial Result; resume it to go on.",
   "A `subagents` call runs in the background unless you set `background: false`: it returns its call id and delegation ids at once, " +
     "and you stay free to answer the user, do unrelated work, check on or steer its workers. Each worker's result comes in its own notice as soon as that worker finishes, and the last one says the call finished. " +
     "Keep the default for exploration, coding, reviews and anything whose length you cannot tell. Set `background: false` only for a " +

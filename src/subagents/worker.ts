@@ -7,6 +7,7 @@ import { READ_ONLY_REVIEWER, trackEdits } from "./editing.ts";
 import type { ResumeWorker } from "./resume.ts";
 import type { BackgroundMessageMode } from "./background.ts";
 import { REPORT_TOOL, reportExtension, type WorkerReports } from "./report.ts";
+import { WorkerCheckIn, type CheckInOutcome, type CheckInSettings } from "./check-in.ts";
 import { SUBAGENTS_VERDICT_TOOL } from "./verdict.ts";
 import { missingResultSections, REPORTING_RULES, type ResultSection } from "./result-format.ts";
 import { AUTO_MODEL_ID, AUTO_PROVIDER, judgeIncomingWorkerMessage, requestFailover, setCarriedClassification, setPendingTask, setRoutingConstraints } from "../router/auto-model.ts";
@@ -84,6 +85,9 @@ export interface WorkerResult {
   /** The worker, or a worker it started, edited in this run, so its
    *  delegation needs a verdict (ADR 0010); absent when it did not. */
   readonly edited?: true;
+  /** The run ended at a check-in (check-in.ts): a foreground worker's check-in, or a background
+   *  one's work the orchestrator accepted. Its Result is partial; absent when it did not. */
+  readonly checkIn?: CheckInOutcome;
 }
 
 export interface WorkerSetup {
@@ -151,6 +155,9 @@ export interface WorkerSetup {
   /** Where the worker's `report` tool sends its reports. The tool is added to
    *  a `tools` list, since every worker gets it (ADR 0008). */
   readonly reports?: WorkerReports;
+  /** The check-in budget (check-in.ts); without it the worker never checks in. A worker whose
+   *  reports take a check-in waits for the orchestrator's decision; any other ends its run. */
+  readonly checkIn?: { readonly settings: CheckInSettings; readonly now?: () => number };
 }
 
 /** What a worker has done so far, for `subagents_status`. */
@@ -328,6 +335,8 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
   const tools = setup.tools === undefined || reports === undefined ? setup.tools : [...setup.tools, REPORT_TOOL];
   const reviewed = review?.delegationId ?? setup.resume?.review?.delegationId;
   const readOnly = isReadOnly(setup);
+  const checkIn = setup.checkIn === undefined ? undefined
+    : new WorkerCheckIn(setup.checkIn.settings, { background: reports?.checkIn !== undefined, now: setup.checkIn.now ?? Date.now });
   let session: WorkerAgentSession;
   /** A new worker on the auto model, not a fork, a named model or a resume. */
   let routed = false;
@@ -341,7 +350,9 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
       resourceLoaderOptions: {
         // A tools list also narrows the built-ins' tools: MCP tools it does not name are not registered (ADR 0007).
         extensionFactories: [...builtinExtensionsBesides(given), ...given, ...(readOnly ? [READ_ONLY_REVIEWER] : []), editTracking,
-          ...(reports === undefined ? [] : [reportExtension(reports)])],
+          ...(reports === undefined ? [] : [reportExtension(reports, checkIn === undefined ? undefined
+            : { waiting: () => checkIn.waiting(), answered: (answer) => checkIn.answered(answer) })]),
+          ...(checkIn === undefined ? [] : [checkIn.extension()])],
         ...(setup.parentDelegationId === undefined && setup.fork === undefined && setup.resume?.fork !== true &&
           (setup.tools === undefined || setup.tools.includes(SUBAGENTS_TOOL))
           ? { extensionsOverride: withoutVerdictTool } : { extensionsOverride: withoutSubagentsTool }),
@@ -405,6 +416,7 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
     if (event.type === "turn_start") {
       activity.turns++;
       report();
+      checkIn?.modelCallStarted();
       return;
     }
     if (event.type === "message_update" || event.type === "message_end") {
@@ -450,6 +462,7 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
         throw error;
       }
     });
+    checkIn?.attach((text) => { if (session.isStreaming) session.steer(text).catch(() => { /* The worker has ended. */ }); });
     // A resumed worker's prompt is a follow-up to its saved session; a new
     // worker's task is judged with its first route.
     if (judgesIncoming && setup.resume) await judgeIncomingWorkerMessage(sessionId, setup.task, "followUp", false);
@@ -466,7 +479,8 @@ async function runWorkerSession(setup: WorkerSetup, sessionManager: SessionManag
     if (last === undefined) return failed("the worker gave no reply");
     if (last.stopReason === "error") return { ...failed(last.errorMessage ?? "the worker's model call failed"), finalText };
     const missingSections = getsReportingRules ? missingResultSections(finalText) : [];
-    return { status: "completed", sessionId, sessionFile: saved(), finalText, ...(missingSections.length === 0 ? {} : { missingSections }) };
+    return { status: "completed", sessionId, sessionFile: saved(), finalText, ...(missingSections.length === 0 ? {} : { missingSections }),
+      ...(checkIn?.outcome === undefined ? {} : { checkIn: checkIn.outcome }) };
   } catch (error) {
     return failed(errorText(error));
   } finally {

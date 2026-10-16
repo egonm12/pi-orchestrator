@@ -43,6 +43,10 @@ A worker whose delegating call returned before it finished. The orchestrator can
 A message a background worker sends the orchestrator on its own: progress, or a question it waits on.
 _Avoid_: Callback, notification (that is the completion notice)
 
+**Check-in**:
+A status a worker gives when it has run for a while without reporting back: what it has done, what blocks it and its next step. A background worker waits on the orchestrator's decision (continue, accept, stop or a hint) and goes on if none comes in time; a foreground worker's run ends with its partial Result, which a resume continues.
+_Avoid_: Heartbeat, pause
+
 **Worker state**:
 Where a worker is in its life: *queued* (held back until a parallel slot frees), *running*, *asking* (waiting on the answer to a question it reported), then one end state: *completed*, *failed* or *aborted*. Only a background worker can be *asking*.
 _Avoid_: Status (that is the tool that reports worker states), waiting
