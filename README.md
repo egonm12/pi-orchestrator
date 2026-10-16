@@ -1,15 +1,16 @@
 # pi-orchestrator
 
-A [pi](https://pi.dev) package for sessions that hand work to subagent workers. It routes each worker to a model that fits the task, keeps banned models away from workers, and makes the orchestrator check what workers changed before it builds on their work.
+A [pi](https://pi.dev) package for sessions that hand work to helpers. Your session plans the work and checks the results. For bigger jobs it starts workers, and pi-orchestrator picks a model for each worker that fits the task. It also keeps banned models away from workers and makes you check what they changed before you build on it.
 
-## What it does
+## How it works
 
-- **Subagents:** a `subagents` tool that starts workers in the orchestrator's own process, in the foreground or background, at most `workerLimit` (default 4) running at once and the rest queued. Workers can be resumed, forked from the current branch, reviewed and retried. They get the orchestrator's installed extensions, including its MCP servers, `tool_search` and `codemode`.
-- **Router:** serves the auto model `orchestrator/auto`. It classifies a worker's first request into a tier (mechanical, standard, elevated, critical) and sends it to a model from your tier map. On a dynamic rung, an effort judge picks the thinking level for each incoming message within the rung's band.
-- **Guard:** enforces a ban list of models that workers may never use, and an optional ban list for the orchestrator itself.
-- **Review gate:** an editing worker needs a verdict (`subagents_verdict`) from the orchestrator or an independent reviewer, depending on its tier and the gate level (`off`, `low`, `medium`, `high`, `max`).
+- **Orchestrator:** your own pi session. It plans, delegates and checks.
+- **Workers:** helpers started with the `subagents` tool. A few run at once, the rest wait in line.
+- **Router:** picks each worker's model from your tier map, based on how hard the task looks.
+- **Judges:** small model calls that pick the thinking effort for each message and decide whether a prompt is better handled by the orchestrator or delegated.
+- **Review gate:** an editing worker's changes need a verdict before the orchestrator builds on them.
 
-Workers need the subagents extension: it is the supported way to start them. You can switch the router or the guard off on its own. Another subagent extension might work if its workers can resolve the virtual model `orchestrator/auto`, but that is not supported or tested.
+The tier classifier, effort judge and handling judge all default to `anthropic/claude-haiku-5-5:low`. You can change them in settings.
 
 ## Install
 
@@ -17,72 +18,31 @@ Workers need the subagents extension: it is the supported way to start them. You
 pi install git:github.com/egonm12/pi-orchestrator@v0.3.0
 ```
 
-It needs pi 1.1.0 or later.
+You need pi 1.1.0 or later. This pins release v0.3.0. To follow `main` instead, install without the `@v0.3.0` tag and update with `pi update git:github.com/egonm12/pi-orchestrator`. See [releases](https://github.com/egonm12/pi-orchestrator/releases) and [CHANGELOG.md](CHANGELOG.md) for what changed.
 
-That pins a release; see [releases](https://github.com/egonm12/pi-orchestrator/releases) and [CHANGELOG.md](CHANGELOG.md). To move to a newer release, install again with its tag. To follow `main` instead, install without `@v...` and update with `pi update git:github.com/egonm12/pi-orchestrator`. How releases are made is in [docs/releasing.md](docs/releasing.md).
+## Quick start
 
-## Set up the orchestrator
+1. Run `/pi-orchestrator init` in an interactive session. It asks about a ban list, the review gate, the worker limit, a starter tier map, effort and the providers that may receive your task text. Escape keeps your current value at any step.
+2. Start a new session. Settings are read when a session starts.
+3. Let the tier map run in `shadow` mode for a while. The router records the model it would pick, but workers still run on your session model.
+4. When the recorded choices look right, set `orchestrator.routing.mode` to `"live"` and start a new session again.
 
-The orchestrator is your own pi session: the one you type into. Workers it starts with the `subagents` tool run on `orchestrator/auto`, and the router picks their model. A fresh install has no tier map, no ban list and no approved providers, so until you set it up every worker runs on the orchestrator's session model. Each new session says what is missing:
+Until you run init, every worker runs on your session model. A new session tells you what is still missing.
 
-```text
-pi-orchestrator: not set up: no tier map (...), no approved recipients (...). Run /pi-orchestrator init.
-```
+Init writes to the `orchestrator` key in `~/.pi/agent/settings.json`. A project's `.pi/settings.json` can override some keys, but it can never change the ban lists. See [Settings](docs/reference.md#settings) and [Tier map](docs/reference.md#tier-map).
 
-### 1. Run `init`
+## Everyday commands
 
-Run `/pi-orchestrator init` in an interactive session. It walks you through:
+- `/pi-orchestrator gate [off|low|medium|high|max]`: change the review gate for this session.
+- `/pi-orchestrator workers [1-32]`: change how many workers run at once for this session.
+- `/pi-orchestrator delegate [prompt]` or `/pi-orchestrator self [prompt]`: decide how one prompt is handled, skipping the handling judge.
+- `alt+a` or `/subagents`: open the worker view.
 
-1. **Worker ban list:** pick installed model families or type your own, with a preview of the models each entry blocks.
-2. **Gate level and worker limit:** saved to your personal settings or to this project's `.pi/settings.json`.
-3. **Tier map:** a starter map built from your installed models, in shadow mode. Cache-safe models start with `auto`, which adjusts effort per message within a tier-specific range. Init summarizes how many rungs adjust per message and notes that shadow routing applies dynamic effort once routing is live. An existing map is rebuilt only when you confirm; custom ranges are shown as choices.
-4. **Effort:** for the orchestrator's own session, choose whether to adjust between low and high per message. This setting is personal. Init does not ask about the effort judge; if its default model is missing, init names the classifier model and fallback chain it will use.
-5. **Providers:** which providers may receive task text.
-
-Running it again starts from your current values. Escape at any step keeps what you had.
-
-### 2. Review the settings
-
-`init` writes to the `orchestrator` key in `~/.pi/agent/settings.json`:
-
-```json
-{
-  "orchestrator": {
-    "subagentBanList": ["opus"],
-    "sessionBanList": [],
-    "routing": {
-      "enabled": true,
-      "mode": "shadow",
-      "classifier": { "model": "anthropic/claude-haiku-4-5:off" },
-      "tiers": {
-        "mechanical": ["anthropic/claude-haiku-4-5:low"],
-        "standard": ["anthropic/claude-sonnet-4-5:medium"],
-        "elevated": ["anthropic/claude-sonnet-4-5:high"],
-        "critical": ["anthropic/claude-sonnet-4-5:xhigh"]
-      }
-    },
-    "subagents": { "gateLevel": "medium", "workerLimit": 4 }
-  }
-}
-```
-
-Each rung is `provider/model:effort`. On cache-safe models, init offers `auto` and writes a tier-specific range such as `provider/model:low-high`; its effort can change per message while the model stays the same (see [Tier map](docs/reference.md#tier-map)). Init also asks whether the orchestrator's own session should adjust between low and high per message. Yes writes `orchestrator.routing.sessionEffort` to your personal settings; No removes an existing value, and Escape keeps it. Picking a thinking level by hand stops session effort changes for the rest of that session. `orchestrator.routing.effortJudge` sets the judge model (see [Settings](docs/reference.md#settings)). Add `sessionBanList` entries if the orchestrator itself must never run on some models. A project's `.pi/settings.json` may replace single tiers, and `orchestrator.subagents` keys when you allow project overrides; it can never change either ban list.
-
-### 3. Start a new session
-
-The router and the guard read their settings at session start, so start a new session after `init` or any edit. Pick the orchestrator's model as usual: it does the planning, delegation and checking, so a capable model pays off. The session gets the orchestrator protocol in its system prompt and the `subagents`, `subagents_status`, `subagents_message` and `subagents_verdict` tools. Workers need no setup of their own.
-
-### 4. Switch routing to live
-
-A new tier map starts in `shadow` mode: the router classifies each worker and records which model it would have picked, but the worker still runs on the orchestrator's session model. Once the recorded choices look right, set `orchestrator.routing.mode` to `"live"` and start a new session. From then on workers run on the model the router picks.
-
-### Change settings in a session
-
-Use `/pi-orchestrator gate [off|low|medium|high|max]` to change the gate level for the current session, and `/pi-orchestrator workers [1-32]` to change how many workers run at once in the current session.
+Changes to settings files need a new session. The commands above apply to the current session only.
 
 ## Learn more
 
-- [Reference](docs/reference.md): every tool, setting and behaviour in detail.
+- [Reference](docs/reference.md): every tool, setting and behaviour. Good starting points are [How routing decides](docs/reference.md#how-routing-decides), [Routing report](docs/reference.md#routing-report) and [Gate level](docs/reference.md#gate-level).
 - [CONTEXT.md](CONTEXT.md): the domain language.
 - [docs/adr](docs/adr): architectural decisions.
 
