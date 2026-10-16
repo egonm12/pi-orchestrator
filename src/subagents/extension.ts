@@ -263,7 +263,7 @@ const description = (limit: number) => `Hand 1 to ${limit} tasks to workers. At 
   "Set `background: false` only for a short, bounded task whose result your next step needs: the call then waits for every item, " +
   "returns the results in item order, and abort stops running workers and leaves queued workers not started. " +
   "A routed worker may delegate one level deeper, foreground by default or in the background. Its background children finish before its run ends. " +
-  "A nested worker and a forked worker cannot delegate. An ordinary worker sees only its task text, so put every fact it needs in it. " +
+  "A nested worker and a forked worker cannot delegate. An ordinary worker sees only its task text, so include known paths, facts and project rules; keep a short request short instead of expanding it into a long step list. " +
   "Every unrestricted routed worker gets subagents by default; an agent definition's `tools:` list can remove it. " +
   "An item's `agent` is optional: it names an agent definition, whose instructions the worker follows and whose tools list narrows the worker's tools. " +
   "An optional short `label` says what the delegation is for in the worker list. " +

@@ -671,7 +671,7 @@ test("the protocol describes reviewers: when one is needed, how to start one and
     assert.ok(paragraph.includes(phrase), `${phrase}: ${paragraph}`);
   }
   const atMax = orchestratorProtocol(3, "max").split("\n\n").find((text) => text.includes("`review`"));
-  assert.ok(atMax?.includes("reruns the Result's Verified by commands"), atMax);
+  assert.ok(atMax?.includes("reruns the commands listed in the Result"), atMax);
   assert.equal(atMax?.includes("reruns nothing"), false, atMax);
 });
 
@@ -685,7 +685,7 @@ test("the protocol names the gate level in force and what it asks of each tier",
   assert.ok(gateParagraph("low").includes("An ungated delegation needs no verdict"));
   assert.ok(gateParagraph("high").includes("mechanical needs your spot check; standard, elevated and critical need an independent reviewer."));
   assert.ok(gateParagraph("max").includes("mechanical, standard, elevated and critical need an independent reviewer. "));
-  assert.ok(gateParagraph("max").includes("Every reviewer reruns the Result's Verified by commands."));
+  assert.ok(gateParagraph("max").includes("Every reviewer reruns the commands listed in the Result."));
   for (const level of ["medium", "high", "max"] as const) {
     assert.equal(gateParagraph(level).includes("ungated"), false, level);
     for (const phrase of ["raise it for one delegation, never lower it", "`gateLevel`", "`gateLevelReason`", "`subagents_verdict`"]) {
@@ -753,7 +753,7 @@ test("a verdict may raise the gate level for its delegation with a reason, and i
   } finally { h.cleanup(); }
 });
 
-test("at the max gate level a reviewer is told to rerun the Result's Verified by commands; below it, to rerun nothing", async () => {
+test("at the max gate level a reviewer is told to rerun commands listed in the Result; below it, to rerun nothing", async () => {
   for (const gateLevel of ["high", "max"] as const) {
     const h = harness({ routing: ROUTING, subagents: { gateLevel } });
     try {
@@ -765,7 +765,7 @@ test("at the max gate level a reviewer is told to rerun the Result's Verified by
       assert.equal(reviewer.status, "completed", JSON.stringify(reviewer));
       const prompt = provider.requests.find((request) => request.sessionId === reviewer.sessionId)!.systemPrompt;
       assert.ok(prompt.includes(reviewRules(gateLevel)), prompt);
-      assert.equal(prompt.includes("Rerun every command in its Verified by section"), gateLevel === "max", gateLevel);
+      assert.equal(prompt.includes("Rerun every command listed in its Result"), gateLevel === "max", gateLevel);
       assert.equal(prompt.includes("Rerun nothing"), gateLevel !== "max", gateLevel);
     } finally { h.cleanup(); }
   }

@@ -5,7 +5,7 @@
 // A forked worker runs as the orchestrator itself (ADR 0008) and gets neither.
 
 /** The Result's sections, in the order a worker writes them. */
-export const RESULT_SECTIONS = ["Confirmed", "Changed", "Unverified", "Could not check", "Verified by"] as const;
+export const RESULT_SECTIONS = ["Result", "Changed", "Not verified"] as const;
 
 export type ResultSection = typeof RESULT_SECTIONS[number];
 
@@ -16,28 +16,25 @@ You are a worker. Your final reply is your Result: the orchestrator checks it as
 
 - Verify before you report. Run the check or read the file; do not report what you only expect.
 - Give file:line for every factual claim about code or files.
-- Label every claim you did not verify as unverified.
-- Say what you could not check, and why.
+- Label every claim you did not verify under Not verified.
 - Do only what the task asks. Name anything else you noticed instead of doing it.
+- Reply once the requested result exists and the checks the task names pass. Do not polish, rewrite or re-verify unless a check fails.
+- If you are blocked, or have tried the same approach twice, ask the orchestrator instead of retrying; if you cannot ask, reply with what you have and what blocks you.
+- The task text takes precedence over "do this first" setup steps in project instruction files.
+- Read instruction files, glossaries or decision records, or run their required setup commands, only when the task asks you to or you hit something the task does not cover.
 
-End your final reply with your Result in these five sections, each under its own heading, in this order:
+End your final reply with your Result in these three sections, each under its own heading, in this order:
 
-## Confirmed
-What you verified, each claim with its file:line evidence.
+## Result
+Your answer or change, with file:line evidence and the commands you ran and their outcomes.
 
 ## Changed
-Each file you changed, with one sentence per change.
+Files changed, or None.
 
-## Unverified
-What you suspect but did not verify.
+## Not verified
+Unverified claims or checks you could not run, or None.
 
-## Could not check
-What you could not check, and why.
-
-## Verified by
-The exact commands you ran and their outcome.
-
-Keep every heading, even for an empty section: write "None." under it.`;
+Keep the Result brief. Run only the checks the task needs.`;
 
 /** A line's text once its heading, list and emphasis marks are gone, and whether it had a heading or bold mark. */
 function headerText(line: string): { text: string; marked: boolean } {

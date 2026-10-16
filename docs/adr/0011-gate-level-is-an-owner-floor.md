@@ -14,7 +14,7 @@ How strictly the quality gate (ADR 0010) treats each tier is set by the gate lev
 | elevated | spot check | reviewer | reviewer | reviewer |
 | critical | reviewer | reviewer | reviewer | reviewer |
 
-*None* needs no verdict, a *spot check* is the orchestrator's own verdict, and a *reviewer* is an independent reviewer worker. At max every reviewer reruns the Result's "Verified by" commands. Critical work gets a reviewer at every level, so low means "do not gate trivia", never "gate nothing".
+*None* needs no verdict, a *spot check* is the orchestrator's own verdict, and a *reviewer* is an independent reviewer worker. At max every reviewer reruns the commands listed in the Result. Critical work gets a reviewer at every level, so low means "do not gate trivia", never "gate nothing".
 
 ## Considered options
 

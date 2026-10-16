@@ -51,7 +51,7 @@ function gateLevelParagraph(level: GateLevel): string {
   return `Your gate level is ${level}. It sets what an editing delegation needs by its tier: ${gateTable(level)}. ` +
     "A delegation without a tier (a forked worker, or one whose agent definition names a model) counts as elevated. " +
     (tiersByGateAction(level).none.length > 0 ? "An ungated delegation needs no verdict; you may still record one. " : "") +
-    (level === "max" ? "Every reviewer reruns the Result's Verified by commands. " : "") +
+    (level === "max" ? "Every reviewer reruns the commands listed in the Result. " : "") +
     "The owner sets the level. You may raise it for one delegation, never lower it: pass `gateLevel` and `gateLevelReason` to " +
     "`subagents_verdict` when the work is riskier than its tier says or the user asks for a closer look, and the verdict is held to the raised level.";
 }
@@ -67,8 +67,9 @@ const paragraphs = (explorationNudge: number, gateLevel: GateLevel): readonly st
   "Delegate exploration and substantial work to workers with the `subagents` tool. Delegate when you expect more than two " +
     "exploratory commands (reads, searches, listings, diffs) before you can answer, when the question is open, such as " +
     "\"any risks?\" or \"why does this fail?\", or when the output will be large and you only need the conclusion. " +
-    "Decide before your first command, not after the fifth. Give each worker one bounded task. Write each `subagents` task as " +
-    "structured Markdown with short sections such as Goal, Context, Steps, Constraints and Report; use bullets instead of one dense paragraph. " +
+    "Decide before your first command, not after the fifth. Give each worker one bounded task. Write each `subagents` task as concise, structured Markdown with the relevant paths, facts and project rules you already know; " +
+    "keep short requests short instead of expanding them into a long step list. Name the checks the result must pass instead of an open-ended quality list, " +
+    "and keep the facts and decisions the worker needs. Use bullets and sections only when helpful. " +
     "Check on a background worker with `subagents_status`, and steer it or answer the question in its Report with `subagents_message`.",
   "A `subagents` call runs in the background unless you set `background: false`: it returns its call id and delegation ids at once, " +
     "and you stay free to answer the user, do unrelated work, check on or steer its workers. Its results come in one completion notice. " +
@@ -107,12 +108,12 @@ const qualityGateParagraphs = (gateLevel: GateLevel): readonly string[] => [
   "Where your gate level calls for an independent reviewer, an editing delegation needs one before its verdict; its Result says so. " +
     "Start one with a `subagents` item whose `review` is the " +
     "delegation id and whose `task` says what to check. The reviewer is routed at the delegation's tier or higher and never on its rung, " +
-    `gets its task, Result and changed files, ${gateLevel === "max" ? "reruns the Result's Verified by commands" : "reruns nothing unless the task tells it to"}, ` +
+    `gets its task, Result and changed files, ${gateLevel === "max" ? "reruns the commands listed in the Result" : "reruns nothing unless the task tells it to"}, ` +
     "and answers accept or request changes with reasons. " +
     "Judge the reviewer's Result like any other, then record the verdict with `subagents_verdict`, naming the reviewer delegation as " +
     "`reviewer`; without it the verdict is refused. A review started before the delegation's latest edit does not count. Where your own " +
     "spot check is enough, a reviewer is welcome too. " +
-    (gateLevel === "max" ? "" : "When you raise the gate level to max for a delegation, tell its reviewer in the task to rerun the Verified by commands. ") +
+    (gateLevel === "max" ? "" : "When you raise the gate level to max for a delegation, tell its reviewer in the task to rerun the commands listed in the Result. ") +
     "In shadow mode or with routing off no other rung can be " +
     "chosen, so the reviewer runs on the delegation's own rung with a fresh context, and the verdict records a same-rung review. If a review " +
     "fails because live routing left no rung but the delegation's own, tell the user.",

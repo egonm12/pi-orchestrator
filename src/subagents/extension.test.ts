@@ -1049,9 +1049,9 @@ test("agent definitions come from the owner's and the project's agent folders, t
   } finally { h.cleanup(); }
 });
 
-/** Whether a worker's system prompt carries the reporting rules and the Result's five sections (ADR 0010). */
+/** Whether a worker's system prompt carries the reporting rules and the Result's three sections (ADR 0010). */
 function hasReportingRules(systemText: string): boolean {
-  return /file:line/.test(systemText) && ["Confirmed", "Changed", "Unverified", "Could not check", "Verified by"]
+  return /file:line/.test(systemText) && ["Result", "Changed", "Not verified"]
     .every((section) => systemText.includes(`## ${section}`));
 }
 
@@ -1073,7 +1073,7 @@ test("every non-fork worker gets the reporting rules, and an agent definition's 
     assert.equal(reviewer.worker.status, "completed", JSON.stringify(reviewer.worker));
     const systemText = provider.requests[1]!.systemText;
     assert.ok(hasReportingRules(systemText), systemText);
-    assert.ok(systemText.indexOf("## Verified by") < systemText.indexOf("REVIEWER INSTRUCTIONS"), "the definition's instructions follow the rules");
+    assert.ok(systemText.indexOf("## Result") < systemText.indexOf("REVIEWER INSTRUCTIONS"), "the definition's instructions follow the rules");
 
     // A resumed worker's rebuilt system prompt has them again.
     await tool.execute("call-2", { items: [{ resume: plain.worker.sessionId, task: "Go on." }], background: false } as never, undefined, undefined, main.ctx);
@@ -1084,16 +1084,15 @@ test("every non-fork worker gets the reporting rules, and an agent definition's 
 test("a Result missing sections gets a note naming them in the tool result; a complete Result gets none", async () => {
   const h = harness();
   try {
-    const partial = fakeAnthropic("## Confirmed\nThe typo is fixed (README.md:3).\n\n**Changed**: README.md\n\nVerified by: npm test");
+    const partial = fakeAnthropic("## Result\nThe typo is fixed (README.md:3). npm test: pass.\n\n## Changed\nREADME.md");
     const partialCall = await callSubagents(loadSubagentsTool([routerExtension(), partial.extension]), orchestrator(h).ctx, "Fix the typo.");
     assert.equal(partialCall.worker.status, "completed", JSON.stringify(partialCall.worker));
-    assert.deepEqual(partialCall.worker.missingSections, ["Unverified", "Could not check"]);
+    assert.deepEqual(partialCall.worker.missingSections, ["Not verified"]);
     assert.match(partialCall.text, /The typo is fixed/);
-    assert.match(partialCall.text, /Result check: this Result has no Unverified, Could not check sections/);
+    assert.match(partialCall.text, /Result check: this Result has no Not verified section/);
     assert.equal(partialCall.worker.finalText.includes("Result check"), false, "the worker's own text is unchanged");
 
-    const complete = fakeAnthropic(["## Confirmed", "README.md:3", "## Changed", "README.md", "## Unverified", "None.",
-      "## Could not check", "None.", "## Verified by", "npm test: pass"].join("\n"));
+    const complete = fakeAnthropic(["## Result", "README.md:3, npm test: pass", "## Changed", "README.md", "## Not verified", "None."].join("\n"));
     const completeCall = await callSubagents(loadSubagentsTool([routerExtension(), complete.extension]), orchestrator(h).ctx, "Fix the typo.");
     assert.equal(completeCall.worker.status, "completed", JSON.stringify(completeCall.worker));
     assert.equal(completeCall.worker.missingSections, undefined);

@@ -1,5 +1,5 @@
 ---
-status: accepted, amended by ADR 0013
+status: accepted, amended by ADR 0013 and the dated amendment below
 date: 2026-09-27
 ---
 
@@ -16,9 +16,13 @@ The orchestrator is the quality gate for every worker result that changed files,
 
 ## Consequences
 
-- Every non-fork worker gets the reporting rules and the Result format (Confirmed with `file:line`, Changed, Unverified, Could not check, Verified by) appended to its system prompt, whatever its agent definition says.
+- Every non-fork worker gets the reporting rules and the current Result format appended to its system prompt, whatever its agent definition says.
 - A delegation without a tier (a forked worker, or one whose agent definition names a model) is gated as elevated.
 - Elevated and critical delegations need a reviewer worker, routed through the auto model at the implementer's tier or higher and never on the implementer's rung. When routing cannot choose another rung, in shadow mode or with routing off, the reviewer runs on the same rung with a fresh context, and its verdict is recorded as a same-rung review. A reviewer may read, search, build and test, but its editing calls are denied, so it never becomes an editing delegation itself. `subagents_verdict` refuses a self-judged verdict there unless it names the reviewer delegation. The gate level (ADR 0011) can require a reviewer for lower tiers too.
 - `request_changes` returns the next effort-ladder rung; the orchestrator starts a retry delegation carrying the feedback, linked to the failed attempt. After two climbs the task goes back to the user. In shadow mode or with routing off the retry runs on the session model like any worker; its effort-ladder record names the rung it would have used, and the two-climb limit still applies.
 - Research results are checked by the protocol but get no verdict. The orchestrator's spot checks count toward the exploration budget (ADR 0005); larger checks go to a reviewer worker.
 - A verdict that was needed and never recorded is *missing*; one that was not needed is *ungated*. Neither is a learning observation, and the routing report counts both.
+
+## Amendment, 2026-10-13: concise worker Results
+
+Every non-fork worker's Result now has three headings: `Result` (the answer or change, with `file:line` evidence and commands run), `Changed` (files changed or none), and `Not verified` (unverified claims or checks that could not be run). Keep the Result brief and run only checks the task needs. The runtime still checks headings only and annotates a Result with missing headings.

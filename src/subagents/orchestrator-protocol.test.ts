@@ -8,8 +8,10 @@ import { markWorkerSession } from "./worker-sessions.ts";
 
 const PROTOCOL = orchestratorProtocol(3, "medium");
 
-test("the protocol asks for scannable Markdown delegation tasks", () => {
-  assert.match(PROTOCOL, /structured Markdown with short sections such as Goal, Context, Steps, Constraints and Report; use bullets/);
+test("the protocol carries known context in short delegation tasks", () => {
+  assert.match(PROTOCOL, /concise, structured Markdown with the relevant paths, facts and project rules you already know/);
+  assert.match(PROTOCOL, /keep short requests short instead of expanding them into a long step list/);
+  assert.match(PROTOCOL, /Use bullets and sections only when helpful/);
 });
 const orchestrator = { sessionManager: { getSessionId: () => "orchestrator-session" } } as never;
 

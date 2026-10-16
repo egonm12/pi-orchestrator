@@ -25,7 +25,7 @@ import { workerSessionDir } from "./worker.ts";
 // it backs record (owner decision 2026-09-28). A reviewer's editing calls are
 // denied (./editing.ts), so it never becomes an editing delegation. Its review
 // rules follow the gate level in force when it starts (./gate-level.ts): at
-// max it reruns the Result's Verified by commands (ADR 0011).
+// max it reruns the commands listed in the Result (ADR 0011).
 //
 // Where the facts come from: the tier and rung from the delegation's latest
 // decision, fork or agent-model record (./quality-gate.ts), else its rung from
@@ -81,11 +81,11 @@ export interface ReviewTarget {
 }
 
 /** Below the max gate level a reviewer reruns nothing unless told to. */
-const RERUN_NOTHING = "- Rerun nothing, no build, test or command from its Verified by section, unless your task tells you to.";
+const RERUN_NOTHING = "- Rerun nothing, no build, test or command listed in its Result, unless your task tells you to.";
 
-/** At the max gate level every reviewer reruns the Result's Verified by commands (ADR 0011). */
-const RERUN_VERIFIED_BY = "- Rerun every command in its Verified by section, as it names them, and say in your Result what each one gave: " +
-  "the max gate level asks every reviewer to. A command that would edit is denied: name it under Could not check.";
+/** At the max gate level every reviewer reruns the Result's commands (ADR 0011). */
+const RERUN_RESULT_COMMANDS = "- Rerun every command listed in its Result and say what each one gave: " +
+  "the max gate level asks every reviewer to. A command that would edit is denied: name it under Not verified.";
 
 /** The review rules at the gate level `level`, appended to a reviewer's
  *  system prompt after the reporting rules, with the reviewed delegation after them. */
@@ -95,11 +95,11 @@ export function reviewRules(level: GateLevel): string {
 You are a reviewer: an independent check of another worker's finished delegation. The orchestrator judges that delegation by your Result. Its task, its Result and the files it changed follow below.
 
 - Check the change itself against the delegation's task: read the changed files and the diff (git status, git diff). Its Result is the worker's account, not evidence: check each claim that matters.
-${level === "max" ? RERUN_VERIFIED_BY : RERUN_NOTHING}
+${level === "max" ? RERUN_RESULT_COMMANDS : RERUN_NOTHING}
 - Change nothing: your editing calls are denied. Name what falls short instead of fixing it.
 - Answer accept or request changes, with the reasons. For request changes, name each shortfall with its file:line and what the task asked for.
 
-Start your Confirmed section with your answer on a line of its own, "Answer: accept" or "Answer: request changes", then write your Result sections as the reporting rules say.`;
+Start your Result section with your answer on a line of its own, "Answer: accept" or "Answer: request changes", then write your Result sections as the reporting rules say.`;
 }
 
 interface MessageLike {
