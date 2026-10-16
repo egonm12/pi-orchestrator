@@ -21,3 +21,9 @@ A task no classifier model could classify runs as elevated, recorded as unclassi
 
 - If the model under-rates a risky change, nothing catches it before the quality gate. The rubric's examples are the place to correct that.
 - Old routing records keep their `floor` field; readers treat it as optional.
+
+## Amendment, 2026-10-13: unclassified runs as standard, small work is mechanical
+
+The speed benchmark (bean pi-orchestrator-2gri) found that none of 77 recent tasks routed to mechanical: bounded lookups, summaries and small fixes went to standard and ran on the slow standard rung. Rubric `tier-rubric-5` widens mechanical to bounded read-only lookups, summaries and small clear fixes in one or two files whose outcome is easy to check. Diagnosing a cause, reviewing a design, multi-file changes and real design choices stay standard or higher.
+
+A task no classifier model could classify now runs as standard, not elevated, still recorded as unclassified. Elevated put every classifier outage on a slow, expensive rung; standard is the tier most tasks get, and the quality gate still reviews the result. This replaces "A task no classifier model could classify runs as elevated" above.

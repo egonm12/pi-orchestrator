@@ -195,7 +195,7 @@ The step that assigns a tier to a task. A general instruction model applies a fi
 _Avoid_: Decision engine, Jev, scorer, System One, keyword floor
 
 **Unclassified task**:
-A task no classifier model could classify. It runs as elevated, and the routing log records it as unclassified.
+A task no classifier model could classify. It runs as standard, and the routing log records it as unclassified.
 _Avoid_: Keyword fallback
 
 **Retry tier**:

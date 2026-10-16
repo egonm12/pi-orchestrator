@@ -8,7 +8,7 @@
 //      next hop. A rung refused at load (subagent ban list, allowed-model list,
 //      no effort) is skipped without being called. The first hop that decides
 //      gives the tier, with the model's own `why` and `risk.reasons`.
-//   2. Unclassified. When no model hop decides, the task runs as `elevated`
+//   2. Unclassified. When no model hop decides, the task runs as `standard`
 //      and the cause is `unclassified` (CONTEXT.md, Unclassified task).
 //
 // Every model hop reserves against the shared task allowance (ticket 09)
@@ -244,7 +244,7 @@ export interface HopOutcome {
 export type ClassifierCause = `model:${string}` | "unclassified" | `retry:${string}`;
 
 /** The tier an unclassified task runs at. */
-export const UNCLASSIFIED_TIER: RiskTier = "elevated";
+export const UNCLASSIFIED_TIER: RiskTier = "standard";
 
 export interface TierClassification {
   readonly tier: RiskTier;

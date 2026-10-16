@@ -254,7 +254,7 @@ test("the model may still choose critical, and its critical stays critical", asy
 });
 
 test("the rubric judges the action, not the subject: read-only work is never critical and a prohibition is a constraint", async () => {
-  assert.equal(RUBRIC_VERSION, "tier-rubric-4");
+  assert.equal(RUBRIC_VERSION, "tier-rubric-5");
   const { calls } = await classify(PLAIN_TASK, config(LUNA), { [LUNA]: { answer: answer("standard") } });
   const prompt = calls[0]!.prompt;
   assert.ok(prompt.startsWith(TIER_RUBRIC));
@@ -273,6 +273,22 @@ test("the rubric judges the action, not the subject: read-only work is never cri
     assert.ok(prompt.includes(rule), rule);
   }
   assert.doesNotMatch(TIER_RUBRIC, /Judge the riskiest part of the task\./);
+});
+
+test("the rubric puts small, clear work on mechanical and keeps diagnosis, design review and multi-file changes on standard", () => {
+  for (const rule of [
+    "4. mechanical: is the task small, clear and easy to check?",
+    "Bounded read-only lookups and summaries, and small clear fixes in one or two files whose outcome is easy to check",
+    "Example: fix the off-by-one in the date range filter and add a regression test.",
+    "Example: find where the retry limit is set and report its value.",
+    "3. standard: does the task need real reasoning or reach beyond a small, clear change?",
+    "Diagnosing a cause, reviewing a design or a pull request, features, changes across more than two files",
+    "Small size never lowers a critical or elevated task: a one-line change can be critical.",
+  ]) {
+    assert.ok(TIER_RUBRIC.includes(rule), rule);
+  }
+  // The off-by-one fix moved from standard to mechanical.
+  assert.ok(TIER_RUBRIC.indexOf("Example: fix the off-by-one") > TIER_RUBRIC.indexOf("4. mechanical:"));
 });
 
 test("the why answer is one short sentence of at most 120 characters, and an over-long why is still a decision, never a schema failure", async () => {
@@ -333,7 +349,7 @@ test("an unknown tier moves to the next hop", async () => {
   assert.equal(record.hops[0]?.outcome, "unknown-tier");
 });
 
-test("with every model hop failing the task is unclassified: elevated, whatever words it holds", async () => {
+test("with every model hop failing the task is unclassified: standard, whatever words it holds", async () => {
   const risky = "Delete the admin password hash, drop table users, rotate the API key and force-push the branch.";
   for (const task of [risky, PLAIN_TASK, RENAME_TASK]) {
     const { record } = await classify(task, config(LUNA, [HAIKU, SOL, LUNA_MEDIUM, GPT5_LUNA]), {
@@ -344,12 +360,12 @@ test("with every model hop failing the task is unclassified: elevated, whatever 
       [GPT5_LUNA]: "throws",
     });
     assert.equal(record.cause, "unclassified", task);
-    assert.equal(record.tier, "elevated", task);
+    assert.equal(record.tier, "standard", task);
     assert.deepEqual(record.risk, { level: "unassessed", reasons: [] });
     assert.equal(record.ambiguity, "unassessed");
     assert.equal(record.complexity, "unassessed");
     assert.equal(record.kindOfWork, "unassessed");
-    assert.match(record.why, /no classifier model could classify the task, so it runs as elevated/);
+    assert.match(record.why, /no classifier model could classify the task, so it runs as standard/);
     assert.equal(record.rubricVersion, RUBRIC_VERSION);
     assert.equal("floor" in record, false);
     assert.deepEqual(record.hops.map((hop) => [hop.hop, hop.outcome]), [
@@ -444,7 +460,7 @@ test("with zero remaining allowance the model hop is skipped and the task is unc
   const { record, calls } = await classify(PLAIN_TASK, config(LUNA), { [LUNA]: { answer: answer("critical") } }, budget);
   assert.equal(calls.length, 0);
   assert.equal(record.cause, "unclassified");
-  assert.equal(record.tier, "elevated");
+  assert.equal(record.tier, "standard");
   assert.equal(record.hops[0]?.outcome, "allowance-exhausted");
   assert.match(record.hops[0]!.detail ?? "", /no remaining task allowance/);
   assert.equal(budget.owner.snapshot().settled.length, 0);

@@ -2035,7 +2035,7 @@ test("by default the router classifies through the session's model registry, not
   } finally { h.cleanup(); }
 });
 
-test("a failing in-session classifier request is a recorded hop failure: the router stays enabled and the worker runs unclassified, as elevated", async () => {
+test("a failing in-session classifier request is a recorded hop failure: the router stays enabled and the worker runs unclassified, as standard", async () => {
   const h = harness(LIVE);
   try {
     const registry = fakeSessionRegistry([
@@ -2051,7 +2051,7 @@ test("a failing in-session classifier request is a recorded hop failure: the rou
     const [first, second] = h.records();
     assert.deepEqual(first?.recordType === "decision" && first.classification.hops.map((hop) => [hop.hop, hop.outcome]), [[`${HAIKU}:low`, "out-of-usage"]]);
     assert.equal(first?.recordType === "decision" && first.classification.cause, "unclassified");
-    assert.equal(first?.recordType === "decision" && first.classification.tier, "elevated");
+    assert.equal(first?.recordType === "decision" && first.classification.tier, "standard");
     assert.equal(second?.recordType === "decision" && second.classification.cause, `model:${HAIKU}:low`, "the next worker still classifies in the session");
   } finally { h.cleanup(); }
 });
