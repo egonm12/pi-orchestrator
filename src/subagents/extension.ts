@@ -7,7 +7,7 @@ import { banListsFromSettings, personalAgentDir, readSettingsFile, subagentBanLi
 import { THINKING_LEVELS, splitKnownThinkingSuffix, type ThinkingLevel } from "../models/model-info.ts";
 import { agentDefinitionDirs, agentDefinitionListing, loadAgentDefinitions, resolveAgent } from "./agent-definitions.ts";
 import { callingDelegation } from "./nested-delegation.ts";
-import { BackgroundCalls, type BackgroundCallResult, type CompletionNotice } from "./background.ts";
+import { BackgroundCalls, type CompletionNotice, type ItemOutcome } from "./background.ts";
 import { registerSubagentsMessageTool } from "./message.ts";
 import { renderSubagentsCall, renderSubagentsResult, shortTask } from "./render.ts";
 import { forkSession } from "./fork-session.ts";
@@ -82,7 +82,7 @@ const parameters = (maxItems: number) => ({
       }, required: ["task"], additionalProperties: false,
     } },
     background: { type: "boolean", description: "Optional: the orchestrator's calls run in the background by default, returning at once with the call id and delegation ids; " +
-      "one completion notice with the results follows when every item has finished. Set `background: false` only for a short, bounded task " +
+      "each worker's result follows in its own notice as soon as it finishes, and the last one says the call finished. Set `background: false` only for a short, bounded task " +
       "whose result your next step needs: the call then waits for every item. Workers may also choose background: true; their run waits for their children before ending." },
   },
   required: ["items"],
@@ -227,7 +227,7 @@ export interface SubagentsBackgroundDetails {
   readonly delegationIds: readonly string[];
 }
 
-/** The custom message type of a background call's completion notice. */
+/** The custom message type of a background call's notices: one per finished worker, the last one also saying the call finished. */
 export const COMPLETION_NOTICE = "subagents-completion";
 
 /** The custom message type that reminds a delegating worker of a child's unanswered question (ADR 0016). */
@@ -258,7 +258,7 @@ export interface SubagentsDependencies {
 const description = (limit: number) => `Hand 1 to ${limit} tasks to workers. At most ${limit} workers run at once across this session, ` +
   "foreground and background calls together (orchestrator.subagents.workerLimit); the rest queue until a worker finishes, and are never refused. " +
   "The orchestrator's calls run in the background by default: the call returns at once with its call id and delegation ids, " +
-  "and one completion notice with the results, in item order, follows when every item has finished. " +
+  "and each worker's result follows in its own notice as soon as that worker finishes; the last item's notice also says the call finished. " +
   "Keep the default for exploration, coding, reviews and work of uncertain length, and check on or steer workers meanwhile. " +
   "Set `background: false` only for a short, bounded task whose result your next step needs: the call then waits for every item, " +
   "returns the results in item order, and abort stops running workers and leaves queued workers not started. " +
@@ -487,6 +487,15 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
           if (file !== undefined) rmSync(file, { force: true });
           return { ...itemFields(items[index]!), status: "not-started", finalText: "" };
         };
+        /** Item i's outcome, once it has finished: its result with its run's user steering, and its text. Only a background
+         *  worker takes the user's messages, and only while it runs: its user steering is complete once it finished. */
+        const outcome = (index: number): ItemOutcome => {
+          const steers = userSteering.steers(feeds[index]!.id);
+          if (steers.length > 0) results[index] = { ...results[index]!, userSteering: steers };
+          const result = results[index]!;
+          return { text: resultText(result, parentDelegationId === undefined, gateLevels.inForce(ctx).level),
+            result: { ...result, boardWorker: board.worker(feeds[index]!.id) } };
+        };
         const showProgress = (index: number, state: SubagentProgress) => {
           progress[index] = state;
           if (state.status !== "queued" && state.status !== "running") {
@@ -494,6 +503,10 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
               ...(state.sessionFile === undefined ? {} : { sessionFile: state.sessionFile }), ...(state.error === undefined ? {} : { error: state.error }) });
           }
           sendProgress();
+          // A background item's result is delivered as soon as it has finished (background.ts).
+          if (backgroundCall !== undefined && state.status !== "queued" && state.status !== "running" && results[index] === state) {
+            backgroundCall.itemFinished(index, outcome(index));
+          }
         };
         sendProgress();
         // A background call's workers stop on its own signals, not on the tool's.
@@ -717,36 +730,31 @@ export function createSubagentsExtension(overrides: Partial<SubagentsDependencie
           } finally { giveUpSlot(index); }
         };
         const lanes = Promise.all(items.map((_, index) => runSlot(index)));
-        const finishCall = async (): Promise<BackgroundCallResult> => {
+        // The call ends once every item has: an item that never got a worker ends not started.
+        const finishCall = async (): Promise<void> => {
           try { await lanes; } finally { unsubscribeTier(); }
           for (let index = 0; index < items.length; index++) {
             if (results[index] === undefined) {
               results[index] = notStarted(index);
               feeds[index]!.ended({ state: "aborted" });
+              backgroundCall?.itemFinished(index, outcome(index));
             }
           }
-          // Only a background worker takes the user's messages, and only while it runs: its run's user steering is complete now.
-          for (const [index, result] of results.entries()) {
-            const steers = userSteering.steers(feeds[index]!.id);
-            if (steers.length > 0) results[index] = { ...result, userSteering: steers };
-          }
-          const details: SubagentsDetails = { results: results.map((item, index) => ({ ...item, boardWorker: board.worker(feeds[index]!.id) })) };
-          const level = gateLevels.inForce(ctx).level;
-          return { text: results.map((result) => resultText(result, parentDelegationId === undefined, level)).join("\n\n"), details };
         };
         if (backgroundCall) {
           backgroundCall.finish(finishCall());
           const { delegationIds } = backgroundCall;
           const details: SubagentsBackgroundDetails = { callId: toolCallId, delegationIds };
           const text = [`Background subagents call ${toolCallId} started. Delegation ids, in item order:`, ...delegationIds,
-            "A completion notice with the results follows when every item has finished."].join("\n");
+            "Each worker's result follows in its own notice as soon as it finishes; the last item's notice also says the call finished."].join("\n");
           return { content: [{ type: "text", text }], details };
         }
         // A foreground worker releases its own slot while its children finish.
         // Background calls return at once, leaving queued children for a later slot.
-        const { text, details } = parentDelegationId === undefined ? await finishCall()
-          : await withoutWorkerSlot(ctx.sessionManager.getSessionId(), signal, finishCall);
-        return { content: [{ type: "text", text }], details };
+        await (parentDelegationId === undefined ? finishCall() : withoutWorkerSlot(ctx.sessionManager.getSessionId(), signal, finishCall));
+        const outcomes = results.map((_, index) => outcome(index));
+        const details: SubagentsDetails = { results: outcomes.map(({ result }) => result) };
+        return { content: [{ type: "text", text: outcomes.map(({ text }) => text).join("\n\n") }], details };
       },
       renderCall: (args, theme) => renderSubagentsCall(args, theme),
       renderResult: (result, options, theme) => renderSubagentsResult(result, options, theme),

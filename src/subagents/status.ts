@@ -8,9 +8,10 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 // The subagents_status tool (ADR 0008, ADR 0016): the caller's view of its
 // background calls. Without an id it lists them; with a call id it gives a
 // snapshot of each item, with a delegation id one item's snapshot. With a call
-// id and `wait: true` it blocks until the call has ended and returns its
-// results, which then take the place of the call's completion notice. Ctrl+C
-// fires the tool's abort signal, which stops only the wait. A delegating worker
+// id and `wait: true` it blocks until the call has ended and returns the
+// results not yet delivered as notices, which the session then does not get,
+// and names the workers whose notices came earlier. Ctrl+C fires the tool's
+// abort signal, which stops only the wait. A delegating worker
 // gets it unless its agent definition narrows its tools.
 
 export const SUBAGENTS_STATUS_TOOL = "subagents_status";
@@ -22,7 +23,7 @@ const PARAMETERS = {
   type: "object",
   properties: {
     id: { type: "string", description: "Optional: a background call id for a snapshot of each item, or a delegation id for that worker's snapshot." },
-    wait: { type: "boolean", description: "With a call id: block until the call finishes and return its results instead of its completion notice. " +
+    wait: { type: "boolean", description: "With a call id: block until the call finishes and return the results not yet delivered as notices. " +
       "It holds your turn: use it only when you cannot go on without the results." },
   },
   additionalProperties: false,
@@ -30,9 +31,10 @@ const PARAMETERS = {
 
 const DESCRIPTION = "Check this session's background subagents calls. Without `id`, list them with each worker's state. " +
   "With a call id, a snapshot of each item; with a delegation id, that worker's snapshot: state, current tool, turns, elapsed time, " +
-  "the last lines of its text and its session file. With a call id and `wait: true`, block until the call finishes and return its results; " +
-  "its completion notice is then not delivered. A wait holds your turn until the call finishes, so wait only when you cannot go on without " +
-  "the results; otherwise carry on and let the completion notice bring them. Aborting a wait stops only the wait, not the workers.";
+  "the last lines of its text and its session file. With a call id and `wait: true`, block until the call finishes and return the results " +
+  "its notices have not brought yet, which then get no notice of their own; results delivered earlier are named by their ids, not repeated. " +
+  "Each worker's result otherwise comes in its own notice as soon as it finishes. A wait holds your turn until the call finishes, so wait only " +
+  "when you cannot go on without the results; otherwise carry on and let the notices bring them. Aborting a wait stops only the wait, not the workers.";
 
 /** The result's `details` for a listing or a snapshot. */
 export interface SubagentsStatusDetails {

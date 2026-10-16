@@ -916,7 +916,7 @@ test("the worker limit counts a foreground and a background call's workers toget
     }
     const details = (await foreground).details as SubagentsDetails;
     assert.deepEqual(details.results.map((result) => result.status), ["completed", "completed"]);
-    await waitFor(() => subagents.messages.length === 2, "both background calls sent their notices");
+    await waitFor(() => subagents.messages.length === 3, "both background calls sent a notice per worker");
     assert.equal(peak, 2, "at most two workers ran at once across the three calls");
     assert.equal(provider.requests.length, 5);
   } finally {
@@ -2183,10 +2183,24 @@ interface BackgroundStart {
   readonly delegationIds: readonly string[];
 }
 
-/** A completion notice's details: the call id and the same results a foreground call returns. */
-type NoticeDetails = SubagentsDetails & { readonly callId: string };
+/** A notice's details: the call id, the same results a foreground call returns, whether the call finished, and on its last notice the ids earlier notices brought. */
+type NoticeDetails = SubagentsDetails & { readonly callId: string; readonly finished: boolean; readonly delivered?: readonly string[] };
 
-test("a background call returns its call id and delegation ids at once, and one completion notice follows when all its items finish", async () => {
+/** The notices `messages` holds for the call `callId`, in the order they came. */
+function callNotices(messages: readonly SentMessage[], callId: string): SentMessage[] {
+  return messages.filter(({ message }) => message.customType === COMPLETION_NOTICE && (message.details as NoticeDetails | undefined)?.callId === callId);
+}
+
+/** Whether the last notice of the call `callId` is in. */
+const callFinished = (messages: readonly SentMessage[], callId: string) =>
+  callNotices(messages, callId).some(({ message }) => (message.details as NoticeDetails).finished);
+
+/** Every result the notices of the call `callId` brought, in the order they came. */
+function callResults(messages: readonly SentMessage[], callId: string): SubagentResult[] {
+  return callNotices(messages, callId).flatMap(({ message }) => (message.details as NoticeDetails).results);
+}
+
+test("a background call returns its call id and delegation ids at once, each worker's notice follows as it finishes, and the last one says the call finished", async () => {
   const h = harness({ orchestrator: { routing: ROUTING, subagents: { maxParallel: 1 } } });
   const pending: (() => void)[] = [];
   try {
@@ -2210,28 +2224,39 @@ test("a background call returns its call id and delegation ids at once, and one 
     await waitFor(() => pending.length === 1, "the first worker starts");
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(pending.length, 1, "no second worker runs at once");
-    while (subagents.messages.length < 2) {
-      await waitFor(() => pending.length > 0 || subagents.messages.length === 2, "a worker is waiting or both notices are in");
+    // The first worker's notice is in before the second worker is released.
+    pending.shift()!();
+    await waitFor(() => subagents.messages.length === 1, "the first worker's own notice");
+    assert.deepEqual((subagents.messages[0]!.message.details as NoticeDetails).finished, false, "the call still runs its second item");
+    while (subagents.messages.length < 4) {
+      await waitFor(() => pending.length > 0 || subagents.messages.length === 4, "a worker is waiting or every notice is in");
       pending.shift()?.();
     }
     await new Promise((resolve) => setTimeout(resolve, 20));
-    assert.equal(subagents.messages.length, 2, "one notice per call");
+    assert.equal(subagents.messages.length, 4, "one notice per worker");
 
-    for (const [index, { message, options }] of subagents.messages.entries()) {
-      assert.deepEqual(options, { triggerTurn: true, deliverAs: "followUp" }, "a follow-up that starts a turn when idle");
-      assert.equal(message.display, true);
-      const details = message.details as NoticeDetails;
-      const callId = details.callId;
-      const start = starts.find((candidate) => candidate.callId === callId);
-      assert.ok(start, `notice ${index} names a started call: ${callId}`);
-      assert.deepEqual(details.results.map((result) => result.status), ["completed", "completed"]);
-      assert.deepEqual(details.results.map((result) => result.sessionId), start.delegationIds, "the delegation ids given at the start are the workers' session ids");
-      const text = message.content;
-      assert.ok(typeof text === "string", "the notice's content is its text");
-      assert.ok(text.includes(callId), text);
-      for (const result of details.results) {
-        assert.ok(text.includes(`Worker ${result.sessionId} completed.\nSession file: ${result.sessionFile}\n\ndone`), `the foreground result text: ${text}`);
+    for (const start of starts) {
+      const notices = subagents.messages.filter(({ message }) => (message.details as NoticeDetails).callId === start.callId);
+      assert.equal(notices.length, 2, `two notices for ${start.callId}`);
+      for (const { message, options } of notices) {
+        assert.deepEqual(options, { triggerTurn: true, deliverAs: "followUp" }, "a follow-up that starts a turn when idle");
+        assert.equal(message.display, true);
+        const details = message.details as NoticeDetails;
+        assert.deepEqual(details.results.map((result) => result.status), ["completed"]);
+        const text = message.content;
+        assert.ok(typeof text === "string", "the notice's content is its text");
+        for (const result of details.results) {
+          assert.ok(text.includes(`Worker ${result.sessionId} completed.\nSession file: ${result.sessionFile}\n\ndone`), `the foreground result text: ${text}`);
+        }
       }
+      const [first, last] = notices.map(({ message }) => ({ text: String(message.content), details: message.details as NoticeDetails }));
+      const [firstId, secondId] = start.delegationIds;
+      assert.deepEqual([first!.details.finished, first!.details.results[0]?.sessionId], [false, firstId],
+        "the delegation ids given at the start are the workers' session ids");
+      assert.ok(first!.text.startsWith(`Background subagents call ${start.callId}: worker ${firstId} finished, 1 of 2 done.\n\n`), first!.text);
+      assert.deepEqual([last!.details.finished, last!.details.results[0]?.sessionId, last!.details.delivered], [true, secondId, [firstId]]);
+      assert.ok(last!.text.startsWith(`Background subagents call ${start.callId} finished. Earlier notices brought the results of ${firstId}.\n\n` +
+        `Worker ${secondId} completed.`), `the last worker's notice says the call finished and is not repeated: ${last!.text}`);
     }
   } finally {
     for (const finish of pending) finish();
@@ -2505,12 +2530,13 @@ test("the deprecated maxBackgroundWorkers sets the worker limit: a background ca
     await waitFor(() => pending.length === 3, "three workers run");
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(provider.requests.length, 3, "the other two queue");
-    while (subagents.messages.length < 3) {
-      await waitFor(() => pending.length > 0 || subagents.messages.length === 3, "a worker is waiting or every notice is in");
+    while (subagents.messages.length < 5) {
+      await waitFor(() => pending.length > 0 || subagents.messages.length === 5, "a worker is waiting or every notice is in");
       pending.shift()?.();
     }
     assert.equal(provider.requests.length, 5, "every queued worker ran");
-    assert.deepEqual(subagents.messages.map(({ message }) => (message.details as NoticeDetails).callId).sort(), ["call-1", "call-2", "call-3"]);
+    assert.deepEqual(subagents.messages.map(({ message }) => (message.details as NoticeDetails).callId).sort(),
+      ["call-1", "call-1", "call-2", "call-2", "call-3"], "one notice per worker");
   } finally {
     for (const finish of pending) finish();
     h.cleanup();
@@ -2578,12 +2604,10 @@ test("Ctrl+C does not stop background workers, and session shutdown aborts them 
     await subagents.tool().execute("call-2", { items: [{ task: "Run long" }, { task: "Wait in line" }], background: true } as never, undefined, undefined, ctx);
     await waitFor(() => pending.length === 2, "both workers run");
     await subagents.shutdownSession(ctx);
-    assert.equal(subagents.messages.length, 2, "shutdown waits until the call has ended");
-    const { message, options } = subagents.messages[1]!;
-    assert.deepEqual(options, { triggerTurn: false }, "the notice is recorded without starting a turn");
-    const details = message.details as NoticeDetails;
-    assert.equal(details.callId, "call-2");
-    assert.deepEqual(details.results.map((result) => result.status), ["aborted", "aborted"]);
+    assert.ok(callFinished(subagents.messages, "call-2"), "shutdown waits until the call has ended");
+    assert.equal(subagents.messages.length, 3, "one notice per aborted worker");
+    for (const { options } of subagents.messages.slice(1)) assert.deepEqual(options, { triggerTurn: false }, "the notice is recorded without starting a turn");
+    assert.deepEqual(callResults(subagents.messages, "call-2").map((result) => result.status), ["aborted", "aborted"]);
     // "stop all" is unchanged from before xytd's picker replaced empty args' text notice.
     assert.deepEqual(await subagents.runCommand("subagents", "stop all", ctx), ["No background subagents calls are running."]);
   } finally {
@@ -2610,10 +2634,10 @@ test("/subagents stop is unchanged: it still stops one worker or a whole backgro
     await waitFor(() => provider.requests.length === 3, "call-2's first item starts");
     // Stopping a call aborts its running worker and leaves its queued item not started.
     assert.deepEqual(await subagents.runCommand("subagents", "stop call-2", ctx), ["Stopping background call call-2."]);
-    await waitFor(() => subagents.messages.length === 1, "call-2's notice is in");
-    const stopped = subagents.messages[0]!.message.details as NoticeDetails;
-    assert.equal(stopped.callId, "call-2");
-    assert.deepEqual(stopped.results.map((result) => result.status), ["aborted", "not-started"]);
+    await waitFor(() => callFinished(subagents.messages, "call-2"), "call-2's last notice is in");
+    assert.deepEqual(callResults(subagents.messages, "call-2").map((result) => result.status), ["aborted", "not-started"]);
+    assert.deepEqual(callResults(subagents.messages, "call-1").map((result) => result.status), ["aborted"],
+      "the stopped worker's notice came as it finished");
 
     assert.deepEqual(await subagents.runCommand("subagents", "stop no-such-id", ctx), ["No running background call or worker has the id no-such-id."]);
     // Before xytd, an unrecognized word such as a bare "list" fell through backgroundCalls.command
@@ -2625,9 +2649,8 @@ test("/subagents stop is unchanged: it still stops one worker or a whole backgro
 
     // Only call-1's second worker is still running; the aborted ones' finishes change nothing.
     for (const finish of pending.splice(0)) finish();
-    await waitFor(() => subagents.messages.length === 2, "call-1's notice is in");
-    const finished = subagents.messages[1]!.message.details as NoticeDetails;
-    assert.deepEqual(finished.results.map((result) => result.status), ["aborted", "completed"]);
+    await waitFor(() => callFinished(subagents.messages, "call-1"), "call-1's last notice is in");
+    assert.deepEqual(callResults(subagents.messages, "call-1").map((result) => result.status), ["aborted", "completed"]);
     assert.equal(provider.requests.length, 3, "call-2's queued item never started");
   } finally {
     for (const finish of pending) finish();
@@ -2734,7 +2757,7 @@ test("subagents_status lists background calls, snapshots each item of a call, an
     await assert.rejects(status({ id: "no-such-id" }), /No running background call or worker has the id no-such-id/);
 
     hold.release();
-    await waitFor(() => subagents.messages.length === 1, "the call's notice is in");
+    await waitFor(() => callFinished(subagents.messages, "call-1"), "the call's last notice is in");
     assert.equal((await status({})).text, "No background subagents calls are running.");
   } finally {
     hold.release();
@@ -2762,6 +2785,79 @@ test("subagents_status wait returns a background call's results, and its complet
     assert.match(toolText(result), new RegExp(`^Background subagents call call-1 finished\\.\\n\\nWorker ${start.delegationIds[0]} completed\\.`));
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.deepEqual(subagents.messages, [], "the result went to the wait, not to a notice");
+  } finally {
+    for (const finish of pending) finish();
+    h.cleanup();
+  }
+});
+
+test("each background result is delivered once: a worker that finished before a wait has its notice, and the wait returns only the rest and names it", async () => {
+  const h = harness();
+  const pending: (() => void)[] = [];
+  try {
+    const provider = fakeAnthropic("done", (finish) => pending.push(finish));
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h).ctx;
+    const start = (await subagents.tool().execute("call-1", { items: [{ task: "Quick" }, { task: "Slow" }, { task: "Slower" }], background: true } as never,
+      undefined, undefined, ctx)).details as BackgroundStart;
+    await waitFor(() => pending.length === 3, "the three workers run");
+    const worker = (index: number) => provider.requests[index]!.sessionId!;
+    const [quick, slow, slower] = [0, 1, 2].map(worker);
+    pending.shift()!();
+    await waitFor(() => subagents.messages.length === 1, "the first worker's notice, while the others run");
+    const first = subagents.messages[0]!.message;
+    assert.deepEqual([(first.details as NoticeDetails).finished, (first.details as NoticeDetails).results.map((result) => result.sessionId)], [false, [quick]]);
+    assert.ok(String(first.content).startsWith(`Background subagents call call-1: worker ${quick} finished, 1 of 3 done.\n\nWorker ${quick} completed.`), String(first.content));
+
+    // A worker that finishes while a wait is pending goes to the wait, not to a notice.
+    const waiting = subagents.statusTool().execute("status-1", { id: "call-1", wait: true } as never, undefined, undefined, ctx);
+    pending.shift()!();
+    await waitFor(() => workerBoard().byDelegation(slow!)?.state === "completed", "the second worker finishes");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(subagents.messages.length, 1, "no notice while the wait is pending");
+    pending.shift()!();
+    const result = await waiting;
+    const details = result.details as NoticeDetails;
+    // The rest come in item order.
+    const rest = start.delegationIds.filter((id) => id !== quick);
+    assert.deepEqual([details.finished, details.results.map((item) => item.sessionId), details.delivered], [true, rest, [quick]]);
+    const text = toolText(result);
+    assert.ok(text.startsWith(`Background subagents call call-1 finished. Earlier notices brought the results of ${quick}.\n\nWorker ${rest[0]} completed.`), text);
+    assert.ok(text.includes(`Worker ${slower} completed.`) && !text.includes(`Worker ${quick} completed.`), `the earlier result is not repeated: ${text}`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(subagents.messages.length, 1, "the wait took the rest");
+  } finally {
+    for (const finish of pending) finish();
+    h.cleanup();
+  }
+});
+
+test("a worker that finished during a wait gets its notice when the wait stops early, and the call's last notice does not repeat it", async () => {
+  const h = harness();
+  const pending: (() => void)[] = [];
+  try {
+    const provider = fakeAnthropic("done", (finish) => pending.push(finish));
+    const subagents = loadSubagents([routerExtension(), provider.extension]);
+    const ctx = orchestrator(h).ctx;
+    await subagents.tool().execute("call-1", { items: [{ task: "Quick" }, { task: "Slow" }], background: true } as never, undefined, undefined, ctx);
+    await waitFor(() => pending.length === 2, "both workers run");
+    const [quick, slow] = [0, 1].map((index) => provider.requests[index]!.sessionId!);
+    const ctrlC = new AbortController();
+    const waiting = subagents.statusTool().execute("status-1", { id: "call-1", wait: true } as never, ctrlC.signal, undefined, ctx);
+    pending.shift()!();
+    await waitFor(() => workerBoard().byDelegation(quick!)?.state === "completed", "the first worker finishes");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(subagents.messages.length, 0, "the pending wait holds its result");
+    ctrlC.abort();
+    await assert.rejects(waiting, /Stopped waiting for background call call-1; its workers run on, and their notices follow\./);
+    assert.equal(subagents.messages.length, 1, "the held result is delivered when the wait stops");
+    assert.deepEqual((subagents.messages[0]!.message.details as NoticeDetails).results.map((result) => result.sessionId), [quick]);
+
+    pending.shift()!();
+    await waitFor(() => subagents.messages.length === 2, "the call's last notice");
+    const last = subagents.messages[1]!.message;
+    assert.deepEqual([(last.details as NoticeDetails).finished, (last.details as NoticeDetails).results.map((result) => result.sessionId)], [true, [slow]]);
+    assert.ok(!String(last.content).includes(`Worker ${quick} completed.`), String(last.content));
   } finally {
     for (const finish of pending) finish();
     h.cleanup();
@@ -3574,11 +3670,12 @@ function toolResultDetails(session: { readonly messages: readonly unknown[] }, t
 }
 
 for (const [how, option] of [["without a background option", {}], ["with background: true", { background: true }]] as const) {
-  test(`an orchestrator's subagents call ${how} returns its ids at once, steering queued during the launch reaches its next turn while the workers are held, and one notice brings every item's result`, async () => {
+  test(`an orchestrator's subagents call ${how} returns its ids at once, steering queued during the launch reaches its next turn while the workers are held, and each item's result comes in its own notice as it finishes`, async () => {
     const h = harness();
     const heldWorkers: (() => void)[] = [];
     const workerProvider = fakeAnthropic("leaf done", (finish) => { heldWorkers.push(finish); });
     const steering = "Switch to checking provider limits";
+    // A request's messages are its whole context, so the last request holds every notice so far.
     const noticeIn = (request: ScriptedRequest) => request.userMessages.filter((text) => text.startsWith("Background subagents call") && text.includes("finished"));
     try {
       mkdirSync(h.stateDir);
@@ -3597,10 +3694,11 @@ for (const [how, option] of [["without a background option", {}], ["with backgro
       });
       try {
         prompt = session.prompt("Start three items");
-        await until(() => mainRequests().length === 2 && !session.isStreaming, "the prompt's run ends while the workers are held", 3000);
+        // The item with an unknown agent fails at once, and its notice follows the steered turn in the prompt's run.
+        await until(() => mainRequests().length === 3 && !session.isStreaming, "the prompt's run ends while the workers are held", 3000);
         await prompt;
         await steered;
-        assert.equal(mainRequests().length, 2, "the prompt's run ended after one more turn");
+        assert.equal(mainRequests().length, 3, "the prompt's run ended after the steered turn and the failed item's notice");
         assert.ok(mainRequests()[1]!.userMessages.includes(steering), JSON.stringify(mainRequests()[1]!.userMessages));
         assert.match(mainRequests()[1]!.toolResults[0]!.text, /^Background subagents call \S+ started\./);
         assert.deepEqual(session.getSteeringMessages(), []);
@@ -3611,14 +3709,17 @@ for (const [how, option] of [["without a background option", {}], ["with backgro
           const workerRequest = workerProvider.requests.find((request) => request.messages.some((message) => message.includes(task)));
           assert.equal(workerRequest?.sessionId, start!.delegationIds[index], `delegation id ${index} is ${task}'s worker`);
         }
-        assert.equal(mainRequests().length, 2, "no notice while the workers are held");
+        assert.equal(mainRequests().length, 3, "no other notice while the workers are held");
+        const [failed] = noticeIn(mainRequests()[2]!);
+        assert.match(failed ?? "", new RegExp(`^Background subagents call \\S+: worker ${start!.delegationIds[1]} finished, 1 of 3 done\\.`), failed);
+        assert.match(failed!, /unknown agent "reviewr"/, "the failed item's result is in its own notice");
 
         for (const finish of heldWorkers) finish();
-        await until(() => mainRequests().length === 3 && session.isIdle, "the run the completion notice starts");
-        const notices = noticeIn(mainRequests()[2]!);
-        assert.equal(notices.length, 1, JSON.stringify(mainRequests()[2]!.userMessages));
-        assert.equal(notices[0]!.match(/leaf done/g)?.length, 2, notices[0]);
-        assert.match(notices[0]!, /unknown agent "reviewr"/, "the failed item's result is in the notice");
+        await until(() => session.isIdle && noticeIn(mainRequests().at(-1)!).length === 3, "the runs the workers' notices start");
+        const notices = noticeIn(mainRequests().at(-1)!);
+        assert.equal(notices.join("\n").match(/leaf done/g)?.length, 2, notices.join("\n"));
+        assert.equal(notices.filter((text) => /^Background subagents call \S+ finished\./.test(text)).length, 1, "only the last notice says the call finished");
+        assert.match(notices[2]!, new RegExp(`Earlier notices brought the results of .*${start!.delegationIds[1]}`), notices[2]);
       } finally {
         unsubscribe();
         for (const finish of heldWorkers) finish();
@@ -4009,7 +4110,7 @@ test("a notice that starts no turn is never held: a call session shutdown stoppe
   } finally { h.cleanup(); }
 });
 
-test("under the default a Ctrl+C during a status wait stops only the wait, a call past the worker limit queues, /subagents stop sends the stopped call's notice, and session shutdown records one without a turn", async () => {
+test("under the default a Ctrl+C during a status wait stops only the wait, a call past the worker limit queues, /subagents stop sends the stopped call's notices, and session shutdown records them without a turn", async () => {
   const h = harness({ orchestrator: { routing: ROUTING, subagents: { workerLimit: 2 } } });
   const heldWorkers: (() => void)[] = [];
   const workerProvider = fakeAnthropic("leaf done", (finish) => { heldWorkers.push(finish); });
@@ -4054,7 +4155,7 @@ test("under the default a Ctrl+C during a status wait stops only the wait, a cal
       await ctrlC;
       await waiting;
       assert.deepEqual(lastResult("subagents_status"),
-        { isError: true, text: `Stopped waiting for background call ${callId}; its workers run on, and its completion notice follows.` });
+        { isError: true, text: `Stopped waiting for background call ${callId}; its workers run on, and their notices follow.` });
       assert.deepEqual(notices(), [], "no notice: the workers run on");
 
       await promptWithin(session, "Start one more");
@@ -4065,8 +4166,11 @@ test("under the default a Ctrl+C during a status wait stops only the wait, a cal
       assert.ok(!workerProvider.requests.some((request) => request.messages.some((message) => message.includes("Item C"))), "its worker waits for a slot");
 
       await session.prompt(`/subagents stop ${callId}`);
-      await until(() => notices().length === 1 && session.isIdle && mainRequests().at(-1)!.userMessages.includes(notices()[0]!), "the stopped call's notice and the run it starts");
-      for (const id of first!.delegationIds) assert.ok(notices()[0]!.includes(`Worker ${id} aborted.`), notices()[0]);
+      // One notice per stopped worker; the second also says the call finished.
+      await until(() => notices().length === 2 && session.isIdle && notices().every((notice) => mainRequests().at(-1)!.userMessages.includes(notice)),
+        "the stopped call's notices and the runs they start");
+      for (const id of first!.delegationIds) assert.ok(notices().join("\n").includes(`Worker ${id} aborted.`), notices().join("\n"));
+      assert.match(notices()[1]!, new RegExp(`^Background subagents call ${callId} finished\\.`), notices()[1]);
       await until(() => heldWorkers.length === 3, "the queued worker's first request, in a slot the stopped call freed");
 
       await promptWithin(session, "Start again");
@@ -4074,8 +4178,8 @@ test("under the default a Ctrl+C during a status wait stops only the wait, a cal
       await until(() => heldWorkers.length === 4, "the new worker's first request");
       const requestsBefore = mainRequests().length;
       await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
-      assert.equal(notices().length, 3, "shutdown waits until both running calls have ended");
-      for (const notice of notices().slice(1)) assert.match(notice, /^Background subagents call \S+ finished[\s\S]*Worker \S+ aborted\./, notice);
+      assert.equal(notices().length, 4, "shutdown waits until both running calls have ended");
+      for (const notice of notices().slice(2)) assert.match(notice, /^Background subagents call \S+ finished[\s\S]*Worker \S+ aborted\./, notice);
       assert.equal(mainRequests().length, requestsBefore, "the notice is recorded without starting a turn");
     } finally {
       hold.release();
@@ -4104,9 +4208,11 @@ test("under a default background call a worker's own calls may choose foreground
       orchestratorId = session.sessionId;
       await session.prompt("Hand out the delegating work");
       assert.match(mainRequests()[1]!.toolResults[0]!.text, /^Background subagents call \S+ started\./, "the orchestrator's call went to the background");
-      await until(() => mainRequests().length === 3 && session.isIdle, "the run the completion notice starts");
+      // One notice per lead; the last request's context holds both.
+      const noticesIn = () => mainRequests().at(-1)!.userMessages.filter((text) => /^Background subagents call \S+( finished\.|: worker)/.test(text));
+      await until(() => noticesIn().length === 2 && session.isIdle, "the runs the leads' notices start");
     } finally { session.dispose(); }
-    const notice = mainRequests()[2]!.userMessages.find((text) => text.includes("Background subagents call"))!;
+    const notice = mainRequests().at(-1)!.userMessages.filter((text) => /^Background subagents call \S+( finished\.|: worker)/.test(text)).join("\n\n");
     assert.match(notice, /delegated: Worker \S+ completed\.[\s\S]*leaf done/, "the nested call returned its worker's result, in the foreground");
     assert.match(notice, /delegated: Background subagents call \S+ started/, notice);
     assert.equal(provider.requests.filter((request) => request.task === "Find the config file").length, 1);

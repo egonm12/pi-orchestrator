@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: accepted, amended by the dated amendments below
 date: 2026-09-26
 ---
 
@@ -24,3 +24,9 @@ Version 2 of the `subagents` tool (ADR 0007) adds forked workers, background wor
 - A resume item `{ resume, task }` continues the same delegation, session and pin, for any worker saved under the orchestrator's session except a not-started or still-running one. The pin must pass the hard filters again, or the resume is refused; it is never re-routed. The latest verdict on a delegation counts.
 - Superseded by ADR 0016: a worker may delegate only when its agent definition lists `subagents`, one level deep, foreground only, routed, with its own `maxParallel` per call. Its records name the parent delegation. Forked workers never delegate.
 - Note (2026-09-30, bean 3cbz): an orchestrator's call that leaves `background` out now runs in the background too, and `background: false` chooses the foreground. A foreground call holds the orchestrator's turn, so the user's steering waited until its slowest worker returned. Superseded by ADR 0016: a worker's call stays foreground only: leaving the option out keeps it foreground, and `background: true` is still refused. Limits, stop, status, wait, messages and notices are unchanged.
+
+## Amendment, 2026-10-13: one result per worker
+
+A background call no longer sends one completion notice after all its items finish. Each worker's result is delivered once, as soon as that worker finishes: to a pending `subagents_status` wait on its call, otherwise as its own notice. The last item's notice also says the call finished and names the workers whose results came earlier. A wait on a call still blocks until the call finishes, and returns the results not yet delivered with the call-finished line; results delivered earlier are named by id, not repeated. A result that finished while a wait was pending gets its own notice if the wait stops early. Notices are still held until the orchestrator settles.
+
+The reason is the speed benchmark (bean pi-orchestrator-2gri). 38% of delegated turns had several workers, and the slowest finished a median of 4 minutes (p90 20 minutes) after the fastest. The orchestrator waited for it before it could act on any result.

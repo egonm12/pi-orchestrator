@@ -1,29 +1,36 @@
-import type { SubagentProgress, SubagentsDetails } from "./extension.ts";
+import type { SubagentProgress, SubagentResult, SubagentsDetails } from "./extension.ts";
 import { shortTask } from "./render.ts";
 import type { WorkerActivity } from "./worker.ts";
 
 // Background calls (ADR 0008). A background subagents call, the orchestrator's
 // default or `background: true` from a worker, returns at
-// once and its items run on here. When every item has finished, the call's one
-// completion notice is delivered. The tool's abort signal, which Ctrl+C fires,
-// does not reach these workers: each call has signals of its own, which
-// `/subagents stop` and session shutdown fire. `subagents_status` reads each
-// call's snapshot here and can wait for a call; a result is delivered once, to
-// a pending wait, otherwise as the completion notice.
+// once and its items run on here. Each worker's result is delivered once, as
+// soon as the worker finishes (ADR 0008, amended 2026-10-13): to a pending
+// `subagents_status` wait on its call, otherwise as its own notice. The last
+// item's notice also says the call finished, with any results not yet
+// delivered. The tool's abort signal, which Ctrl+C fires, does not reach these
+// workers: each call has signals of its own, which `/subagents stop` and
+// session shutdown fire. `subagents_status` reads each call's snapshot here
+// and can wait for a call.
 
-/** The completion notice's details: the call id and the results a foreground call returns. */
-export type CompletionNoticeDetails = SubagentsDetails & { readonly callId: string };
+/** A notice's details: the call id, the results it brings, as a foreground call returns them, and whether the call finished.
+ *  `delivered` names the workers whose results earlier notices brought, on the call's last notice. */
+export type CompletionNoticeDetails = SubagentsDetails & {
+  readonly callId: string;
+  readonly finished: boolean;
+  readonly delivered?: readonly string[];
+};
 
-/** A background call's completion notice. Without `details` when the call itself failed. */
+/** A background call's notice: one worker's result, or the call's end. Without `details` when the call itself failed. */
 export interface CompletionNotice {
   readonly text: string;
   readonly details?: CompletionNoticeDetails;
 }
 
-/** A finished call's result: the text and details a foreground call returns. */
-export interface BackgroundCallResult {
+/** A finished item's outcome: its result and its text, as a foreground call returns them. */
+export interface ItemOutcome {
   readonly text: string;
-  readonly details: SubagentsDetails;
+  readonly result: SubagentResult;
 }
 
 export type BackgroundMessageMode = "steer" | "followUp";
@@ -72,15 +79,17 @@ export interface BackgroundCallHandle {
   readonly callSignal: AbortSignal;
   /** `itemSignals[i]` stops item i alone; `callSignal` fires it too. */
   readonly itemSignals: readonly AbortSignal[];
-  /** Hands over the call's result, which becomes its completion notice when it settles. */
-  readonly finish: (result: Promise<BackgroundCallResult>) => void;
+  /** Hands over item i's outcome once it has finished; it is delivered at once, unless a wait takes it or it is the call's last. */
+  readonly itemFinished: (index: number, outcome: ItemOutcome) => void;
+  /** Hands over the promise that settles when every item has finished; the call's last notice follows it. */
+  readonly finish: (ended: Promise<void>) => void;
   /** `onActivity[i]` takes item i's worker activity, for its snapshot. */
   readonly onActivity: readonly ((activity: WorkerActivity) => void)[];
 }
 
 /** A pending `subagents_status` wait on a call. */
 interface Waiter {
-  /** Hands the wait the call's notice, which the session then does not get. */
+  /** Hands the wait the call's last notice, with every result not yet delivered, which the session then does not get. */
   readonly deliver: (notice: CompletionNotice) => void;
   /** Ends the wait early with `reason`; the call runs on. */
   readonly interrupt: (reason: string) => void;
@@ -98,11 +107,15 @@ interface RunningCall {
   readonly delegationIds: readonly string[];
   readonly stopCall: () => void;
   readonly stopItem: (index: number) => void;
-  /** Settles once the notice is delivered, or handed to the pending waits; never rejects. */
+  /** Settles once the last notice is delivered, or handed to the pending waits; never rejects. */
   readonly finished: Promise<void>;
   /** `activities[i]`: item i's worker activity, once its worker started. */
   readonly activities: (ItemActivity | undefined)[];
-  /** The pending `subagents_status` waits, which get the notice instead of the session. */
+  /** `outcomes[i]`: item i's outcome, once it finished. */
+  readonly outcomes: (ItemOutcome | undefined)[];
+  /** `delivered[i]`: whether item i's result reached the session as its own notice. */
+  readonly delivered: boolean[];
+  /** The pending `subagents_status` waits, which get the results instead of the session. */
   readonly waiters: Set<Waiter>;
 }
 
@@ -121,6 +134,28 @@ function stateText(item: SubagentProgress): string {
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** A finished worker's own notice. */
+function workerNotice(callId: string, running: Pick<RunningCall, "outcomes" | "delegationIds">, index: number): CompletionNotice {
+  const { text, result } = running.outcomes[index]!;
+  const done = running.outcomes.filter((outcome) => outcome !== undefined).length;
+  return {
+    text: `Background subagents call ${callId}: worker ${running.delegationIds[index]} finished, ${done} of ${running.outcomes.length} done.\n\n${text}`,
+    details: { callId, finished: false, results: [result] },
+  };
+}
+
+/** The call's last notice: the call-finished line and every result not yet delivered, in item order.
+ *  `failure` is the call's own error, if it failed. */
+function lastNotice(callId: string, running: Pick<RunningCall, "outcomes" | "delivered" | "delegationIds">, failure?: string): CompletionNotice {
+  const delivered = running.delegationIds.filter((_, index) => running.delivered[index]);
+  const rest = running.outcomes.filter((outcome, index): outcome is ItemOutcome => outcome !== undefined && !running.delivered[index]);
+  const head = failure === undefined ? `Background subagents call ${callId} finished.` : `Background subagents call ${callId} failed: ${failure}`;
+  const earlier = delivered.length === 0 ? "" : ` Earlier notices brought the results of ${delivered.join(", ")}.`;
+  const text = [`${head}${earlier}`, ...rest.map((outcome) => outcome.text)].join("\n\n");
+  if (failure !== undefined) return { text };
+  return { text, details: { callId, finished: true, results: rest.map((outcome) => outcome.result), ...(delivered.length === 0 ? {} : { delivered }) } };
 }
 
 function lastLines(text: string): string[] {
@@ -151,13 +186,13 @@ export class BackgroundCalls {
   readonly #deliver: (notice: CompletionNotice, startTurn: boolean) => void;
   #shuttingDown = false;
 
-  /** `deliver` gets each call's notice once. `startTurn` is false for a call
-   *  that ended because the session shut down. */
+  /** `deliver` gets each notice once. `startTurn` is false once the session shuts down. */
   constructor(deliver: (notice: CompletionNotice, startTurn: boolean) => void) {
     this.#deliver = deliver;
   }
 
-  /** Registers `call` as running. Its notice is delivered when the result handed to `finish` settles. */
+  /** Registers `call` as running. Each item's notice is delivered as `itemFinished` hands it over,
+   *  and the last notice when the promise handed to `finish` settles. */
   start(call: BackgroundCall): BackgroundCallHandle {
     const { callId } = call;
     const { delegationIds } = call;
@@ -168,14 +203,17 @@ export class BackgroundCalls {
       activities[index] = { activity, startedAt: tracked?.startedAt ?? now, ...(activity.ended ? { endedAt: tracked?.endedAt ?? now } : {}) };
     });
     const waiters = new Set<Waiter>();
+    const outcomes: (ItemOutcome | undefined)[] = delegationIds.map(() => undefined);
+    const delivered = delegationIds.map(() => false);
     const callController = new AbortController();
     const itemControllers = delegationIds.map(() => new AbortController());
     const itemSignals = itemControllers.map((controller) => AbortSignal.any([callController.signal, controller.signal]));
-    let finish!: (result: Promise<BackgroundCallResult>) => void;
-    const result = new Promise<BackgroundCallResult>((resolve) => { finish = resolve; });
-    const finished = result.then(
-      ({ text, details }): CompletionNotice => ({ text: `Background subagents call ${callId} finished.\n\n${text}`, details: { callId, ...details } }),
-      (error: unknown): CompletionNotice => ({ text: `Background subagents call ${callId} failed: ${errorText(error)}` }),
+    let finish!: (ended: Promise<void>) => void;
+    const ended = new Promise<void>((resolve) => { finish = resolve; });
+    const parts = { outcomes, delivered, delegationIds };
+    const finished = ended.then(
+      (): CompletionNotice => lastNotice(callId, parts),
+      (error: unknown): CompletionNotice => lastNotice(callId, parts, errorText(error)),
     ).then((notice) => {
       this.#running.delete(callId);
       for (const id of delegationIds) {
@@ -187,14 +225,32 @@ export class BackgroundCalls {
       this.#changed();
     }).catch((error: unknown) => {
       this.#changed();
-      process.stderr.write(`pi-orchestrator subagents: the completion notice of background call ${callId} was not delivered: ${errorText(error)}\n`);
+      process.stderr.write(`pi-orchestrator subagents: the last notice of background call ${callId} was not delivered: ${errorText(error)}\n`);
     });
-    this.#running.set(callId, {
-      call, delegationIds, finished, activities, waiters,
+    const running: RunningCall = {
+      call, delegationIds, finished, activities, outcomes, delivered, waiters,
       stopCall: () => callController.abort(),
       stopItem: (index) => itemControllers[index]?.abort(),
-    });
-    return { delegationIds, callSignal: callController.signal, itemSignals, finish, onActivity };
+    };
+    this.#running.set(callId, running);
+    const itemFinished = (index: number, outcome: ItemOutcome) => {
+      if (outcomes[index] !== undefined || this.#running.get(callId) !== running) return;
+      outcomes[index] = outcome;
+      this.#deliverFinished(running);
+    };
+    return { delegationIds, callSignal: callController.signal, itemSignals, itemFinished, finish, onActivity };
+  }
+
+  /** Delivers each finished, undelivered item's result as its own notice, unless a wait is pending, which takes them
+   *  when the call ends, or every item has finished, when the call's last notice brings them. */
+  #deliverFinished(running: RunningCall): void {
+    const { outcomes, delivered, waiters, call } = running;
+    if (waiters.size > 0 || outcomes.every((outcome) => outcome !== undefined)) return;
+    for (const [index, outcome] of outcomes.entries()) {
+      if (outcome === undefined || delivered[index]) continue;
+      delivered[index] = true;
+      this.#deliver(workerNotice(call.callId, running, index), !this.#shuttingDown);
+    }
   }
 
   /** Snapshots of every running call; of one call, by its call id; or of one worker, by its delegation id.
@@ -213,17 +269,19 @@ export class BackgroundCalls {
       const index = running.delegationIds.indexOf(id);
       if (index >= 0) return [snapshot(running, [index])];
     }
-    throw new Error(`No running background call or worker has the id ${id}. A finished call's results are in its completion notice.`);
+    throw new Error(`No running background call or worker has the id ${id}. A finished call's results are in its notices.`);
   }
 
-  /** Waits until the call with the id `id` has ended, and returns its notice, which is then not delivered.
-   *  Throws for any other id. `signal` stops the wait alone; the call runs on and delivers its notice if no other wait is pending. */
+  /** Waits until the call with the id `id` has ended, and returns its last notice, with every result not yet
+   *  delivered, which the session then does not get. Results finished while the wait is pending go to it.
+   *  Throws for any other id. `signal` stops the wait alone; the call runs on, and its results finished
+   *  meanwhile are delivered as notices if no other wait is pending. */
   wait(id: string, signal?: AbortSignal): Promise<CompletionNotice> {
     const running = this.#running.get(id);
     if (running === undefined) {
       const inCall = this.#callWith(id);
       throw new Error(inCall === undefined
-        ? `wait needs a background call id, and no running background call has the id ${id}. A finished call's results are in its completion notice.`
+        ? `wait needs a background call id, and no running background call has the id ${id}. A finished call's results are in its notices.`
         : `wait needs a background call id; ${id} is a worker of background call ${inCall.call.callId}.`);
     }
     const { callId } = running.call;
@@ -235,8 +293,10 @@ export class BackgroundCalls {
         signal?.removeEventListener("abort", stop);
         running.waiters.delete(waiter);
         reject(new Error(reason));
+        // The results that finished while the wait was pending are delivered now, unless another wait takes them.
+        if (this.#running.get(callId) === running) this.#deliverFinished(running);
       };
-      const stop = () => interrupt(`Stopped waiting for background call ${callId}; its workers run on, and its completion notice follows.`);
+      const stop = () => interrupt(`Stopped waiting for background call ${callId}; its workers run on, and their notices follow.`);
       const waiter: Waiter = {
         deliver: (notice) => {
           signal?.removeEventListener("abort", stop);

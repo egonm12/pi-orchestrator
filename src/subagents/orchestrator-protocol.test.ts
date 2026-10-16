@@ -116,7 +116,7 @@ test("the protocol text opens with its heading, so a section patch is self-delim
 test("the protocol says a subagents call runs in the background unless foreground is chosen, and not to wait on it by default", () => {
   const paragraph = PROTOCOL.split("\n\n").find((text) => text.startsWith("A `subagents` call runs in the background"));
   assert.ok(paragraph, PROTOCOL);
-  for (const phrase of ["`background: false`", "short, bounded task", "`subagents_status`", "`wait: true`", "completion notice"]) {
+  for (const phrase of ["`background: false`", "short, bounded task", "`subagents_status`", "`wait: true`", "its own notice as soon as that worker finishes", "the last one says the call finished"]) {
     assert.ok(paragraph.includes(phrase), `${phrase}: ${paragraph}`);
   }
 });
