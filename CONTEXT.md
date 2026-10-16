@@ -191,7 +191,7 @@ _Avoid_: Prohibited patterns, Fable/Astra rule, ban list (alone)
 The owner's optional list of model names the orchestrator's own session may not run on. Empty by default.
 
 **Classifier**:
-The step that assigns a tier to a task. A general instruction model applies a fixed rubric to the task text and role and answers in a JSON schema, with a reason. No keyword list raises or replaces its answer. A task's tier follows the action it asks for, not the subject it touches: a review or investigation that changes nothing is never critical, and a prohibition ("do not delete anything") is a constraint, not a risk.
+The step that assigns a tier to a task. A general instruction model applies a fixed rubric to the task text and role and answers in a JSON schema, with a reason. No keyword list raises or replaces its answer. A task's tier follows the action it asks for, not the subject it touches: a review or investigation that changes nothing is never critical, and a prohibition ("do not delete anything") is a constraint, not a risk. Its default model is `anthropic/claude-haiku-5-5:low`, the same as the effort judge's.
 _Avoid_: Decision engine, Jev, scorer, System One, keyword floor
 
 **Unclassified task**:

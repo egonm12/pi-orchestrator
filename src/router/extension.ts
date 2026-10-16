@@ -13,6 +13,7 @@ import { ROUTING_MODES, writeEffortDecisionRecord, type RoutingMode } from "../r
 import { sessionClassifierModelCall, type SessionClassifierCallReport } from "../routing/session-classifier-call.ts";
 import {
   classifierConfigFromSettings,
+  DEFAULT_CLASSIFIER_CONFIG,
   loadClassifierChain,
   type ClassifierModelCall,
 } from "../routing/tier-classifier.ts";
@@ -170,7 +171,11 @@ function startRouting(ctx: ExtensionContext, deps: RouterDependencies): ActiveRo
   const installedModels = ctx.modelRegistry.getAvailable().map((model) => toModelInfo(model));
   const tierMap = tierMapFromSettings(personal, project, { installedModels, banLists });
   if (tierMap === undefined) throw new Error("orchestrator.routing.tiers is missing");
-  const chain = loadClassifierChain(classifierConfigFromSettings(personal));
+  const classifierConfig = classifierConfigFromSettings(personal);
+  // The default fallback is a convenience, not an owner choice: drop it when pi does not have its model.
+  const chain = loadClassifierChain(classifierConfig.fallback === DEFAULT_CLASSIFIER_CONFIG.fallback
+    ? { ...classifierConfig, fallback: classifierConfig.fallback.filter((rung) => installedModel(splitKnownThinkingSuffix(rung).baseModel, installedModels) !== undefined) }
+    : classifierConfig);
   for (const { rung } of chain.entries) {
     const { baseModel } = splitKnownThinkingSuffix(rung);
     if (installedModel(baseModel, installedModels) === undefined) {

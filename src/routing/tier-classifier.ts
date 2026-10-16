@@ -43,6 +43,7 @@ import {
   type TierAnswer,
 } from "./tier-answer-schema.ts";
 import { classifierPrompt, RUBRIC_VERSION, type ClassifierInput } from "./tier-rubric.ts";
+import { DEFAULT_ROUTING_FALLBACK_RUNG, DEFAULT_ROUTING_MODEL_RUNG } from "./default-rung.ts";
 
 // ---------------------------------------------------------------------------
 // Settings: orchestrator.routing.classifier
@@ -58,12 +59,12 @@ export interface ClassifierConfig {
   readonly fallback: readonly string[];
 }
 
-export const DEFAULT_CLASSIFIER_RUNG = "openai-codex/gpt-6-luna:low";
+export const DEFAULT_CLASSIFIER_RUNG = DEFAULT_ROUTING_MODEL_RUNG;
 
 export const DEFAULT_CLASSIFIER_CONFIG: ClassifierConfig = Object.freeze({
   model: DEFAULT_CLASSIFIER_RUNG,
   timeoutMs: 30_000,
-  fallback: Object.freeze([]),
+  fallback: Object.freeze([DEFAULT_ROUTING_FALLBACK_RUNG]),
 });
 
 const CLASSIFIER_KEYS = ["model", "timeoutMs", "fallback"] as const;

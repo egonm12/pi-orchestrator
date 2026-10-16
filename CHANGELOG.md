@@ -11,6 +11,7 @@ All notable changes to this package are listed here. The format follows [Keep a 
 ### Changed
 
 - **Router:** balanced tiers now weigh effective quota headroom, including a tighter weekly window, as well as recent provider usage counts.
+- **Router:** the tier classifier defaults to `anthropic/claude-haiku-5-5:low` (was `openai-codex/gpt-6-luna:low`), the same as the effort judge. Its default fallback is `openai-codex/gpt-6-luna:low`, which the judges inherit. The effort judge's inherited fallback no longer repeats its own model.
 
 ## [0.3.0] - 2026-10-11
 

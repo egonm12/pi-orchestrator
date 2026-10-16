@@ -145,7 +145,8 @@ async function classify(
 // ---------------------------------------------------------------------------
 
 test("a schema-valid standard from the primary is recorded with cause, the four signals, why and both versions", async () => {
-  assert.equal(DEFAULT_CLASSIFIER_CONFIG.model, LUNA);
+  assert.equal(DEFAULT_CLASSIFIER_CONFIG.model, "anthropic/claude-haiku-5-5:low");
+  assert.deepEqual(DEFAULT_CLASSIFIER_CONFIG.fallback, ["openai-codex/gpt-6-luna:low"]);
   const reply = answer("standard", {
     risk: { level: "some", reasons: ["touches an existing service"] },
     ambiguity: "partial",
@@ -153,7 +154,7 @@ test("a schema-valid standard from the primary is recorded with cause, the four 
     kindOfWork: "implement",
     why: "routine feature in ordinary code",
   });
-  const { record } = await classify(PLAIN_TASK, DEFAULT_CLASSIFIER_CONFIG, { [LUNA]: { answer: reply } });
+  const { record } = await classify(PLAIN_TASK, config(LUNA), { [LUNA]: { answer: reply } });
   assert.equal(record.tier, "standard");
   assert.equal(record.cause, `model:${LUNA}`);
   assert.deepEqual(record.risk, { level: "some", reasons: ["touches an existing service"] });
@@ -185,7 +186,7 @@ test("the model sees the task text, the role and the named paths, and never the 
     ],
   };
   await classifyTier(delegation, {
-    chain: loadClassifierChain(DEFAULT_CLASSIFIER_CONFIG),
+    chain: loadClassifierChain(config(LUNA)),
     callModel: fake.call,
     allowance: allowance(),
   });
@@ -217,7 +218,7 @@ const AUTH_CHANGE_TASK =
   "Change one line in src/auth/middleware.ts so the authentication check also accepts requests whose session is still refreshing.";
 
 test("a mechanical answer for a rename that forbids a push and asks for the commit hash stays mechanical", async () => {
-  const { record } = await classify(RENAME_TASK, DEFAULT_CLASSIFIER_CONFIG, {
+  const { record } = await classify(RENAME_TASK, config(LUNA), {
     [LUNA]: { answer: answer("mechanical", { kindOfWork: "mechanical-edit", why: "a rename a tool can check" }) },
   });
   assert.equal(record.tier, "mechanical");
@@ -227,7 +228,7 @@ test("a mechanical answer for a rename that forbids a push and asks for the comm
 
 test("the DLQ investigation keeps the model's tier, though it forbids redrive, purge and delete and names aws sso login", async () => {
   const reasons = ["reads production messages and logs", "changes nothing: the task forbids redrive, purge and delete"];
-  const { record } = await classify(DLQ_TASK, DEFAULT_CLASSIFIER_CONFIG, {
+  const { record } = await classify(DLQ_TASK, config(LUNA), {
     [LUNA]: { answer: answer("elevated", {
       risk: { level: "some", reasons },
       ambiguity: "partial",
@@ -245,16 +246,16 @@ test("the DLQ investigation keeps the model's tier, though it forbids redrive, p
 });
 
 test("the model may still choose critical, and its critical stays critical", async () => {
-  const { record } = await classify(AUTH_CHANGE_TASK, DEFAULT_CLASSIFIER_CONFIG, { [LUNA]: { answer: answer("critical") } });
+  const { record } = await classify(AUTH_CHANGE_TASK, config(LUNA), { [LUNA]: { answer: answer("critical") } });
   assert.equal(record.tier, "critical");
   assert.equal(record.cause, `model:${LUNA}`);
-  const plain = await classify(PLAIN_TASK, DEFAULT_CLASSIFIER_CONFIG, { [LUNA]: { answer: answer("critical") } });
+  const plain = await classify(PLAIN_TASK, config(LUNA), { [LUNA]: { answer: answer("critical") } });
   assert.equal(plain.record.tier, "critical");
 });
 
 test("the rubric judges the action, not the subject: read-only work is never critical and a prohibition is a constraint", async () => {
   assert.equal(RUBRIC_VERSION, "tier-rubric-4");
-  const { calls } = await classify(PLAIN_TASK, DEFAULT_CLASSIFIER_CONFIG, { [LUNA]: { answer: answer("standard") } });
+  const { calls } = await classify(PLAIN_TASK, config(LUNA), { [LUNA]: { answer: answer("standard") } });
   const prompt = calls[0]!.prompt;
   assert.ok(prompt.startsWith(TIER_RUBRIC));
   for (const rule of [
@@ -279,7 +280,7 @@ test("the why answer is one short sentence of at most 120 characters, and an ove
   assert.doesNotMatch(TIER_RUBRIC, /one or two sentences/);
   const long = "The task changes a shared helper used across several modules, so a mistake would spread to every caller. ".repeat(3).trim();
   assert.ok(long.length > 120, long);
-  const { record } = await classify(PLAIN_TASK, DEFAULT_CLASSIFIER_CONFIG, { [LUNA]: { answer: answer("standard", { why: long }) } });
+  const { record } = await classify(PLAIN_TASK, config(LUNA), { [LUNA]: { answer: answer("standard", { why: long }) } });
   assert.equal(record.tier, "standard");
   assert.equal(record.cause, `model:${LUNA}`);
   assert.equal(record.why, long);
@@ -418,7 +419,7 @@ test("each classifier call reserves before the call, settles after, and the ledg
   };
   await classifyTier(
     { task: PLAIN_TASK, role: "worker", paths: [] },
-    { chain: loadClassifierChain(DEFAULT_CLASSIFIER_CONFIG), callModel: call, allowance: budget },
+    { chain: loadClassifierChain(config(LUNA)), callModel: call, allowance: budget },
   );
   assert.equal(CLASSIFIER_ALLOWANCE_LABEL, "classifier");
   assert.deepEqual(openDuringCall, ["classifier:openai-codex/gpt-6-luna"]);
@@ -440,7 +441,7 @@ test("a failed hop still settles its reservation, so every attempted call is acc
 
 test("with zero remaining allowance the model hop is skipped and the task is unclassified", async () => {
   const budget = allowance(0);
-  const { record, calls } = await classify(PLAIN_TASK, DEFAULT_CLASSIFIER_CONFIG, { [LUNA]: { answer: answer("critical") } }, budget);
+  const { record, calls } = await classify(PLAIN_TASK, config(LUNA), { [LUNA]: { answer: answer("critical") } }, budget);
   assert.equal(calls.length, 0);
   assert.equal(record.cause, "unclassified");
   assert.equal(record.tier, "elevated");
@@ -452,7 +453,7 @@ test("with zero remaining allowance the model hop is skipped and the task is unc
 
 test("a metered hop whose estimate exceeds the remaining allowance is refused and not called", async () => {
   const budget = meteredAllowance(0.0001);
-  const { record, calls } = await classify(PLAIN_TASK, DEFAULT_CLASSIFIER_CONFIG, { [LUNA]: { answer: answer("critical") } }, budget);
+  const { record, calls } = await classify(PLAIN_TASK, config(LUNA), { [LUNA]: { answer: answer("critical") } }, budget);
   assert.equal(calls.length, 0);
   assert.equal(record.cause, "unclassified");
   assert.equal(record.hops[0]?.outcome, "allowance-refused");
@@ -463,7 +464,7 @@ test("a metered hop whose estimate exceeds the remaining allowance is refused an
 
 test("a metered call that reports no cost keeps its reservation held open", async () => {
   const budget = meteredAllowance(5);
-  const { record } = await classify(PLAIN_TASK, DEFAULT_CLASSIFIER_CONFIG, { [LUNA]: { answer: answer("standard") } }, budget);
+  const { record } = await classify(PLAIN_TASK, config(LUNA), { [LUNA]: { answer: answer("standard") } }, budget);
   assert.equal(record.cause, `model:${LUNA}`);
   assert.equal(record.hops[0]?.allowance?.settlement, "held-open");
   const ledger = budget.owner.snapshot();
@@ -478,7 +479,7 @@ test("a metered call that reports its cost settles with that cost", async () => 
   const call: ClassifierModelCall = async () => ({ text: answer("standard"), reportedUsd: 0.002 });
   const record = await classifyTier(
     { task: PLAIN_TASK, role: "worker", paths: [] },
-    { chain: loadClassifierChain(DEFAULT_CLASSIFIER_CONFIG), callModel: call, allowance: budget },
+    { chain: loadClassifierChain(config(LUNA)), callModel: call, allowance: budget },
   );
   assert.equal(record.hops[0]?.allowance?.settlement, "settled");
   const [charge] = budget.owner.snapshot().settled;
@@ -491,7 +492,7 @@ for (const reportedUsd of [Number.NaN, -1, Number.POSITIVE_INFINITY]) {
     const call: ClassifierModelCall = async () => ({ text: answer("critical"), reportedUsd });
     const record = await classifyTier(
       { task: PLAIN_TASK, role: "worker", paths: [] },
-      { chain: loadClassifierChain(DEFAULT_CLASSIFIER_CONFIG), callModel: call, allowance: budget },
+      { chain: loadClassifierChain(config(LUNA)), callModel: call, allowance: budget },
     );
     assert.equal(record.cause, "unclassified");
     assert.equal(record.hops[0]?.outcome, "error");

@@ -12,6 +12,7 @@ import {
   type ClassifierConfig,
 } from "./tier-classifier.ts";
 import { effortJudgePrompt } from "./effort-rubric.ts";
+import { DEFAULT_ROUTING_MODEL_RUNG } from "./default-rung.ts";
 import type { EffortBand, EffortJudgeInput } from "./effort-rubric.ts";
 
 export type { EffortBand, EffortJudgeInput, EffortJudgeKind } from "./effort-rubric.ts";
@@ -22,16 +23,17 @@ export interface EffortJudgeConfig {
   readonly fallback: readonly string[];
 }
 
-export const DEFAULT_EFFORT_JUDGE_MODEL = "anthropic/claude-haiku-5-5:low";
+export const DEFAULT_EFFORT_JUDGE_MODEL = DEFAULT_ROUTING_MODEL_RUNG;
 
-function classifierFallback(classifier: ClassifierConfig): readonly string[] {
-  return Object.freeze([classifier.model, ...classifier.fallback]);
+/** The classifier's chain without `primary`: the judge must not retry its own primary rung. */
+function classifierFallback(classifier: ClassifierConfig, primary: string): readonly string[] {
+  return Object.freeze([classifier.model, ...classifier.fallback].filter((rung) => rung !== primary));
 }
 
 export const DEFAULT_EFFORT_JUDGE_CONFIG: EffortJudgeConfig = Object.freeze({
   model: DEFAULT_EFFORT_JUDGE_MODEL,
   timeoutMs: 8_000,
-  fallback: classifierFallback(DEFAULT_CLASSIFIER_CONFIG),
+  fallback: classifierFallback(DEFAULT_CLASSIFIER_CONFIG, DEFAULT_EFFORT_JUDGE_MODEL),
 });
 
 const SETTINGS_KEY = "orchestrator.routing.effortJudge";
@@ -63,9 +65,8 @@ export function effortJudgeConfigFromSettings(personal: unknown): EffortJudgeCon
   const orchestrator = objectAt(personal, "orchestrator", "orchestrator");
   const routing = orchestrator && objectAt(orchestrator, "routing", "orchestrator.routing");
   const judge = routing && objectAt(routing, "effortJudge", SETTINGS_KEY);
-  const inheritedFallback = classifierFallback(classifier);
   if (!judge) {
-    return Object.freeze({ ...DEFAULT_EFFORT_JUDGE_CONFIG, fallback: inheritedFallback });
+    return Object.freeze({ ...DEFAULT_EFFORT_JUDGE_CONFIG, fallback: classifierFallback(classifier, DEFAULT_EFFORT_JUDGE_MODEL) });
   }
 
   const unknownKeys = Object.keys(judge).filter((key) => !(EFFORT_JUDGE_KEYS as readonly string[]).includes(key));
@@ -86,7 +87,7 @@ export function effortJudgeConfigFromSettings(personal: unknown): EffortJudgeCon
     throw new Error(`${SETTINGS_KEY}.fallback must be an array of rung strings; got ${JSON.stringify(rawFallback)}.`);
   }
   const fallback = rawFallback === undefined
-    ? inheritedFallback
+    ? classifierFallback(classifier, model)
     : Object.freeze(rawFallback.map((rung, index) => rungSetting(rung, `${SETTINGS_KEY}.fallback[${index}]`)));
 
   return Object.freeze({ model, timeoutMs, fallback });

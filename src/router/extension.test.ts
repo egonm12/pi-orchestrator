@@ -185,7 +185,9 @@ async function stderrOf(run: () => Promise<unknown>): Promise<string> {
   return output;
 }
 
-const CLASSIFIER = { model: `${HAIKU}:low`, timeoutMs: 1_000 };
+const CLASSIFIER = { model: `${HAIKU}:low`, timeoutMs: 1_000, fallback: [] };
+/** Pins the classifier to LUNA: the effort judge inherits it as its fallback, and its tests expect that rung. */
+const LUNA_CLASSIFIER = { model: "openai-codex/gpt-6-luna:low", timeoutMs: 1_000 };
 const LIVE = { enabled: true, mode: "live", classifier: CLASSIFIER, tiers: TEST_TIERS };
 const SHADOW = { enabled: true, mode: "shadow", classifier: CLASSIFIER, tiers: TEST_TIERS };
 
@@ -1367,7 +1369,7 @@ test("a failed worker judge uses the band maximum and exposes its decision", asy
 });
 
 test("session effort judges an owner prompt and manual selection disables it", async () => {
-  const h = harness({ enabled: false, sessionEffort: "low-high" });
+  const h = harness({ enabled: false, sessionEffort: "low-high", classifier: LUNA_CLASSIFIER });
   try {
     const handlers = piHandlers();
     let level = "high";
@@ -1409,7 +1411,7 @@ test("session effort judges an owner prompt and manual selection disables it", a
 });
 
 test("session effort judges the owner prompt once its message is shown, not before the run starts", async () => {
-  const h = harness({ enabled: false, sessionEffort: "low-high" });
+  const h = harness({ enabled: false, sessionEffort: "low-high", classifier: LUNA_CLASSIFIER });
   try {
     const handlers = piHandlers();
     let level = "high";
@@ -1443,7 +1445,7 @@ test("session effort judges the owner prompt once its message is shown, not befo
 });
 
 test("a failed owner effort judge falls back to the band maximum once the message is shown, without throwing", async () => {
-  const h = harness({ enabled: false, sessionEffort: "low-high" });
+  const h = harness({ enabled: false, sessionEffort: "low-high", classifier: LUNA_CLASSIFIER });
   try {
     const handlers = piHandlers();
     let level = "low";
@@ -1470,7 +1472,7 @@ test("a failed owner effort judge falls back to the band maximum once the messag
 
 test("a short owner reply is judged when the assistant's last reply asked a question, and kept otherwise", async () => {
   for (const [sessionId, reply, judged] of [["asked-owner", "Should I archive the old branches?", 1], ["stated-owner", "Archived the old branches.", 0]] as const) {
-    const h = harness({ enabled: false, sessionEffort: "low-high" });
+    const h = harness({ enabled: false, sessionEffort: "low-high", classifier: LUNA_CLASSIFIER });
     try {
       const handlers = piHandlers();
       let judgeCalls = 0;
@@ -1494,7 +1496,7 @@ test("a short owner reply is judged when the assistant's last reply asked a ques
 });
 
 test("an owner effort judge fallback notifies the owner once per session, with the reason", async () => {
-  const h = harness({ enabled: false, sessionEffort: "low-high" });
+  const h = harness({ enabled: false, sessionEffort: "low-high", classifier: LUNA_CLASSIFIER });
   try {
     const handlers = piHandlers();
     let level = "low";
@@ -1524,7 +1526,7 @@ test("an owner effort judge fallback notifies the owner once per session, with t
 });
 
 test("a level change that fails once the owner's message is shown warns and does not throw", async () => {
-  const h = harness({ enabled: false, sessionEffort: "low-high" });
+  const h = harness({ enabled: false, sessionEffort: "low-high", classifier: LUNA_CLASSIFIER });
   try {
     const handlers = piHandlers();
     const create = await isolatedRouterExtension();
@@ -1545,7 +1547,7 @@ test("a level change that fails once the owner's message is shown warns and does
 });
 
 test("session effort leaves an unsafe model alone and warns once", async () => {
-  const h = harness({ enabled: false, sessionEffort: "low-high" });
+  const h = harness({ enabled: false, sessionEffort: "low-high", classifier: LUNA_CLASSIFIER });
   try {
     const handlers = piHandlers();
     let calls = 0;

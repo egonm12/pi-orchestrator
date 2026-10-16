@@ -53,6 +53,17 @@ test("the effort judge loader refuses a level unsupported by its installed model
   assert.match(chain.entries[0]!.refusal ?? "", /effort 'max' is not supported/);
 });
 
+test("the inherited fallback drops the judge's own model, so no rung is tried twice", () => {
+  const sameAsJudge = effortJudgeConfigFromSettings({
+    orchestrator: { routing: { classifier: { model: "anthropic/claude-haiku-5-5:low", fallback: [CLASSIFIER_FALLBACK] } } },
+  });
+  assert.deepEqual(sameAsJudge.fallback, [CLASSIFIER_FALLBACK]);
+  const chain = effortJudgeConfigFromSettings({
+    orchestrator: { routing: { classifier: { model: "anthropic/claude-haiku-5-5:low", fallback: ["openai-codex/gpt-6-luna:low"] } } },
+  });
+  assert.deepEqual([chain.model, ...chain.fallback], ["anthropic/claude-haiku-5-5:low", "openai-codex/gpt-6-luna:low"]);
+});
+
 test("an explicit empty fallback list overrides the classifier's inherited fallback", () => {
   const config = effortJudgeConfigFromSettings({
     orchestrator: {
