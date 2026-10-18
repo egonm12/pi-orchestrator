@@ -6,6 +6,7 @@ All notable changes to this package are listed here. The format follows [Keep a 
 
 ### Added
 
+- **Router:** a worker budget for mechanical and standard workers: a tool-call budget in their system prompt and no delegation tools (ADR 0021). `orchestrator.routing.workerBudget: false` turns it off.
 - **Setup:** `/pi-orchestrator init` offers per-message effort for cache-safe tier models, supports custom ranges on rebuild, and configures session effort in personal settings.
 - **Router:** a handling judge gives each owner prompt a `self` or `delegate` verdict (ADR 0020). It has its own setting, `orchestrator.routing.handlingJudge`, and shares the effort judge's call when both run. A failed judgement is `self`.
 - **Protocol:** each prompt's verdict is a handling line in the orchestrator's system prompt.
@@ -14,9 +15,12 @@ All notable changes to this package are listed here. The format follows [Keep a 
 
 ### Changed
 
+- **Subagents:** the orchestrator protocol makes doing the work itself the default (ADR 0021). It delegates for parallel parts, large work or large output, no longer past two exploratory commands.
+- **Router:** the handling judge and the effort judge's combined question answer `self` by default and `delegate` only for parallel parts or large work; running for minutes is no longer a reason.
+- **Router:** classifier rubric `tier-rubric-6` puts read-only fact-finding (lookups, inventories, summaries, explanations) on mechanical.
 - **Router:** balanced tiers now weigh effective quota headroom, including a tighter weekly window, as well as recent provider usage counts.
 - **Router:** the tier classifier defaults to `anthropic/claude-haiku-5-5:low` (was `openai-codex/gpt-6-luna:low`), the same as the effort judge. Its default fallback is `openai-codex/gpt-6-luna:low`, which the judges inherit. The effort judge's inherited fallback no longer repeats its own model.
-- **Subagents:** the exploration nudge follows the handling verdict (ADR 0020, amending ADR 0013). A `self` prompt is nudged after 8 exploratory calls, up from 3; a `delegate` prompt is reminded at its first exploratory call. `orchestrator.subagents.explorationNudge` now defaults to 8.
+- **Subagents:** the exploration nudge follows the handling verdict (ADR 0020, amending ADR 0013). A `self` prompt is nudged after 20 exploratory calls (ADR 0021), up from 3; a `delegate` prompt is reminded at its first exploratory call. `orchestrator.subagents.explorationNudge` now defaults to 20.
 
 ## [0.3.0] - 2026-10-11
 

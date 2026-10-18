@@ -1,4 +1,5 @@
 import { THINKING_LEVELS, type ThinkingLevel } from "../models/model-info.ts";
+import { HANDLING_CRITERIA } from "./handling-criteria.ts";
 import type { RiskTier } from "./tiers.ts";
 
 export const RUBRIC_VERSION = "effort-rubric-1";
@@ -60,7 +61,7 @@ export const EFFORT_AND_HANDLING_ANSWER_SCHEMA = {
 } as const;
 
 /** The handling question added to the rubric when one reply also judges the handling. */
-const HANDLING_QUESTION = "Also judge the handling of this message. Answer self for one lookup, edit or check. Answer delegate for several independent things, open research, or work likely to run for minutes. Give handling and a short handlingWhy with your effort answer.";
+const HANDLING_QUESTION = `Also judge the handling of this message. ${HANDLING_CRITERIA} Give handling and a short handlingWhy with your effort answer.`;
 
 function firstCharacters(value: string | undefined, limit: number): string {
   return (value ?? "").slice(0, limit);

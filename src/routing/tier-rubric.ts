@@ -8,7 +8,7 @@
 
 import { TIER_ANSWER_SCHEMA } from "./tier-answer-schema.ts";
 
-export const RUBRIC_VERSION = "tier-rubric-5";
+export const RUBRIC_VERSION = "tier-rubric-6";
 
 export interface ClassifierInput {
   readonly task: string;
@@ -32,16 +32,20 @@ Ask the four questions below from the top down. The tier is the first one answer
    That means a breaking change to a public API or wire format, releases and deploys, data migrations, concurrency, performance-critical paths, changing how untrusted input is validated or sanitised, logging of sensitive data, or requirements vague enough to need judgement. An additive change that existing callers need not use, such as a new optional parameter with a default, is not breaking.
    Example: rename a field in a published JSON response that other services read.
    Example: review a pull request that changes OAuth. The review changes nothing, so it is elevated, not critical.
-3. standard: does the task need real reasoning or reach beyond a small, clear change?
+3. standard: does the task diagnose a cause, review a design or a pull request, or change more than a small, clear fix?
    Diagnosing a cause, reviewing a design or a pull request, features, changes across more than two files, refactors, and changes whose requirements leave a real design choice open, where tests or review catch a mistake and a revert undoes it.
+   Gathering facts is not this kind of reasoning: a read-only task that finds, lists, inventories, summarises, compares documented facts or explains how code works is mechanical, however many files or sources it reads.
    Example: investigate why messages reached the DLQ and report the cause.
    Example: add a retry option to the HTTP client and thread it through its three callers.
 4. mechanical: is the task small, clear and easy to check?
-   Bounded read-only lookups and summaries, and small clear fixes in one or two files whose outcome is easy to check, as well as formatting, typos, comment wording, import order and renames a tool can check.
+   Read-only lookups, searches, inventories, summaries, explanations and fact-finding research, and small clear fixes in one or two files whose outcome is easy to check, as well as formatting, typos, comment wording, import order and renames a tool can check.
+   When a read-only task could be standard or mechanical, choose mechanical.
    Example: fix the off-by-one in the date range filter and add a regression test.
    Example: find where the retry limit is set and report its value.
    Example: summarise what src/util.ts exports.
    Example: sort the imports in src/util.ts alphabetically.
+   Example: list every place the codebase reads DOTENV_KEY, with file:line.
+   Example: look up the manufacturer's rated output of a product and report it with its source.
 
 Also report:
 - risk: "none", "some" or "high", with the reasons that made it so (an empty list for "none").

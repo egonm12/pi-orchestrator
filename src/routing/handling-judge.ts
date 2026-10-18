@@ -1,3 +1,4 @@
+import { HANDLING_CRITERIA } from "./handling-criteria.ts";
 import { judgeConfigFromSettings, type EffortJudgeConfig, type EffortJudgeModelCall, type LoadedEffortJudgeChain } from "./effort-judge.ts";
 
 // The handling judge (ADR 0020): one small model call per orchestrator user
@@ -30,7 +31,7 @@ export interface HandlingJudgeInput {
 
 const PROMPT = (message: string): string => [
   "Judge how the orchestrator should handle one user prompt.",
-  "Answer self when the prompt is one lookup, edit or check. Answer delegate when it has several independent parts, open research, or work likely to run for minutes.",
+  HANDLING_CRITERIA,
   'Answer with one JSON object only: {"handling":"self" or "delegate","why":"a short reason"}.',
   "",
   "Prompt (first 2000 characters):",

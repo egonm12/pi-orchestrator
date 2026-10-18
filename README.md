@@ -4,13 +4,19 @@ A [pi](https://pi.dev) package for sessions that hand work to helpers. Your sess
 
 ## How it works
 
-- **Orchestrator:** your own pi session. It plans, delegates and checks.
-- **Workers:** helpers started with the `subagents` tool. A few run at once, the rest wait in line.
+- **Orchestrator:** your own pi session. It plans, does most of the work itself, delegates and checks.
+- **Workers:** helpers started with the `subagents` tool. A few run at once, the rest wait in line. Workers on simple tasks get a tool-call budget and cannot start workers of their own.
 - **Router:** picks each worker's model from your tier map, based on how hard the task looks.
 - **Judges:** small model calls that pick the thinking effort for each message and decide whether a prompt is better handled by the orchestrator or delegated.
 - **Review gate:** an editing worker's changes need a verdict before the orchestrator builds on them.
 
 The tier classifier, effort judge and handling judge all default to `anthropic/claude-haiku-5-5:low`. You can change them in settings.
+
+## When it delegates
+
+A worker is not free. Each one costs a routing call, its own startup, a task the orchestrator writes and a Result it checks, often a minute before it does useful work. So the orchestrator handles questions, lookups, fixes in a few files, builds, tests and commits itself, even when they take a few minutes. It delegates when the work has independent parts that can run in parallel, when it is large, or when its output would be large and only the conclusion matters.
+
+Workers are only as fast as the rungs in your tier map. A high or max effort on the `mechanical` or `standard` tier makes simple work slow, so keep those tiers at low or medium effort.
 
 ## Install
 

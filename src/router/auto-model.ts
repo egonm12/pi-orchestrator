@@ -454,6 +454,10 @@ export interface AutoModelRouter {
   classifyEarly(sessionId: string, agentRole: string): void;
   /** Drops session `sessionId`'s early classification and its effort judgements, when its session ends. */
   dropEarlyClassification(sessionId: string): void;
+  /** The tier of worker session `sessionId`'s task (worker-budget.ts): a retry's carried tier, the early
+   *  classification's once it settles, else the tier its latest route or saved pin names. `undefined` when
+   *  none is known or the classification failed. Never throws, and leaves the early classification in place. */
+  workerTier(sessionId: string, ctx: RouteContext): Promise<RiskTier | undefined>;
   /** Judges `text` for worker session `sessionId` on a dynamic rung, as
    *  judgeIncomingWorkerMessage says; `ctx` is the session's, for its saved
    *  pin and model registry. Judgements of one session run one at a time,
@@ -687,6 +691,15 @@ export function createAutoModelRouter(deps: AutoModelDependencies): AutoModelRou
       // rejection must not count as unhandled.
       classification.catch(() => undefined);
       earlyClassifications.set(sessionId, { router, taskText, agentRole, classification });
+    },
+    async workerTier(sessionId, ctx) {
+      const carried = carriedClassifications().get(sessionId);
+      if (carried !== undefined) return carried.tier;
+      const early = earlyClassifications.get(sessionId);
+      if (early !== undefined) {
+        try { return (await early.classification).tier; } catch { return undefined; }
+      }
+      try { return (latestStates.get(sessionId) ?? branchPin(ctx))?.tier; } catch { return undefined; }
     },
     dropEarlyClassification: (sessionId) => {
       earlyClassifications.delete(sessionId);

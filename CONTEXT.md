@@ -64,12 +64,16 @@ A delegation whose worker, or a worker it started, changed files in the working 
 _Avoid_: Implementation delegation (the kind of work is the classifier's, editing is what the worker did)
 
 **Exploration nudge**:
-A reminder added to the result of an exploratory call the orchestrator makes, suggesting it hand the work to a worker. On a `self` prompt it comes after a safety limit of 8 exploratory calls in that prompt; on a `delegate` prompt it comes with the first exploratory call. Guidance, never a denial (ADR 0020 amends ADR 0013).
+A reminder added to the result of an exploratory call the orchestrator makes, suggesting it hand the work to a worker. On a `self` prompt it comes after a safety limit of 20 exploratory calls in that prompt (ADR 0021); on a `delegate` prompt it comes with the first exploratory call. Guidance, never a denial (ADR 0020 amends ADR 0013).
 _Avoid_: Exploration budget (the earlier hard limit), call limit
 
 **Handling judge**:
-The small model call that gives each owner prompt in the orchestrator's session a verdict, `self` (one lookup, edit or check) or `delegate` (several independent things, open research, or work likely to run for minutes), with a short reason. It runs once per prompt before the first request and never for a worker or another extension's message. A failed judgement is `self`. When the effort judge also runs for the prompt, one reply carries both verdicts. Distinct from the effort judge, which picks effort, and from the classifier, which assigns a worker's tier.
+The small model call that gives each owner prompt in the orchestrator's session a verdict, `self` (the default: questions, lookups, investigating one problem, edits in a few files, sequential steps) or `delegate` (independent parts that can run in parallel, or large work), with a short reason. Running for minutes is not a reason to delegate (ADR 0021). It runs once per prompt before the first request and never for a worker or another extension's message. A failed judgement is `self`. When the effort judge also runs for the prompt, one reply carries both verdicts. Distinct from the effort judge, which picks effort, and from the classifier, which assigns a worker's tier.
 _Avoid_: Routing judge, mode judge
+
+**Worker budget**:
+The section a routed worker on a mechanical or standard tier gets in its system prompt: about how many tool calls to aim for, and the count past which it stops and replies with a partial Result. Such a worker also loses its delegation tools. Guidance, never an abort; elevated and critical workers get none (ADR 0021).
+_Avoid_: Turn limit, step cap
 
 **Handling line**:
 The protocol line that carries a prompt's verdict, such as `Handling: delegate (three independent edits)`, in the orchestrator's system prompt. An owner override appears in it as a forced verdict.

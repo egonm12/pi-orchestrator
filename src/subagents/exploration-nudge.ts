@@ -8,7 +8,7 @@ import { classifyToolCall, type ToolCallKind } from "./tool-call-kind.ts";
 // The orchestrator's exploration nudge (ADR 0013, amended by ADR 0020): a
 // prompt's handling verdict from the handling judge sets it. On a `self`
 // prompt the result of each exploratory call past the owner's
-// `orchestrator.subagents.explorationNudge` (8 by default) ends with a reminder
+// `orchestrator.subagents.explorationNudge` (20 by default) ends with a reminder
 // to hand the rest to a worker. On a `delegate` prompt the first exploratory
 // call's result does. A prompt with no verdict counts as `self`. No call is
 // ever denied.

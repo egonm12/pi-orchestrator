@@ -254,7 +254,7 @@ test("the model may still choose critical, and its critical stays critical", asy
 });
 
 test("the rubric judges the action, not the subject: read-only work is never critical and a prohibition is a constraint", async () => {
-  assert.equal(RUBRIC_VERSION, "tier-rubric-5");
+  assert.equal(RUBRIC_VERSION, "tier-rubric-6");
   const { calls } = await classify(PLAIN_TASK, config(LUNA), { [LUNA]: { answer: answer("standard") } });
   const prompt = calls[0]!.prompt;
   assert.ok(prompt.startsWith(TIER_RUBRIC));
@@ -275,13 +275,15 @@ test("the rubric judges the action, not the subject: read-only work is never cri
   assert.doesNotMatch(TIER_RUBRIC, /Judge the riskiest part of the task\./);
 });
 
-test("the rubric puts small, clear work on mechanical and keeps diagnosis, design review and multi-file changes on standard", () => {
+test("the rubric puts small, clear work and read-only fact-finding on mechanical and keeps diagnosis, design review and multi-file changes on standard", () => {
   for (const rule of [
     "4. mechanical: is the task small, clear and easy to check?",
-    "Bounded read-only lookups and summaries, and small clear fixes in one or two files whose outcome is easy to check",
+    "Read-only lookups, searches, inventories, summaries, explanations and fact-finding research, and small clear fixes in one or two files whose outcome is easy to check",
+    "When a read-only task could be standard or mechanical, choose mechanical.",
+    "a read-only task that finds, lists, inventories, summarises, compares documented facts or explains how code works is mechanical, however many files or sources it reads.",
     "Example: fix the off-by-one in the date range filter and add a regression test.",
     "Example: find where the retry limit is set and report its value.",
-    "3. standard: does the task need real reasoning or reach beyond a small, clear change?",
+    "3. standard: does the task diagnose a cause, review a design or a pull request, or change more than a small, clear fix?",
     "Diagnosing a cause, reviewing a design or a pull request, features, changes across more than two files",
     "Small size never lowers a critical or elevated task: a one-line change can be critical.",
   ]) {

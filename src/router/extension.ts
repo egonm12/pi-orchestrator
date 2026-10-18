@@ -24,6 +24,7 @@ import { INIT_COMMAND } from "../init/setup.ts";
 import { registerSubcommands, showOwner, type Subcommand } from "../init/subcommands.ts";
 import { stateFolderEvidence, type EvidenceSetup, type RoutingEvidenceSource } from "./evidence.ts";
 import { usageObservationsPath } from "./usage-observations.ts";
+import { applyWorkerBudget, workerBudgetFromSettings } from "../routing/worker-budget.ts";
 import { isOrchestratorSession } from "../subagents/orchestrator-session.ts";
 import { publishOrchestratorRouter } from "./orchestrator-router.ts";
 import { effortJudgeConfigFromSettings, loadEffortJudgeChain, judgeEffort, type EffortBand, type EffortJudgeModelCall } from "../routing/effort-judge.ts";
@@ -341,6 +342,8 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
     // Each worker session on the auto model this copy serves, with the
     // function that removes its incoming-message judge.
     const incomingJudges = new Map<string, () => void>();
+    /** Whether this session's owner settings leave the worker budget on (worker-budget.ts). */
+    let workerBudgetOn = true;
     pi.on("session_start", (_event, ctx) => {
       sessionEffortOff = false;
       sessionBand = undefined;
@@ -348,6 +351,8 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
         effortPersonal = readSettingsFile(join(personalAgentDir(), "settings.json")) ?? {};
         sessionBand = sessionEffortBandFromSettings(effortPersonal);
       } catch (error) { autoDeps.warn("session-effort-settings", String(error)); }
+      try { workerBudgetOn = workerBudgetFromSettings(effortPersonal); }
+      catch (error) { workerBudgetOn = true; autoDeps.warn("worker-budget-settings", String(error)); }
       rememberSessionModel(ctx.model, ctx.thinkingLevel ?? "off", ctx);
       if (orchestratorSessionId !== undefined) publishOrchestratorRouter(orchestratorSessionId, undefined);
       orchestratorSessionId = isOrchestratorSession(ctx) ? ctx.sessionManager?.getSessionId() : undefined;
@@ -380,6 +385,21 @@ export function createRouterExtension(overrides: Partial<RouterDependencies> = {
         let systemPrompt = "";
         try { systemPrompt = ctx.getSystemPrompt?.() ?? ""; } catch { /* The first request classifies again if the role differs. */ }
         autoModel.classifyEarly(workerId, agentRoleOf(systemPrompt));
+      }
+    });
+
+    // A routed worker on a simple tier gets a tool-call budget and loses its
+    // delegation tools (worker-budget.ts, ADR 0021). Its first request awaits
+    // the same classification, so waiting for it here costs no time.
+    pi.on("before_agent_start", async (event, ctx) => {
+      if (disabled || !workerBudgetOn || !isAutoModel(ctx.model) || isOrchestratorSession(ctx)) return undefined;
+      const workerId = ctx.sessionManager?.getSessionId();
+      if (workerId === undefined) return undefined;
+      try {
+        return applyWorkerBudget(event, pi, await autoModel.workerTier(workerId, ctx));
+      } catch (error) {
+        autoDeps.warn("worker-budget", `could not apply the worker budget: ${String(error).split(/\r?\n/, 1)[0]}`);
+        return undefined;
       }
     });
 

@@ -13,7 +13,7 @@ import { markWorkerSession } from "./worker-sessions.ts";
 // handling-decision channel, as the router extension emits it.
 
 const SESSION = "orchestrator-session";
-const SAFETY_LIMIT = 8;
+const SAFETY_LIMIT = 20;
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 
@@ -62,7 +62,7 @@ function readCall(fire: (name: string, event: unknown, ctx: unknown) => unknown,
   return result === undefined ? undefined : result.content.at(-1)?.text;
 }
 
-test("a self prompt gets no nudge through the 8-call safety limit, and one from the ninth call", () => {
+test("a self prompt gets no nudge through the 20-call safety limit, and one from the 21st call", () => {
   const box = sandbox();
   try {
     const { pi, fire } = fakePi();
@@ -71,7 +71,7 @@ test("a self prompt gets no nudge through the 8-call safety limit, and one from 
     userPrompt(fire, ctx, "self");
     const texts = Array.from({ length: SAFETY_LIMIT + 1 }, (_, index) => readCall(fire, ctx, `call-${index + 1}`));
     assert.deepEqual(texts.slice(0, SAFETY_LIMIT), Array(SAFETY_LIMIT).fill(undefined));
-    assert.match(texts[SAFETY_LIMIT]!, /^9 exploratory calls this prompt/);
+    assert.match(texts[SAFETY_LIMIT]!, /^21 exploratory calls this prompt/);
   } finally { box.cleanup(); }
 });
 

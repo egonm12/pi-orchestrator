@@ -27,6 +27,7 @@ import { markWorkerSession } from "./worker-sessions.ts";
 import { isOrchestratorSession } from "./orchestrator-session.ts";
 import { orchestratorProtocol } from "./orchestrator-protocol.ts";
 import { emitHandlingDecision } from "../routing/effort-decisions.ts";
+import { workerBudget } from "../routing/worker-budget.ts";
 import { workerBoard, type BoardWorker } from "./worker-board.ts";
 import { openTranscript } from "./transcript-view.ts";
 import { compactLines, workerRows, widgetLines, widgetRows } from "./worker-widget.ts";
@@ -70,6 +71,9 @@ const ROUTING = {
   mode: "live",
   classifier: { model: RUNG, timeoutMs: 1_000 },
   tiers: { mechanical: [RUNG], standard: [RUNG], elevated: [RUNG], critical: [RUNG] },
+  // The fake classifier answers mechanical, whose worker budget takes away a worker's delegation
+  // tools; these tests delegate from workers, so the budget is off unless a test turns it on.
+  workerBudget: false,
 };
 
 interface Harness {
@@ -695,6 +699,29 @@ test("the worker loads subagents and its background controls, but not the orches
     assert.ok(tools.includes("probe"), `another extension's tool reaches the worker: ${JSON.stringify(tools)}`);
     for (const name of ["subagents", "subagents_status", "subagents_message"]) assert.ok(tools.includes(name), JSON.stringify(tools));
     assert.equal(tools.includes("subagents_verdict"), false, JSON.stringify(tools));
+  } finally { h.cleanup(); }
+});
+
+test("with the worker budget on, a mechanical worker loses its delegation tools and gets the budget; an elevated one keeps both", async () => {
+  const h = harness({ orchestrator: { routing: { ...ROUTING, workerBudget: true } } });
+  try {
+    const provider = fakeAnthropic("done");
+    const tool = loadSubagentsTool([routerExtension(), provider.extension, createSubagentsExtension()]);
+    const { worker } = await callSubagents(tool, orchestrator(h).ctx, "Say done.");
+    assert.equal(worker.status, "completed", JSON.stringify(worker));
+    const request = provider.requests[0]!;
+    for (const name of ["subagents", "subagents_status", "subagents_message"]) assert.equal(request.tools.includes(name), false, JSON.stringify(request.tools));
+    assert.ok(request.tools.includes("read"), JSON.stringify(request.tools));
+    assert.ok(request.systemText.includes(workerBudget("mechanical")!), request.systemText);
+
+    const elevated = JSON.stringify({ tier: "elevated", risk: { level: "some", reasons: ["a release"] }, ambiguity: "clear", complexity: "medium", kindOfWork: "implement", why: "fake classifier says elevated" });
+    const second = fakeAnthropic("done");
+    const elevatedTool = loadSubagentsTool([routerExtension([HAIKU], { classifierCall: () => async () => elevated }), second.extension, createSubagentsExtension()]);
+    const run = await callSubagents(elevatedTool, orchestrator(h).ctx, "Say done.");
+    assert.equal(run.worker.status, "completed", JSON.stringify(run.worker));
+    const elevatedRequest = second.requests[0]!;
+    assert.ok(elevatedRequest.tools.includes("subagents"), JSON.stringify(elevatedRequest.tools));
+    assert.equal(elevatedRequest.systemText.includes("# Worker budget"), false, elevatedRequest.systemText);
   } finally { h.cleanup(); }
 });
 
@@ -4272,7 +4299,7 @@ test("the orchestrator's session has the protocol in its system prompt on every 
     } finally { session.dispose(); }
     const turns = provider.requests.filter((request) => request.tools.length > 0);
     assert.equal(turns.length, 4, "two turns per prompt");
-    for (const turn of turns) assert.ok(turn.systemPrompt.includes(orchestratorProtocol(8, "medium")), turn.systemPrompt);
+    for (const turn of turns) assert.ok(turn.systemPrompt.includes(orchestratorProtocol(20, "medium")), turn.systemPrompt);
   } finally { h.cleanup(); }
 });
 
@@ -4315,7 +4342,7 @@ test("a completion notice that wakes the idle orchestrator runs with the protoco
     const notice = woken[0]!.userMessages.find((text) => text.includes("Background subagents call"));
     assert.ok(notice?.includes("leaf done"), `the worker ran and finished: ${notice}`);
     assert.equal(woken[1]!.toolResults.length, woken[0]!.toolResults.length + 1, "the second turn follows the read");
-    for (const request of woken) assert.ok(request.systemPrompt.includes(orchestratorProtocol(8, "medium")), request.systemPrompt);
+    for (const request of woken) assert.ok(request.systemPrompt.includes(orchestratorProtocol(20, "medium")), request.systemPrompt);
   } finally { h.cleanup(); }
 });
 
@@ -4337,7 +4364,7 @@ test("a worker's question sent with triggerTurn wakes the idle orchestrator with
     } finally { session.dispose(); }
     const woken = provider.requests.slice(1);
     assert.ok(woken[0]!.userMessages.some((text) => text.includes("which config?")), JSON.stringify(woken[0]!.userMessages));
-    for (const request of woken) assert.ok(request.systemPrompt.includes(orchestratorProtocol(8, "medium")), request.systemPrompt);
+    for (const request of woken) assert.ok(request.systemPrompt.includes(orchestratorProtocol(20, "medium")), request.systemPrompt);
   } finally { h.cleanup(); }
 });
 
@@ -4360,7 +4387,7 @@ test("a typed skill prompt keeps the protocol when an extension loaded earlier f
     assert.ok(provider.requests[0]!.userMessages[0]!.includes("Read the README first."), "the skill was expanded");
     for (const request of provider.requests) {
       assert.ok(request.systemPrompt.includes("## Project rules"), "the forced prompt is what the model got");
-      assert.ok(request.systemPrompt.includes(orchestratorProtocol(8, "medium")), request.systemPrompt);
+      assert.ok(request.systemPrompt.includes(orchestratorProtocol(20, "medium")), request.systemPrompt);
     }
   } finally { h.cleanup(); }
 });
@@ -4420,11 +4447,11 @@ test("a run a message starts with triggerTurn has the usage line on every reques
       await until(() => provider.requests.length === 3 && session.isIdle, "the woken run");
     } finally { session.dispose(); }
     const [prompted, ...woken] = provider.requests;
-    assert.ok(prompted!.systemPrompt.includes(orchestratorProtocol(8, "medium")), prompted!.systemPrompt);
+    assert.ok(prompted!.systemPrompt.includes(orchestratorProtocol(20, "medium")), prompted!.systemPrompt);
     assert.equal(prompted!.systemPrompt.includes("usage:"), false, "the store was empty when the prompt ran");
     assert.equal(woken.length, 2, "the woken run's two turns");
     for (const request of woken) {
-      assert.ok(request.systemPrompt.includes(orchestratorProtocol(8, "medium", "usage: openai-codex throttled until 12:05")), request.systemPrompt);
+      assert.ok(request.systemPrompt.includes(orchestratorProtocol(20, "medium", "usage: openai-codex throttled until 12:05")), request.systemPrompt);
       assert.equal(occurrences(request.systemPrompt, "usage:"), 1, request.systemPrompt);
     }
   } finally { h.cleanup(); }
@@ -4471,8 +4498,8 @@ test("the usage line leaves the protocol once the only limit has lifted during a
     const session = await orchestratorSession(h, provider.extension, [provider.extension], [], { now: () => clock });
     try { await session.prompt("Read README.md"); } finally { session.dispose(); }
     const [first, second] = provider.requests;
-    assert.ok(first!.systemPrompt.includes(orchestratorProtocol(8, "medium", "usage: anthropic throttled until 12:05")), first!.systemPrompt);
-    assert.ok(second!.systemPrompt.includes(orchestratorProtocol(8, "medium")), second!.systemPrompt);
+    assert.ok(first!.systemPrompt.includes(orchestratorProtocol(20, "medium", "usage: anthropic throttled until 12:05")), first!.systemPrompt);
+    assert.ok(second!.systemPrompt.includes(orchestratorProtocol(20, "medium")), second!.systemPrompt);
     assert.equal(second!.systemPrompt.includes("usage:"), false, second!.systemPrompt);
   } finally { h.cleanup(); }
 });
@@ -4494,7 +4521,7 @@ test("the usage line leaves out a header reading past its window's reset, or fiv
     const session = await orchestratorSession(h, provider.extension, [provider.extension], [], { now: () => clock });
     try { await session.prompt("Read README.md"); } finally { session.dispose(); }
     const [first, second] = provider.requests;
-    assert.ok(first!.systemPrompt.includes(orchestratorProtocol(8, "medium", "usage: anthropic 71% left · openai-codex low, 8% left")), first!.systemPrompt);
+    assert.ok(first!.systemPrompt.includes(orchestratorProtocol(20, "medium", "usage: anthropic 71% left · openai-codex low, 8% left")), first!.systemPrompt);
     assert.equal(second!.systemPrompt.includes("usage:"), false, second!.systemPrompt);
   } finally { h.cleanup(); }
 });
@@ -4520,7 +4547,7 @@ test("a prompt an earlier extension forces carries the usage line once, as the r
     const lines = provider.requests.map((request) => request.systemPrompt.split("\n").filter((line) => line.startsWith("usage:")));
     assert.deepEqual(lines, [["usage: openai-codex 62% left"], ["usage: openai-codex 62% left"]]);
     const [first, second] = provider.requests;
-    assert.ok(first!.systemPrompt.includes(orchestratorProtocol(8, "medium", "usage: openai-codex 62% left")), first!.systemPrompt);
+    assert.ok(first!.systemPrompt.includes(orchestratorProtocol(20, "medium", "usage: openai-codex 62% left")), first!.systemPrompt);
     assert.equal(occurrences(second!.systemPrompt, "# Orchestrator protocol"), 1, second!.systemPrompt);
   } finally { h.cleanup(); }
 });
@@ -4564,7 +4591,7 @@ test("the usage line marks an estimated lift time, dates one on another day, and
       await session.prompt("Say done");
     } finally { session.dispose(); }
     assert.equal(provider.requests.length, 1);
-    assert.ok(provider.requests[0]!.systemPrompt.includes(orchestratorProtocol(8, "medium",
+    assert.ok(provider.requests[0]!.systemPrompt.includes(orchestratorProtocol(20, "medium",
       "usage: anthropic exhausted until about 16:30 · google throttled until 2026-09-30 09:00 · openai-codex low · zai available")),
     provider.requests[0]!.systemPrompt);
   } finally { h.cleanup(); }
@@ -4584,7 +4611,7 @@ test("an empty usage store adds no usage line to any request", async () => {
     assert.equal(existsSync(usageObservationsPath(h.stateDir)), false, "no store file");
     assert.equal(provider.requests.length, 2);
     for (const request of provider.requests) {
-      assert.ok(request.systemPrompt.includes(orchestratorProtocol(8, "medium")), request.systemPrompt);
+      assert.ok(request.systemPrompt.includes(orchestratorProtocol(20, "medium")), request.systemPrompt);
       assert.equal(request.systemPrompt.includes("usage:"), false, request.systemPrompt);
     }
   } finally { h.cleanup(); }
@@ -4630,7 +4657,7 @@ test("no worker gets the protocol: not a routed worker, not one that delegates, 
 
     const orchestratorRequests = provider.requests.filter((request) => request.sessionId === orchestratorId);
     assert.equal(orchestratorRequests.length, 2);
-    for (const request of orchestratorRequests) assert.ok(request.systemPrompt.includes(orchestratorProtocol(8, "medium")), request.systemPrompt);
+    for (const request of orchestratorRequests) assert.ok(request.systemPrompt.includes(orchestratorProtocol(20, "medium")), request.systemPrompt);
     const workerRequests = provider.requests.filter((request) => request.sessionId !== orchestratorId);
     assert.equal(new Set(workerRequests.map((request) => request.sessionId)).size, 4, "three workers and the lead's own worker");
     for (const request of workerRequests) assert.equal(request.systemPrompt.includes("Orchestrator protocol"), false, request.systemPrompt);
@@ -4671,7 +4698,8 @@ function toolOutcomes(session: { readonly messages: readonly unknown[] }, from =
 }
 
 test("past the 8-call safety limit the orchestrator's exploratory calls still run and their results carry the nudge with the count; actions are not counted", async () => {
-  const h = harness();
+  // An explicit safety limit of 8 keeps the counts below short.
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { explorationNudge: 8 } } });
   try {
     writeFileSync(join(h.projectDir, "README.md"), "# Project\n");
     const provider = plannedAnthropic();
@@ -4693,7 +4721,8 @@ test("past the 8-call safety limit the orchestrator's exploratory calls still ru
 });
 
 test("only read-only and unrecognised bash calls count toward the exploration nudge", async () => {
-  const h = harness();
+  // An explicit safety limit of 8 keeps the counts below short.
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { explorationNudge: 8 } } });
   try {
     writeFileSync(join(h.projectDir, "README.md"), "# Project\\n");
     writeFileSync(join(h.projectDir, "counter.test.js"), 'import test from "node:test"; import assert from "node:assert/strict"; test("counter test", () => assert.equal(1, 1));\\n');
@@ -4747,7 +4776,8 @@ test("the nudge starts after the owner's explorationNudge setting, and the proto
 });
 
 test("a new user prompt starts the count again; a prompt an extension sends and a run a message starts count on", async () => {
-  const h = harness();
+  // An explicit safety limit of 8 keeps the counts below short.
+  const h = harness({ orchestrator: { routing: ROUTING, subagents: { explorationNudge: 8 } } });
   try {
     writeFileSync(join(h.projectDir, "README.md"), "# Project\n");
     // A command that starts a run with a message, as a background call's completion notice does.
@@ -5870,7 +5900,7 @@ test("at gate level off the quality gate is gone: no subagents_verdict tool, no 
       assert.ok(mainRequests().length > 0);
       for (const request of mainRequests()) {
         assert.equal(request.tools.includes("subagents_verdict"), false, JSON.stringify(request.tools));
-        assert.ok(request.systemPrompt.includes(orchestratorProtocol(8, "off")), request.systemPrompt);
+        assert.ok(request.systemPrompt.includes(orchestratorProtocol(20, "off")), request.systemPrompt);
         assert.doesNotMatch(request.systemPrompt, /Your gate level is/);
       }
 
@@ -5911,7 +5941,7 @@ test("at gate level off a commit's result says nothing of verdicts, even when th
 });
 
 test("the protocol tells the orchestrator to judge an editing delegation's Result and record the verdict with subagents_verdict", () => {
-  const protocol = orchestratorProtocol(8, "medium");
+  const protocol = orchestratorProtocol(20, "medium");
   const paragraph = protocol.split("\n\n").find((text) => text.includes("subagents_verdict"));
   assert.ok(paragraph, protocol);
   for (const phrase of ["edited", "accept", "request_changes", "reason", "replaces", "research", "resume", "git commit or git push always goes through",
